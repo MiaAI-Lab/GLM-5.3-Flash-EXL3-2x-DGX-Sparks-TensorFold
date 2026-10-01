@@ -31,13 +31,27 @@ WORKER="${WORKER:-}"                 # e.g. user@<worker address>; set it in scr
 FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is reached over another network
 MASTER_PORT="${MASTER_PORT:-29551}"  # TensorFold's rendezvous port between the ranks (keep it on the private link)
 
-MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"   # EXL3 routed experts (4 bpw), BF16 elsewhere
+# ABLIT=1: serve the weights-level abliterated checkpoint (bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit) instead of the
+# stock TR3 4-bpw pack. The abliteration is baked into those weights: the runtime is checkpoint-agnostic, nothing else
+# changes, and the checkpoint's ABLIT_META.json is data the loader ignores. An explicit MODEL_ID (environment,
+# scripts/local.sh or .env) still wins: ABLIT only picks the default. The recipe's performance and quality numbers
+# were measured on the stock checkpoint.
+ABLIT="${ABLIT:-0}"
+if [[ "$ABLIT" == 1 ]]; then
+  _model_default="bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit"
+  _model_pin="14858211ed81d7fa773f8a0db02f38f36d230252"
+else
+  _model_default="Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw"
+  _model_pin="9eaebb7c4e96d983dcd538e18624622ba5b820a8"
+fi
+MODEL_ID="${MODEL_ID:-$_model_default}"   # EXL3 routed experts (4 bpw), BF16 elsewhere
 # The checkpoint's revision (a Hugging Face commit sha; DFLASH2_REVISION below is DFlash2's): the one this recipe was
 # measured with. prepare.sh downloads exactly it, start.sh serves that snapshot from the local cache (no network), and
 # a new upstream commit changes nothing here until the pin does. Empty: the Hub's main when first downloaded. The pin
 # belongs to the default MODEL_ID; another MODEL_ID gets no pin unless you set one.
-_rev=""; [[ "$MODEL_ID" == Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw ]] && _rev=9eaebb7c4e96d983dcd538e18624622ba5b820a8
+_rev=""; [[ "$MODEL_ID" == "$_model_default" ]] && _rev=$_model_pin
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
+unset _model_default _model_pin
 TF_VERSION="${TF_VERSION:-v0.5.0}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"

@@ -20,7 +20,10 @@ vision, tool calling, `/tokenize` and `/metrics`.
 
 - Checkpoint: [`Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
   (EXL3 routed experts at 4 bits a weight, BF16 elsewhere, ~176 GB), a byte-identical mirror of
-  [`brandonmusic/GLM-5.3-Flash-tr3-4bpw`](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw)
+  [`brandonmusic/GLM-5.3-Flash-tr3-4bpw`](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw). `ABLIT=1`
+  serves the weights-level abliterated variant
+  [`bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit`](https://huggingface.co/bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit)
+  instead (see [Configuration](#configuration))
 - Drafter: [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2), or the checkpoint's
   own MTP head (`DRAFTER`, see [Configuration](#configuration))
 - API model id: `GLM-5.3-Flash-EXL3`
@@ -254,6 +257,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | --- | --- | --- |
 | `WORKER` / `FABRIC_PEER` | empty | the worker's ssh target (`user@<address>`), and its CX7 address when `WORKER` is on another network |
 | `MASTER_PORT` | `29551` | the ranks' rendezvous port (keep it on the private link) |
+| `ABLIT` | `0` | `1`: serve the weights-level abliterated checkpoint [`bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit`](https://huggingface.co/bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit) @ `14858211…` instead of the stock pack; the abliteration is baked into those weights, so nothing else changes. An explicit `MODEL_ID` still wins; the recipe's performance and quality numbers were measured on the stock checkpoint. Set it before the first `./start.sh` and the abliterated checkpoint is what gets downloaded |
 | `PARALLEL` | `4` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 4 (above 1 needs `DRAFTER=dflash2`) |
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |

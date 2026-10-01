@@ -3,6 +3,16 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+### Added
+- `ABLIT=1`: serve the weights-level abliterated checkpoint
+  [`bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit`](https://huggingface.co/bullerwins/GLM-5.3-Flash-exl3-4bpw-ablit) @
+  `14858211ed81d7fa773f8a0db02f38f36d230252` instead of the stock TR3 4-bpw pack. The runtime is checkpoint-agnostic:
+  the abliteration is baked into those weights (the checkpoint's `ABLIT_META.json` is data the loader ignores), so no
+  other setting changes. `scripts/prepare.sh` downloads exactly that revision and copies it to the worker like any
+  model switch; an explicit `MODEL_ID` still wins over `ABLIT`. No image change (script-level setting only).
+
 ## v1.1 (2026-10-01): up to 50 images and 4 videos a request
 
 Image `v0.5.0-cb7c56f7f921` (`sha256:6ee3c6e0430040b69ddcb0c96c7fbbcb94a5bed47d48a8ba092626369ae533b9`), 53 patches.
