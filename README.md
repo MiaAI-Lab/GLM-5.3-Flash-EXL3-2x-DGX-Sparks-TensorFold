@@ -288,6 +288,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `COPY` / `COPY_MAX` | `1` / `15` | copy drafts: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round |
 | `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
+| `GLP` / `GLP_ALPHA` | empty / the file's own | GLP steering: a [weightless](https://weightless.msuiche.com) control vector applied after every decoder layer ([GLP steering](#glp-steering)); empty: off. Forces `SPLIT=0` |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -321,6 +322,32 @@ Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one CX7
 port even when both are up), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
 server reach Hugging Face; by default it serves from the local cache only).
+
+### GLP steering
+
+The server can apply a **GLP (GGUF Layer Projection) control vector** from the
+[weightless](https://weightless.msuiche.com) project ([github.com/msuiche/weightless](https://github.com/msuiche/weightless),
+format: [`spec/GLP.md`](https://github.com/msuiche/weightless/blob/main/spec/GLP.md)): a megabyte-scale GGUF sidecar of
+per-layer unit directions, projected off the widened hyper-connection stream after every decoder layer
+(`x <- x - alpha * (x . d) d`, `glp.mode=project`). The published vector for this model is
+[`msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44`](https://huggingface.co/msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44)
+(layers 1-44 of 45, calibrated at alpha 2.0, its `glp.alpha_default`).
+
+Steering **changes the replies** — that is its point. It is off by default.
+
+```bash
+# put the sidecar in the head's Hugging Face cache (start.sh copies it to the worker's)
+mkdir -p ~/.cache/huggingface/glp44 && cp GLM-5.3-Flash-abliterated-cyber-GLP-44.gguf ~/.cache/huggingface/glp44/
+GLP=glp44/GLM-5.3-Flash-abliterated-cyber-GLP-44.gguf ./start.sh restart
+# tools/glpcheck.py <file> validates a sidecar offline (the same gates the engine applies)
+```
+
+The contract is fail-closed: a file the engine cannot apply exactly — another mode than `project`, another hook than
+`residual_stream_post_layer`, another width than this model's 16,384-wide stream, rank above 1, alpha multipliers, a
+copy that differs between the two Sparks — fails the boot; the server never runs unsteered when steering was asked
+for. `GLP_ALPHA` overrides the file's `glp.alpha_default`. `SPLIT` is forced to `0` while steering (the split prompt
+path is not steered), which costs prefill speed; decode is unchanged. The MTP/DFlash2 drafts stay unsteered (they
+only propose; the steered model verifies), and their taps keep reading the stock stream.
 
 ### Thinking and sampling
 
@@ -382,6 +409,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Concurrent requests | `0026-glm-multi-kda`, `0027-glm-multi-dflash2`, `0029-glm-multi-dsa`, `0030-glm-multi-stream-engine`, `0035-glm-multi-rounds`, `0040-glm-parallel-deadlocks`, `0041-glm-parallel-ring-base`, `0048-glm-timing-tokens`, `0049-glm-multi-prefill` | several streams over one shared pool of per-token caches, one batched verify window a round, both ranks kept in step; prompts that arrive together filled in one forward (`MULTI_PREFILL`: 4 prose requests at once 103.4 -> 108.8 tok/s, first token 590 -> 340 ms); a request alone on the one-stream graphs (`TF_GLM_MULTI_LONE=1`, off by default since v1.3.1: +0.6-0.9%); the startup timings of verify windows on distinct tokens | 4 requests at once ([Performance](#performance)) |
 | Sampling | `0034-cuda-nucleus-union` | a top_p draw from both ranks' candidates together, the same draw with fewer whole-shard reads (`TENSORFOLD_NUCLEUS_UNION=1`, off by default) | opt-in |
 | Server | `0003-glm-vision`, `0050-glm-many-media`, `0036-glm-tool-calls`, `0051-glm-tool-history-recovery`, `0053-glm-whole-tool-calls`, `0037-cuda-tokenize`, `0023-server-effort-max`, `0044-cuda-context-errors`, `0045-cuda-metrics` | GLM's image and video processors and vision tower; up to 50 pictures and 4 clips a request in 96 MiB bodies; GLM tool calls for agent clients; a past tool call whose arguments are not a JSON object left out of the prompt with its result and logged, instead of HTTP 400 (agents replay history, so a 400 ended the conversation); each call sent whole once written, a call the reply ends inside never sent; `/tokenize` and `/detokenize`; `reasoning_effort: "max"`; the `param` field and GLM's own refusals on TensorFold v0.6.0's `context_length_exceeded` errors, and `/health`'s figures in its Prometheus `/metrics` | the API features above |
+| Steering | `0054-glm-glp-steering` | a [weightless](https://weightless.msuiche.com) GLP control vector (`glp.mode=project`) projected off the widened hyper-connection stream after every decoder layer, in the captured graphs, fail-closed at boot (`GLP`) | off by default; steers the replies when on |
 
 ## Checks
 

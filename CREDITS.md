@@ -75,6 +75,12 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
 - `0047-glm-exl3-decode-loads` (routed-expert decode loads, `TF_GLM_EXL3_LOADS`): adapted from patch 0580 of
   [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) (Apache 2.0); changes listed
   in `NOTICE`.
+- `0054-glm-glp-steering` (`GLP`): implements the GLP (GGUF Layer Projection) contract of the
+  [weightless](https://weightless.msuiche.com) project by Matt Suiche
+  ([github.com/msuiche/weightless](https://github.com/msuiche/weightless), `spec/GLP.md`; the vLLM plugin's
+  `weightless_steer` package, whose reader gates this patch mirrors, is MIT). The published vectors, e.g.
+  [`msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44`](https://huggingface.co/msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44),
+  are downloaded from Hugging Face and are not part of this repository.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

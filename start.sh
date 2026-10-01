@@ -18,7 +18,8 @@
 # Setup: WORKER=user@<worker address> in scripts/local.sh (key-based ssh).
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
-#            SHARED_PREFIX, MULTI_PREFILL, KV_POOL_GIB, MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
+#            SHARED_PREFIX, MULTI_PREFILL, KV_POOL_GIB, MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS,
+#            GLP, GLP_ALPHA, COMM, SERVED_NAME, HOST, PORT
 #   nodes    WORKER, FABRIC_PEER, MASTER_PORT, NCCL_RAILS (1: one CX7 port), NCCL_CHANNELS, NCCL_DEBUG
 #   files    MODEL_ID, MODEL_REVISION, DFLASH2_ID, DFLASH2_REVISION, HF_CACHE (default: HF_HOME), KERNEL_CACHE,
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
@@ -67,6 +68,7 @@ for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL; do [[ "${!v}" 
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
 [[ "$TF_GLM_EXL3_LOADS" =~ ^(0|ldg|1|nc|nc1|nc2|nc4)$ ]] || die "TF_GLM_EXL3_LOADS is 0, nc, nc2 or nc4, not $TF_GLM_EXL3_LOADS"
 [[ "$TF_ROCE_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "TF_ROCE_MAX_KB is a size in KiB (512: up to 32-row windows over RoCE), not $TF_ROCE_MAX_KB"
+[[ -z "$GLP_ALPHA" || "$GLP_ALPHA" =~ ^[0-9]*[.]?[0-9]+$ ]] || die "GLP_ALPHA is a non-negative number, not $GLP_ALPHA"
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
@@ -161,6 +163,22 @@ MODEL_ARG=$(snapshot "$MODEL_ID")
 if [[ "$DRAFTER" == dflash2 ]]; then DRAFTER_ARG=$(snapshot "$DFLASH2_ID")
 else DRAFTER_ARG=none; fi                           # the checkpoint's MTP head, even when DFlash2 is downloaded
 SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the command line comes later and wins
+
+# GLP steering (config.sh's GLP): the sidecar lives in the Hugging Face cache on both Sparks (the containers mount it
+# at the same path), copied to the worker when missing. TF_GLM_GLP / TF_GLM_GLP_ALPHA ride the TF_GLM_* pass-through.
+if [[ -n "$GLP" ]]; then
+  GLP_REL="${GLP#/root/.cache/huggingface/}"; GLP_REL="${GLP_REL#"$HF_CACHE"/}"; GLP_REL="${GLP_REL#/}"
+  [[ -f "$HF_CACHE/$GLP_REL" ]] || die "GLP=$GLP: $HF_CACHE/$GLP_REL does not exist; put the sidecar there first (README, GLP steering)"
+  if [[ "$WORKER_WEIGHTS" == nfs ]]; then
+    worker_nfs test -f "/hf/$GLP_REL" || die "the worker does not see $GLP_REL over NFS ($NFS_VOLUME)"
+  elif ! worker "test -f '$WORKER_HF/$GLP_REL'"; then
+    log "copying the GLP sidecar to the worker ($GLP_REL)"
+    worker "mkdir -p '$WORKER_HF/$(dirname "$GLP_REL")'"
+    scp -q "$HF_CACHE/$GLP_REL" "$WORKER:$WORKER_HF/$GLP_REL"
+  fi
+  export TF_GLM_GLP="/root/.cache/huggingface/$GLP_REL"
+  [[ -z "$GLP_ALPHA" ]] || export TF_GLM_GLP_ALPHA="$GLP_ALPHA"
+fi
 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, link, previous server, port, memory"

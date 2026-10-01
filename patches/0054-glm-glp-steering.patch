@@ -1,0 +1,404 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 9b80e31..54efc61 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -85,7 +85,8 @@ class Engine:
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
+-                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
++                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None,
++                 glp: tuple[torch.Tensor, float] | None = None) -> None:
+         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
+         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
+         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
+@@ -93,7 +94,8 @@ class Engine:
+         draft chains take one row a step, so the MTP buffers need not be as wide as the verify windows; ``streams``:
+         stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``,
+         default ``capacity``) for concurrent streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
+-        ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
++        ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another.
++        ``glp``: a GLP steering table and alpha (``glp.py``), installed on the main and prompt buffers, or None."""
+ 
+         if grid and prefill_rows % grid:
+             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
+@@ -117,6 +119,11 @@ class Engine:
+         if taps:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
++        if glp is not None:
++            table, alpha = glp                                 # before any graph capture, like the taps
++            for buf in (self.buf, self.pbuf):
++                buf.glp_dirs = table
++                buf.glp_alpha = alpha
+         if split is not None and split.split:
+             from .hcsplit import HcSplit
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 267e84c..871c14f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -391,6 +391,8 @@ class GlmEngine:
+         instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests); ``parallel``: requests decoded together
+         (``multi``: their caches share one pool, each stream up to the context window; DFlash2 drafts only)."""
+ 
++        import math
++
+         import torch
+ 
+         from tensorfold.cuda.comm import NCCL
+@@ -536,13 +538,41 @@ class GlmEngine:
+             verify_code = [verify_code] + MultiSettings.from_env().code()
+         else:
+             verify_code = [verify_code]
++        # GLP steering (glp.py): TF_GLM_GLP names the sidecar (one container path, the same on both ranks). The
++        # file is read and validated here so a bad one fails the boot before any weight work; its hash joins the
++        # settings fingerprint below, so ranks carrying different files refuse to start. The split prompt path is
++        # not steered (its rows live one half a rank mid-layer), so it is refused rather than silently unsteered.
++        glp_arg = None
++        glp_sha = 0
++        glp_path = os.environ.get("TF_GLM_GLP", "").strip()
++        if glp_path:
++            if self.split.split:
++                raise ValueError("TF_GLM_GLP with TF_GLM_HC_SPLIT=1: the split prompt path is not steered. Set "
++                                 "TF_GLM_HC_SPLIT=0 (SPLIT=0 in the recipe) or unset TF_GLM_GLP. Refusing to serve "
++                                 "a partially steered boot.")
++            from . import glp
++            glp_dirs, glp_alpha, glp_sha = glp.load(glp_path, layers=cfg.layers, width=cfg.hidden * cfg.streams)
++            alpha_env = os.environ.get("TF_GLM_GLP_ALPHA", "").strip()
++            if alpha_env:
++                try:
++                    glp_alpha = float(alpha_env)
++                except ValueError:
++                    raise ValueError(f"TF_GLM_GLP_ALPHA is a float, not {alpha_env!r}") from None
++                if not math.isfinite(glp_alpha):
++                    raise ValueError(f"TF_GLM_GLP_ALPHA must be finite, not {alpha_env!r}")
++            table = torch.zeros((cfg.layers, cfg.hidden * cfg.streams), dtype=torch.float32)
++            for li, vec in glp_dirs.items():
++                table[li] = torch.from_numpy(vec)
++            glp_arg = (table.cuda(), glp_alpha)
++            print(f"[tensorfold] GLP steering (weightless, mode=project, hook {glp.HOOK}): {glp_path}, "
++                  f"{len(glp_dirs)} layers {min(glp_dirs)}..{max(glp_dirs)}, alpha {glp_alpha}", flush=True)
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv)]
++                                 KV_KINDS.index(kv), glp_sha]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -554,7 +584,7 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_GLP): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -605,7 +635,8 @@ class GlmEngine:
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
++                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv,
++                        glp=glp_arg)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index c32686e..c3d38e1 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -142,6 +142,10 @@ class Buffers:
+         # DFlash2 taps: the mean of the streams after chosen layers (``set_taps``), filled by every forward
+         self.taps: list[torch.Tensor] = []
+         self.tap_at: dict[int, list[int]] = {}
++        # GLP steering (glp.py): the dense [layers, S*D] fp32 direction table and alpha, installed by Engine before
++        # any graph capture; None keeps the apply out of the captured graphs entirely (steering off)
++        self.glp_dirs: torch.Tensor | None = None
++        self.glp_alpha = 0.0
+         self.experts = c.experts
+         self.top_k = c.top_k
+         # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
+@@ -949,6 +953,11 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
+             for slot in b.tap_at.get(layer.index, ()):
+                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
++            if b.glp_dirs is not None:
++                # GLP steering, after the taps so the drafter keeps seeing the stock stream: project the layer's
++                # direction off the widened stream (a zero table row is an exact no-op on unsteered layers). The
++                # split prompt path never reaches here: the engine refuses TF_GLM_GLP with TF_GLM_HC_SPLIT on.
++                glue.glp_project(b.x[:R], b.glp_dirs[layer.index], b.glp_alpha)
+         glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+diff --git tensorfold/families/glm5_next/cuda/glp.py tensorfold/families/glm5_next/cuda/glp.py
+new file mode 100644
+index 0000000..675b93f
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/glp.py
+@@ -0,0 +1,219 @@
++"""GLP (GGUF Layer Projection) steering: a per-layer direction projected off the widened residual stream.
++
++A GLP sidecar is a small GGUF v3 file of per-decoder-layer unit directions (F32 tensors ``direction.<N>``, N the
++1-based layer id, layer 0 inexpressible) under a ``glp.*`` metadata contract. With ``glp.mode=project`` every row of
++the stream is edited after each steered layer: ``x <- x - alpha * (x . d) d``. The contract is fail-closed: a reader
++that does not understand the file must refuse it, never fall back to adding (the same numbers under the wrong
++operation produce no error, just wrong output).
++
++Format, derivation and published vectors: https://github.com/msuiche/weightless (spec/GLP.md) and
++https://weightless.msuiche.com. The reference reader this file's gates mirror is
++vllm-plugin/weightless_steer/container.py there.
++
++This lane implements the scalar case: rank-1 vectors, one alpha for every steered layer, the
++``residual_stream_post_layer`` hook. Rank-k (subspace) files and the spec_version-2 alpha multipliers are refused
++rather than partially applied. The apply itself is in glue.py (``glp_project``); this module reads and validates.
++
++TF_GLM_GLP names the sidecar (a container path, the same on both ranks); TF_GLM_GLP_ALPHA overrides the file's
++glp.alpha_default. The engine refuses to start when the file is missing, malformed, made for another hook or model,
++or differs between the ranks.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++import re
++import struct
++
++import numpy as np
++
++HOOK = "residual_stream_post_layer"       # the one site this engine steers (after the layer's second hc_post)
++
++_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
++_FM = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f",
++       7: "<B", 10: "<Q", 11: "<q", 12: "<d"}
++
++_DIRECTION_RE = re.compile(r"direction\.(\d+)(?:\.(\d+))?")
++
++
++def _int_meta(meta: dict, key: str, default: int) -> int:
++    """An integer metadata value, coerced: real GGUF writers emit uint32, fixture files carry strings."""
++    v = meta.get(key)
++    if v is None or v == "":
++        return default
++    return int(float(str(v)))
++
++
++def read_gguf(path: str) -> tuple[dict, dict[str, np.ndarray]]:
++    """Minimal GGUF v3 reader for control vectors (F32 tensors only): (metadata, {tensor name: array})."""
++
++    with open(path, "rb") as f:
++        data = f.read()
++    if data[:4] != b"GGUF":
++        raise ValueError(f"{path}: bad magic, not a GGUF file")
++    ver, n_tensors, n_kv = struct.unpack_from("<IQQ", data, 4)
++    if ver != 3:
++        raise ValueError(f"{path}: GGUF version {ver}, expected 3")
++    off = 24
++
++    def rd_string(o):
++        (n,) = struct.unpack_from("<Q", data, o)
++        o += 8
++        return data[o:o + n].decode("utf-8"), o + n
++
++    meta = {}
++    for _ in range(n_kv):
++        key, off = rd_string(off)
++        (vtype,) = struct.unpack_from("<I", data, off)
++        off += 4
++        if vtype == 8:    # string
++            val, off = rd_string(off)
++        elif vtype == 9:  # array
++            etype, cnt = struct.unpack_from("<IQ", data, off)
++            off += 12
++            if etype == 8:
++                val = []
++                for _ in range(cnt):
++                    s, off = rd_string(off)
++                    val.append(s)
++            else:
++                val = struct.unpack_from(f"<{cnt}{_FM[etype][1]}", data, off)
++                off += _SZ[etype] * cnt
++        else:
++            (val,) = struct.unpack_from(_FM[vtype], data, off)
++            off += _SZ[vtype]
++        meta[key] = val
++
++    infos = []
++    for _ in range(n_tensors):
++        name, off = rd_string(off)
++        (nd,) = struct.unpack_from("<I", data, off)
++        off += 4
++        dims = struct.unpack_from(f"<{nd}Q", data, off)
++        off += 8 * nd
++        (tt,) = struct.unpack_from("<I", data, off)
++        off += 4
++        (toff,) = struct.unpack_from("<Q", data, off)
++        off += 8
++        infos.append((name, dims, tt, toff))
++
++    align = meta.get("general.alignment", 32)
++    base = (off + align - 1) // align * align
++    tensors = {}
++    for name, dims, tt, toff in infos:
++        if tt != 0:
++            raise ValueError(f"{path}: {name} is not F32 (ggml type {tt})")
++        n = 1
++        for d in dims:
++            n *= d
++        tensors[name] = np.frombuffer(data, dtype="<f4", count=n, offset=base + toff).copy()
++    return meta, tensors
++
++
++def load(path: str, *, layers: int, width: int) -> tuple[dict[int, np.ndarray], float, int]:
++    """Read and validate a GLP sidecar for a model of ``layers`` decoder layers and a ``width``-wide stream.
++
++    Returns ({layer id: unit F32 direction}, alpha, content hash). Every check here is a refusal, not a warning:
++    a boot that asked for steering must never serve unsteered, and a file this lane cannot honour exactly must not
++    be applied approximately. ``alpha`` is the file's glp.alpha_default (1.0 when absent); the caller applies the
++    TF_GLM_GLP_ALPHA override.
++    """
++
++    with open(path, "rb") as f:
++        raw = f.read()
++    sha = int.from_bytes(hashlib.sha256(raw).digest()[:4], "little") & 0x7FFF_FFFF  # int32, for the rank fingerprint
++    meta, tensors = read_gguf(path)
++
++    mode = meta.get("glp.mode")
++    if mode is None:
++        raise ValueError(f"{path}: no glp.mode. Refusing to guess: an additive control vector and a projective one "
++                         "are different operations.")
++    if mode != "project":
++        raise ValueError(f"{path}: glp.mode={mode!r}, but this engine only implements projective ablation "
++                         "(x -= alpha*(x.d)d). Refusing to apply.")
++
++    file_hook = meta.get("glp.hook_point")
++    if file_hook != HOOK:
++        raise ValueError(f"{path}: glp.hook_point={file_hook!r} does not match this engine's hook ({HOOK}). "
++                         "Refusing to apply at the wrong site.")
++
++    # The version gate: rank > 1 and the alpha-scaling keys change what a reader computes, so they are only valid
++    # under spec_version 2. A version-1 reader would ignore keys it does not know and apply the file with the wrong
++    # alphas -- silently. Refuse instead.
++    version = _int_meta(meta, "glp.spec_version", 1)
++    if version not in (1, 2):
++        raise ValueError(f"{path}: glp.spec_version={meta.get('glp.spec_version')!r} is not implemented by this "
++                         "reader (1 and 2 are). Refusing.")
++    rank_declared = _int_meta(meta, "glp.rank", 1)
++    if version == 1 and (rank_declared != 1 or "glp.dir_scales" in meta or "glp.layer_scales" in meta):
++        raise ValueError(f"{path}: glp.rank={rank_declared} / alpha-scaling keys require glp.spec_version 2 "
++                         "(this file declares 1). Refusing.")
++
++    # This lane serves one scalar alpha for every steered layer; a file carrying per-direction or per-layer
++    # multipliers would be served at the wrong strength with no way to tell from the output.
++    scales = sorted(set(meta) & {"glp.dir_scales", "glp.layer_scales"})
++    if scales:
++        raise ValueError(f"{path}: carries {', '.join(scales)}, which this engine does not implement. Refusing to "
++                         "ignore alpha multipliers.")
++    if rank_declared != 1:
++        raise ValueError(f"{path}: glp.rank={rank_declared} (subspace) -- this engine implements rank 1 only. "
++                         "Refusing to serve a partially applied subspace.")
++
++    alpha = float(meta.get("glp.alpha_default", 1.0))
++    if not math.isfinite(alpha):
++        raise ValueError(f"{path}: glp.alpha_default must be finite, not {meta.get('glp.alpha_default')!r}")
++
++    grouped: dict[int, dict[int, np.ndarray]] = {}
++    for name, arr in tensors.items():
++        m = _DIRECTION_RE.fullmatch(name)
++        if m is None:
++            if name.startswith("direction."):
++                raise ValueError(f"{path}: malformed tensor name {name!r} -- 'direction.' must be followed by an "
++                                 "integer layer id")
++            continue
++        idx, j = int(m.group(1)), int(m.group(2) or 0)
++        if idx < 1:
++            raise ValueError(f"{path}: {name} is invalid; layer 0 cannot be expressed in this container")
++        if j != 0:
++            raise ValueError(f"{path}: {name} names a rank-{j + 1} direction; this engine implements rank 1 only. "
++                             "Refusing.")
++        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
++        if not np.isfinite(arr).all() or not np.any(arr):
++            raise ValueError(f"{path}: {name} must be finite and nonzero")
++        grouped.setdefault(idx, {})[j] = arr
++    if not grouped:
++        raise ValueError(f"{path}: no direction.<N> tensors found")
++
++    # Cross-check the tensor names against the informational layer list: they are written from the same source, so a
++    # disagreement means a broken exporter. The names are what execute; a one-layer shift degrades rather than fails
++    # (adjacent-layer refusal directions are highly correlated), so this check is load-bearing.
++    declared = meta.get("glp.layer_ids_zero_based")
++    if declared:
++        try:
++            want = sorted(int(x) for x in declared.split(",") if x.strip())
++        except ValueError:
++            raise ValueError(f"{path}: glp.layer_ids_zero_based is not a comma list of integers: {declared!r}") \
++                from None
++        if want and want != sorted(grouped):
++            raise ValueError(f"{path}: glp.layer_ids_zero_based declares layers {want[0]}..{want[-1]} "
++                             f"({len(want)} entries) but the direction tensors resolve to {sorted(grouped)[0]}.."
++                             f"{sorted(grouped)[-1]} ({len(grouped)} entries). The tensor names are what get "
++                             "applied, so this file would steer the wrong layers. Re-export it.")
++
++    dirs: dict[int, np.ndarray] = {}
++    for idx, js in grouped.items():
++        if not 0 <= idx < layers:
++            raise ValueError(f"{path}: direction layer {idx} out of range for this model ({layers} layers)")
++        vec = js[0].astype(np.float64)
++        if vec.size != width:
++            raise ValueError(f"{path}: direction layer {idx} is {vec.size} wide; this model's widened stream is "
++                             f"{width} (streams * hidden). Refusing to steer a different geometry.")
++        # The published vectors ship unit directions; normalise anyway (in float64, so a finite but extreme f32
++        # export cannot overflow its own squared norm) so no export can silently scale alpha.
++        norm = np.linalg.norm(vec)
++        if not math.isfinite(norm) or norm <= 0:
++            raise ValueError(f"{path}: direction layer {idx} must be finite and nonzero")
++        dirs[idx] = (vec / norm).astype(np.float32)
++
++    return dirs, alpha, sha
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index ae13bb7..34b9938 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -321,6 +321,36 @@ def stream_mean(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
++# -- GLP steering (glp.py) --------------------------------------------------------------------------------------
++@triton.jit
++def _glp_project(X, DIR, alpha, D: tl.constexpr, BLOCK: tl.constexpr):
++    """Row r of the widened stream: x <- x - alpha * (x . d) d; the dot accumulates fp32 in fixed block order and
++    the write-back rounds to bf16 explicitly, so both ranks compute identical bits. A zero DIR row is an exact
++    no-op (bf16 -> fp32 -> bf16 is lossless), which keeps the captured graph identical for every layer set."""
++
++    r = tl.program_id(0)
++    acc = 0.0
++    for cb in tl.static_range(D // BLOCK):
++        d = cb * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(X + r * D + d).to(tl.float32)
++        acc += tl.sum(x * tl.load(DIR + d), axis=0)
++    coef = alpha * acc
++    for cb in tl.static_range(D // BLOCK):
++        d = cb * BLOCK + tl.arange(0, BLOCK)
++        x = tl.load(X + r * D + d).to(tl.float32)
++        v = tl.load(DIR + d)
++        tl.store(X + r * D + d, (x - coef * v).to(tl.bfloat16))
++
++
++def glp_project(x: torch.Tensor, drow: torch.Tensor, alpha: float) -> None:
++    """In place on x [R, S*D] bf16: project this layer's GLP direction off every row (drow fp32 [S*D], unit norm)."""
++
++    rows, wide = x.shape
++    if wide % 1024:
++        raise ValueError(f"glp_project: stream width {wide} is not a multiple of 1024")
++    _glp_project[(rows,)](x, drow, float(alpha), D=wide, BLOCK=1024, num_warps=4)
++
++
+ # -- MLP and MoE ----------------------------------------------------------------------------------------------
+ @triton.jit
+ def _swiglu(GU, OUT, XS, LIMIT, W: tl.constexpr, BLOCK: tl.constexpr):

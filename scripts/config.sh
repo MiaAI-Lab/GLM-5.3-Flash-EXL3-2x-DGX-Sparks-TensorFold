@@ -175,6 +175,17 @@ export TF_GLM_EXL3_LOADS="${TF_GLM_EXL3_LOADS:-nc}"
 # later chats prefill in 0.13 s instead of 4.24 s. Same replies. SHARED_PREFIX=0 turns it off.
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
 export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
+# GLP steering (patch 0054; the weightless project, https://weightless.msuiche.com): a GGUF sidecar of per-layer
+# projection directions (glp.mode=project), projected off the widened hyper-connection stream after every decoder
+# layer. GLP is the file's path inside the Hugging Face cache (glp44/control.gguf, say; empty, the default: no
+# steering); start.sh copies it to the worker's cache when it is missing there. GLP_ALPHA overrides the file's
+# glp.alpha_default (the published GLP-44 vector for this model ships 2.0). Unlike the speed settings above, steering
+# CHANGES the replies -- that is its point. A file the engine cannot apply exactly (wrong hook, wrong width, rank >
+# 1, alpha multipliers, a copy that differs between the Sparks) fails the boot, never serves unsteered. SPLIT is
+# forced to 0: the split prompt path is not steered (prefill ~1,730 -> ~1,270 tok/s while steering).
+GLP="${GLP:-}"
+GLP_ALPHA="${GLP_ALPHA:-}"
+[[ -z "$GLP" ]] || { SPLIT=0; export TF_GLM_HC_SPLIT=0 TF_GLM_PREFILL_OVERLAP=0; }
 # The shared KV pool beyond the 1,048,576-token window (kept prompt states, several long conversations at once) grows
 # into the memory left at start. TensorFold sizes it from MemAvailable at start minus MEMORY_RESERVE_GIB
 # (TENSORFOLD_MEMORY_RESERVE_GIB), capped at KV_POOL_GIB (its TF_GLM_CACHE_GIB). The server uses about 10 GiB more than

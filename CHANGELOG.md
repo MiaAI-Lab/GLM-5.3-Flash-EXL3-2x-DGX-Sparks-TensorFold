@@ -3,6 +3,22 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased: GLP steering (weightless control vectors)
+
+### Added
+- **GLP steering** (`GLP`, patch `0054-glm-glp-steering`): a [weightless](https://weightless.msuiche.com) GLP control
+  vector -- a GGUF sidecar of per-layer unit directions, `glp.mode=project` -- projected off the widened
+  hyper-connection stream after every decoder layer, prefill and decode, inside the captured graphs. The sidecar
+  lives in the Hugging Face cache on both Sparks (`start.sh` copies it to the worker when missing), `GLP_ALPHA`
+  overrides the file's `glp.alpha_default`, and the file's hash joins the startup settings fingerprint, so the ranks
+  can never carry different files. Fail-closed: anything but an exact apply (wrong mode, hook, width or layer range;
+  rank > 1; alpha multipliers; a missing file) fails the boot instead of serving unsteered. The published vector for
+  this model is
+  [`msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44`](https://huggingface.co/msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44)
+  (alpha 2.0). Unlike the speed patches, steering changes the replies -- that is its point.
+- `tools/glpcheck.py`: validates a GLP sidecar offline (the same gates, no GPU).
+- The split prompt path (`SPLIT=1`) is not steered, so `GLP` forces `SPLIT=0` while it is on (prefill ~1,730 ->
+  ~1,270 tok/s steered; decode unchanged). Steering the split path is row-local and can come later.
 ## v1.3.2 (2026-10-01): more kept prompts, a note on non-English prompts
 
 Image unchanged: `v0.6.0-ae8d1c789b47`.
