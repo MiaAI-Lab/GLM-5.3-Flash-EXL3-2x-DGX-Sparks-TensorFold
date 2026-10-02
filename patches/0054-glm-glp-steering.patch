@@ -35,7 +35,7 @@ index 9b80e31..54efc61 100644
              from .hcsplit import HcSplit
  
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 267e84c..871c14f 100644
+index 267e84c..cbb4ada 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -391,6 +391,8 @@ class GlmEngine:
@@ -47,22 +47,19 @@ index 267e84c..871c14f 100644
          import torch
  
          from tensorfold.cuda.comm import NCCL
-@@ -536,13 +538,41 @@ class GlmEngine:
+@@ -536,13 +538,38 @@ class GlmEngine:
              verify_code = [verify_code] + MultiSettings.from_env().code()
          else:
              verify_code = [verify_code]
 +        # GLP steering (glp.py): TF_GLM_GLP names the sidecar (one container path, the same on both ranks). The
 +        # file is read and validated here so a bad one fails the boot before any weight work; its hash joins the
-+        # settings fingerprint below, so ranks carrying different files refuse to start. The split prompt path is
-+        # not steered (its rows live one half a rank mid-layer), so it is refused rather than silently unsteered.
++        # settings fingerprint below, so ranks carrying different files refuse to start. Both prompt paths are
++        # steered: unsplit in forward._compute, row-split in hcsplit.HcSplit.glue (each rank projects its own
++        # rows; the kernel is row-independent, so the union over the ranks is the unsplit path's bits).
 +        glp_arg = None
 +        glp_sha = 0
 +        glp_path = os.environ.get("TF_GLM_GLP", "").strip()
 +        if glp_path:
-+            if self.split.split:
-+                raise ValueError("TF_GLM_GLP with TF_GLM_HC_SPLIT=1: the split prompt path is not steered. Set "
-+                                 "TF_GLM_HC_SPLIT=0 (SPLIT=0 in the recipe) or unset TF_GLM_GLP. Refusing to serve "
-+                                 "a partially steered boot.")
 +            from . import glp
 +            glp_dirs, glp_alpha, glp_sha = glp.load(glp_path, layers=cfg.layers, width=cfg.hidden * cfg.streams)
 +            alpha_env = os.environ.get("TF_GLM_GLP_ALPHA", "").strip()
@@ -90,7 +87,7 @@ index 267e84c..871c14f 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -554,7 +584,7 @@ class GlmEngine:
+@@ -554,7 +581,7 @@ class GlmEngine:
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
@@ -99,7 +96,7 @@ index 267e84c..871c14f 100644
                                 f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                 "(or pass --drafter none to both) and give both the same flags")
          self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
-@@ -605,7 +635,8 @@ class GlmEngine:
+@@ -605,7 +632,8 @@ class GlmEngine:
          self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
                          graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                          taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
@@ -110,7 +107,7 @@ index 267e84c..871c14f 100644
              self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
              if rank == 0:
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index c32686e..c3d38e1 100644
+index c32686e..fb07761 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -142,6 +142,10 @@ class Buffers:
@@ -124,14 +121,24 @@ index c32686e..c3d38e1 100644
          self.experts = c.experts
          self.top_k = c.top_k
          # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
-@@ -949,6 +953,11 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
+@@ -888,7 +892,8 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
+             front = mixer_front(nxt, w, b) if fronts and nxt is not None else None
+             with prof.timed("hc (layer end)"):
+                 sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
+-                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front)
++                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front,
++                        glp_layer=layer.index)
+             done = sp.own() if front is not None else None
+     finally:
+         sp.finish()
+@@ -949,6 +954,11 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True,
              layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
              for slot in b.tap_at.get(layer.index, ()):
                  glue.stream_mean(b.x[:R], b.taps[slot][:R])
 +            if b.glp_dirs is not None:
 +                # GLP steering, after the taps so the drafter keeps seeing the stock stream: project the layer's
 +                # direction off the widened stream (a zero table row is an exact no-op on unsteered layers). The
-+                # split prompt path never reaches here: the engine refuses TF_GLM_GLP with TF_GLM_HC_SPLIT on.
++                # split prompt path steers the same site in hcsplit.HcSplit.glue, on this rank's own rows.
 +                glue.glp_project(b.x[:R], b.glp_dirs[layer.index], b.glp_alpha)
          glue.stream_mean(b.x[:R], b.hidden[:R])
      if not logits:
@@ -402,3 +409,31 @@ index ae13bb7..34b9938 100644
  # -- MLP and MoE ----------------------------------------------------------------------------------------------
  @triton.jit
  def _swiglu(GU, OUT, XS, LIMIT, W: tl.constexpr, BLOCK: tl.constexpr):
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 5426bb7..d2278ba 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -239,9 +239,12 @@ class HcSplit:
+         return self.mine(), min(self.mine() + self.H, self.R)
+ 
+     def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+-             front: Callable[[int, int], None] | None = None) -> None:
++             front: Callable[[int, int], None] | None = None, glp_layer: int | None = None) -> None:
+         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
+-        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's. ``front(lo, hi)``
++        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's. ``glp_layer``: the layer whose
++        GLP direction (``glp.py``) is projected off the stream after the taps (the layer-end site passes it; the
++        projection is row-independent, so each rank steering its own rows is the unsplit path's bits).
++        ``front(lo, hi)``
+         (TF_GLM_PREFILL_OVERLAP=2): the next block's row-independent start on this rank's rows of each piece, on the
+         main stream right after the piece's glue, while its swap (and the later pieces' partials) are on the wire;
+         the caller runs it on the peer's rows (``own`` is what was done) after this returns."""
+@@ -260,6 +263,8 @@ class HcSplit:
+             glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
+             for slot in taps:
+                 glue.stream_mean(x, b.taps[slot][lo:hi])
++            if glp_layer is not None and b.glp_dirs is not None:
++                glue.glp_project(x, b.glp_dirs[glp_layer], b.glp_alpha)
+             if final:
+                 glue.stream_mean(x, b.hidden[lo:hi])
+             if hc is not None:

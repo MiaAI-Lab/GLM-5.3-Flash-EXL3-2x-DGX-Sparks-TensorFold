@@ -17,8 +17,9 @@ Every change to this recipe, newest first. Each release names the image it serve
   [`msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44`](https://huggingface.co/msuiche/GLM-5.3-Flash-abliterated-cyber-GLP-44)
   (alpha 2.0). Unlike the speed patches, steering changes the replies -- that is its point.
 - `tools/glpcheck.py`: validates a GLP sidecar offline (the same gates, no GPU).
-- The split prompt path (`SPLIT=1`) is not steered, so `GLP` forces `SPLIT=0` while it is on (prefill ~1,730 ->
-  ~1,270 tok/s steered; decode unchanged). Steering the split path is row-local and can come later.
+- The split prompt path (`SPLIT=1`) is steered too: each rank projects its own rows of a prompt chunk (the
+  projection is row-independent, so the union over the ranks is the unsplit path's bits -- verified against the
+  unsplit hook row for row). `SPLIT` stays on; prefill and decode speeds are unchanged.
 ## v1.3.2 (2026-10-01): more kept prompts, a note on non-English prompts
 
 Image unchanged: `v0.6.0-ae8d1c789b47`.

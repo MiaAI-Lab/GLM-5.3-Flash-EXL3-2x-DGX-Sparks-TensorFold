@@ -288,7 +288,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `COPY` / `COPY_MAX` | `1` / `15` | copy drafts: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round |
 | `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
-| `GLP` / `GLP_ALPHA` | empty / the file's own | GLP steering: a [weightless](https://weightless.msuiche.com) control vector applied after every decoder layer ([GLP steering](#glp-steering)); empty: off. Forces `SPLIT=0` |
+| `GLP` / `GLP_ALPHA` | empty / the file's own | GLP steering: a [weightless](https://weightless.msuiche.com) control vector applied after every decoder layer ([GLP steering](#glp-steering)); empty: off |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -345,9 +345,10 @@ GLP=glp44/GLM-5.3-Flash-abliterated-cyber-GLP-44.gguf ./start.sh restart
 The contract is fail-closed: a file the engine cannot apply exactly — another mode than `project`, another hook than
 `residual_stream_post_layer`, another width than this model's 16,384-wide stream, rank above 1, alpha multipliers, a
 copy that differs between the two Sparks — fails the boot; the server never runs unsteered when steering was asked
-for. `GLP_ALPHA` overrides the file's `glp.alpha_default`. `SPLIT` is forced to `0` while steering (the split prompt
-path is not steered), which costs prefill speed; decode is unchanged. The MTP/DFlash2 drafts stay unsteered (they
-only propose; the steered model verifies), and their taps keep reading the stock stream.
+for. `GLP_ALPHA` overrides the file's `glp.alpha_default`. Both prompt paths are steered — with `SPLIT=1` each rank
+projects its own rows of a prompt chunk, the same bits as the unsplit path — so prefill and decode speeds are
+unchanged. The MTP/DFlash2 drafts stay unsteered (they only propose; the steered model verifies), and their taps
+keep reading the stock stream.
 
 ### Thinking and sampling
 
