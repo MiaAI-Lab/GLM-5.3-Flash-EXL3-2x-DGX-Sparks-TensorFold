@@ -134,8 +134,9 @@ download() {  # <repo id> <revision or empty>
     # Host CLI: resumable, parallel, writes the standard HF cache layout.
     hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
   else
-    docker run --rm --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
-      -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" -c \
+    # Keep downloads owned by the host user, in the same HF_CACHE/hub layout as the host CLI.
+    docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+      -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
       'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
   fi
 }

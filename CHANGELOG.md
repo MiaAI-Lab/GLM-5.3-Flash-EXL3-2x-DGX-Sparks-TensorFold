@@ -3,6 +3,12 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+### Fixed
+- **Container downloads keep host-user ownership.** When the host `hf` CLI is missing, `prepare.sh` now downloads
+  as the invoking user's UID/GID, preserving the same `hub/` cache layout without creating root-owned files.
+
 ## v1.3.2 (2026-10-01): more kept prompts, a note on non-English prompts
 
 Image unchanged: `v0.6.0-ae8d1c789b47`.
