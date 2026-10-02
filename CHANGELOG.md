@@ -3,6 +3,13 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+### Changed
+- **Earlier turns' reasoning stays in the prompt** (patch `0054-glm-keep-thinking`), as in zai-org's current template.
+  The checkpoint's template dropped it at each new user message, so agents prefilled the previous turn's tool loop
+  again (a replayed agent session: 85,127 -> 16,106 tokens). `TF_GLM_CLEAR_THINKING=1` restores the old rendering.
+
 ## v1.3.2 (2026-10-01): more kept prompts, a note on non-English prompts
 
 Image unchanged: `v0.6.0-ae8d1c789b47`.

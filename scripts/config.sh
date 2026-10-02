@@ -156,6 +156,9 @@ export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
 # or four alternating conversations push each other out (issue #17). Each entry reserves its fixed state (~45 MiB) at
 # start: 32 takes ~1 GiB more than 8.
 export TF_GLM_CACHE_ENTRIES="${TF_GLM_CACHE_ENTRIES:-32}"
+# Earlier turns keep their reasoning in the prompt (patch 0054), as in zai-org's current template. 1: drop it, as the
+# checkpoint's template does; agents then prefill the previous turn's tool loop again at each new user message.
+export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
 # Waiting prompts filled together in one forward (patch 0049): shared work (expert weights, glue, projections) runs once
 # for every waiting prompt, attention per prompt on its own state, so each gets the bits it gets alone. sparkDash, prose at
 # 4 at once: 103.4 -> 108.8 tok/s, time to first token 590 -> 340 ms; structured at 3 / 4 at once: 175.2 -> 196.3 and
