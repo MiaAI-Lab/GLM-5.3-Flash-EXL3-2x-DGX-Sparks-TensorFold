@@ -250,6 +250,12 @@ case "$TP" in 3) _pool=32 ;; *) _pool=12.5 ;; esac
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 
+# Multi-stream decode on the fork (aditya1503/TensorFold@mtp_concurrent): one packed all-gather a round whatever the
+# samplings; chain depth from the startup-timed window curve; rank 0's messages overlap the next round (same bits).
+export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
+export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
+export TF_GLM_MULTI_ASYNC="${TF_GLM_MULTI_ASYNC:-1}"
+
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
