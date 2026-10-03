@@ -33,7 +33,8 @@
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); WAIT_TIMEOUT (seconds, default 1800);
 #            DRY_RUN=1 (print the docker commands, change nothing);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
-#   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0)
+#   decode   TF_GLM_L2PF (1), TF_GLM_EXL3_LOADS (nc), TF_ROCE_MAX_KB (512), TF_GLM_MULTI_LONE (0),
+#            TF_GLM_MULTI_WINDOW (32)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
@@ -60,7 +61,7 @@ SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKEN
 check_workers
 [[ "$KV" =~ ^(bf16|fp8)$ ]] || die "KV is bf16 or fp8, not $KV"
 [[ "$CONTEXT" =~ ^[0-9]+$ && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count up to 1048576 (0: the largest that fits), not $CONTEXT"
-[[ "$PARALLEL" =~ ^[1-4]$ ]] || die "PARALLEL is 1 to 4, not $PARALLEL"
+[[ "$PARALLEL" =~ ^[1-8]$ ]] || die "PARALLEL is 1 to 8, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 # this TensorFold (aditya1503/TensorFold@mtp_concurrent) drafts with MTP and DFlash2 alike under --parallel
 for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL STREAM_SMOOTH; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
@@ -72,6 +73,7 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$DRAFT_POLICY" == f* ]] || die "DRAFT_POLICY is a DFlash2 policy (fc5:0.3, fnc7:0.3, fcost7:noisy ...), not $DRAFT_POLICY"
 # decode settings the ranks read at load (scripts/config.sh): checked here so a typo fails before anything is stopped
 [[ "$TF_GLM_MULTI_LONE" =~ ^[01]$ ]] || die "TF_GLM_MULTI_LONE is 0 or 1, not $TF_GLM_MULTI_LONE"
+[[ "$TF_GLM_MULTI_WINDOW" =~ ^(16|24|32|40|48|56|64)$ ]] || die "TF_GLM_MULTI_WINDOW is 16 to 64 rows in steps of 8, not $TF_GLM_MULTI_WINDOW"
 [[ "$TF_GLM_CLEAR_THINKING" =~ ^[01]$ ]] || die "TF_GLM_CLEAR_THINKING is 0 or 1, not $TF_GLM_CLEAR_THINKING"
 [[ "$TF_GLM_L2PF" =~ ^(0|off|1|bulk|lines|touch)$ ]] || die "TF_GLM_L2PF is 0, 1 (bulk), lines or touch, not $TF_GLM_L2PF"
 [[ "$TF_GLM_EXL3_LOADS" =~ ^(0|ldg|1|nc|nc1|nc2|nc4)$ ]] || die "TF_GLM_EXL3_LOADS is 0, nc, nc2 or nc4, not $TF_GLM_EXL3_LOADS"

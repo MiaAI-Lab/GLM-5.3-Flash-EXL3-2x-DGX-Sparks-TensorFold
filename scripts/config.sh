@@ -59,7 +59,7 @@ esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
 TF_VERSION="${TF_VERSION:-mtp_concurrent}"   # aditya1503's branch: TensorFold 0.6.2 + this recipe's patches merged + MTP under --parallel
 TF_REPO="${TF_REPO:-https://github.com/aditya1503/TensorFold.git}"
-TF_HASH="${TF_HASH:-1d2e725}"                # the pinned commit on TF_VERSION's branch (reproducible builds)
+TF_HASH="${TF_HASH:-35b4ef1}"                # the pinned commit on TF_VERSION's branch (reproducible builds)
 APPLY_PATCHES="${APPLY_PATCHES:-0}"      # the fork already carries the patch series; 1 re-applies patches/ onto upstream TF (what main does)
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
@@ -72,8 +72,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two and three Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-5e01f1bb74d8}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:14f15591eae5d6a540f09218d3852068962fe5381371bbfefe0e9194cd834529}"
+IMAGE_TAG="${IMAGE_TAG:-v0.6.0-9f73cca659a1}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
@@ -95,9 +95,12 @@ export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
-# a round): 1 to 4, with DRAFTER=dflash2 only (mtp: 1). 4 (default), prose in all (sparkDash): 60.4 / 79.2 / 89.5 /
-# 108.8 tok/s at 1 / 2 / 3 / 4 at once; structured 114.7 / 147.6 / 196.3 / 227.9.
-PARALLEL="${PARALLEL:-4}"                     # MTP drafts under --parallel too on this build (no dflash2 needed)
+# a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only on main; this branch's fork also drafts MTP under --parallel. Default 4 on two Sparks, 8 on three (v1.5).
+# sparkDash aggregate decode at 4 / 8 requests at once: two Sparks prose 103.2 / 130.8 tok/s, code 126.7 / 167.0; three
+# Sparks prose 121.8 / 166.0, code 165.3 / 211.5. One request alone decodes as fast either way. The memory reserve
+# grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
+if [[ "${TP:-2}" == 3 ]]; then _par=8; else _par=4; fi   # this fork also drafts MTP under --parallel (unlike main)
+PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
 # pool 2,922,496 tokens at the measured start). Lossy: GSM8K 98.0%, HumanEval 97.6%, 1M needle found; drafted replies still equal serial
@@ -173,6 +176,16 @@ export TF_GLM_WIDE_GRAPHS="$_w" TF_GLM_COPY_REPLY_MATCH="$_w"
 # kept prompts there, so interactive sessions miss the prompt cache and re-read whole histories (issues #12, #13).
 # Off by default until that move keeps them. Exact either way.
 export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
+# --parallel: rows of every request's verify window together in a round (patch 0069; TensorFold's TF_GLM_MULTI_WINDOW):
+# 16 to 64 in steps of 8; default 64 past 4 requests, else 32. With more requests at once each one's drafts get fewer of
+# these rows (8 at 32: ~3 drafts each): at 8 requests, code 141.2 (32 rows) / 160.3 (48) / 167.0 (64) tok/s, prose the
+# same at any size (two Sparks). Past 32 rows a round's all-gathers exceed 512 KiB (16 KiB a row): TF_ROCE_MAX_KB rises
+# with it (64 rows: 1024) unless you set it. Exact at any size; 64 rows add ~250 MiB a Spark to the estimate.
+if (( PARALLEL > 4 )); then _win=64; else _win=32; fi
+export TF_GLM_MULTI_WINDOW="${TF_GLM_MULTI_WINDOW:-$_win}"
+if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 ]]; then
+  export TF_ROCE_MAX_KB=$(( TF_GLM_MULTI_WINDOW * 16 ))
+fi
 # Kept prompt states (TensorFold's TF_GLM_CACHE_ENTRIES, 8 by default): the oldest is dropped past this count, however
 # much of the pool is free. A drafted agent request keeps 1 to 3 (its own plus shared-prefix states), so 8 let three
 # or four alternating conversations push each other out (issue #17). Each entry reserves its fixed state (~45 MiB) at
@@ -222,7 +235,13 @@ export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
 # about 4.5 GiB there, and the pool comes out at ~2.1-2.9M tokens depending on what is free at start. TensorFold's own
 # defaults (a tenth of RAM, ~12.2; 3 GiB: pool 1,411,072 tokens) leave more. Raise the reserve if other work shares
 # the Sparks' memory.
-MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-14.5}"
+# Past 4 requests, or a verify window past 32 rows, the server takes more than its estimate counts (measured on two
+# Sparks, rank 0's lowest free memory: PARALLEL=4 10.8 GiB, PARALLEL=8 7.0, PARALLEL=8 with a 64-row window 5.8): the
+# reserve grows by that much (~0.95 GiB a request past 4, ~0.04 GiB a row past 32), so the lowest free memory stays
+# where PARALLEL=4 has it; the pool shrinks instead.
+_extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; if (p > 4) e += 0.95 * (p - 4);
+  if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
+MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt

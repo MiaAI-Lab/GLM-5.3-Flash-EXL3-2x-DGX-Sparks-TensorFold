@@ -24,7 +24,7 @@
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
 OpenAI-compatible API, with **4 concurrent requests**, the model's full **1,048,576-token context** and **image and
 video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 on both Sparks (one rank on each)
-in NVIDIA's PyTorch container, plus 68 patches (65 of v1.4 and 3 for 3 Sparks, experimental): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
+in NVIDIA's PyTorch container, plus 70 patches (65 of v1.4, 3 for 3 Sparks, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
 faster prompt kernels, a one-shot RoCE all-gather between the Sparks, several requests over one shared cache pool,
 vision, tool calling, `/tokenize` and `/metrics`.
 
@@ -55,6 +55,21 @@ DFlash2 plus copy drafts, vision on), with the GPU clocks capped at 2,200 MHz. D
 
 Replies served 4 at a time are identical to the same requests served one at a time (11 of 11 cases staggered, and 11
 of 11 sent in a burst).
+
+**Up to 8 requests at once** (`PARALLEL=8`, v1.5; its verify window then defaults to 64 rows). Measured with sparkDash on
+one boot (2026-10-03); one or two requests decode as fast as at `PARALLEL=4`:
+
+| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 103.2 tok/s | 26.8 tok/s | 298 ms | 126.7 tok/s | 34.1 tok/s | 446 ms |
+| 6 | 116.8 tok/s | 20.6 tok/s | 362 ms | 150.0 tok/s | 26.8 tok/s | 457 ms |
+| 8 | 130.8 tok/s | 17.0 tok/s | 405 ms | 167.0 tok/s | 22.8 tok/s | 733 ms |
+
+Eight at once: +27% prose and +32% code over four. The window matters for code (8 requests: 141.2 / 160.3 / 167.0
+tok/s at 32 / 48 / 64 rows), not prose. Replies stay identical to one at a time (11 of 11 staggered and in a burst, 8
+in flight; drafted == serial). The memory reserve grows with `PARALLEL` (see `MEMORY_RESERVE_GIB`), so the shared pool
+is ~1.5M tokens at 8 instead of 2.0-2.6M at 4, with the head's lowest free memory at 12.9 GiB under a 195k-token
+prompt. Two Sparks therefore stay at 4 by default; three Sparks default to 8 ([3 Sparks](#3-sparks-experimental)).
 
 **Prefill**
 
@@ -305,7 +320,9 @@ mid-fill gone in 0.16 s with the other replies unchanged, tool calls whole. Pref
 (two Sparks: 6.5 / 26.8 / 87.1). Streaming, gaps p50 / p90 between a reply's events: one reply 15 / 18 ms, four at
 once 34 / 46 ms; three replies while a ~25k-token prompt fills 81 / 134 ms with the sliced fill (134 / 400 ms with
 `FILL_BUDGET_MS=0`). Rank 0 had 10.6 GiB free idle and 8.4 GiB at its lowest (a 149k prompt); at the default 32 GiB
-it had 5.8 GiB free idle, below the ~10 GiB this recipe keeps under load, so these runs used 27.
+it had 5.8 GiB free idle, below the ~10 GiB this recipe keeps under load, so these runs used 27. With v1.5's defaults at
+three Sparks (8 requests, a 64-row window, the reserve grown to 19.6 GiB) the pool is ~4.0M tokens and rank 0 had
+14.4 GiB free idle and 11.5 GiB at its lowest under a 195k-token prompt (ranks 1 and 2: 27.6 / 21.1 GiB).
 
 **Three Sparks, measured with sparkDash** (the default configuration otherwise: 4 streams, 1,048,576-token window, FP8 KV
 cache, 4-bit dense weights, DFlash2 plus copy drafts, vision on)
@@ -328,6 +345,20 @@ cache, 4-bit dense weights, DFlash2 plus copy drafts, vision on)
 
 Against two Sparks ([Performance](#performance)): prose decode 60.4 -> 77.6 tok/s for one request and 108.8 -> 146.2
 tok/s for four at once; prefill about the same (1-4% faster).
+
+**Three Sparks, 8 requests at once** (v1.5's default there: `PARALLEL=8`, 64-row window, `COMM=nccl`; one boot,
+2026-10-03, so compare its rows with each other rather than with the table above, which another boot measured):
+
+| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 65.7 tok/s | 65.7 tok/s | 143 ms | 100.4 tok/s | 100.4 tok/s | 187 ms |
+| 2 | 93.8 tok/s | 48.6 tok/s | 229 ms | 129.5 tok/s | 65.6 tok/s | 280 ms |
+| 4 | 121.8 tok/s | 31.8 tok/s | 336 ms | 165.3 tok/s | 43.1 tok/s | 356 ms |
+| 6 | 146.3 tok/s | 26.1 tok/s | 391 ms | 192.6 tok/s | 33.4 tok/s | 381 ms |
+| 8 | 166.0 tok/s | 21.7 tok/s | 337 ms | 211.5 tok/s | 28.9 tok/s | 612 ms |
+
+Eight at once: +36% prose and +28% code over four. Replies identical to one at a time (11 of 11 staggered and in a
+burst), drafted == serial, the 195k needle right.
 
 `DRY_RUN=1 ./start-tp3.sh` shows what would run (every rank's `docker run`, the links found, nothing stopped or
 started). It uses NCCL for every all-gather by default (`COMM=nccl`); `COMM=roce ./start-tp3.sh` sends the small
@@ -373,11 +404,11 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `MASTER_PORT` | `29551` | the ranks' rendezvous port (keep it on the private link) |
 | `TP` / `WORKER2` | `2` / empty | Sparks in all (`2`, or `3` through `./start-tp3.sh`), and the ssh target of rank 2 ([3 Sparks](#3-sparks-experimental)); `FABRIC_PEER2`, `WORKER_HF_CACHE2`, `WORKER_WEIGHTS2`, `NFS_SERVER2` as the worker's own |
 | `MASTER_ADDR` / `SOCKET_IFNAME` | see [3 Sparks](#3-sparks-experimental) | the rendezvous address (`TP=2`: the head's address on the link) and, with `TP` above 2, NCCL's bootstrap netdev |
-| `PARALLEL` | `4` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 4 (above 1 needs `DRAFTER=dflash2`) |
+| `PARALLEL` | `4`, `8` at `TP=3` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 8 (above 1 needs `DRAFTER=dflash2`); 8 at once: +27-36% aggregate decode over 4, at a smaller shared pool ([Performance](#performance)) |
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
-| `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5` | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB); raise it when other work shares the Sparks |
+| `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |
 | `DRAFTER` | `dflash2` | `dflash2`: IncoAI's DFlash2 drafter, licensed [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), **non-commercial use only**; +5-10% decode. `mtp`: the checkpoint's own MTP head, one request at a time, which avoids that license (set it before the first `./start.sh` and DFlash2 is never downloaded) |
 | `TF_GLM_MTP` | `auto` | the checkpoint's MTP head beside DFlash2: `auto` leaves it out while DFlash2 drafts every request; `1` (TensorFold v0.6.0's own default) loads it, 1.77 GiB a Spark, with `PARALLEL=1`. `DRAFTER=mtp` always loads it |
@@ -395,6 +426,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_GLM_EXL3_LOADS` | `nc` | the decode expert kernel's trellis as 16-byte non-coherent loads a step ahead (`nc2` / `nc4`: 2 or 4 steps); `0`: TensorFold's 32-bit loads |
 | `TF_ROCE_MAX_KB` | `512` | the largest all-gather (KiB) sent over RoCE with `COMM=roce` (TensorFold's default: 256); 512 covers the 17-32-row verify windows of concurrent requests |
 | `TF_ROCE_WAIT_S` | `20` | seconds a RoCE all-gather waits for the other Spark before it fails (1 to 3600); until the engine is built, each gather first meets the peer in an NCCL barrier, so a long first start (kernels compiling) does not run into it |
+| `TF_GLM_MULTI_WINDOW` | `32`, `64` past 4 requests | with `PARALLEL` above 1, the rows of every request's verify window together in a round (16 to 64 in steps of 8): with more requests at once each one's drafts get fewer of them (8 requests' code: 141.2 / 160.3 / 167.0 tok/s at 32 / 48 / 64 rows); past 32 rows `TF_ROCE_MAX_KB` rises with it (64: 1024) unless you set it. Exact at any size |
 | `TF_GLM_MULTI_LONE` | `0` | `1`: with `PARALLEL` above 1, a request decoding alone runs on the one-stream graphs (+0.6-0.9%), but its move to the pool's first rows evicts other conversations' kept prompts there (issues #12, #13); `0`: on the batched ones |
 | `TF_GLM_CACHE_ENTRIES` | `32` | kept prompt states at most (TensorFold's default is 8); past this count a conversation's earlier (superseded) states go first, then the least recently used, however much of the pool is free (patch `0063`, @Alexbob0). An agent request keeps 1 to 3 (issue #17); each costs ~45 MiB at start |
 | `TF_GLM_MULTI_WATCHDOG_S` / `TF_GLM_MULTI_WATCHDOG_EXIT` | `300` / `0` | a rank stuck this many seconds in one step prints every thread's stack to its log (`/health`'s `iteration_s` shows how long the current step has run); `EXIT=1`: the server then exits (code 1) instead of waiting, so a supervisor can restart it. Both ranks also check that they received the same message each step, and stop with an error naming it if not |
@@ -494,6 +526,8 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Sampling | `0034-cuda-nucleus-union` | a top_p draw from both ranks' candidates together, the same draw with fewer whole-shard reads (`TENSORFOLD_NUCLEUS_UNION=1`, off by default) | opt-in |
 | Server | `0003-glm-vision`, `0050-glm-many-media`, `0056-glm-tool-result-media`, `0036-glm-tool-calls`, `0051-glm-tool-history-recovery`, `0053-glm-whole-tool-calls`, `0055-glm-open-tool-calls`, `0037-cuda-tokenize`, `0023-server-effort-max`, `0057-server-thinking-alias`, `0044-cuda-context-errors`, `0045-cuda-metrics`, `0058-server-client-gone-poll`, `0059-server-refused-bodies`, `0061-server-smooth-stream` | GLM's image and video processors and vision tower; up to 50 pictures and 4 clips a request in 96 MiB bodies, in user messages and tool results; GLM tool calls for agent clients; a past tool call whose arguments are not a JSON object left out of the prompt with its result and logged, instead of HTTP 400 (agents replay history, so a 400 ended the conversation); each call sent whole once written, a call the token limit cuts never sent, one the model ends without `</tool_call>` closed when it parses (else text), a missing `<arg_key>` put back; `/tokenize` and `/detokenize`; `reasoning_effort: "max"`; `chat_template_kwargs.thinking` read as `enable_thinking` (from Alexbob0's #25); the `param` field and GLM's own refusals on TensorFold v0.6.0's `context_length_exceeded` errors, and `/health`'s figures in its Prometheus `/metrics`; the client-gone check past 1,023 descriptors (TensorFold PR #218, jayleaton); a refused POST's body read before the reply (TensorFold v0.6.1's #181 fix); smooth streaming from a playout buffer (`STREAM_SMOOTH`) | the API features above |
 | 3 Sparks (experimental) | `0066-glm-tp-n`, `0067-glm-tp3-split-pad`, `0068-glm-tpn-split-buffer-rows` | the engine on 2 or 3 ranks (`--tp`): heads, expert columns, vocabulary and DFlash2 KV groups split in whole units, the remainder to the lowest ranks; the row split (`SPLIT`) and its early connection to every peer; RoCE all-gathers over per-peer routes (b12x's proxy modified for more than two Sparks); prompt buffers and the memory estimate hold the split's pad row at three ranks | [3 Sparks](#3-sparks-experimental); two Sparks unchanged |
+| Eight requests at once | `0069-glm-eight-streams` | up to 8 concurrent requests (`PARALLEL` 1 to 8): the batched verify window's segment tables (and the segmented kernels' launch grids) sized for the streams, four as before up to four; the multi-stream DFlash2 drafter, scheduler and memory estimate for 5 to 8 streams; the shared verify window's rows set by `TF_GLM_MULTI_WINDOW` (32 as before; 64 by default past 4 requests) and counted at start | 8 at once: +27% prose, +32% code over 4 on two Sparks (+36% / +28% on three); `PARALLEL` 1 to 4 unchanged ([Performance](#performance)) |
+| Serial stop | `0070-glm-serial-stop` | at `PARALLEL=1`, a request whose client left, or that hit a stop string or a gate cut, ends on both ranks after the same round (rank 0's stop rides on the round's sample all-gather; issue #38); `--parallel` above 1 without DFlash2 refused at start with the options | same replies |
 | Concurrent fill | `0062-glm-sliced-fill` | a new prompt's chunks run in layer slices (`FILL_BUDGET_MS`) with decode rounds between them, drafted as usual (`FILL_DRAFTS`), both ranks on the same layer boundaries; the chunk's buffers kept between slices, grouped fills, cache moves and cancellation mid-fill; whole forwards when nothing else decodes | with smooth streaming, the other replies' pauses during a 25k-token fill 630-690 ms -> 81-149 ms (table below) |
 
 Concurrent prompt fill and smooth streaming on two Sparks (`PARALLEL=4`, DFlash2, 1,024-row chunks): three 400-token

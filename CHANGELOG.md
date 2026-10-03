@@ -3,7 +3,35 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## v1.5 (unreleased)
+## v1.5 (2026-10-03): up to 8 requests at once (8 by default on three Sparks), serial requests stop when their client leaves
+
+Image: `v0.6.0-9f73cca659a1` (`sha256:ef83797d791fef96c4605e8d37367aca6de5aeac7bb672792cb682e2e55d4237`), 70 patches, for two and three Sparks.
+
+### Added
+- **Up to 8 concurrent requests** (patch `0069-glm-eight-streams`): `PARALLEL` takes 1 to 8 (was 1 to 4; above 1 still
+  needs `DRAFTER=dflash2`). Default: 4 on two Sparks (unchanged), 8 on three. The batched verify window's segment tables
+  and the segmented kernels' launch grids hold one segment a stream past four (four, as before, up to four), and the
+  multi-stream DFlash2 drafter, scheduler and startup estimate take 5 to 8 streams. sparkDash aggregate decode, 4 -> 8
+  requests at once: two Sparks prose 103.2 -> 130.8 tok/s (+27%), code 126.7 -> 167.0 (+32%); three Sparks prose 121.8
+  -> 166.0 (+36%), code 165.3 -> 211.5 (+28%); one request alone unchanged. Replies byte-identical: 22/22 concurrent
+  cases equal their serial references with 8 in flight (two and three Sparks, windows 32 and 64), drafted == serial,
+  the long-prompt hashes and the 195k needle unchanged; `PARALLEL=4` gives v1.4's shas.
+- **`TF_GLM_MULTI_WINDOW`** (patch `0069`): the rows of every request's verify window together in a round, 16 to 64 in
+  steps of 8; 32 as before, 64 by default past 4 requests (8 requests' code: 141.2 / 160.3 / 167.0 tok/s at 32 / 48 / 64
+  rows; prose the same at any size). `TF_ROCE_MAX_KB` follows it past 32 rows (64: 1024) unless set, keeping a round's
+  all-gathers on RoCE.
+- **The memory reserve grows with the requests at once** (`MEMORY_RESERVE_GIB`: 14.5, plus ~0.95 GiB a request past 4
+  and ~0.04 GiB a window row past 32: 19.6 at 8 requests and 64 rows): more requests take more than the startup
+  estimate counts (two Sparks, head's lowest free memory at the same reserve: 10.8 GiB at 4, 7.0 at 8, 5.8 at 8 with 64
+  rows). With the grown reserve: two Sparks 12.9 GiB at the lowest under a 195k-token prompt (pool ~1.5M tokens), three
+  Sparks 11.5 GiB (pool ~4.0M).
+
+### Fixed
+- **#38: at `PARALLEL=1` a request whose client left kept decoding to `MAX_TOKENS`** (patch `0070-glm-serial-stop`), and
+  every later request waited behind it; stop strings and gate cuts waited the same way. The serial decode loops did
+  not read the request's stop: rank 0's decision now rides on the round's sample all-gather, so both ranks end after
+  the same round. Same replies. `--parallel` above 1 without the DFlash2 drafter is refused at start with the options
+  (DFlash2, `PARALLEL=1`, or no drafts) instead of a confusing message after loading.
 
 ### Changed
 - The README no longer offers the earlier TR3-4bpw checkpoint, and `scripts/config.sh` no longer pins its revision:

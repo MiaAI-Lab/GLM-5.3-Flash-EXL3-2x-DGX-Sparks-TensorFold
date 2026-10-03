@@ -1,0 +1,354 @@
+# 0069-glm-eight-streams: --parallel 1 to 8 for GLM-5.3-Flash (segment tables sized by the streams, four as
+# before up to four) and TF_GLM_MULTI_WINDOW, the shared verify window's rows (default 32), counted at start.
+# MiaAI-Lab, Apache-2.0.
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 8256956..ce38110 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -271,14 +271,17 @@ def even_share(world: int):
+ 
+ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+                  prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
+-                 exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16", share=None) -> Geometry:
++                 exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16", share=None,
++                 decode_rows: int | None = None) -> Geometry:
+     """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
+     one; GLM's TF_GLM_MTP can leave it out); ``onepass``: prompt chunks' sparse latent attention keeps no partials
+     (TF_GLM_SPARSE_ONEPASS); an EXL3 checkpoint's ``exl3_prompt``: prompt chunks run the prompt expert kernels
+     (TF_GLM_EXL3_PROMPT: no split-K sums), ``prompt_split_k``: the prompt buffers keep split-K partials for BF16 / FP8
+     projections (``forward.Buffers.sk``); ``kv``: the DSA caches' format (TF_GLM_KV: the latent rows and the
+     indexer's pooled keys; the indexer's per-token keys and gates are bf16 rings); ``share(family, total)``: this
+-    rank's share of a split dimension (GLM's ``tp.Layout``: heads, lin, dense, moe, vocab), default ``even_share``."""
++    rank's share of a split dimension (GLM's ``tp.Layout``: heads, lin, dense, moe, vocab), default ``even_share``;
++    ``decode_rows``: the decode windows' rows the buffers are sized for (default MLA_DECODE_ROWS; GLM's --parallel
++    asks for more when its own verify window and the batched one take more together)."""
+     share = even_share(world) if share is None else share
+     linear, attention = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+@@ -289,7 +292,8 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
+     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
+-    rows, d, streams = MLA_DECODE_ROWS, int(t["hidden_size"]), int(t.get("hc_mult", 4))
++    rows = MLA_DECODE_ROWS if decode_rows is None else int(decode_rows)
++    d, streams = int(t["hidden_size"]), int(t.get("hc_mult", 4))
+     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
+     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
+     fixed += linear * rows * lh * (12 * ld + 4)
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index 10c53b5..702610d 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -9,7 +9,7 @@ updates stack every stream's kept rows; each row carries its own position and ri
+ 
+ API (both ranks call it identically, the same streams in the same order):
+ 
+-    md = MultiDrafter(drafter, streams=4)          # drafter: a dflash2.Drafter (its weights are shared)
++    md = MultiDrafter(drafter, streams=8)          # drafter: a dflash2.Drafter (its weights are shared)
+     ctx = md.contexts[i]                            # stream i's DraftContext (duck-types a Drafter's context for
+                                                     # decode.prefill / take_snapshot / restore: add_taps, reset,
+                                                     # context_end, pos_dev, kc, vc, ring, window)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index a6332ba..64549a8 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -304,10 +304,37 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
+ 
+ 
+-PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
++PARALLEL_MOST = 8                     # --parallel: concurrent requests at most (segments.MAX_SEGS: a window's streams)
+ MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+ 
+ 
++def multi_window(value: str | None = None) -> int:
++    """TF_GLM_MULTI_WINDOW: --parallel's shared verify window, the rows of every stream's windows together in a round
++    (the longest tails trimmed past it): 32 (default) or 16 to 64 in steps of 8 (``geometry.MLA_DECODE_ROWS``: the
++    widest decode window the kernels serve). The batched window's buffers, token selection scratch and CUDA graphs (one
++    a row count) are sized for it, and the startup estimate counts them. Past 32 rows a round's all-gathers exceed
++    TF_ROCE_MAX_KB=512 (16 KiB a row) and go through NCCL unless it is raised (1024 for 64 rows)."""
++
++    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
++
++    value = (os.environ.get("TF_GLM_MULTI_WINDOW", "") if value is None else value).strip()
++    if value == "":
++        return MULTI_WINDOW
++    if not value.isdecimal() or not 16 <= int(value) <= MLA_DECODE_ROWS or int(value) % 8:
++        raise ValueError(f"TF_GLM_MULTI_WINDOW: 16 to {MLA_DECODE_ROWS} rows in steps of 8, not {value!r}")
++    return int(value)
++
++
++def multi_decode_rows(parallel: int, window: int, rows: int = MAX_ROWS) -> int:
++    """Decode-window rows the startup estimate sizes buffers for: MLA_DECODE_ROWS, or under --parallel the engine's own
++    window (``rows``: TF_GLM_MAX_ROWS, a lone stream's) and the batched one (``window``) together when they take more
++    (TF_GLM_MULTI_WINDOW past 48 at the default 16 rows; 16 + 32 = 48 fit the 64 rows as ever)."""
++
++    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
++
++    return max(MLA_DECODE_ROWS, int(rows) + int(window)) if parallel > 1 else MLA_DECODE_ROWS
++
++
+ def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
+     """What one more stream slot (``forward.Slots``) takes on rank ``rank`` of ``world``, from the text config:
+     every KDA layer's recurrent states (two parities), conv window, a decode window's projections and replay
+@@ -343,8 +370,19 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
+     window = int(t.get("sliding_window", 0))
+     ring_rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
+     cap = ring_rows if 0 < ring_rows < capacity + block else capacity + block
+-    trash = -(-max(64, streams * tap_rows) // block) * block
+-    return 2 * layers * heads * hd * (streams * cap + trash) * 2
++
++    def update_rows(n: int) -> int:                 # a context update's rows (MultiDrafter.t_max): the trash
++        return -(-max(64, n * tap_rows) // block) * block
++
++    trash = update_rows(streams)
++    # past four streams (whose blocks and updates the drafter's own 64-row estimate covers): the batched block pass's
++    # activations (dflash2_geometry's 16 fp32 values a row and width) and the context update's tap rows grow too
++    four = min(streams, 4)
++    hidden, inter = int(t.get("hidden_size", 0)), int(t.get("intermediate_size", 0))
++    taps = len((t.get("dflash_config") or {}).get("target_layer_ids") or ()) or 5
++    passes = (16 * (max(64, streams * block) - max(64, four * block)) * (hidden + inter) * 4
++              + (trash - update_rows(four)) * taps * hidden * 2)
++    return 2 * layers * heads * hd * (streams * cap + trash) * 2 + passes
+ 
+ 
+ def draft_fraction(draft_dir, rank: int, world: int):
+@@ -462,6 +500,8 @@ class GlmEngine:
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         self.parallel = parallel
++        # TF_GLM_MULTI_WINDOW: the rows of a round's shared verify window (--parallel), read on every rank (compared below)
++        self.multi_window = multi_window()
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else NCCL(rank, world, master, port)
+@@ -561,12 +601,14 @@ class GlmEngine:
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+-                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
++                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv,
++                             decode_rows=multi_decode_rows(parallel, self.multi_window))
+             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
+-            # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
+-            # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
++            # verify window's buffers (TF_GLM_MULTI_WINDOW rows) beside the engine's own fit the decode rows the
++            # estimate sizes (``multi_decode_rows``), its token selection's fp32 scores (window rows x a pool of 4
++            # tokens) grow with the pool
+             extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
+-            per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
++            per = 4 * self.multi_window // 4 if parallel > 1 else 0
+             if not extra and not per:
+                 return g
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+@@ -607,7 +649,7 @@ class GlmEngine:
+ 
+             from .sliced_fill import budget_ms
+ 
+-            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
++            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms()) + [self.multi_window]
+         else:
+             verify_code = [verify_code]
+         # every rank must run the same calls: refuse to start when they were given different settings
+@@ -628,7 +670,7 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+-                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
++                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+@@ -770,7 +812,8 @@ class GlmEngine:
+                 self.scheduler = GlmScheduler(self.multi, max_streams=parallel)
+                 self.concurrent = True
+                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+-                      f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
++                      f"in one pool of {pool_rows} tokens (each up to {self.limit}), their verify windows "
++                      f"{self.multi.window} rows together (TF_GLM_MULTI_WINDOW); DFlash2 drafts, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}"
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index bfc06e2..24d3e6f 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -14,11 +14,12 @@ TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling str
+ stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
+ budget). A round: each
+ decoding stream (admission order) proposes drafts under its own DFlash2 policy (copy drafts first), the combined
+-window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
+-(``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
+-DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own forward; TF_GLM_MULTI_VERIFY),
+-one packed all-gather for the samplers, each stream accepts and commits its own. Between prompt slices, a
+-round takes one token per stream without drafts to keep its latency and the newcomer's inserted work small;
++window is capped at TF_GLM_MULTI_WINDOW rows (``MAX_WINDOW`` by default; the longest tails trimmed), one verify
++over every stream's rows (``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through
++the segmented KDA and DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own
++forward; TF_GLM_MULTI_VERIFY), one packed all-gather for the samplers, each stream accepts and commits its own.
++Between prompt slices, a round takes one token per stream without drafts to keep its latency and the newcomer's
++inserted work small;
+ TF_GLM_FILL_SHARE applies to unsliced fills, slices alternate with these short rounds. Contiguous layer ranges
+ are balanced within the budget without adding rounds; GPU layer cost, finalization and dispatch overhead are
+ learned separately so extra slices cannot inflate every layer cost.
+@@ -134,7 +135,7 @@ def unseal(msg: Sequence[int], seq: int, rank: int = 1) -> list[int]:
+ 
+ LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+-MAX_WINDOW = 32                          # rows of every stream's windows together in one round
++MAX_WINDOW = 32                          # rows of every stream's windows together in one round (TF_GLM_MULTI_WINDOW)
+ SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
+ 
+ 
+@@ -384,11 +385,15 @@ class NoRoom(RuntimeError):
+ class MultiDecoder:
+     """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
+ 
++    window = MAX_WINDOW                 # rows of a round's windows together (TF_GLM_MULTI_WINDOW; set by __init__)
++
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+-                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None) -> None:
++                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None,
++                 window: int | None = None) -> None:
+         """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
+         drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
+-        ``SerialVerify``)."""
++        ``SerialVerify``); ``window``: the rows of a round's windows together (default the engine's
++        TF_GLM_MULTI_WINDOW, ``engine.multi_window``, else MAX_WINDOW)."""
+         from .engine import DFLASH_POLICY, encode_policy
+ 
+         self.g = engine
+@@ -398,6 +403,9 @@ class MultiDecoder:
+         self.count = streams
+         if e.slots.count < streams:
+             raise ValueError(f"the engine holds {e.slots.count} stream slots, not {streams}")
++        self.window = int(window if window is not None else getattr(engine, "multi_window", MAX_WINDOW))
++        if self.window < streams:
++            raise ValueError(f"a verify window of {self.window} rows cannot hold {streams} streams' pending tokens")
+         self.rows_max = e.rows                           # a stream's window (decode.MAX_ROWS)
+         self.pool = Pool(e.caches.rows)
+         self.arena = e.caches.arena
+@@ -431,7 +439,7 @@ class MultiDecoder:
+         if verify is None:
+             if verify_kind() == "batched":
+                 taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+-                verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
++                verify = BatchedVerify(e, taps=taps, rows=self.window)
+                 # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
+                 if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
+                     verify.capture()
+@@ -556,7 +564,7 @@ class MultiDecoder:
+         comm.all_gather(vals[:n], allv)
+ 
+     def _time_rows(self, reps: int = 5) -> list[float]:
+-        """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
++        """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. its rows (its graphs, fastest of
+         ``reps``), the larger of both ranks' (so both allocate alike)."""
+ 
+         v = self.verify
+@@ -1469,7 +1477,7 @@ class MultiDecoder:
+             got = self.drafts.propose([a for _, a in asks])
+             for (k, _), d in zip(asks, got):
+                 drafts[k] = list(d)
+-        drafts = trim(drafts, MAX_WINDOW)
++        drafts = trim(drafts, self.window)
+         if prof is not None:
+             prof.mark("propose")
+         segments = []
+@@ -1564,7 +1572,7 @@ class MultiDecoder:
+             reach.append(reach_of(confs))
+         asked = {k for k, _ in live}
+         fixed = sum(1 + (0 if k in asked else len(d)) for k, d in enumerate(drafts))
+-        take = allocate(reach, fixed, self._row_cost, self.tune.overhead_ms, MAX_WINDOW)
++        take = allocate(reach, fixed, self._row_cost, self.tune.overhead_ms, self.window)
+         for (k, _), n in zip(live, take):
+             drafts[k] = drafts[k][:n]
+ 
+diff --git tensorfold/families/glm5_next/cuda/segments.py tensorfold/families/glm5_next/cuda/segments.py
+index ae8b0d9..b8361aa 100644
+--- tensorfold/families/glm5_next/cuda/segments.py
++++ tensorfold/families/glm5_next/cuda/segments.py
+@@ -15,10 +15,23 @@ import torch
+ 
+ from .sparse import POOL, SPARSE_FROM, TOKENS, split_scratch
+ 
+-MAX_SEGS = 4          # streams a window holds
++MAX_SEGS = 8          # streams a window holds at most (--parallel up to engine.PARALLEL_MOST)
++SEGS_DEFAULT = 4      # a window's tables hold at least this many segments: --parallel 2 to 4 keep the four they had
+ EXTENT = 2048         # a stream's extent starts at a multiple of this many tokens (its pooled keys at base / 4)
+ 
+ 
++def seg_count(streams: int) -> int:
++    """Segments a batched window's tables (and the launch grids its CUDA graphs capture) hold for ``streams`` stream
++    slots: SEGS_DEFAULT up to four streams (the tables and grids of v1.4), one a stream past that, at most MAX_SEGS.
++    Every segmented kernel loops over the table's segments and skips one of 0 rows, so a larger table only adds
++    programs that exit at once: each segment's bits are those of its stream's window alone at any size."""
++
++    streams = int(streams)
++    if not 1 <= streams <= MAX_SEGS:
++        raise ValueError(f"a batched verify window holds 1 to {MAX_SEGS} streams, not {streams}")
++    return max(SEGS_DEFAULT, streams)
++
++
+ class SegRows:
+     """Device tables of a window of up to ``rows`` rows in up to ``max_segs`` segments, one int32 tensor:
+ 
+@@ -34,9 +47,11 @@ class SegRows:
+ 
+     NO_RING = 2 ** 31 - 1      # the kernels' ring size without rings (positions stay below it: base + pos)
+ 
+-    def __init__(self, rows: int, device, max_segs: int = MAX_SEGS, ring: int | None = None) -> None:
++    def __init__(self, rows: int, device, max_segs: int = SEGS_DEFAULT, ring: int | None = None) -> None:
+         if ring is not None and ring < 4:
+             raise ValueError(f"an index ring of {ring} rows")
++        if not 1 <= max_segs <= MAX_SEGS:
++            raise ValueError(f"tables of {max_segs} segments: 1 to {MAX_SEGS}")
+         self.rows, self.max_segs = rows, max_segs
+         self.ring = ring
+         self.ring_rows = ring if ring is not None else self.NO_RING
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 64dbc7c..07dcba8 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -74,14 +74,16 @@ def timing_tokens(vocab: int, n: int) -> list[int]:
+ 
+ 
+ class BatchedVerify:
+-    """One forward over every segment's rows (``rows`` at most, ``segments.MAX_SEGS`` streams), on buffers of its
+-    own; see the module docstring. ``taps``: the drafter's tap layers (DFlash2's inputs), or ()."""
++    """One forward over every segment's rows (``rows`` at most: TF_GLM_MULTI_WINDOW), on buffers of its own; see the
++    module docstring. ``taps``: the drafter's tap layers (DFlash2's inputs), or (); ``segs``: the streams a window
++    holds (its segment tables and the kernels' segment grids; default ``segments.seg_count`` of the engine's stream
++    slots: 4 up to four streams, one a stream up to ``segments.MAX_SEGS``)."""
+ 
+-    def __init__(self, e, *, taps: Sequence[int] = (), rows: int = 32) -> None:
++    def __init__(self, e, *, taps: Sequence[int] = (), rows: int = 32, segs: int | None = None) -> None:
+         from . import kda as kda_mod
+         from . import latent
+         from .forward import Buffers
+-        from .segments import MAX_SEGS, SegRows, SelectScratch
++        from .segments import SegRows, SelectScratch, seg_count
+ 
+         if not latent.ENABLED:
+             raise ValueError("batched verify windows need the latent cache (TF_GLM_LATENT=1)")
+@@ -93,7 +95,8 @@ class BatchedVerify:
+         if taps:
+             self.b.set_taps(tuple(taps), c.hidden)
+         self.taps = bool(taps)
+-        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if e.caches.rings else None)
++        self.segs = seg_count(e.slots.count) if segs is None else int(segs)
++        self.seg_rows = SegRows(rows, dev, max_segs=self.segs, ring=e.caches.ring if e.caches.rings else None)
+         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         n = len(kda_layers)
+@@ -105,8 +108,8 @@ class BatchedVerify:
+         self.dsa_index = {l.index: i for i, l in enumerate(l for l in w.layers if l.kind == "dsa")}
+         self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
+         self.scratch = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
+-        self.kseg = torch.zeros((MAX_SEGS, kda_mod.SEG_COLS), dtype=torch.int32, device=dev)
+-        self.kseg_host = torch.zeros((MAX_SEGS, kda_mod.SEG_COLS), dtype=torch.int32,
++        self.kseg = torch.zeros((self.segs, kda_mod.SEG_COLS), dtype=torch.int32, device=dev)
++        self.kseg_host = torch.zeros((self.segs, kda_mod.SEG_COLS), dtype=torch.int32,
+                                      pin_memory=torch.cuda.is_available())
+         self.staged = torch.cuda.Event() if torch.cuda.is_available() else None
+         self.segments: list[Segment] = []
