@@ -1,0 +1,41 @@
+# A request that resumes from a shared system prompt's kept state took over the extent holding it, and evicted every
+# longer kept state in that extent. That extent belongs to the conversation that first wrote the shared prefix, so
+# any other conversation with the same system prompt (an agent's sub-agents, several chats on one system prompt)
+# deleted that conversation's state, and its next turn read its whole history again. The shared rows are now copied
+# into an extent of their own when free rows hold it; without room the rows are overwritten as before. Same replies:
+# placement only, the copied rows are the same bytes (issue #43).
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index bfc06e2..ea4f096 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -721,13 +721,22 @@ class MultiDecoder:
+         base = None
+         if hit is not None and hit.extent.owner is None:
+             x = hit.extent
+-            for c in list(x.kept):            # kept prompts the stream would overwrite: gone
+-                if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key:
+-                    self._evict(c)
+-            if self._grow(x, need, protect=[x]):
+-                base = x.base
+-            else:
+-                hit = None
++            # kept prompts the stream would overwrite: another conversation's longer states in the same rows (a shared
++            # system prompt's state lives in the extent of the conversation that wrote it). Copy the shared rows into
++            # an extent of their own instead, so that conversation keeps its state. Only into free rows: evicting other
++            # conversations to make room would cost more than it saves, so then the rows are overwritten as before.
++            others = [c for c in x.kept if len(c.ids) > len(hit.ids) and key[:len(c.ids)] != c.key]
++            if others:
++                base = self.pool.place(need)
++                copy = int(base is not None)
++            if base is None:
++                for c in others:
++                    if c in self.kept:
++                        self._evict(c)
++                if self._grow(x, need, protect=[x]):
++                    base = x.base
++                else:
++                    hit = None
+         if base is None:
+             base = self._room(need, [hit.extent] if hit is not None else [])
+             if base is None and hit is not None:          # no room beside the kept rows: start fresh
