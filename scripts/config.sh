@@ -57,8 +57,10 @@ case "$MODEL_ID" in
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.0}"
-TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
+TF_VERSION="${TF_VERSION:-mtp_concurrent}"   # aditya1503's branch: TensorFold 0.6.2 + this recipe's patches merged + MTP under --parallel
+TF_REPO="${TF_REPO:-https://github.com/aditya1503/TensorFold.git}"
+TF_HASH="${TF_HASH:-1d2e725}"                # the pinned commit on TF_VERSION's branch (reproducible builds)
+APPLY_PATCHES="${APPLY_PATCHES:-0}"      # the fork already carries the patch series; 1 re-applies patches/ onto upstream TF (what main does)
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
 # pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
@@ -82,7 +84,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on 
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash-EXL3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-DRAFTER="${DRAFTER:-dflash2}"        # dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
+DRAFTER="${DRAFTER:-mtp}"            # mtp (default here): the checkpoint's own head; on this TensorFold it drafts under --parallel too. dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
                                      # use only), +5-10% decode over mtp; mtp: the checkpoint's own MTP head
 # The checkpoint's MTP head beside DFlash2 (TensorFold's TF_GLM_MTP): auto (default) leaves it out while DFlash2
 # drafts every request; TensorFold v0.6.0's own default, 1, would load it (1.77 GiB a Spark) with PARALLEL=1.
@@ -95,8 +97,7 @@ VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
 # a round): 1 to 4, with DRAFTER=dflash2 only (mtp: 1). 4 (default), prose in all (sparkDash): 60.4 / 79.2 / 89.5 /
 # 108.8 tok/s at 1 / 2 / 3 / 4 at once; structured 114.7 / 147.6 / 196.3 / 227.9.
-if [[ "$DRAFTER" == dflash2 ]]; then _par=4; else _par=1; fi
-PARALLEL="${PARALLEL:-$_par}"
+PARALLEL="${PARALLEL:-4}"                     # MTP drafts under --parallel too on this build (no dflash2 needed)
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
 # pool 2,922,496 tokens at the measured start). Lossy: GSM8K 98.0%, HumanEval 97.6%, 1M needle found; drafted replies still equal serial
