@@ -28,6 +28,10 @@ vision, tool calling, `/tokenize` and `/metrics`.
 - Tool calling, structured outputs (xgrammar), `/tokenize`, and `reasoning_effort` `low` / `high` / `max`
 - One command on the first Spark: `./start.sh` sets up both Sparks and starts both ranks; `./stop.sh` stops them
 
+## Hermes Agent and optional abliterated weights
+
+[Hermes custom-endpoint setup and pinned abliterated configuration](docs/hermes-agent.md), with a [synthetic benchmark harness and measured standard/abliterated comparison](docs/hermes-benchmark-results.md). The standard checkpoint remains the default; the alternative is explicitly identified and pinned.
+
 ## Performance
 
 Two DGX Sparks at the default configuration (4 streams, 1,048,576-token window, FP8 KV cache, 4-bit dense weights,

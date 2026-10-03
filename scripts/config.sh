@@ -53,7 +53,7 @@ MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold}"   # EXL3 ro
 # a new upstream commit changes nothing here until the pin does. Empty: the Hub's main when first downloaded. The pin
 # belongs to the checkpoint above; another MODEL_ID gets no pin unless you set one.
 case "$MODEL_ID" in
-  Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=078455ffe6472f9a52fbc1139f58b9db2881b25c ;;
+  Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=6c5b28260ab9e80c6608de8b419e624cbe71b7cf ;;
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
