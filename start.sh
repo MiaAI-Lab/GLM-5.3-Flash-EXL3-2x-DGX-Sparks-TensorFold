@@ -63,7 +63,7 @@ check_workers
 [[ "$CONTEXT" =~ ^[0-9]+$ && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count up to 1048576 (0: the largest that fits), not $CONTEXT"
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || die "PARALLEL is 1 to 8, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-[[ "$DRAFTER" == dflash2 || "$PARALLEL" == 1 ]] || die "PARALLEL=$PARALLEL needs DRAFTER=dflash2 (mtp serves one request at a time: PARALLEL=1)"
+# this TensorFold (aditya1503/TensorFold@mtp_concurrent) drafts with MTP and DFlash2 alike under --parallel
 for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL STREAM_SMOOTH; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$WORKER_WEIGHTS" == copy || "$WORKER_WEIGHTS" == nfs ]] || die "WORKER_WEIGHTS is copy or nfs, not $WORKER_WEIGHTS"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1

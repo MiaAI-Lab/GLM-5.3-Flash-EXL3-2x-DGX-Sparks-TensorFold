@@ -57,8 +57,10 @@ case "$MODEL_ID" in
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.0}"
-TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
+TF_VERSION="${TF_VERSION:-mtp_concurrent}"   # aditya1503's branch: TensorFold 0.6.2 + this recipe's patches merged + MTP under --parallel
+TF_REPO="${TF_REPO:-https://github.com/aditya1503/TensorFold.git}"
+TF_HASH="${TF_HASH:-35b4ef1}"                # the pinned commit on TF_VERSION's branch (reproducible builds)
+APPLY_PATCHES="${APPLY_PATCHES:-0}"      # the fork already carries the patch series; 1 re-applies patches/ onto upstream TF (what main does)
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
 # pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
@@ -82,7 +84,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on 
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash-EXL3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-DRAFTER="${DRAFTER:-dflash2}"        # dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
+DRAFTER="${DRAFTER:-mtp}"            # mtp (default here): the checkpoint's own head; on this TensorFold it drafts under --parallel too. dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
                                      # use only), +5-10% decode over mtp; mtp: the checkpoint's own MTP head
 # The checkpoint's MTP head beside DFlash2 (TensorFold's TF_GLM_MTP): auto (default) leaves it out while DFlash2
 # drafts every request; TensorFold v0.6.0's own default, 1, would load it (1.77 GiB a Spark) with PARALLEL=1.
@@ -93,11 +95,11 @@ export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
-# a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only (mtp: 1). Default 4 on two Sparks, 8 on three (v1.5).
+# a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only on main; this branch's fork also drafts MTP under --parallel. Default 4 on two Sparks, 8 on three (v1.5).
 # sparkDash aggregate decode at 4 / 8 requests at once: two Sparks prose 103.2 / 130.8 tok/s, code 126.7 / 167.0; three
 # Sparks prose 121.8 / 166.0, code 165.3 / 211.5. One request alone decodes as fast either way. The memory reserve
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
-if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" == 3 ]]; then _par=8; else _par=4; fi
+if [[ "${TP:-2}" == 3 ]]; then _par=8; else _par=4; fi   # this fork also drafts MTP under --parallel (unlike main)
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
@@ -247,6 +249,12 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 case "$TP" in 3) _pool=32 ;; *) _pool=12.5 ;; esac
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
+
+# Multi-stream decode on the fork (aditya1503/TensorFold@mtp_concurrent): one packed all-gather a round whatever the
+# samplings; chain depth from the startup-timed window curve; rank 0's messages overlap the next round (same bits).
+export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
+export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
+export TF_GLM_MULTI_ASYNC="${TF_GLM_MULTI_ASYNC:-1}"
 
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 

@@ -1,5 +1,15 @@
 <h1 align="center">GLM-5.3-Flash EXL3 on DGX Sparks with TensorFold</h1>
 
+# GLM-5.3-Flash EXL3 on 2x DGX Spark with TensorFold — MTP-concurrent variant
+
+> **Branch `adi_mtp_concurrent`.** Identical to `main` except serving runs on
+> [`aditya1503/TensorFold@mtp_concurrent`](https://github.com/aditya1503/TensorFold) (pinned by `TF_HASH`, currently
+> `1d2e725`): upstream v0.6.0 + this recipe's 53 serving patches + MTP drafting under `--parallel`. Consequence:
+> `DRAFTER=mtp PARALLEL=4` works (on `main`, MTP means one request at a time and this recipe's DFlash2 is needed for
+> concurrency). `patches/` is intentionally empty on this branch — the fork carries their code; the upstream series sits in
+> `patches.upstream/` for reference only and is not applied. The newer main-branch patches 0054–0068 are not in it yet.
+
+
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
   <br><br>
