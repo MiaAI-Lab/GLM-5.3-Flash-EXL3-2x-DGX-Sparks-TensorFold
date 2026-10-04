@@ -262,7 +262,8 @@ caches from **one shared pool**:
 
 Any one request can grow to the full window, and the four together share the pool: e.g. one 1M-token conversation
 next to one more of 1M, or next to three of ~640k. A request the pool cannot place yet waits until others finish (kept prompt states give way
-first); `/health` shows `pool_tokens`, `pool_free_tokens` and the streams decoding, filling and paused.
+first, least recently used first, and only while the free rows fall short: free rows in several ranges are gathered by
+moving caches instead, patch `0073`); `/health` shows `pool_tokens`, `pool_free_tokens` and the streams decoding, filling and paused.
 
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
 TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
@@ -522,6 +523,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | 3 Sparks (experimental) | `0066-glm-tp-n`, `0067-glm-tp3-split-pad`, `0068-glm-tpn-split-buffer-rows` | the engine on 2 or 3 ranks (`--tp`): heads, expert columns, vocabulary and DFlash2 KV groups split in whole units, the remainder to the lowest ranks; the row split (`SPLIT`) and its early connection to every peer; RoCE all-gathers over per-peer routes (b12x's proxy modified for more than two Sparks); prompt buffers and the memory estimate hold the split's pad row at three ranks | [3 Sparks](#3-sparks-experimental); two Sparks unchanged |
 | Eight requests at once | `0069-glm-eight-streams` | up to 8 concurrent requests (`PARALLEL` 1 to 8): the batched verify window's segment tables (and the segmented kernels' launch grids) sized for the streams, four as before up to four; the multi-stream DFlash2 drafter, scheduler and memory estimate for 5 to 8 streams; the shared verify window's rows set by `TF_GLM_MULTI_WINDOW` (32 as before; 64 by default past 4 requests) and counted at start | 8 at once: +27% prose, +32% code over 4 on two Sparks (+36% / +28% on three); `PARALLEL` 1 to 4 unchanged ([Performance](#performance)) |
 | Serial stop | `0070-glm-serial-stop` | at `PARALLEL=1`, a request whose client left, or that hit a stop string or a gate cut, ends on both ranks after the same round (rank 0's stop rides on the round's sample all-gather; issue #38); `--parallel` above 1 without DFlash2 refused at start with the options | same replies |
+| Pool room | `0073-glm-compact-before-evict` | a request or a growing stream whose rows the pool has free, but not in one range, gets them by moving other caches (each at most once) instead of evicting kept prompts until a range opens; eviction only while the free rows fall short (by ezoushen, issue #61) | two conversations taking turns at a nearly full pool keep each other's kept state (`tools/pool_pressure.py`: the other's next turn 0% -> 100% resumed) |
 | Concurrent fill | `0062-glm-sliced-fill` | a new prompt's chunks run in layer slices (`FILL_BUDGET_MS`) with decode rounds between them, drafted as usual (`FILL_DRAFTS`), both ranks on the same layer boundaries; the chunk's buffers kept between slices, grouped fills, cache moves and cancellation mid-fill; whole forwards when nothing else decodes | with smooth streaming, the other replies' pauses during a 25k-token fill 630-690 ms -> 81-149 ms (table below) |
 
 Concurrent prompt fill and smooth streaming on two Sparks (`PARALLEL=4`, DFlash2, 1,024-row chunks): three 400-token
@@ -570,6 +572,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | --- | --- |
 | `tools/needle.py [label] [size]` | hides a passphrase in a ~195k-token prompt (the prompt comes out at ~0.8 x `size` tokens) and checks the model returns it |
 | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+| `tools/pool_pressure.py [size]` | on a fresh server with nothing else sending requests: two conversations of ~`size` tokens (default 30000) take a turn each, others fill the pool, then each takes another turn; exit 1 when a turn resumes less than 90% of its previous prompt, 2 when the kept-prompt cap stops the fill first (a smaller pool runs it faster: `CONTEXT=131072 KV_POOL_GIB=0.5`) |
+| `tools/pool_room_check.py` | patch 0073's checks, run in the image (`docker run ... --entrypoint python`, see the file): the pool's room-making on a CPU arena, what it evicts and moves, and rank 1 replaying the same ops |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 
 ## Repository layout
@@ -582,7 +586,7 @@ scripts/      config.sh (all settings), local.sh.example (this setup's WORKER), 
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
 patches/      patches baked into the image
-tools/        checks against the running server (needle, tool calls, end of turn)
+tools/        checks against the running server (needle, tool calls, end of turn, kept prompts under a full pool)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
