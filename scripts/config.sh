@@ -251,8 +251,8 @@ export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 # a headless Spark never uses and MemAvailable never counts. DISPLAY_KV_MIB of it (a multiple of 16, at most 2032;
 # 2048 failed ENOMEM in the vLLM kit's #234; 1792 measured here) joins the shared pool on every rank, on top of
 # KV_POOL_GIB, without taking host memory: 1792 adds ~277k tokens at PARALLEL=8 (276,480-278,528 with the pool's size).
-# Same replies, decode and prefill. Needs /dev/dri/card0 in the containers (nvidia_drm with modeset=1; --gpus all
-# passes it). 0 (default): off.
+# Same replies, decode and prefill. Headless Sparks only: start.sh and each rank refuse it while a display is connected
+# to card0. Needs /dev/dri/card0 in the containers (nvidia_drm with modeset=1; --gpus all passes it). 0 (default): off.
 DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
 export TF_GLM_DISPLAY_KV_MIB="$DISPLAY_KV_MIB"
 

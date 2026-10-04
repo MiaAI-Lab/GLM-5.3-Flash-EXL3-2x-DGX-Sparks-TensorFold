@@ -4,7 +4,7 @@
     docker run --rm --gpus all --entrypoint python -v "$PWD/tools/display_kv_check.py:/c.py" tensorfold-glm53:v0.6.0 \
       /c.py [--gpu]
 
-Without --gpu: the setting, how many latent planes the span takes, the span's mapping and unwinding (a fake for every
+Without --gpu: the setting, the refusal while a display is connected, how many latent planes the span takes, the span's mapping and unwinding (a fake for every
 DRM and CUDA driver call), the planes carved from a span, and the pool's row copies of spanned planes against stock
 ones. With --gpu, on a Spark whose display reservation is free (the server stopped, or started with DISPLAY_KV_MIB=0):
 the real span, written and read back by the GPU across both halves, and a pool copy across the boundary. Exit code 1
@@ -126,8 +126,31 @@ def names(system):
     return [c[0] for c in system.calls]
 
 
+def fake_sysfs(states):
+    import tempfile
+
+    root = tempfile.mkdtemp()
+    for name, state in states.items():
+        os.makedirs(f"{root}/{name}")
+        with open(f"{root}/{name}/status", "w") as f:
+            f.write(state + "\n")
+    return root
+
+
+# -- a connected display keeps its reservation ------------------------------------------------------------------------
+check("headless: no output of card0 connected",
+      dk.connected_outputs(fake_sysfs({"card0-HDMI-A-1": "disconnected", "card0-Unknown-1": "disconnected",
+                                       "card1-DP-1": "connected"}), "card0") == [])
+check("a connected output is named",
+      dk.connected_outputs(fake_sysfs({"card0-HDMI-A-1": "connected", "card0-DP-1": "disconnected"}), "card0")
+      == ["HDMI-A-1"])
 dk.SYSTEM = FakeSystem
 D, O = 1792 * MIB, 256 * MIB
+FakeSystem.last = None
+dk.SYSFS = fake_sysfs({"card0-DP-2": "connected"})
+check("a connected display refuses the span before any driver call",
+      raises(dk.map_span, O, D, match="card0-DP-2") and FakeSystem.last is None)
+dk.SYSFS = fake_sysfs({"card0-DP-2": "disconnected"})
 span = dk.map_span(O, D)
 check("span covers both halves", (span.pointer, span.size) == (1 << 44, O + D))
 check("display half sits right above the ordinary half",

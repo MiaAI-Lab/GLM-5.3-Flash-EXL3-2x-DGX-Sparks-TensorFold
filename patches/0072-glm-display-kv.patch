@@ -1,11 +1,11 @@
-# The shared pool also takes part of the GB10's display reservation (DISPLAY_KV_MIB, off by default). The firmware
-# keeps ~2 GiB for a screen that a headless Spark never uses and MemAvailable never counts. With --parallel the pool is
+# The shared pool also takes part of the GB10's display reservation (DISPLAY_KV_MIB, off by default). The firmware keeps
+# ~2 GiB for a screen that a headless Spark never uses and MemAvailable never counts. With --parallel the pool is
 # credited TF_GLM_DISPLAY_KV_MIB of it, and the first DSA layers' latent planes are carved from one span: ordinary host
-# memory, then a DRM dumb buffer on /dev/dri/card0 mapped right above it, both registered with cuMemHostRegister, so
-# the planes take exactly the credit from the reservation and no more host memory than without it. CUDA refuses a
-# memcpy across the two registrations, so the pool's row copies of those planes go through an elementwise kernel.
-# Placement only: the same bits. Fails closed. After @gabewillen's display-reserve KV for the vLLM kit
-# (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks#234). By @ezoushen.
+# memory, then a DRM dumb buffer on /dev/dri/card0 mapped right above it, both registered with cuMemHostRegister, so the
+# planes take exactly the credit from the reservation and no more host memory than without it. CUDA refuses a memcpy
+# across the two registrations, so the pool's row copies of those planes go through an elementwise kernel. Placement
+# only: the same bits. Headless Sparks only: a connected display stops the start. Fails closed. After @gabewillen's
+# display-reserve KV for the vLLM kit (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks#234). By @ezoushen.
 
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
 index eeb54be..2e4b01e 100644
@@ -40,10 +40,10 @@ index eeb54be..2e4b01e 100644
          self.last_hidden: torch.Tensor | None = None
 diff --git tensorfold/families/glm5_next/cuda/display_kv.py tensorfold/families/glm5_next/cuda/display_kv.py
 new file mode 100644
-index 0000000..5200ef5
+index 0000000..8e8c621
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/display_kv.py
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,270 @@
 +"""The cache pool's first latent planes in the GB10's UEFI display reservation (TF_GLM_DISPLAY_KV_MIB).
 +
 +The firmware sets aside a framebuffer region that nothing claims on a headless Spark and that MemAvailable never
@@ -56,6 +56,7 @@ index 0000000..5200ef5
 +
 +``TF_GLM_DISPLAY_KV_MIB``: unset or 0 off; a multiple of 16 up to 2032 (2048 fails ENOMEM on GB10).
 +``TF_GLM_DISPLAY_KV_CARD``: the DRM card (default /dev/dri/card0; the container needs it as a device).
++For headless Sparks only: a card with a connected output (a monitor) keeps its reservation, and the start stops.
 +Fails closed: the credited bytes were never budgeted against host memory, so a span that cannot be mapped stops the
 +start instead of falling back to ordinary memory.
 +"""
@@ -68,6 +69,7 @@ index 0000000..5200ef5
 +ENV = "TF_GLM_DISPLAY_KV_MIB"
 +CARD_ENV = "TF_GLM_DISPLAY_KV_CARD"
 +LARGEST_MIB = 2032
++SYSFS = "/sys/class/drm"
 +
 +
 +def mib() -> int:
@@ -99,6 +101,18 @@ index 0000000..5200ef5
 +        raise ValueError(f"{ENV}: {display >> 20} MiB is more than the {count} latent planes hold "
 +                         f"({count * plane_bytes >> 20} MiB); lower it")
 +    return max(1, k)
++
++
++def connected_outputs(sysfs: str, card: str) -> list[str]:
++    """The outputs of ``card`` (e.g. card0) with a display connected, by their sysfs status."""
++    import glob
++
++    found = []
++    for path in sorted(glob.glob(os.path.join(sysfs, f"{card}-*", "status"))):
++        with open(path) as f:
++            if f.read().strip() == "connected":
++                found.append(os.path.basename(os.path.dirname(path))[len(card) + 1:])
++    return found
 +
 +
 +class System:
@@ -239,6 +253,10 @@ index 0000000..5200ef5
 +def map_span(ordinary: int, display: int) -> Span:
 +    """``ordinary`` bytes of host memory and the ``display`` bytes of the reservation right above them, both
 +    registered with CUDA, as one span. Unwound completely on any failure."""
++    card = os.path.basename(os.environ.get(CARD_ENV, "/dev/dri/card0"))
++    if busy := connected_outputs(SYSFS, card):
++        raise RuntimeError(f"{ENV}: {', '.join(f'{card}-{o}' for o in busy)} has a display connected, which uses the "
++                           f"reservation; unset {ENV} on a Spark with a monitor")
 +    total = ordinary + display
 +    system = SYSTEM()
 +    fd = handle = base = None

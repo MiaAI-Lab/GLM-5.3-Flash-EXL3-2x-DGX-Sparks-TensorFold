@@ -69,6 +69,10 @@ for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL STREAM_SMOOTH; 
   die "DISPLAY_KV_MIB is a multiple of 16 from 0 to 2032, not $DISPLAY_KV_MIB"
 (( DISPLAY_KV_MIB == 0 || PARALLEL > 1 )) || die "DISPLAY_KV_MIB adds to the shared pool, which needs PARALLEL above 1"
 (( DISPLAY_KV_MIB == 0 )) || [[ -e /dev/dri/card0 ]] || die "DISPLAY_KV_MIB needs /dev/dri/card0, which this Spark lacks"
+if (( DISPLAY_KV_MIB )); then        # headless only: a monitor's framebuffer lives in the reservation
+  _shown=$(grep -lx connected /sys/class/drm/card0-*/status 2>/dev/null | sed 's|.*/\(card0-[^/]*\)/status|\1|' | paste -sd, -)
+  [[ -z "$_shown" ]] || die "DISPLAY_KV_MIB is for headless Sparks, and $_shown has a display connected; set it to 0"
+fi
 [[ "$WORKER_WEIGHTS" == copy || "$WORKER_WEIGHTS" == nfs ]] || die "WORKER_WEIGHTS is copy or nfs, not $WORKER_WEIGHTS"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$KV_POOL_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GIB is a number of GiB, not $KV_POOL_GIB"

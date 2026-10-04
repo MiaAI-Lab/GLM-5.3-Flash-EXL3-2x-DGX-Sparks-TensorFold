@@ -273,7 +273,9 @@ counts. With `PARALLEL` above 1, `DISPLAY_KV_MIB=1792` (patch 0072) adds that mu
 top of `KV_POOL_GIB`: the first DSA layers' latent planes sit in a span of ordinary memory with the reservation mapped
 right above it, so the pool takes no more host memory than the budget gives it. Same replies, decode and prefill. It
 needs `/dev/dri/card0` in the containers (`nvidia_drm` with `modeset=1`; `--gpus all` passes the device); `start.sh`
-checks it on the head, and a worker without it stops at load. 1792 is measured; 2048 failed in the vLLM kit (#234).
+checks it on the head, and a worker without it stops at load. **Headless Sparks only:** a monitor's framebuffer lives
+in that reservation, so `start.sh` and each rank refuse the setting while any `card0` output reports `connected`.
+1792 is measured; 2048 failed in the vLLM kit (#234).
 On the Spark's unified memory, running out tends to freeze the machine rather than fail an allocation. A setting that
 does not fit is refused before any weights load, with the largest window that fits; `start.sh` then restarts once
 with that window and says so (free memory on both Sparks for the full one). Other settings' windows:
@@ -406,7 +408,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
 | `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
-| `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0` |
+| `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0`; headless Sparks only (refused while a display is connected) |
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |
 | `DRAFTER` | `dflash2` | `dflash2`: IncoAI's DFlash2 drafter, licensed [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), **non-commercial use only**; +5-10% decode. `mtp`: the checkpoint's own MTP head, one request at a time, which avoids that license (set it before the first `./start.sh` and DFlash2 is never downloaded) |
 | `TF_GLM_MTP` | `auto` | the checkpoint's MTP head beside DFlash2: `auto` leaves it out while DFlash2 drafts every request; `1` (TensorFold v0.6.0's own default) loads it, 1.77 GiB a Spark, with `PARALLEL=1`. `DRAFTER=mtp` always loads it |
