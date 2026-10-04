@@ -2,7 +2,7 @@
 
 Run after applying the recipe patches to TensorFold v0.6.0:
   python3 -B tools/test_queued_cancellation.py --source-root /path/to/src
-Use --expect-stock after patches 0001..0070 to reproduce the original full-lanes
+Use --expect-stock before patch 0073 to reproduce the original full-lanes
 gap. No Torch/CUDA, sockets, package installation or source writes are needed.
 """
 from __future__ import annotations
@@ -326,6 +326,124 @@ def main():
     cancelled_reply(thread, reply, ValueError)
     assert obj.decoder.live() == 0 and obj.decoder.finished == [stream]
     checks.append("active poll failure propagates only after decoder finish")
+
+    # Delivery failures latch an error, not a normal stop, and never let the
+    # caller return before active decoder cleanup. Preserve the original error.
+    failure = ValueError("delivery failed")
+    deliveries = []
+    def broken_emit(tokens):
+        deliveries.append(tokens)
+        raise failure
+    obj = scheduler()
+    thread, reply = ask(obj, lambda: False, emit_hook=broken_emit)
+    box = obj.waiting.queue[0][2][1]
+    try:
+        obj._admit()
+        stream = next(iter(obj.decoder.streams.values()))
+        stream.take([2])
+        wait(stream.emit.cancel_requested)
+        obj._cancel_waiting()
+        assert thread.is_alive() and not reply and obj.decoder.live() == 1
+        assert stream.emit.cancel_error() is failure and not stream.done
+        stream.take([2, 3])
+        obj._iteration()
+        cancelled_reply(thread, reply, ValueError)
+        assert reply["error"] is failure and len(deliveries) == 1
+        assert obj.decoder.finished == [stream] and obj.decoder.live() == 0 and not obj.boxes
+    finally:
+        box.put(("error", failure))
+        thread.join(2)
+    checks.append("delivery failure stops once and propagates after active decoder finish")
+
+    # A delivery callback can be in flight while the scheduler yields/requeues
+    # its stream. Test failure both before and after replay, including a
+    # memory-held replay; queue removal remains owned by the scheduler.
+    for method in ("_yield", "_requeue"):
+        for timing in ("before", "after", "held"):
+            permit, emitted, box = threading.Event(), threading.Event(), ObservedBox()
+            failure = ValueError(method + " delivery " + timing)
+            deliveries = []
+            def delayed_failure(tokens):
+                deliveries.append(tokens)
+                emitted.set()
+                assert permit.wait(2)
+                raise failure
+            obj = scheduler()
+            ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
+            thread, reply = ask(obj, lambda: False, background=True, emit_hook=delayed_failure)
+            try:
+                obj._admit()
+                stream = next(iter(obj.decoder.streams.values()))
+                stream.take([2])
+                assert emitted.wait(2)
+                if timing == "before":
+                    permit.set()
+                    assert box.next_get.wait(2)
+                    assert stream.emit.cancel_requested() and thread.is_alive() and not reply
+                if method == "_yield":
+                    obj.max_streams = 1
+                    obj.waiting.put((Stream([99], 100), queue.Queue()))
+                else:
+                    obj.decoder.streams.clear()  # decoder freed the lane before reporting requeue
+                    obj.decoder.requeue = [stream]
+                getattr(obj, method)()
+                if method == "_yield":
+                    assert obj.waiting.get_nowait()[0].prompt == [99]
+                again = obj.waiting.queue[0][2][0]
+                assert again.emit is stream.emit and id(stream) not in obj.boxes
+                if timing == "held":
+                    obj.decoder.room = False
+                    obj._admit()
+                    assert obj.held is not None and obj.held[0] is again
+                if timing != "before":
+                    assert not again.emit.cancel_requested() and thread.is_alive() and not reply
+                    permit.set()
+                    assert box.next_get.wait(2)
+                assert again.emit.cancel_requested() and again.emit.cancel_error() is failure
+                assert thread.is_alive() and not reply
+                obj._cancel_waiting()
+                cancelled_reply(thread, reply, ValueError)
+                assert reply["error"] is failure and len(deliveries) == 1
+                assert obj.waiting.empty() and obj.held is None and not obj.boxes
+                assert obj.decoder.admitted == [stream] and obj.decoder.live() == 0
+                obj._cancel_waiting()
+                assert box.empty()  # one terminal reply only
+            finally:
+                permit.set()
+                box.put(("error", failure))
+                thread.join(2)
+                ns["queue"] = queue
+            checks.append(method + " delivery failure " + timing + " replay keeps cleanup/error ownership")
+
+    # The decoder may already have finished while the caller is still inside
+    # delivery. Its queued terminal reply must not turn that failure into stats.
+    permit, emitted, box = threading.Event(), threading.Event(), ObservedBox()
+    failure = ValueError("delivery failed after finish")
+    def late_failure(tokens):
+        emitted.set()
+        assert permit.wait(2)
+        raise failure
+    obj = scheduler()
+    ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
+    thread, reply = ask(obj, lambda: False, emit_hook=late_failure)
+    try:
+        obj._admit()
+        stream = next(iter(obj.decoder.streams.values()))
+        stream.take([2])
+        assert emitted.wait(2)
+        stream.done = True
+        obj._iteration()
+        assert obj.decoder.finished == [stream] and obj.decoder.live() == 0 and not obj.boxes
+        assert thread.is_alive() and not reply
+        permit.set()
+        cancelled_reply(thread, reply, ValueError)
+        assert reply["error"] is failure and "stats" not in reply
+    finally:
+        permit.set()
+        box.put(("error", failure))
+        thread.join(2)
+        ns["queue"] = queue
+    checks.append("delivery failure after decoder finish is not swallowed by terminal stats")
     print(json.dumps({"status": "PASS", "tests": len(checks), "checks": checks, "device_calls": 0,
                       "source_sha256": hashlib.sha256(source.replace("\r\n", "\n").encode()).hexdigest()}, indent=2))
 
