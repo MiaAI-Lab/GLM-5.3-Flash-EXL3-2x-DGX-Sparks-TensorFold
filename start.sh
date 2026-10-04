@@ -65,6 +65,10 @@ check_workers
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 [[ "$DRAFTER" == dflash2 || "$PARALLEL" == 1 ]] || die "PARALLEL=$PARALLEL needs DRAFTER=dflash2 (mtp serves one request at a time: PARALLEL=1)"
 for v in SPLIT SHARED_PREFIX KDA_CHUNKED COPY_CODE MULTI_PREFILL STREAM_SMOOTH; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "$DISPLAY_KV_MIB" =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( DISPLAY_KV_MIB % 16 == 0 && DISPLAY_KV_MIB <= 2032 )) ||
+  die "DISPLAY_KV_MIB is a multiple of 16 from 0 to 2032, not $DISPLAY_KV_MIB"
+(( DISPLAY_KV_MIB == 0 || PARALLEL > 1 )) || die "DISPLAY_KV_MIB adds to the shared pool, which needs PARALLEL above 1"
+(( DISPLAY_KV_MIB == 0 )) || [[ -e /dev/dri/card0 ]] || die "DISPLAY_KV_MIB needs /dev/dri/card0, which this Spark lacks"
 [[ "$WORKER_WEIGHTS" == copy || "$WORKER_WEIGHTS" == nfs ]] || die "WORKER_WEIGHTS is copy or nfs, not $WORKER_WEIGHTS"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 [[ "$KV_POOL_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "KV_POOL_GIB is a number of GiB, not $KV_POOL_GIB"

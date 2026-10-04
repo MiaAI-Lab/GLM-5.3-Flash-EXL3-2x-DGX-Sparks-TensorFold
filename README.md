@@ -259,6 +259,7 @@ caches from **one shared pool**:
 | Rank 0's startup estimate | 88.09 GiB |
 | Free memory (`MemAvailable`) at idle | 7.0 GiB on rank 0, 10.5 GiB on rank 1 |
 | Lowest free memory under a 1M-token prompt | 5.6 GiB on rank 0, 9.5 GiB on rank 1 |
+| Display reservation in the pool (`DISPLAY_KV_MIB`) | off; 1792 MiB adds ~277k tokens at `PARALLEL=8` without taking host memory |
 
 Any one request can grow to the full window, and the four together share the pool: e.g. one 1M-token conversation
 next to one more of 1M, or next to three of ~640k. A request the pool cannot place yet waits until others finish (kept prompt states give way
@@ -267,6 +268,12 @@ first); `/health` shows `pool_tokens`, `pool_free_tokens` and the streams decodi
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
 TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
 reserve also sets the lowest free memory.
+The GB10 firmware also keeps about 2 GiB for a screen, which a headless Spark never uses and `MemAvailable` never
+counts. With `PARALLEL` above 1, `DISPLAY_KV_MIB=1792` (patch 0072) adds that much of it to the pool on every rank, on
+top of `KV_POOL_GIB`: the first DSA layers' latent planes sit in a span of ordinary memory with the reservation mapped
+right above it, so the pool takes no more host memory than the budget gives it. Same replies, decode and prefill. It
+needs `/dev/dri/card0` in the containers (`nvidia_drm` with `modeset=1`; `--gpus all` passes the device); `start.sh`
+checks it on the head, and a worker without it stops at load. 1792 is measured; 2048 failed in the vLLM kit (#234).
 On the Spark's unified memory, running out tends to freeze the machine rather than fail an allocation. A setting that
 does not fit is refused before any weights load, with the largest window that fits; `start.sh` then restarts once
 with that window and says so (free memory on both Sparks for the full one). Other settings' windows:
@@ -399,6 +406,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
 | `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
+| `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0` |
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |
 | `DRAFTER` | `dflash2` | `dflash2`: IncoAI's DFlash2 drafter, licensed [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), **non-commercial use only**; +5-10% decode. `mtp`: the checkpoint's own MTP head, one request at a time, which avoids that license (set it before the first `./start.sh` and DFlash2 is never downloaded) |
 | `TF_GLM_MTP` | `auto` | the checkpoint's MTP head beside DFlash2: `auto` leaves it out while DFlash2 drafts every request; `1` (TensorFold v0.6.0's own default) loads it, 1.77 GiB a Spark, with `PARALLEL=1`. `DRAFTER=mtp` always loads it |
@@ -502,6 +510,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | --- | --- | --- | --- |
 | Weights | `0002-glm-dense-fp8`, `0005-glm-dense-q4` | the checkpoint's BF16 dense weights in FP8, or 4-bit with MSE-searched ranges (`DENSE`) | q4 over fp8: prose 38.9 -> 44.4 tok/s, code 44.2 -> 48.7, prefill ~1,090 -> ~1,260 tok/s |
 | KV cache | `0038-glm-kv-fp8` | the DSA latent cache and the indexer's pooled keys as FP8 rows (`KV=fp8`) | the 1M window with 4 requests fits |
+| KV pool | `0072-glm-display-kv` | the first DSA latent planes in a span ending in the GPU's display reservation, which `MemAvailable` does not count; the pool's row copies of those planes by a kernel (a memcpy may not cross the span's two registrations) (`DISPLAY_KV_MIB`, by ezoushen) | 1792 MiB: ~277k more tokens at `PARALLEL=8`; the same bits, decode and prefill |
 | Prompt | `0001-glm-exl3-prompt-experts`, `0004-glm-prompt-kernels`, `0009-glm-prefill-kernels`, `0020-glm-prompt-experts-order`, `0024-glm-prompt-select-rows`, `0028-glm-lean-prompt-scratch` | EXL3 expert kernels that keep a prompt chunk's rows in L2, launched in a better order; each row's input rotated once; dense attention only where the sparse pass needs it; token selection in blocks of 512 rows; smaller prompt scratch | faster prefill, less memory at 1M |
 | Prompt, two Sparks | `0010-glm-hc-split`, `0033-glm-prefill-overlap2`, `0017-glm-overlap-priority`, `0022-glm-overlap-normal-priority`, `0064-glm-split-connect-early` | hyper-connection glue split by rows between the Sparks, exchanges overlapped with the next rows' work (`SPLIT`); the split's send/receive connection opened before the weights and the cache pool (issue #36) | 50k prefill ~1,270 -> ~1,730 tok/s with 0009 and 0020; decode rounds pay ~1.5% |
 | Prompt, KDA | `0012-glm-kda-chunked`, `0014-glm-kda-chunked-gb10`, `0039-glm-kda-chunked-kernel` | the linear-attention layers' prompt chunks in chunked (WY) form, one CUDA kernel (`KDA_CHUNKED`) | 50k prefill 29.3 -> 26.4 s, 149k 91.1 -> 84.5 s (one start each) |
@@ -566,6 +575,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | --- | --- |
 | `tools/needle.py [label] [size]` | hides a passphrase in a ~195k-token prompt (the prompt comes out at ~0.8 x `size` tokens) and checks the model returns it |
 | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
+| `tools/display_kv_check.py [--gpu]` | patch 0072's checks, run in the image (`docker run ... --entrypoint python`, see the file): the setting, the span's mapping and unwinding through a fake driver, the carved planes and the pool's copies; with `--gpu`, the real span on a Spark whose display reservation is free |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 
 ## Repository layout
@@ -578,7 +588,7 @@ scripts/      config.sh (all settings), local.sh.example (this setup's WORKER), 
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
 patches/      patches baked into the image
-tools/        checks against the running server (needle, tool calls, end of turn)
+tools/        checks against the running server (needle, tool calls, end of turn) and patch 0072's in the image
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
