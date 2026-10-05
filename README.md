@@ -477,6 +477,38 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
   the same three Sparks.
 - `prepare.sh` on its own takes `TP` too: `TP=3 scripts/prepare.sh`.
 
+## 4 Sparks (experimental)
+
+`./start-tp4.sh` runs the recipe as tensor parallel over four Sparks (`TP=4` with `./start.sh`'s options; `./stop.sh`
+stops every configured worker), on the same engine (patches 0066-0068 run 2, 3 or 4 ranks) and the same published image.
+**Measured** on a four-Spark ring (2026-10-05, sparkDash, prose, thinking off): 82.0 tok/s one request (three Sparks
+65.7), 112.2 / 131.0 / 142.5 tok/s at 2 / 3 / 4 at once, time to first token 117 ms. Prefill is not tuned yet, and
+exactness at four ranks has not been run. Its defaults are three Sparks' (`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
+
+- **Cabling: a ring without a switch.** A Spark has two CX7 ports, so four Sparks without a switch form a ring: each
+  Spark cabled to its two neighbours, one subnet per cable (both PCIe twins of a port may share it, as `.N` and
+  `.10N`). The two Sparks across the ring from each other have no cable. Every pair on one switch works too (the
+  mesh, as at three Sparks).
+- **Rank order follows the ring.** `WORKER` (rank 1), `WORKER2` (rank 2) and `WORKER3` (rank 3) go around the ring from
+  the head, so rank 2 is the Spark across from it. `start.sh` finds the ring from the subnets the nodes share and stops
+  when the workers are in another order, naming the order that fits. `WORKER3` has its own `FABRIC_PEER3`,
+  `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`.
+- **Nothing goes across the ring.** NCCL carries every all-gather (`COMM=nccl`; `COMM=roce` is refused, as it sends
+  to every peer) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
+  (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges run as
+  all-gathers (`TF_GLM_HC_EXCHANGE=gather`; the default `p2p` sends to every peer), without their overlap. NCCL's
+  devices, GIDs and bootstrap socket are found as at three Sparks, and each rank gets an NCCL graph file
+  (`NCCL_GRAPH_FILE`, NIC fusion off). On a ring cabled port to like port (p1-p1, p0-p0) a Spark's neighbours sit on
+  different ports, which ones alternating around the ring; NCCL picks one device a channel for both directions, the
+  same on every Spark, so its own pick (or its fused devices) sends part of the traffic to a port without that peer.
+  The file makes each Spark listen on the port toward the previous rank, and subnet-aware routing sends on the one
+  toward the next (a decode-sized all-gather 109 us instead of 184). `RING_GRAPH=0` leaves NCCL to pick.
+- **The worker across the ring** reaches the head through a neighbour: its rendezvous and NFS server are the head's
+  address on its route to `WORKER2` (with `WORKER2` given by an address the Sparks route between them, e.g. one on
+  `lo`, that path runs over the CX7 links). An NFS export must allow that worker's source address on the route back.
+- `DRY_RUN=1 ./start-tp4.sh` prints the ring found and every rank's `docker run`; `TP=4 scripts/prepare.sh` prepares
+  the four Sparks. On such a ring `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
+
 ## Configuration
 
 Every setting lives in [`scripts/config.sh`](scripts/config.sh). Set one for a single run from the environment
@@ -489,9 +521,9 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `WORKER` / `FABRIC_PEER` | empty | the worker's ssh target (`user@<address>` or `user@<host name>`), and its CX7 address when `WORKER` is on another network |
 | `WORKER_HF_CACHE` | the worker's `HF_HOME` | the worker's Hugging Face cache, when it is not its `HF_HOME` (e.g. a shared models folder) |
 | `MASTER_PORT` | `29551` | the ranks' rendezvous port (keep it on the private link) |
-| `TP` / `WORKER2` | `2` / empty | Sparks in all (`2`, or `3` through `./start-tp3.sh`), and the ssh target of rank 2 ([3 Sparks](#3-sparks-experimental)); `FABRIC_PEER2`, `WORKER_HF_CACHE2`, `WORKER_WEIGHTS2`, `NFS_SERVER2` as the worker's own |
+| `TP` / `WORKER2` / `WORKER3` | `2` / empty / empty | Sparks in all (`2`, `3` through `./start-tp3.sh`, `4` through `./start-tp4.sh`), and the ssh targets of ranks 2 and 3 ([3 Sparks](#3-sparks-experimental), [4 Sparks](#4-sparks-experimental)); `FABRIC_PEER2`, `WORKER_HF_CACHE2`, `WORKER_WEIGHTS2`, `NFS_SERVER2` (and the same with `3`) as the worker's own |
 | `MASTER_ADDR` / `SOCKET_IFNAME` | see [3 Sparks](#3-sparks-experimental) | the rendezvous address (`TP=2`: the head's address on the link) and, with `TP` above 2, NCCL's bootstrap netdev |
-| `PARALLEL` | `4`, `8` at `TP=3` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 8 (above 1 needs `DRAFTER=dflash2`); 8 at once: +27-36% aggregate decode over 4, at a smaller shared pool ([Performance](#performance)) |
+| `PARALLEL` | `4`, `8` at `TP=3` and `4` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 8 (above 1 needs `DRAFTER=dflash2`); 8 at once: +27-36% aggregate decode over 4, at a smaller shared pool ([Performance](#performance)) |
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
@@ -722,6 +754,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 ```
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
+start-tp4.sh  the same on four Sparks, e.g. a ring without a switch (experimental, patches 0066-0068)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),

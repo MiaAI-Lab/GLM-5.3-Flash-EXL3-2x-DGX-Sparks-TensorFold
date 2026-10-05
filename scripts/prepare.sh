@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepare both Sparks to serve Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (with ABLIT=1, the gated
-# Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit, which needs HF_TOKEN) with TensorFold (two ranks; with TP=3, both
-# workers the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2):
+# Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit, which needs HF_TOKEN) with TensorFold (two ranks; with TP=3 or 4,
+# every worker the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2 / WORKER_WEIGHTS3):
 #   1. preflight checks: docker and the GPU on both nodes, key-based ssh to the worker, the RoCE link, disk space
 #   2. the image on the head: TensorFold plus patches/*.patch on NVIDIA's PyTorch container, pulled prebuilt from
 #      $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else built locally

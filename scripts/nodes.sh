@@ -1,5 +1,6 @@
-# The Sparks: this machine (rank 0), and the workers over ssh: WORKER (rank 1), WORKER2 (rank 2).
-# Each node's links to the others are found from the routes and subnets between them.
+# The Sparks: this machine (rank 0), and the workers over ssh: WORKER (rank 1), WORKER2 (rank 2), WORKER3 (rank 3).
+# Each node's links to the others are found from the routes and subnets between them: a direct cable between every
+# pair (two Sparks, a triangle of three), or a ring of four cabled in rank order (see detect_links).
 # Sourced by start.sh, stop.sh and prepare.sh after config.sh.
 
 # wvar <NAME> <i>: the name of worker i's own setting: NAME for worker 1 (WORKER, FABRIC_PEER, NFS_SERVER,
@@ -10,14 +11,14 @@ wval() { local v; v=$(wvar "$1" "$2"); echo "${!v:-}"; }
 worker_host() { wval WORKER "$1"; }
 # The workers this start uses (1 .. TP-1), and every worker configured at all (stop.sh stops them all).
 worker_ids() { seq 1 $((TP - 1)); }
-configured_workers() { local i; for i in 1 2; do [[ -z "$(worker_host "$i")" ]] || echo "$i"; done; }
+configured_workers() { local i; for i in 1 2 3; do [[ -z "$(worker_host "$i")" ]] || echo "$i"; done; }
 # worker i's weights: WORKER_WEIGHTS for worker 1, WORKER_WEIGHTS<i> (default: WORKER_WEIGHTS) for the others
 worker_weights() { local w; w=$(wval WORKER_WEIGHTS "$1"); echo "${w:-$WORKER_WEIGHTS}"; }
 
-# check_workers: TP is 2 or 3, and WORKER .. WORKER<TP-1> are set and distinct (later ones are left out).
+# check_workers: TP is 2, 3 or 4, and WORKER .. WORKER<TP-1> are set and distinct (later ones are left out).
 check_workers() {
   local i j h
-  [[ "$TP" =~ ^[23]$ ]] || die "TP is 2 (./start.sh) or 3 (./start-tp3.sh, experimental) Sparks, not $TP"
+  [[ "$TP" =~ ^[234]$ ]] || die "TP is 2 (./start.sh), 3 (./start-tp3.sh) or 4 (./start-tp4.sh) Sparks (3 and 4 experimental), not $TP"
   for i in $(worker_ids); do
     h=$(worker_host "$i")
     [[ -n "$h" ]] || die "TP=$TP needs $((TP - 1)) workers: set $(wvar WORKER "$i")=user@<address of rank $i> in scripts/local.sh (see scripts/local.sh.example)"
@@ -188,6 +189,10 @@ worker_link_info() { worker "$1" "$(declare -f link_info); link_info $2"; }
 # each device's own); LINK_HEAD_ADDR[i] / LINK_WORKER_ADDR[i]: the head's and worker i's addresses on their link (the
 # head's is worker i's NFS server).
 declare -a NODE_DEV=() NODE_HCAS=() NODE_GID=() LINK_HEAD_ADDR=() LINK_WORKER_ADDR=()
+# On a ring (FABRIC=ring): NODE_GRAPH[r], the path on rank r's node of its NCCL graph file (ring_graphs); TOWARD["r s"],
+# rank r's RoCE devices toward rank s.
+declare -a NODE_GRAPH=()
+declare -A TOWARD=()
 
 # An image's identity by content (its layers' diffIDs and runtime config), the same under Docker's overlay2 and
 # containerd image stores: .Id is the config digest under one and the manifest digest under the other, so it never
@@ -304,7 +309,10 @@ node_inventory() {
 # pair_links <ranks...> (stdin: node_inventory lines, each prefixed with its rank): two nodes are linked where they
 # have addresses in one subnet (a direct cable, or a switch). Prints "rank <r> <default netdev> <hcas> <gid or ->" (a
 # node's RoCE devices toward all its peers, in its sysfs order; the GID index when it is one for all of them), "peer <i>
-# <worker i's lowest address on its link to the head>" and "missing <a> <b>" for two ranks without a common subnet.
+# <worker i's lowest address on its link to the head>", "missing <a> <b>" for two ranks without a common subnet, and
+# "ring <ranks...>" when the links form one ring through four or more ranks and no others (every rank linked to two),
+# in its order from rank 0 toward its lower-numbered neighbour, and "toward <r> <s> <hcas>" for every linked pair (r's
+# RoCE devices on the subnets it shares with s, in its sysfs order).
 pair_links() {
   python3 -c '
 import ipaddress, sys
@@ -317,6 +325,7 @@ for line in sys.stdin:
         nodes.setdefault(int(f[0]), []).append((f[1], f[2], ipaddress.ip_interface(f[3]), f[4]))
 ranks = [int(x) for x in sys.argv[1:]]
 linked = lambda e, others: any(e[2].network == o[2].network for o in others)
+links = {r: set() for r in ranks}
 for r in ranks:
     used = set()
     for s in ranks:
@@ -327,7 +336,9 @@ for r in ranks:
             if r < s:
                 print("missing", r, s)
             continue
+        links[r].add(s)
         used.update(id(e) for e in mine)
+        print("toward", r, s, ",".join(dict.fromkeys(e[1] for e in mine)))
         if r == 0:
             print("peer", s, min(o[2].ip for o in nodes[s] if linked(o, mine)))
     hcas, gids = [], set()
@@ -335,6 +346,15 @@ for r in ranks:
         if id(e) in used and e[1] not in hcas:
             hcas.append(e[1]); gids.add(e[3])
     print("rank", r, default.get(r) or "-", ",".join(hcas) or "-", gids.pop() if len(gids) == 1 else "-")
+if len(ranks) > 3 and all(len(links[r]) == 2 for r in ranks):
+    order = [ranks[0], min(links[ranks[0]])]
+    while len(order) <= len(ranks):
+        nxt = (links[order[-1]] - {order[-2]}).pop()
+        if nxt == order[0]:
+            break
+        order.append(nxt)
+    if len(order) == len(ranks):
+        print("ring", *order)
 ' "$@"
 }
 
@@ -342,9 +362,15 @@ for r in ranks:
 # toward all its peers. NCCL's bootstrap socket goes over each node's default-route netdev (SOCKET_IFNAME overrides
 # it): on a triangle every pair has its own subnet, so no CX7 netdev reaches both peers, and the 10.0.0.x-style
 # addresses some setups route over the cables sit on lo. The rendezvous is MASTER_ADDR (config.sh).
+# Four Sparks have two CX7 ports each, so no switch means a ring: each Spark cabled to two others, the two across from
+# it reached only through a neighbour. That is FABRIC=ring when the ring runs in rank order (0-1-2-3-0, WORKER ..
+# WORKER3 around it): NCCL's ring all-gather then only sends to the next rank, over a cable (nccl_env_n), and a worker
+# across the ring from the head gets the head's address on its route there (an address on lo the Sparks route between
+# them, say) for its rendezvous and NFS. FABRIC=mesh: every pair cabled.
+FABRIC=mesh
 detect_links() {
   if (( TP == 2 )); then detect_link; return; fi
-  local r i peer kind a b c d pairs line missing="" names
+  local r i k peer kind a b c d pairs line missing="" names ring="" order=""
   [[ -n "$MASTER_ADDR" ]] || die "no MASTER_ADDR: set it to an address of this node that every worker reaches (its LAN address)"
   local -a inv=()
   inv[0]=$(node_inventory)
@@ -372,8 +398,34 @@ detect_links() {
         read -r LINK_HEAD_ADDR[a] _ <<<"$(link_info "$peer")" || true
         LINK_WORKER_ADDR[a]=$peer ;;
       missing) missing+=" $a-$b" ;;
+      ring) ring="$a $b $c $d" ;;
+      toward) TOWARD["$a $b"]=$c ;;
     esac
   done <<<"$pairs"
+  ring=$(xargs <<<"$ring")
+  if [[ -n "$missing" && -n "$ring" ]]; then
+    if [[ "$ring" != "$(seq -s ' ' 0 $((TP - 1)))" ]]; then
+      for k in $(cut -d' ' -f2- <<<"$ring"); do order+=", $(worker_host "$k")"; done
+      die "the Sparks are cabled as a ring, but the workers are not in its order (rank 0 to $((TP - 1)): this node$order around it): set WORKER .. $(wvar WORKER $((TP - 1))) in that order in scripts/local.sh (each with its own FABRIC_PEER, WORKER_WEIGHTS, NFS_SERVER and WORKER_HF_CACHE, if set)"
+    fi
+    [[ "$COMM" == nccl ]] ||
+      die "COMM=roce sends to every peer directly, and on a ring of $TP Sparks two pairs have no cable: use COMM=nccl (./start-tp$TP.sh's default)"
+    FABRIC=ring; missing=""
+    for i in $(worker_ids); do
+      [[ -z "${LINK_HEAD_ADDR[i]:-}" && -z "${WORKER_DOWN[$i]:-}" ]] || continue
+      peer=$(wval FABRIC_PEER "$i"); [[ -n "$peer" ]] || { peer=$(worker_host "$i"); peer=${peer#*@}; }
+      if [[ ! "$peer" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        c=$(getent ahostsv4 "$peer" | awk 'NR == 1 {print $1}') || true
+        [[ -n "$c" ]] || die "cannot resolve $peer ($(wvar WORKER "$i")) to an IPv4 address"
+        peer=$c
+      fi
+      read -r LINK_HEAD_ADDR[i] _ <<<"$(link_info "$peer")" || true
+      [[ -n "${LINK_HEAD_ADDR[i]:-}" ]] || die "no route from this node to $peer ($(wvar WORKER "$i"))"
+      LINK_WORKER_ADDR[i]=$peer
+      log "rank $i ($(worker_host "$i")) is across the ring from this node: its rendezvous and NFS go to ${LINK_HEAD_ADDR[i]} (through a neighbour)"
+    done
+    [[ "${RING_GRAPH:-1}" == 0 ]] || ring_graphs   # RING_GRAPH=0: NCCL picks the devices itself
+  fi
   for r in 0 $(worker_ids); do
     if [[ -n "${WORKER_DOWN[$r]:-}" ]]; then
       names=$(wvar WORKER "$r")
@@ -393,9 +445,50 @@ detect_links() {
       warn "DRY_RUN: the link between ranks $a and $b is unknown (a worker that cannot be reached)"
       continue
     fi
-    die "ranks $a and $b share no RoCE subnet: $TP Sparks need a link between every pair (a triangle of direct cables; see README)"
+    die "ranks $a and $b share no RoCE subnet: $TP Sparks need a link between every pair (a triangle of direct cables), or four a ring in rank order (on a ring of four no three Sparks are all cabled to each other: ./start-tp4.sh, or ./start.sh with a neighbour); see README"
   done
   return 0
+}
+
+# ring_graphs (FABRIC=ring): an NCCL graph file for each rank, so that every ring channel runs over cables. With one GPU
+# a node NCCL takes one RoCE device a channel for both its receive from the previous rank and its send to the next, the
+# same device index on every node; on a ring cabled port to like port (p1-p1, p0-p0) a node's two neighbours sit on
+# different ports, and which one alternates around the ring, so NCCL's own pick (or its fused "rocep1s0f0+rocep1s0f1"
+# devices, which stripe each connection over both ports) sends part of the traffic to a port without that peer. Each
+# file names, channel by channel, a device toward the previous rank (where the node listens); subnet-aware routing then
+# moves each send to the device on the next rank's subnet. Channels alternate over the devices toward the peer (a port
+# and its PCIe twin). Measured on four Sparks: a decode-sized all-gather 109 us against 184 with NCCL's fused devices,
+# prompt-sized ones the same. NCCL numbers the devices in NCCL_IB_HCA's (sysfs) order, which NODE_HCAS keeps.
+ring_graphs() {
+  local r prev d k idx n xml path ch="" all toward
+  for r in 0 $(worker_ids); do
+    [[ -z "${WORKER_DOWN[$r]:-}" ]] || continue
+    prev=$(( (r + TP - 1) % TP ))
+    IFS=, read -r -a all <<<"${NODE_HCAS[r]}"
+    IFS=, read -r -a toward <<<"${TOWARD["$r $prev"]:-}"
+    (( ${#toward[@]} )) || die "rank $r has no RoCE device toward rank $prev"
+    ch=""
+    for (( k = 0; k < ${NCCL_CHANNELS:-4}; k++ )); do
+      d=${toward[k % ${#toward[@]}]}; idx=-1
+      for (( n = 0; n < ${#all[@]}; n++ )); do [[ "${all[n]}" == "$d" ]] && idx=$n; done
+      ch+="    <channel><net dev=\"$idx\"/><gpu dev=\"0\" rank=\"$r\"/><net dev=\"$idx\"/></channel>"$'\n'
+    done
+    xml="<graphs version=\"1\">"$'\n'
+    for k in "0 4" "1 3"; do
+      xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"1\" nchannels=\"${NCCL_CHANNELS:-4}\" speedintra=\"12\" speedinter=\"12\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"P2C\" samechannels=\"1\">"$'\n'"$ch  </graph>"$'\n'
+    done
+    for k in "4 6" "2 3" "3 5"; do
+      xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"0\" nchannels=\"0\" speedintra=\"0\" speedinter=\"0\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"LOC\" samechannels=\"0\"/>"$'\n'
+    done
+    xml+="</graphs>"
+    if (( r == 0 )); then path="$STATE_DIR/nccl-graph-rank0.xml"; mkdir -p "$STATE_DIR"; printf '%s\n' "$xml" > "$path"
+    else
+      path=$(worker "$r" 'mkdir -p "$HOME/.local/state/glm53-tensorfold" && echo "$HOME/.local/state/glm53-tensorfold/nccl-graph-rank'"$r"'.xml"') ||
+        die "could not reach $(worker_host "$r") to write its NCCL graph"
+      printf '%s\n' "$xml" | worker "$r" "cat > '$path'" || die "could not write $path on $(worker_host "$r")"
+    fi
+    NODE_GRAPH[r]=$path
+  done
 }
 
 # The NCCL settings of rank r's container (docker -e arguments).
@@ -416,9 +509,15 @@ nccl_env() {
 # cable joins port 0 of one node to port 1 of the next, and NCCL otherwise pairs device index with device index
 # (ibv_modify_qp ... Connection timed out); no P2P or SHM transport (one GPU a node). The GID index only when it is the
 # same on all of a node's devices; else NCCL picks each device's RoCE v2 IPv4 entry itself.
+# On a ring (FABRIC=ring) nothing may go to the ranks across it, which no cable reaches: NCCL_ALGO=Ring, whose
+# all-gather sends only to the next rank (PAT, which NCCL may pick with one GPU a node, also sends two ranks away),
+# and the split prefill's exchanges as all-gathers (TF_GLM_HC_EXCHANGE=gather: p2p sends to every peer; no overlap).
+# The ring's ports come from the node's graph file (ring_graphs), with NCCL's NIC fusion off.
 nccl_env_n() {
-  local dev=$1 hcas=$2 gid=$3
-  echo "-e NCCL_SOCKET_IFNAME=$dev -e NCCL_IB_HCA=$hcas ${gid:+-e NCCL_IB_GID_INDEX=$gid}" \
+  local dev=$1 hcas=$2 gid=$3 ring=""   # $4: the node's NCCL graph file (FABRIC=ring)
+  [[ "$FABRIC" != ring ]] || ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
+  [[ -z "${4:-}" ]] || ring+=" -e NCCL_IB_MERGE_NICS=0 -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}:/nccl-graph.xml:ro"
+  echo "-e NCCL_SOCKET_IFNAME=$dev -e NCCL_IB_HCA=$hcas ${gid:+-e NCCL_IB_GID_INDEX=$gid} $ring" \
        "-e NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1} -e NCCL_IB_SUBNET_AWARE_ROUTING=${NCCL_IB_SUBNET_AWARE_ROUTING:-1}" \
        "-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1" \
        "-e NCCL_MIN_NCHANNELS=${NCCL_CHANNELS:-4} -e NCCL_MAX_NCHANNELS=${NCCL_CHANNELS:-4}" \
@@ -427,5 +526,5 @@ nccl_env_n() {
 }
 rank_nccl_env() {
   if (( TP == 2 )); then nccl_env "${NODE_DEV[$1]}" "${NODE_HCAS[$1]}" "${NODE_GID[$1]}"
-  else nccl_env_n "${NODE_DEV[$1]}" "${NODE_HCAS[$1]}" "${NODE_GID[$1]}"; fi
+  else nccl_env_n "${NODE_DEV[$1]}" "${NODE_HCAS[$1]}" "${NODE_GID[$1]}" "${NODE_GRAPH[$1]:-}"; fi
 }

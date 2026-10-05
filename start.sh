@@ -2,7 +2,7 @@
 # Serve GLM-5.3 Flash EXL3 (Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) with TensorFold on two DGX Sparks, end to end:
 # runs scripts/prepare.sh on both Sparks when the image or the checkpoint is not ready yet (first run, or after patches
 # change), starts rank 1 on the worker and rank 0 here, which serves the API on port 8888, waits until the OpenAI API
-# answers, then runs a smoke test. Stop it with ./stop.sh. (3 Sparks: ./start-tp3.sh, experimental.)
+# answers, then runs a smoke test. Stop it with ./stop.sh. (3 Sparks: ./start-tp3.sh, 4: ./start-tp4.sh, experimental.)
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
 #   ./start.sh                         # scripts/config.sh defaults: 4 requests at once, a 1,048,576-token window,
@@ -22,11 +22,12 @@
 #            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
 #            MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
-#            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks)
+#            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks),
+#            WORKER3, FABRIC_PEER3, WORKER_HF_CACHE3 (4 Sparks), NCCL_ALGO (on a ring of 4: Ring)
 #   files    ABLIT (1: the gated Ablit weights, needs HF_TOKEN), MODEL_ID, MODEL_REVISION, DFLASH2_ID, DFLASH2_REVISION,
 #            HF_CACHE (default: HF_HOME), KERNEL_CACHE,
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
-#            WORKER_WEIGHTS2, NFS_SERVER2,
+#            WORKER_WEIGHTS2, NFS_SERVER2, WORKER_WEIGHTS3, NFS_SERVER3,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
@@ -232,7 +233,7 @@ docker run --rm --entrypoint python "$IMAGE" -c \
 detect_links
 if (( TP == 2 )); then log "Link: $HEAD_ADDR ($HEAD_DEV) <-> $WORKER_ADDR ($WORKER_DEV), RoCE $HEAD_HCAS / $WORKER_HCAS (GID $HEAD_GID / $WORKER_GID; $(tr ',' '\n' <<<"$HEAD_HCAS" | wc -l) rail(s) -> NCCL_IB_HCA, TF_ROCE_HCA)"
 else
-  log "Rendezvous: $MASTER_ADDR:$MASTER_PORT; NCCL bootstrap over ${NODE_DEV[*]} (rank 0 to $((TP - 1)))"
+  log "Rendezvous: $MASTER_ADDR:$MASTER_PORT; NCCL bootstrap over ${NODE_DEV[*]} (rank 0 to $((TP - 1)))$( [[ "$FABRIC" == ring ]] && echo "; a ring in rank order: NCCL_ALGO=${NCCL_ALGO:-Ring}, TF_GLM_HC_EXCHANGE=gather")"
   for r in 0 $(worker_ids); do
     log "  rank $r: RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]:-per device})$( (( r == 0 )) || echo ", link to the head ${LINK_WORKER_ADDR[r]:-?} <-> ${LINK_HEAD_ADDR[r]:-?}")"
   done
@@ -431,6 +432,7 @@ for attempt in 1 2 3 4; do
   [[ "${FOREGROUND:-0}" == 1 ]] && foreground
   case "$TP" in
     3) step 4 "Loading: the weights on each Spark (~60 GiB on rank 0, ~50 on the others) (2-6 min; the very first start also compiles CUDA kernels)" ;;
+    4) step 4 "Loading: a quarter of the weights on each Spark, rank 0 the most (2-6 min; the very first start also compiles CUDA kernels)" ;;
     *) step 4 "Loading: ~80 GiB of weights on each Spark (2-6 min; the very first start also compiles CUDA kernels)" ;;
   esac
   # docker logs is the background job, so killing it ends the whole pipeline (no orphaned `docker logs -f`)
