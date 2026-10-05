@@ -3,12 +3,15 @@
 # By @desy0305 (PR #51).
 # Each waiting caller polls with a 0.1 s queue timeout (~10 wakes/s/caller); acknowledgement also waits for a scheduler round.
 # Extends 0058's client-gone poll to queued callers; preserves 0070's decoder/rank stop vote and serial path.
-# Delivery-failure idea by @johnwhited (PR #48); shared-loop ownership pending author agreement.
-# Proposed GLM integration: stop on callback error, then report it after decoder cleanup.
-# No admission limit or HTTP status changes; the generic cuda/scheduler.py delivery fix remains separate.
+# Delivery-failure idea by @johnwhited (PR #48); GLM relay ownership agreed in PR #48 comment 5987545410.
+# GLM integration: stop on callback error, retain the first error, then report it after decoder cleanup.
+# No admission limit or HTTP status changes; 0076's generic cuda/scheduler.py equivalent remains in PR #48.
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -1774,19 +1774,79 @@
+@@ -1773,20 +1773,89 @@
++        import threading
++
+         box: queue.Queue = queue.Queue()
          stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                          constraint=constraint, background=background)
          stream.glm = dict(glm or {})
@@ -17,7 +20,14 @@
 -        stream.emit.cancelled = getattr(emit, "cancelled", None)
 +        # The caller polls; only the scheduler removes cancelled queued requests.
 +        stop, disconnected, cancel_error = [False], [False], [None]
++        error_lock = threading.Lock()
 +        poll = getattr(emit, "cancelled", None)
++
++        def fail(exc: Exception) -> None:
++            with error_lock:
++                if cancel_error[0] is None:
++                    cancel_error[0] = exc
++                stop[0] = True
 +
 +        def cancelled() -> bool:
 +            if not disconnected[0] and cancel_error[0] is None and poll is not None:
@@ -25,7 +35,7 @@
 +                    if poll():                      # sticky: an older False poll must never undo another's True
 +                        disconnected[0] = stop[0] = True
 +                except Exception as exc:
-+                    cancel_error[0], stop[0] = exc, True
++                    fail(exc)
 +            return disconnected[0] or cancel_error[0] is not None
 +
 +        stream.emit = lambda new: (box.put(("tokens", new)), stop[0])[1]
@@ -48,7 +58,7 @@
 +                        if emit(value):
 +                            stop[0] = True           # a normal stop/gate cut is not cancellation
 +                    except Exception as exc:
-+                        cancel_error[0], stop[0] = exc, True
++                        fail(exc)
              elif kind == "error":
                  raise value
              else:
@@ -94,7 +104,7 @@
  
      def _admit(self, first=None, until: float | None = None) -> list[Stream]:
          """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
-@@ -1804,6 +1864,8 @@
+@@ -1804,6 +1873,8 @@
                      item = self.waiting.get(timeout=left) if left > 0 else self.waiting.get_nowait()
                  except queue.Empty:
                      break
@@ -103,7 +113,7 @@
              stream, box = item
              if not self.decoder.fits(stream):
                  self.held = item                     # waits, first in line, for room
-@@ -1864,6 +1926,7 @@
+@@ -1864,6 +1935,7 @@
                      self._reply(s, "error", exc)
  
      def _iteration(self) -> None:

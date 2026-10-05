@@ -355,6 +355,71 @@ def main():
         thread.join(2)
     checks.append("delivery failure stops once and propagates after active decoder finish")
 
+    # Both callbacks may already be in flight when a yielded stream replays.
+    # Release their failures in each order; the first latched error must survive.
+    for first in ("delivery", "poll"):
+        permit_emit, emitted, permit_poll, polling, armed = [threading.Event() for _ in range(5)]
+        box, delivery_error, poll_error = ObservedBox(), ValueError("delivery first error"), RuntimeError("poll first error")
+        def overlapping_poll():
+            if armed.is_set():
+                polling.set()
+                assert permit_poll.wait(2)
+                raise poll_error
+            return False
+        def overlapping_emit(tokens):
+            emitted.set()
+            assert permit_emit.wait(2)
+            raise delivery_error
+        obj, worker_errors = scheduler(capacity=1), []
+        ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
+        thread, reply = ask(obj, overlapping_poll, background=True, emit_hook=overlapping_emit)
+        worker = None
+        try:
+            obj._admit()
+            stream = next(iter(obj.decoder.streams.values()))
+            stream.take([2])
+            assert emitted.wait(2)
+            box.next_get.clear()  # discard initial queue timeouts while delivery is blocked
+            obj.waiting.put((Stream([99], 100), queue.Queue()))
+            obj._yield()
+            assert obj.waiting.get_nowait()[0].prompt == [99]
+            again = obj.waiting.queue[0][2][0]
+            assert again.emit is stream.emit and obj.decoder.finished == [stream]
+            armed.set()
+            def readmit():
+                try:
+                    obj._admit()
+                except Exception as exc:
+                    worker_errors.append(exc)
+            worker = threading.Thread(target=readmit, daemon=True)
+            worker.start()
+            assert polling.wait(2)  # both callbacks entered before either fails
+            expected = delivery_error if first == "delivery" else poll_error
+            if first == "delivery":
+                permit_emit.set()
+                assert box.next_get.wait(2)  # the caller latched the delivery failure
+                assert again.emit.cancel_error() is expected and thread.is_alive() and not reply
+            permit_poll.set()
+            worker.join(2)
+            assert not worker.is_alive() and not worker_errors
+            assert again.emit.cancel_error() is expected, "an overlapping poll replaced the first callback error"
+            assert obj.waiting.empty() and obj.held is None and not obj.boxes and obj.decoder.live() == 0
+            if first == "poll":
+                assert thread.is_alive() and not reply  # the caller is still delivering
+                permit_emit.set()
+            cancelled_reply(thread, reply, type(expected))
+            assert reply["error"] is expected and again.emit.cancel_error() is expected
+            assert box.empty()  # the replay receives exactly one terminal reply
+        finally:
+            permit_emit.set()
+            permit_poll.set()
+            box.put(("error", Cancelled("test cleanup")))
+            thread.join(2)
+            if worker is not None:
+                worker.join(2)
+            ns["queue"] = queue
+        checks.append(first + " failure survives an overlapping callback error during yielded replay")
+
     # A delivery callback can be in flight while the scheduler yields/requeues
     # its stream. Test failure both before and after replay, including a
     # memory-held replay; queue removal remains owned by the scheduler.
