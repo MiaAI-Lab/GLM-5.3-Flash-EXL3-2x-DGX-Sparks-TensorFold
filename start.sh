@@ -2,7 +2,8 @@
 # Serve GLM-5.3 Flash EXL3 (Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) with TensorFold on two DGX Sparks, end to end:
 # runs scripts/prepare.sh on both Sparks when the image or the checkpoint is not ready yet (first run, or after patches
 # change), starts rank 1 on the worker and rank 0 here, which serves the API on port 8888, waits until the OpenAI API
-# answers, then runs a smoke test. Stop it with ./stop.sh. (3 Sparks: ./start-tp3.sh, 4: ./start-tp4.sh, experimental.)
+# answers, then runs a smoke test. Stop it with ./stop.sh. (3 Sparks: ./start-tp3.sh; 4: ./start-tp4.sh on a switch,
+# ./start-tp4-switchless.sh on a ring; experimental.)
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
 #   ./start.sh                         # scripts/config.sh defaults: 4 requests at once, a 1,048,576-token window,

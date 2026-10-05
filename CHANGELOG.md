@@ -3,24 +3,26 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## Unreleased: 4 Sparks (experimental), on a ring without a switch
+## Unreleased: 4 Sparks (experimental), on a switch or a ring without one
 
 Image: not published yet; `prepare.sh` builds it locally (76 patches, `d067b074d565`), on two and three Sparks too
 (the patches' hash no longer matches the pinned `v0.6.0-c4cab25d2d36` until a new image is published and pinned). The
 TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0076 adds the ring exchange.
 
 ### Added
-- **`./start-tp4.sh`**: `./start.sh` with `TP=4` and `COMM=nccl`, with `WORKER3` (rank 3) and its own `FABRIC_PEER3`,
-  `WORKER_WEIGHTS3`, `NFS_SERVER3`, `WORKER_HF_CACHE3`. Four Sparks may be cabled as a ring (two CX7 ports each, no
-  switch): `scripts/nodes.sh` finds the ring from the subnets the nodes share and needs the workers in its order; NCCL
-  then runs `NCCL_ALGO=Ring`, the split prefill exchanges by all-gather (`TF_GLM_HC_EXCHANGE=gather`), and `COMM=roce`
-  is refused, so nothing is sent between the two pairs of Sparks without a cable. The worker across the ring gets the
-  head's address on its route there for its rendezvous and NFS. Each rank also gets an NCCL graph file
-  (`NCCL_GRAPH_FILE`, NIC fusion off): on a ring cabled port to like port NCCL listens on the port toward the
-  previous rank, and subnet-aware routing sends toward the next; NCCL's own pick (or its fused devices) puts part of
-  the traffic on a port without that peer. `RING_GRAPH=0` leaves NCCL to pick. Measured on four Sparks (2026-10-05):
-  a decode-sized all-gather 109 us against 184 with fused devices; sparkDash prose 82.0 tok/s one request (three
-  Sparks 65.7), 142.5 at 4 at once, time to first token 117 ms. README: 4 Sparks.
+- **`./start-tp4.sh`** (on a switch) and **`./start-tp4-switchless.sh`** (on a ring): `./start.sh` with `TP=4` and
+  `COMM=nccl`, with `WORKER3` (rank 3) and its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3`, `WORKER_HF_CACHE3`.
+  Each stops, naming the other, when the Sparks are connected the other way (`FABRIC_EXPECT`). On a switch every pair
+  shares a subnet and runs as three Sparks do (not measured yet). Without a switch four Sparks are cabled as a ring (two
+  CX7 ports each): `scripts/nodes.sh` finds the ring from the subnets the nodes share and needs the workers in its
+  order; NCCL then runs `NCCL_ALGO=Ring`, the split prefill exchanges by all-gather (`TF_GLM_HC_EXCHANGE=gather`), and
+  `COMM=roce` is refused, so nothing is sent between the two pairs of Sparks without a cable. The worker across the ring
+  gets the head's address on its route there for its rendezvous and NFS. Each rank also gets an NCCL graph file
+  (`NCCL_GRAPH_FILE`, NIC fusion off): on a ring cabled port to like port NCCL listens on the port toward the previous
+  rank, and subnet-aware routing sends toward the next; NCCL's own pick (or its fused devices) puts part of the traffic
+  on a port without that peer. `RING_GRAPH=0` leaves NCCL to pick. Measured on four Sparks (2026-10-05): a decode-sized
+  all-gather 109 us against 184 with fused devices; sparkDash prose 82.0 tok/s one request (three Sparks 65.7), 142.5 at
+  4 at once, time to first token 117 ms. README: 4 Sparks.
 - **Patch `0076-cuda-ring-exchange`**: on a ring (`TF_NCCL_RING=1`, set by `scripts/nodes.sh`) the split prefill's
   send/receive exchange passes each message the shorter way round the ring, over a two-rank NCCL link with each
   neighbour (its own graph file, its own stream), the rank opposite half each way: the same bytes as `p2p`, overlapped,

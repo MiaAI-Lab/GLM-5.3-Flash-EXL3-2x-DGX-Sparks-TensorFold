@@ -27,9 +27,9 @@ fi
 unset _n _line _key _value
 
 # The Sparks: this machine serves rank 0 and the API; WORKER (ssh target, key-based) runs rank 1. TP: how many Sparks
-# (2, the default; 3 through ./start-tp3.sh and 4 through ./start-tp4.sh, experimental: README "3 Sparks", "4 Sparks"),
-# with WORKER2 (rank 2) and WORKER3 (rank 3); a start uses WORKER .. WORKER<TP-1> and leaves later ones out (stop.sh
-# stops every configured one).
+# (2, the default; 3 through ./start-tp3.sh, 4 through ./start-tp4.sh on a switch or ./start-tp4-switchless.sh on a
+# ring, experimental: README "3 Sparks", "4 Sparks"), with WORKER2 (rank 2) and WORKER3 (rank 3); a start uses WORKER ..
+# WORKER<TP-1> and leaves later ones out (stop.sh stops every configured one).
 TP="${TP:-2}"
 WORKER="${WORKER:-}"                 # e.g. user@<worker address>; set it in scripts/local.sh
 FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is reached over another network
@@ -146,7 +146,7 @@ export TF_GLM_DENSE="$DENSE"
 # The ranks' all-gathers. roce (default): the small ones (a decode round's partials, the samplers; up to
 # TF_ROCE_MAX_KB below) as one-shot RDMA writes over the Sparks' RoCE link, b12x's transport (patch 0006): 11 us a
 # 16 KiB gather against NCCL's 45; decode +6% (prose 44.2 -> 46.9, code 48.7 -> 51.6). NCCL keeps the rest. nccl: NCCL
-# for all. Same bits. Past two Sparks the default is nccl (start-tp3.sh, start-tp4.sh); roce on a triangle sends each
+# for all. Same bits. Past two Sparks the default is nccl (start-tp3.sh, start-tp4*.sh); roce on a triangle sends each
 # peer over the devices that share its subnet (the TP-N engine's RoCE; TF_ROCE_HCA lists them all, the GID is found per
 # device). A ring of four (README "4 Sparks") runs nccl only: roce sends to every peer, and two pairs have no cable.
 _comm=roce; [[ "$TP" == 2 ]] || _comm=nccl

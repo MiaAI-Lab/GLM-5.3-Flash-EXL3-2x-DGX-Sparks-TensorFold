@@ -5,7 +5,8 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # WORKER2=user@192.0.2.3       # rank 2
 # WORKER_WEIGHTS2=nfs          # per worker: copy or nfs (default: WORKER_WEIGHTS)
 # WORKER_HF_CACHE2=/models/hf   # per worker: its Hugging Face cache when it is not its HF_HOME
-# A fourth Spark (./start-tp4.sh, experimental; README "4 Sparks"), on a ring: WORKER .. WORKER3 in the ring's order
+# A fourth Spark (experimental; README "4 Sparks"): ./start-tp4.sh on a switch, ./start-tp4-switchless.sh on a ring
+# without one (WORKER .. WORKER3 then in the ring's order)
 # WORKER3=user@192.0.2.4       # rank 3 (WORKER_WEIGHTS3, NFS_SERVER3, FABRIC_PEER3, WORKER_HF_CACHE3 as above)
 # ABLIT=1                      # the gated Ablit weights instead (README "Ablit weights"); needs HF_TOKEN below
 # HF_TOKEN=hf_...              # a Hugging Face read token whose account agreed to the Ablit model's terms

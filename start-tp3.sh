@@ -2,7 +2,7 @@
 # Serve GLM-5.3 Flash EXL3 on three DGX Sparks (TP=3, experimental): ./start.sh with TP=3, COMM=nccl by default.
 # Needs the TP-N GLM engine (patches 0066-0068; prepare.sh builds the image on the first start), WORKER and WORKER2 in
 # scripts/local.sh, and a triangle of direct CX7 cables, one per pair (one subnet per cable). Four Sparks in a ring
-# have no such triangle: ./start-tp4.sh runs them all.
+# have no such triangle: ./start-tp4-switchless.sh runs them all.
 # README: "3 Sparks (experimental)".
 #
 # Usage: ./start-tp3.sh [restart] [extra tensorfold serve args]   (as ./start.sh; ./stop.sh stops it)

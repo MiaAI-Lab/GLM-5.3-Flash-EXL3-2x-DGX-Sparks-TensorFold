@@ -479,8 +479,16 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
 
 ## 4 Sparks (experimental)
 
-`./start-tp4.sh` runs the recipe as tensor parallel over four Sparks (`TP=4` with `./start.sh`'s options; `./stop.sh`
-stops every configured worker), on the same engine (patches 0066-0068 run 2, 3 or 4 ranks) plus patch 0076 for a ring;
+Two scripts run the recipe as tensor parallel over four Sparks (`TP=4` with `./start.sh`'s options; `./stop.sh` stops
+every configured worker), one for each way of connecting them:
+
+| Connection | Script | |
+|---|---|---|
+| A switch (every Spark's CX7 on it) | `./start-tp4.sh` | every pair shares a subnet, as at three Sparks; not measured yet |
+| No switch: a ring of direct cables | `./start-tp4-switchless.sh` | measured below |
+
+Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
+connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patch 0076 on a ring;
 the image is not published yet, so `prepare.sh` builds it on the first start. **Measured** on a four-Spark ring
 (2026-10-05, sparkDash, prose, thinking off): 83.2 tok/s one request (three Sparks 65.7), 115.5 / 133.9 / 147.1 tok/s at
 2 / 3 / 4 at once, time to first token 118 ms; prefill ~2,000-2,075 tok/s (8k and 30k-token prompts). Replies equal the
@@ -488,10 +496,12 @@ gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full ex
 (concurrent == serial, drafted == serial, needles) have not been run at four. Its defaults are three Sparks'
 (`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
 
-- **Cabling: a ring without a switch.** A Spark has two CX7 ports, so four Sparks without a switch form a ring: each
-  Spark cabled to its two neighbours, one subnet per cable (both PCIe twins of a port may share it, as `.N` and
-  `.10N`). The two Sparks across the ring from each other have no cable. Every pair on one switch works too (the
-  mesh, as at three Sparks).
+- **On a switch (`./start-tp4.sh`).** `WORKER`, `WORKER2` and `WORKER3` in any order. Every pair talks directly, as
+  on a triangle of three: NCCL picks its own algorithm and devices, the split prefill exchanges point to point, and
+  `COMM=roce` is allowed. The rest of this section is about the ring.
+- **Cabling without a switch: a ring (`./start-tp4-switchless.sh`).** A Spark has two CX7 ports, so four Sparks
+  without a switch form a ring: each Spark cabled to its two neighbours, one subnet per cable (both PCIe twins of a
+  port may share it, as `.N` and `.10N`). The two Sparks across the ring from each other have no cable.
 - **Rank order follows the ring.** `WORKER` (rank 1), `WORKER2` (rank 2) and `WORKER3` (rank 3) go around the ring from
   the head, so rank 2 is the Spark across from it. `start.sh` finds the ring from the subnets the nodes share and stops
   when the workers are in another order, naming the order that fits. `WORKER3` has its own `FABRIC_PEER3`,
@@ -511,8 +521,9 @@ gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full ex
 - **The worker across the ring** reaches the head through a neighbour: its rendezvous and NFS server are the head's
   address on its route to `WORKER2` (with `WORKER2` given by an address the Sparks route between them, e.g. one on
   `lo`, that path runs over the CX7 links). An NFS export must allow that worker's source address on the route back.
-- `DRY_RUN=1 ./start-tp4.sh` prints the ring found and every rank's `docker run`; `TP=4 scripts/prepare.sh` prepares
-  the four Sparks. On such a ring `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
+- `DRY_RUN=1 ./start-tp4-switchless.sh` (or `./start-tp4.sh` on a switch) prints the links found and every rank's
+  `docker run`; `TP=4 scripts/prepare.sh` prepares the four Sparks. On a ring `./start-tp3.sh` stops: no three Sparks
+  are all cabled to each other.
 
 ## Configuration
 
@@ -526,7 +537,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `WORKER` / `FABRIC_PEER` | empty | the worker's ssh target (`user@<address>` or `user@<host name>`), and its CX7 address when `WORKER` is on another network |
 | `WORKER_HF_CACHE` | the worker's `HF_HOME` | the worker's Hugging Face cache, when it is not its `HF_HOME` (e.g. a shared models folder) |
 | `MASTER_PORT` | `29551` | the ranks' rendezvous port (keep it on the private link) |
-| `TP` / `WORKER2` / `WORKER3` | `2` / empty / empty | Sparks in all (`2`, `3` through `./start-tp3.sh`, `4` through `./start-tp4.sh`), and the ssh targets of ranks 2 and 3 ([3 Sparks](#3-sparks-experimental), [4 Sparks](#4-sparks-experimental)); `FABRIC_PEER2`, `WORKER_HF_CACHE2`, `WORKER_WEIGHTS2`, `NFS_SERVER2` (and the same with `3`) as the worker's own |
+| `TP` / `WORKER2` / `WORKER3` | `2` / empty / empty | Sparks in all (`2`, `3` through `./start-tp3.sh`, `4` through `./start-tp4.sh` or `./start-tp4-switchless.sh`), and the ssh targets of ranks 2 and 3 ([3 Sparks](#3-sparks-experimental), [4 Sparks](#4-sparks-experimental)); `FABRIC_PEER2`, `WORKER_HF_CACHE2`, `WORKER_WEIGHTS2`, `NFS_SERVER2` (and the same with `3`) as the worker's own |
 | `MASTER_ADDR` / `SOCKET_IFNAME` | see [3 Sparks](#3-sparks-experimental) | the rendezvous address (`TP=2`: the head's address on the link) and, with `TP` above 2, NCCL's bootstrap netdev |
 | `PARALLEL` | `4`, `8` at `TP=3` and `4` (`1` with `DRAFTER=mtp`) | requests decoded together, 1 to 8 (above 1 needs `DRAFTER=dflash2`); 8 at once: +27-36% aggregate decode over 4, at a smaller shared pool ([Performance](#performance)) |
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
@@ -759,7 +770,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 ```
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
-start-tp4.sh  the same on four Sparks, e.g. a ring without a switch (experimental, patches 0066-0068)
+start-tp4.sh  the same on four Sparks on a switch (experimental, patches 0066-0068)
+start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a switch (experimental, patch 0076 too)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),

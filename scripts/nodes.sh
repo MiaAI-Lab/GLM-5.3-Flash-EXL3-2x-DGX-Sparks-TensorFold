@@ -18,7 +18,7 @@ worker_weights() { local w; w=$(wval WORKER_WEIGHTS "$1"); echo "${w:-$WORKER_WE
 # check_workers: TP is 2, 3 or 4, and WORKER .. WORKER<TP-1> are set and distinct (later ones are left out).
 check_workers() {
   local i j h
-  [[ "$TP" =~ ^[234]$ ]] || die "TP is 2 (./start.sh), 3 (./start-tp3.sh) or 4 (./start-tp4.sh) Sparks (3 and 4 experimental), not $TP"
+  [[ "$TP" =~ ^[234]$ ]] || die "TP is 2 (./start.sh), 3 (./start-tp3.sh) or 4 (./start-tp4.sh on a switch, ./start-tp4-switchless.sh on a ring) Sparks (3 and 4 experimental), not $TP"
   for i in $(worker_ids); do
     h=$(worker_host "$i")
     [[ -n "$h" ]] || die "TP=$TP needs $((TP - 1)) workers: set $(wvar WORKER "$i")=user@<address of rank $i> in scripts/local.sh (see scripts/local.sh.example)"
@@ -421,13 +421,22 @@ detect_links() {
     esac
   done <<<"$pairs"
   ring=$(xargs <<<"$ring")
+  # FABRIC_EXPECT (./start-tp4.sh: mesh, a switch; ./start-tp4-switchless.sh: ring): stop when the links are the other
+  # kind, naming the script that fits (not with a worker DRY_RUN cannot reach: its links are unknown)
+  if [[ -n "${FABRIC_EXPECT:-}" && ${#WORKER_DOWN[@]} == 0 ]]; then
+    if [[ "$FABRIC_EXPECT" == mesh && -n "$missing" && -n "$ring" ]]; then
+      die "these $TP Sparks are cabled as a ring without a switch (no RoCE subnet between ranks$missing): use ./start-tp$TP-switchless.sh"
+    elif [[ "$FABRIC_EXPECT" == ring && -z "$missing" ]]; then
+      die "every pair of these $TP Sparks shares a RoCE subnet (a switch), not a ring: use ./start-tp$TP.sh"
+    fi
+  fi
   if [[ -n "$missing" && -n "$ring" ]]; then
     if [[ "$ring" != "$(seq -s ' ' 0 $((TP - 1)))" ]]; then
       for k in $(cut -d' ' -f2- <<<"$ring"); do order+=", $(worker_host "$k")"; done
       die "the Sparks are cabled as a ring, but the workers are not in its order (rank 0 to $((TP - 1)): this node$order around it): set WORKER .. $(wvar WORKER $((TP - 1))) in that order in scripts/local.sh (each with its own FABRIC_PEER, WORKER_WEIGHTS, NFS_SERVER and WORKER_HF_CACHE, if set)"
     fi
     [[ "$COMM" == nccl ]] ||
-      die "COMM=roce sends to every peer directly, and on a ring of $TP Sparks two pairs have no cable: use COMM=nccl (./start-tp$TP.sh's default)"
+      die "COMM=roce sends to every peer directly, and on a ring of $TP Sparks two pairs have no cable: use COMM=nccl (./start-tp$TP-switchless.sh's default)"
     FABRIC=ring; missing=""
     for i in $(worker_ids); do
       [[ -z "${LINK_HEAD_ADDR[i]:-}" && -z "${WORKER_DOWN[$i]:-}" ]] || continue
@@ -463,7 +472,7 @@ detect_links() {
       warn "DRY_RUN: the link between ranks $a and $b is unknown (a worker that cannot be reached)"
       continue
     fi
-    die "ranks $a and $b share no RoCE subnet: $TP Sparks need a link between every pair (a triangle of direct cables), or four a ring in rank order (on a ring of four no three Sparks are all cabled to each other: ./start-tp4.sh, or ./start.sh with a neighbour); see README"
+    die "ranks $a and $b share no RoCE subnet: $TP Sparks need a link between every pair (a triangle of direct cables), or four a ring in rank order (on a ring of four no three Sparks are all cabled to each other: ./start-tp4-switchless.sh, or ./start.sh with a neighbour); see README"
   done
   return 0
 }
