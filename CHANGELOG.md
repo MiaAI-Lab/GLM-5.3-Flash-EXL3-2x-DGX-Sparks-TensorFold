@@ -5,8 +5,8 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one
 
-Image: not published yet; `prepare.sh` builds it locally (76 patches, `d067b074d565`), on two and three Sparks too
-(the patches' hash no longer matches the pinned `v0.6.0-c4cab25d2d36` until a new image is published and pinned). The
+Image: not published yet; `prepare.sh` builds it locally (77 patches, `a8f84374f3c2`), on two and three Sparks too
+(the patches' hash no longer matches the pinned `v0.6.0-1692d2df78d2` until a new image is published and pinned). The
 TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0076 adds the ring exchange.
 
 ### Added
