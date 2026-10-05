@@ -189,8 +189,8 @@ worker_link_info() { worker "$1" "$(declare -f link_info); link_info $2"; }
 # each device's own); LINK_HEAD_ADDR[i] / LINK_WORKER_ADDR[i]: the head's and worker i's addresses on their link (the
 # head's is worker i's NFS server).
 declare -a NODE_DEV=() NODE_HCAS=() NODE_GID=() LINK_HEAD_ADDR=() LINK_WORKER_ADDR=()
-# On a ring (FABRIC=ring): NODE_GRAPH[r], the path on rank r's node of its NCCL graph file (ring_graphs); TOWARD["r s"],
-# rank r's RoCE devices toward rank s.
+# On a ring (FABRIC=ring): NODE_GRAPH[r], the path prefix on rank r's node of its NCCL graph files (ring_graphs:
+# <prefix>.xml, <prefix>-link-prev.xml, <prefix>-link-next.xml); TOWARD["r s"], rank r's RoCE devices toward rank s.
 declare -a NODE_GRAPH=()
 declare -A TOWARD=()
 
@@ -478,35 +478,45 @@ detect_links() {
 # and its PCIe twin). Measured on four Sparks: a decode-sized all-gather 109 us against 184 with NCCL's fused devices,
 # prompt-sized ones the same. NCCL numbers the devices in NCCL_IB_HCA's (sysfs) order, which NODE_HCAS keeps.
 ring_graphs() {
-  local r prev d k idx n xml path ch="" all toward
+  local r prev next path spec
   for r in 0 $(worker_ids); do
     [[ -z "${WORKER_DOWN[$r]:-}" ]] || continue
-    prev=$(( (r + TP - 1) % TP ))
-    IFS=, read -r -a all <<<"${NODE_HCAS[r]}"
-    IFS=, read -r -a toward <<<"${TOWARD["$r $prev"]:-}"
-    (( ${#toward[@]} )) || die "rank $r has no RoCE device toward rank $prev"
-    ch=""
-    for (( k = 0; k < ${NCCL_CHANNELS:-4}; k++ )); do
-      d=${toward[k % ${#toward[@]}]}; idx=-1
-      for (( n = 0; n < ${#all[@]}; n++ )); do [[ "${all[n]}" == "$d" ]] && idx=$n; done
-      ch+="    <channel><net dev=\"$idx\"/><gpu dev=\"0\" rank=\"$r\"/><net dev=\"$idx\"/></channel>"$'\n'
-    done
-    xml="<graphs version=\"1\">"$'\n'
-    for k in "0 4" "1 3"; do
-      xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"1\" nchannels=\"${NCCL_CHANNELS:-4}\" speedintra=\"12\" speedinter=\"12\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"P2C\" samechannels=\"1\">"$'\n'"$ch  </graph>"$'\n'
-    done
-    for k in "4 6" "2 3" "3 5"; do
-      xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"0\" nchannels=\"0\" speedintra=\"0\" speedinter=\"0\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"LOC\" samechannels=\"0\"/>"$'\n'
-    done
-    xml+="</graphs>"
-    if (( r == 0 )); then path="$STATE_DIR/nccl-graph-rank0.xml"; mkdir -p "$STATE_DIR"; printf '%s\n' "$xml" > "$path"
+    prev=$(( (r + TP - 1) % TP )); next=$(( (r + 1) % TP ))
+    if (( r == 0 )); then path="$STATE_DIR/nccl-graph-rank0"; mkdir -p "$STATE_DIR"
     else
-      path=$(worker "$r" 'mkdir -p "$HOME/.local/state/glm53-tensorfold" && echo "$HOME/.local/state/glm53-tensorfold/nccl-graph-rank'"$r"'.xml"') ||
-        die "could not reach $(worker_host "$r") to write its NCCL graph"
-      printf '%s\n' "$xml" | worker "$r" "cat > '$path'" || die "could not write $path on $(worker_host "$r")"
+      path=$(worker "$r" 'mkdir -p "$HOME/.local/state/glm53-tensorfold" && echo "$HOME/.local/state/glm53-tensorfold/nccl-graph-rank'"$r"'"') ||
+        die "could not reach $(worker_host "$r") to write its NCCL graphs"
     fi
+    # the ring (rank r of TP), and the two-rank links of patch 0076's ring exchange: to the previous rank (this rank
+    # is the link's rank 1) and to the next (its rank 0)
+    for spec in "$path.xml $r $prev" "$path-link-prev.xml 1 $prev" "$path-link-next.xml 0 $next"; do
+      set -- $spec
+      if (( r == 0 )); then graph_xml "$r" "$2" "$3" > "$1"
+      else graph_xml "$r" "$2" "$3" | worker "$r" "cat > '$1'" || die "could not write $1 on $(worker_host "$r")"; fi
+    done
     NODE_GRAPH[r]=$path
   done
+}
+# graph_xml <rank> <rank in the communicator> <peer>: an NCCL graph whose channels listen on rank's devices toward the
+# peer, a port and its PCIe twin in turn (subnet-aware routing moves each send to the device on the receiver's subnet)
+graph_xml() {
+  local r=$1 cr=$2 peer=$3 k n d idx ch="" all toward xml
+  IFS=, read -r -a all <<<"${NODE_HCAS[r]}"
+  IFS=, read -r -a toward <<<"${TOWARD["$r $peer"]:-}"
+  (( ${#toward[@]} )) || die "rank $r has no RoCE device toward rank $peer"
+  for (( k = 0; k < ${NCCL_CHANNELS:-4}; k++ )); do
+    d=${toward[k % ${#toward[@]}]}; idx=-1
+    for (( n = 0; n < ${#all[@]}; n++ )); do [[ "${all[n]}" == "$d" ]] && idx=$n; done
+    ch+="    <channel><net dev=\"$idx\"/><gpu dev=\"0\" rank=\"$cr\"/><net dev=\"$idx\"/></channel>"$'\n'
+  done
+  xml="<graphs version=\"1\">"$'\n'
+  for k in "0 4" "1 3"; do
+    xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"1\" nchannels=\"${NCCL_CHANNELS:-4}\" speedintra=\"12\" speedinter=\"12\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"P2C\" samechannels=\"1\">"$'\n'"$ch  </graph>"$'\n'
+  done
+  for k in "4 6" "2 3" "3 5"; do
+    xml+="  <graph id=\"${k% *}\" pattern=\"${k#* }\" crossnic=\"0\" nchannels=\"0\" speedintra=\"0\" speedinter=\"0\" latencyinter=\"0\" typeintra=\"LOC\" typeinter=\"LOC\" samechannels=\"0\"/>"$'\n'
+  done
+  printf '%s</graphs>\n' "$xml"
 }
 
 # The NCCL settings of rank r's container (docker -e arguments).
@@ -529,12 +539,20 @@ nccl_env() {
 # same on all of a node's devices; else NCCL picks each device's RoCE v2 IPv4 entry itself.
 # On a ring (FABRIC=ring) nothing may go to the ranks across it, which no cable reaches: NCCL_ALGO=Ring, whose
 # all-gather sends only to the next rank (PAT, which NCCL may pick with one GPU a node, also sends two ranks away),
-# and the split prefill's exchanges as all-gathers (TF_GLM_HC_EXCHANGE=gather: p2p sends to every peer; no overlap).
+# and the split prefill's exchanges: with the graph files (ring_graphs) over patch 0076's ring exchange
+# (TF_NCCL_RING=1: each message passed round the ring over two-rank links with the neighbours, the same bytes as p2p,
+# overlapped; an 8 MiB block a peer 2.7 ms against 4.6), else as all-gathers (TF_GLM_HC_EXCHANGE=gather: p2p sends to
+# every peer; three times the bytes, no overlap).
 # The ring's ports come from the node's graph file (ring_graphs), with NCCL's NIC fusion off.
 nccl_env_n() {
   local dev=$1 hcas=$2 gid=$3 ring=""   # $4: the node's NCCL graph file (FABRIC=ring)
-  [[ "$FABRIC" != ring ]] || ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
-  [[ -z "${4:-}" ]] || ring+=" -e NCCL_IB_MERGE_NICS=0 -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}:/nccl-graph.xml:ro"
+  if [[ "$FABRIC" == ring && -n "${4:-}" ]]; then
+    ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e NCCL_IB_MERGE_NICS=0 -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}.xml:/nccl-graph.xml:ro"
+    ring+=" -e TF_NCCL_RING=1 -e TF_NCCL_RING_GRAPHS=/nccl-link-prev.xml,/nccl-link-next.xml"
+    ring+=" -v ${4}-link-prev.xml:/nccl-link-prev.xml:ro -v ${4}-link-next.xml:/nccl-link-next.xml:ro"
+  elif [[ "$FABRIC" == ring ]]; then
+    ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
+  fi
   # the prefix that keeps a port and its PCIe twin apart (pair_links), so each send goes out the device the graph means:
   # NCCL's default puts both in one subnet and sends every channel on the first (measured: twins idle, prompt-sized
   # all-gathers 16.7 GB/s; with the prefix both carry half, 25.6 GB/s, a decode-sized one 94 -> 69 us)

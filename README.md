@@ -480,10 +480,13 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
 ## 4 Sparks (experimental)
 
 `./start-tp4.sh` runs the recipe as tensor parallel over four Sparks (`TP=4` with `./start.sh`'s options; `./stop.sh`
-stops every configured worker), on the same engine (patches 0066-0068 run 2, 3 or 4 ranks) and the same published image.
-**Measured** on a four-Spark ring (2026-10-05, sparkDash, prose, thinking off): 82.0 tok/s one request (three Sparks
-65.7), 112.2 / 131.0 / 142.5 tok/s at 2 / 3 / 4 at once, time to first token 117 ms. Prefill is not tuned yet, and
-exactness at four ranks has not been run. Its defaults are three Sparks' (`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
+stops every configured worker), on the same engine (patches 0066-0068 run 2, 3 or 4 ranks) plus patch 0076 for a ring;
+the image is not published yet, so `prepare.sh` builds it on the first start. **Measured** on a four-Spark ring
+(2026-10-05, sparkDash, prose, thinking off): 83.2 tok/s one request (three Sparks 65.7), 115.5 / 133.9 / 147.1 tok/s at
+2 / 3 / 4 at once, time to first token 118 ms; prefill ~2,000-2,075 tok/s (8k and 30k-token prompts). Replies equal the
+gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full exactness checks of three Sparks
+(concurrent == serial, drafted == serial, needles) have not been run at four. Its defaults are three Sparks'
+(`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
 
 - **Cabling: a ring without a switch.** A Spark has two CX7 ports, so four Sparks without a switch form a ring: each
   Spark cabled to its two neighbours, one subnet per cable (both PCIe twins of a port may share it, as `.N` and
@@ -495,8 +498,10 @@ exactness at four ranks has not been run. Its defaults are three Sparks' (`PARAL
   `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`.
 - **Nothing goes across the ring.** NCCL carries every all-gather (`COMM=nccl`; `COMM=roce` is refused, as it sends
   to every peer) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
-  (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges run as
-  all-gathers (`TF_GLM_HC_EXCHANGE=gather`; the default `p2p` sends to every peer), without their overlap. NCCL's
+  (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges go
+  round the ring (patch 0076, `TF_NCCL_RING=1`): each message the shorter way, a hop a step, over a two-rank NCCL
+  link with each neighbour, the same bytes as `p2p` and overlapped (prefill ~2,000-2,075 tok/s, against ~1,720 with
+  `gather`'s all-gather of every rank's whole partial; `RING_GRAPH=0` goes back to that). NCCL's
   devices, GIDs and bootstrap socket are found as at three Sparks, and each rank gets an NCCL graph file
   (`NCCL_GRAPH_FILE`, NIC fusion off). On a ring cabled port to like port (p1-p1, p0-p0) a Spark's neighbours sit on
   different ports, which ones alternating around the ring; NCCL picks one device a channel for both directions, the

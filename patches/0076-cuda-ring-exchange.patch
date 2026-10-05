@@ -1,0 +1,180 @@
+# The split prefill's exchanges on a ring (TF_NCCL_RING=1, set by scripts/nodes.sh on four Sparks cabled as a ring
+# without a switch). exchange_all sent every peer its rows straight there (ncclSend / ncclRecv), which needs a cable
+# between every pair; on a ring two pairs have none, so start.sh fell back to TF_GLM_HC_EXCHANGE=gather, an all-gather
+# of every rank's whole fp32 partial at each exchange (three times the bytes, no overlap). Now exchange_all passes each
+# message the shorter way round the ring, a hop a step, the rank opposite half each way, and delivers exactly the same
+# bytes, so the rank-order sums and replies are unchanged. Each hop is a two-rank all-gather on a communicator with
+# that neighbour, opened at start in link order with its own NCCL graph file (TF_NCCL_RING_GRAPHS: toward the previous
+# rank, toward the next): NCCL's point-to-point receives take no graph file and listen on a device of NCCL's choosing,
+# on a ring cabled port to like port half the time one without the peer (ibv_modify_qp timeouts). The two links run on
+# their own streams, launched in link order on every rank. Measured on four Sparks (an 8 MiB block a peer, the split
+# prefill's): 2.6-2.75 ms against 4.6-5.0 for the gather mode's all-gather of the same rows; every byte checked. Off
+# (the default), nothing changes.
+
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -10,7 +10,7 @@
+ 
+ import torch
+ 
+-_DTYPES = {torch.float32: 7, torch.bfloat16: 9, torch.int32: 2, torch.int64: 4}
++_DTYPES = {torch.float32: 7, torch.bfloat16: 9, torch.int32: 2, torch.int64: 4, torch.int8: 0}
+ 
+ 
+ class _UniqueId(ctypes.Structure):
+@@ -40,6 +40,11 @@
+         from torch.distributed import TCPStore
+ 
+         self.rank, self.world = rank, world
++        # TF_NCCL_RING=1: the ranks are cabled as a ring in rank order, each only to the next and the previous, so
++        # exchange_all passes every message along the ring over two-rank links with the neighbours (_exchange_ring)
++        self.ring = os.environ.get("TF_NCCL_RING", "0").strip() == "1" and world > 2
++        self.links: dict[int, ctypes.c_void_p] = {}
++        self.link_streams: dict[int, torch.cuda.Stream] = {}
+         self.lib = _library()
+         lib = self.lib
+         lib.ncclGetErrorString.restype = ctypes.c_char_p
+@@ -64,6 +69,45 @@
+         self.comm = ctypes.c_void_p()
+         torch.cuda.current_device()
+         self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
++        if self.ring:
++            self._open_links()
++
++    def _open_links(self) -> None:
++        """TF_NCCL_RING: a two-rank communicator with each neighbour (link a joins rank a, its rank 0, and rank a + 1,
++        its rank 1), opened in link order, so no rank waits on one that waits on it. Each reads its own NCCL graph
++        file (TF_NCCL_RING_GRAPHS: the one toward the previous rank, then the one toward the next), so its channels
++        run over the cable to that neighbour, a port and its PCIe twin. Point-to-point sends take no graph file: NCCL
++        receives them on a device of its choosing, and on a ring cabled port to like port that is half the time a
++        port without the peer."""
++
++        N, me = self.world, self.rank
++        files = (os.environ.get("TF_NCCL_RING_GRAPHS", "") + ",").split(",")[:2]
++        self.lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
++                                           ctypes.c_void_p, ctypes.c_void_p]
++        saved = os.environ.get("NCCL_GRAPH_FILE")
++        try:
++            for a in sorted({(me - 1) % N, me}):
++                first = a == me                         # this rank is the link's rank 0: the link to the next rank
++                uid = _UniqueId()
++                if first:
++                    self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
++                    self.store.set(f"tf_nccl_link_{a}", bytes(uid.internal))
++                else:
++                    ctypes.memmove(ctypes.addressof(uid), self.store.get(f"tf_nccl_link_{a}"), 128)
++                graph = files[1] if first else files[0]
++                if graph:
++                    os.environ["NCCL_GRAPH_FILE"] = graph
++                else:
++                    os.environ.pop("NCCL_GRAPH_FILE", None)
++                comm = ctypes.c_void_p()
++                self._check(self.lib.ncclCommInitRank(ctypes.byref(comm), 2, uid, 0 if first else 1))
++                self.links[1 if first else -1] = comm
++                self.link_streams[1 if first else -1] = torch.cuda.Stream()
++        finally:
++            if saved is None:
++                os.environ.pop("NCCL_GRAPH_FILE", None)
++            else:
++                os.environ["NCCL_GRAPH_FILE"] = saved
+ 
+     def _check(self, code: int) -> None:
+         if code != 0:
+@@ -135,6 +179,9 @@
+             for s, r in zip(sends[p], recvs[p]):
+                 if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                     raise ValueError("exchange_all: each send and receive must be contiguous and alike")
++        if self.ring:
++            self._exchange_ring(sends, recvs)
++            return
+         stream = torch.cuda.current_stream().cuda_stream
+         self._check(self.lib.ncclGroupStart())
+         try:
+@@ -146,6 +193,86 @@
+         finally:
+             self._check(self.lib.ncclGroupEnd())
+ 
++    def _exchange_ring(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
++        """exchange_all on a ring where each rank reaches only its neighbours (TF_NCCL_RING=1): a message from rank s
++        to rank t goes the shorter way round, one hop a step, a message to the rank opposite (N even) half each way.
++        Each of the floor(N / 2) steps is a two-rank all-gather on each link (_open_links), each on the link's own
++        stream (two communicators' kernels on one stream run one after the other: measured on four Sparks, both
++        links 10 GB/s each way on one stream, 14 on two): a rank packs what it sends that neighbour, as bytes, and
++        gets back what the neighbour sends it. Every rank must name all the others, and the i-th tensor must have the same size
++        and dtype for every peer (row blocks of equal shares), so that a relaying rank knows each message's size.
++        recvs end up with exactly exchange_all's bytes."""
++
++        N, me = self.world, self.rank
++        peers = [p for p in range(N) if p != me]
++        if sorted(sends) != peers:
++            raise ValueError("exchange_all (TF_NCCL_RING): every other rank, in one call")
++        k = len(sends[peers[0]])
++        spec = [(sends[peers[0]][i].numel(), sends[peers[0]][i].dtype) for i in range(k)]
++        for p in peers:
++            if len(sends[p]) != k or any((t.numel(), t.dtype) != spec[i] for d in (sends[p], recvs[p])
++                                         for i, t in enumerate(d)):
++                raise ValueError("exchange_all (TF_NCCL_RING): the same sizes and dtypes for every peer")
++
++        def segments(s: int, t: int, i: int) -> list[tuple[int, int, int, int]]:
++            """(lo, hi, direction, hops) of the message s -> t, tensor i, as flat element ranges."""
++            n, d = spec[i][0], (t - s) % N
++            if 2 * d < N:
++                return [(0, n, 1, d)]
++            if 2 * d > N:
++                return [(0, n, -1, N - d)]
++            return [(0, n // 2, 1, d), (n // 2, n, -1, d)]
++
++        def moving(src: int, direction: int, h: int) -> list[tuple[int, int, int, int, int]]:
++            """The messages from src that travel ``direction`` on their h-th hop: (t, i, lo, hi, hops), in the one
++            order both ends of a link list them."""
++            return [(t, i, lo, hi, hops) for t in range(N) if t != src for i in range(k)
++                    for lo, hi, dr, hops in segments(src, t, i) if dr == direction and hops >= h and hi > lo]
++
++        held: dict[tuple[int, int, int, int], torch.Tensor] = {}   # bytes this rank relays, by (s, t, i, lo)
++        main = torch.cuda.current_stream()
++        for h in range(1, N // 2 + 1):
++            work = []
++            for direction in (1, -1):                   # the link to the next rank, then the one to the previous
++                src_out = (me - direction * (h - 1)) % N    # what leaves on this link: travelling `direction`
++                src_in = (me + direction * h) % N           # what arrives on it: travelling the other way
++                out = [sends[t][i].view(-1)[lo:hi].view(torch.int8) if h == 1 else held.pop((src_out, t, i, lo))
++                       for t, i, lo, hi, hops in moving(src_out, direction, h)]
++                arrive = moving(src_in, -direction, h)
++                size = lambda segs: sum((hi - lo) * spec[i][1].itemsize for t, i, lo, hi, hops in segs)
++                L = max(sum(x.numel() for x in out), size(arrive))
++                if L == 0:
++                    continue
++                buf = torch.zeros(L, dtype=torch.int8, device="cuda")
++                if out:
++                    torch.cat(out, out=buf[:sum(x.numel() for x in out)])
++                both = torch.empty(2 * L, dtype=torch.int8, device="cuda")
++                work.append((direction, buf, both, src_in, arrive))
++            # every rank launches its links in link order (the one to the previous rank first, except on rank 0,
++            # whose link 0 comes before link N - 1): without an NCCL group around two communicators, kernels that
++            # run one at a time would otherwise wait on each other round the ring
++            work.sort(key=lambda w: (me - 1) % N if w[0] == -1 else me)
++            for direction, buf, both, _, _ in work:
++                side = self.link_streams[direction]
++                side.wait_stream(main)
++                buf.record_stream(side)
++                both.record_stream(side)
++                self._check(self.lib.ncclAllGather(buf.data_ptr(), both.data_ptr(), buf.numel(), _DTYPES[torch.int8],
++                                                   self.links[direction], side.cuda_stream))
++            for direction, *_ in work:
++                main.wait_stream(self.link_streams[direction])
++            for direction, buf, both, src_in, arrive in work:
++                theirs = both[buf.numel():] if direction == 1 else both[:buf.numel()]   # the neighbour's slot
++                at = 0
++                for t, i, lo, hi, hops in arrive:
++                    nbytes = (hi - lo) * spec[i][1].itemsize
++                    chunk = theirs[at:at + nbytes]
++                    at += nbytes
++                    if hops == h:                       # its last hop: this rank is t
++                        recvs[src_in][i].view(-1)[lo:hi].view(torch.int8).copy_(chunk)
++                    else:
++                        held[(src_in, t, i, lo)] = chunk
++
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")

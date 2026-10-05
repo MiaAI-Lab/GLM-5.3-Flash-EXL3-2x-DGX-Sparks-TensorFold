@@ -5,7 +5,9 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased: 4 Sparks (experimental), on a ring without a switch
 
-Image: unchanged (`v0.6.0-c4cab25d2d36`); the TP-N engine of patches 0066-0068 already runs 4 ranks.
+Image: not published yet; `prepare.sh` builds it locally (76 patches, `d067b074d565`), on two and three Sparks too
+(the patches' hash no longer matches the pinned `v0.6.0-c4cab25d2d36` until a new image is published and pinned). The
+TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0076 adds the ring exchange.
 
 ### Added
 - **`./start-tp4.sh`**: `./start.sh` with `TP=4` and `COMM=nccl`, with `WORKER3` (rank 3) and its own `FABRIC_PEER3`,
@@ -18,7 +20,13 @@ Image: unchanged (`v0.6.0-c4cab25d2d36`); the TP-N engine of patches 0066-0068 a
   previous rank, and subnet-aware routing sends toward the next; NCCL's own pick (or its fused devices) puts part of
   the traffic on a port without that peer. `RING_GRAPH=0` leaves NCCL to pick. Measured on four Sparks (2026-10-05):
   a decode-sized all-gather 109 us against 184 with fused devices; sparkDash prose 82.0 tok/s one request (three
-  Sparks 65.7), 142.5 at 4 at once, time to first token 117 ms. Prefill not tuned yet. README: 4 Sparks.
+  Sparks 65.7), 142.5 at 4 at once, time to first token 117 ms. README: 4 Sparks.
+- **Patch `0076-cuda-ring-exchange`**: on a ring (`TF_NCCL_RING=1`, set by `scripts/nodes.sh`) the split prefill's
+  send/receive exchange passes each message the shorter way round the ring, over a two-rank NCCL link with each
+  neighbour (its own graph file, its own stream), the rank opposite half each way: the same bytes as `p2p`, overlapped,
+  instead of `gather`'s all-gather of every rank's whole partial. Measured on four Sparks: an 8 MiB block a peer 2.7 ms
+  against 4.6; prefill 8k / 30k tokens 1,698 / 1,729 -> 2,031-2,075 / 1,999-2,048 tok/s; replies byte-identical to
+  `gather` (four prompts, 14 to 20,474 tokens). Off the ring nothing changes.
 
 ### Changed
 - Past two Sparks `COMM` defaults to `nccl` in `scripts/config.sh` too (as `start-tp3.sh` already set it), so
