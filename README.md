@@ -482,10 +482,10 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
 Two scripts run the recipe as tensor parallel over four Sparks (`TP=4` with `./start.sh`'s options; `./stop.sh` stops
 every configured worker), one for each way of connecting them:
 
-| Connection | Script | |
+| Connection | Script | Guide |
 |---|---|---|
-| A switch (every Spark's CX7 on it) | `./start-tp4.sh` | every pair shares a subnet, as at three Sparks; not measured yet |
-| No switch: a ring of direct cables | `./start-tp4-switchless.sh` | measured below |
+| A switch (every Spark's CX7 on it) | `./start-tp4.sh` | [On a switch](#on-a-switch-start-tp4sh) (not tested on a switch yet) |
+| No switch: a ring of direct cables | `./start-tp4-switchless.sh` | [Without a switch](#without-a-switch-start-tp4-switchlesssh) (measured below) |
 
 Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
 connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patch 0076 on a ring;
@@ -496,16 +496,91 @@ gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full ex
 (concurrent == serial, drafted == serial, needles) have not been run at four. Its defaults are three Sparks'
 (`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
 
-- **On a switch (`./start-tp4.sh`).** `WORKER`, `WORKER2` and `WORKER3` in any order. Every pair talks directly, as
-  on a triangle of three: NCCL picks its own algorithm and devices, the split prefill exchanges point to point, and
-  `COMM=roce` is allowed. The rest of this section is about the ring.
-- **Cabling without a switch: a ring (`./start-tp4-switchless.sh`).** A Spark has two CX7 ports, so four Sparks
-  without a switch form a ring: each Spark cabled to its two neighbours, one subnet per cable (both PCIe twins of a
-  port may share it, as `.N` and `.10N`). The two Sparks across the ring from each other have no cable.
-- **Rank order follows the ring.** `WORKER` (rank 1), `WORKER2` (rank 2) and `WORKER3` (rank 3) go around the ring from
-  the head, so rank 2 is the Spark across from it. `start.sh` finds the ring from the subnets the nodes share and stops
-  when the workers are in another order, naming the order that fits. `WORKER3` has its own `FABRIC_PEER3`,
-  `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`.
+Both need what two Sparks need ([Requirements](#requirements)) on all four: ~110 GiB free GPU memory each, Docker with
+the NVIDIA runtime, `rsync`, and key-based ssh from the head (the Spark that runs the script and the API) to the three
+workers (`ssh-copy-id user@<worker>`).
+
+### On a switch: `./start-tp4.sh`
+
+Not run on a switch yet: the steps are what the scripts check and need. Every pair of Sparks talks directly, as on a
+triangle of three Sparks ([3 Sparks](#3-sparks-experimental)).
+
+1. **Cable** each Spark's CX7 port to the switch (both ports, if you want both). Set the switch up for RoCE v2 as its
+   vendor describes; the ring here runs MTU 9000 on every CX7 netdev.
+2. **Address** every CX7 netdev in one subnet, both PCIe twins of each cabled port (`enp1s0f0np0` and
+   `enP2p1s0f0np0`, say; [Requirements](#requirements)), e.g. Spark N `192.0.2.N/24` and `192.0.2.10N/24`. Check
+   with `ping` from every Spark to every other.
+3. **Settings** in `scripts/local.sh`: `WORKER`, `WORKER2`, `WORKER3`, in any order, each `user@<address>`. With
+   `WORKER_WEIGHTS=nfs` ([Worker weights over NFS](#worker-weights-over-nfs)) export the head's cache to the subnet:
+   `$HOME/.cache/huggingface 192.0.2.0/24(ro,no_subtree_check)`. `MASTER_ADDR`, when the head's hostname does not
+   resolve to an address every worker reaches.
+4. **Dry run:** `DRY_RUN=1 ./start-tp4.sh` prints the links found and every rank's `docker run`, and changes nothing.
+   No line about a ring; every rank's `NCCL_IB_HCA` lists its CX7 devices. When it says the Sparks are cabled as a
+   ring, or that two ranks share no RoCE subnet, some Sparks are not on the switch's subnet.
+5. **Start:** `./start-tp4.sh` (the first start prepares all four Sparks and builds the image; `TP=4
+   scripts/prepare.sh` does that on its own). NCCL carries the all-gathers (`COMM=nccl`); `COMM=roce ./start-tp4.sh`
+   sends the small ones over RoCE, as at three Sparks.
+
+When a port and its twin share a subnet, NCCL may send everything on one of them and leave the twin idle (on the ring
+`NCCL_IB_SUBNET_PREFIX_LEN` keeps them apart; it is not set on a switch). That costs speed, not correctness.
+
+### Without a switch: `./start-tp4-switchless.sh`
+
+Tested on four Sparks, spark1 the head. A Spark has two CX7 ports, so four Sparks without a switch form a ring: each
+cabled to its two neighbours, and the two across the ring from each other (spark1 and spark3, spark2 and spark4) have
+no cable. Traffic between those goes through a neighbour.
+
+1. **Cable the ring**, one QSFP cable a pair of neighbours. Tested port to like port (port 1 to port 1, port 0 to port
+   0): spark1 p1 - spark2 p1, spark2 p0 - spark3 p0, spark3 p1 - spark4 p1, spark4 p0 - spark1 p0.
+2. **Address every cable** as its own subnet, MTU 9000, both PCIe twins of each port (`.N` on the port, `.10N` on its
+   twin, N the Spark's number):
+
+   | Cable | Subnet | Addresses |
+   |---|---|---|
+   | spark1 p1 - spark2 p1 | `10.0.22.0/24` | spark1 `.1` / `.101`, spark2 `.2` / `.102` |
+   | spark2 p0 - spark3 p0 | `10.0.33.0/24` | spark2 `.2` / `.102`, spark3 `.3` / `.103` |
+   | spark3 p1 - spark4 p1 | `10.0.34.0/24` | spark3 `.3` / `.103`, spark4 `.4` / `.104` |
+   | spark4 p0 - spark1 p0 | `10.0.41.0/24` | spark4 `.4` / `.104`, spark1 `.1` / `.101` |
+
+3. **An address on `lo` for each Spark, routed round the ring**, so the two across from each other reach each other:
+   `10.0.0.N/32` on `lo`, a route to each other Spark's `10.0.0.M` through a neighbour (`src 10.0.0.N`), and
+   forwarding on. On spark1:
+
+   ```bash
+   sudo ip addr add 10.0.0.1/32 dev lo
+   sudo ip route add 10.0.0.2 via 10.0.22.2 src 10.0.0.1   # spark2, a neighbour
+   sudo ip route add 10.0.0.3 via 10.0.22.2 src 10.0.0.1   # spark3, across: through spark2
+   sudo ip route add 10.0.0.4 via 10.0.41.4 src 10.0.0.1   # spark4, a neighbour
+   sudo sysctl -w net.ipv4.ip_forward=1
+   ```
+
+   The same on the others (spark3 reaches spark1 through spark2, say), made permanent the way your system keeps its
+   network settings. Docker sets the `FORWARD` policy to `DROP`: allow forwarding between the CX7 netdevs in the
+   `DOCKER-USER` chain, and again after Docker restarts. Check with `ping 10.0.0.3` from spark1.
+4. **Check each link's speed** before the first start, both ways on every cable: `ib_write_bw -d <roce device> -x <RoCE
+   v2 GID index, 3 here> -s 1048576 -q 4 -D 3 --report_gbits` on one end, the same plus the other end's address on the
+   other. Each direction gives ~112 Gb/s. Here two Sparks sent at ~13 Gb/s (receiving was fine) and one GPU was held at
+   507 MHz (driver: SW Power Capping); a reboot fixed both. Under load
+   `nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv -l 1` shows ~2,180 MHz and 70-80 W on a healthy Spark.
+5. **Settings** in `scripts/local.sh`, the workers in the ring's order from the head (rank 2 is the Spark across from
+   it), by addresses on the CX7 links, so their traffic stays there (the tested settings):
+
+   ```bash
+   WORKER=user@10.0.22.2   # spark2, a neighbour
+   WORKER2=user@10.0.0.3   # spark3, across the ring: its lo address
+   WORKER3=user@10.0.0.4   # spark4, the other neighbour
+   ```
+
+   `MASTER_ADDR=10.0.0.1` when the head's hostname does not resolve to it. With `WORKER_WEIGHTS=nfs`, the head's
+   export allows every worker's address on its route back: the cables' subnets and the `lo` addresses (`10.0.0.2`,
+   `10.0.0.3`, `10.0.0.4`); the worker across the ring mounts from the head's `10.0.0.1`.
+6. **Dry run:** `DRY_RUN=1 ./start-tp4-switchless.sh` prints the ring found, which worker is across it, and every
+   rank's `docker run`, and changes nothing. When the workers are in another order it stops and names the order that
+   fits; when every pair shares a subnet it points to `./start-tp4.sh`.
+7. **Start:** `./start-tp4-switchless.sh` (the first start prepares all four Sparks and builds the image).
+
+How the ring runs:
+
 - **Nothing goes across the ring.** NCCL carries every all-gather (`COMM=nccl`; `COMM=roce` is refused, as it sends
   to every peer) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
   (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges go
@@ -518,12 +593,13 @@ gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full ex
   same on every Spark, so its own pick (or its fused devices) sends part of the traffic to a port without that peer.
   The file makes each Spark listen on the port toward the previous rank, and subnet-aware routing sends on the one
   toward the next (a decode-sized all-gather 109 us instead of 184). `RING_GRAPH=0` leaves NCCL to pick.
+- **A port and its PCIe twin both carry traffic:** they share a /24, so the ranks get `NCCL_IB_SUBNET_PREFIX_LEN`
+  (26 here), the shortest prefix that tells them apart, and each send is split over the two.
 - **The worker across the ring** reaches the head through a neighbour: its rendezvous and NFS server are the head's
   address on its route to `WORKER2` (with `WORKER2` given by an address the Sparks route between them, e.g. one on
   `lo`, that path runs over the CX7 links). An NFS export must allow that worker's source address on the route back.
-- `DRY_RUN=1 ./start-tp4-switchless.sh` (or `./start-tp4.sh` on a switch) prints the links found and every rank's
-  `docker run`; `TP=4 scripts/prepare.sh` prepares the four Sparks. On a ring `./start-tp3.sh` stops: no three Sparks
-  are all cabled to each other.
+- `WORKER3` has its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`. On a ring
+  `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
 
 ## Configuration
 
