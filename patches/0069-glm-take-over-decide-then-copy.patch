@@ -1,0 +1,86 @@
+# Kept prompt states: a new conversation that shares no prefix with the last one no longer clones every kept state and
+# then drops some; it works out which states stay and clones only those. The states that stay and the replies are the
+# same by design (the old walk is simulated by size; 200 random cases match). On 2 DGX Sparks, after a 256k, 21-turn
+# conversation, a fresh one: save_rows 22 -> 1, reserved +14.8 -> +1.4 GiB, take_over 3.3 -> 0.10 s; before, the driver
+# logged NV_ERR_NO_MEMORY. Applies after 0015 and 0063. Upstream: ashhart/TensorFold#421 (drop this patch once merged).
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index a6332ba..0543fd9 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -960,36 +960,60 @@
+             torch.cuda.empty_cache()
+ 
+     def _take_over(self, keep: list[int]) -> None:
+-        """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
+-        from .decode import row_bytes, save_rows
++        """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike.
++
++        Decided first, copied after: which snapshots stay within the budget is worked out from their sizes alone, the
++        rest are dropped without a copy, and only the survivors are cloned. Cloning each in turn and dropping it for the
++        next grew the allocator's pool with every larger copy (reserved memory far past the budget)."""
++        from .decode import row_bytes, save_rows, snapshot_bytes
+ 
+         drafter = self._kept_drafter()
+         live = self.live
+-        dropped = False
++        order = list(self.cache)
+ 
+         def resumes(c) -> bool:
+             return len(c.ids) <= len(keep) and keep[:len(c.ids)] == c.ids
+ 
+-        for snap in list(self.cache):
++        alive = {id(c) for c in order}
++        saved: dict[int, int] = {}                   # a survivor's held bytes once its rows are saved
++        drops: list = []
++        over_budget = False                          # a drop made for the budget (not a row already gone)
++
++        def held() -> int:
++            return sum(saved[id(c)] if id(c) in saved else snapshot_bytes(c) for c in order if id(c) in alive)
++
++        def forget(c) -> None:
++            alive.discard(id(c))
++            saved.pop(id(c), None)
++            drops.append(c)
++
++        for snap in order:                           # the walk of saving one by one, with the sizes standing in for the copies
+             n = len(snap.ids)
+-            if snap not in self.cache or snap.rows is not None or resumes(snap):
++            if id(snap) not in alive or snap.rows is not None or resumes(snap):
+                 continue
+             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
+-                self._drop(snap)
++                forget(snap)
+                 continue
+             need = row_bytes(self.e, snap, drafter=drafter)
+-            while self._held_bytes() + need > self.cache_bytes:
+-                old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
++            while held() + need > self.cache_bytes:
++                old = next((c for c in order if id(c) in alive and c is not snap and not resumes(c)), None)
+                 if old is None:
+                     break
+-                self._drop(old)
+-                dropped = True
+-            if self._held_bytes() + need > self.cache_bytes:
+-                self._drop(snap)
+-                dropped = True
++                forget(old)
++                over_budget = True
++            if held() + need > self.cache_bytes:
++                forget(snap)
++                over_budget = True
+                 continue
+-            save_rows(self.e, snap, drafter=drafter)
+-        if dropped:
++            shed = 0 if drafter is not None and snap.drafter_end == n else sum(
++                t.numel() * t.element_size() for t in snap.drafter_rows or [])
++            saved[id(snap)] = snapshot_bytes(snap) - shed + need
++        for snap in drops:
++            self._drop(snap)
++        for snap in order:
++            if id(snap) in saved:
++                save_rows(self.e, snap, drafter=drafter)
++        if over_budget:
+             import torch
+ 
+             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool

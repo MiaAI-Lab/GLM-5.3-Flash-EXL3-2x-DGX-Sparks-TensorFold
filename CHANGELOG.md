@@ -3,6 +3,21 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+Image: to be rebuilt (the patch set hash changes); maintainers pin the new tag and digest in `scripts/config.sh` at release. 69 patches.
+
+### Fixed
+- **A fresh conversation after a long one no longer runs both ranks out of memory** (`_take_over`, patch
+  `0069-glm-take-over-decide-then-copy`, the same change as upstream ashhart/TensorFold#421). When a conversation
+  sharing no prefix with the last one arrived after a long conversation, both ranks died with `NV_ERR_NO_MEMORY`; it
+  also happened with the 1M window and `KV_POOL_GIB=3`. `_take_over` cloned every kept state and only then dropped the
+  ones over the budget, so reserved memory grew to the sum of all their sizes. It now works out which states stay and
+  clones only those; the states that stay and the replies are the same by design (200 random cases against the old
+  walk). After a 256k, 21-turn conversation, a fresh one on 2 Sparks: `save_rows` 22 -> 1, reserved +14.8 -> +1.4 GiB,
+  `take_over` 3.3 -> 0.10 s; before, the driver logged `NV_ERR_NO_MEMORY` 22 times. After: 3 fresh boots, 5 cycles
+  of a long task then a fresh one, 48 benchmark attempts, no allocation failure; pass counts match the unpatched build where it had the same trials (15 of 21 graded at low effort on both; 15 of 21 at high effort against 10 of 11 before).
+
 ## v1.4 (2026-10-03): image prompts resume, tool calls never dropped, pictures in tool results, earlier reasoning kept, smooth concurrent streaming, 3 Sparks (experimental)
 
 Image: `v0.6.0-5e01f1bb74d8` (`sha256:14f15591eae5d6a540f09218d3852068962fe5381371bbfefe0e9194cd834529`), 68 patches, for two and three Sparks.

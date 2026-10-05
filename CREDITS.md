@@ -90,6 +90,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [SxMShaDoW](https://github.com/SxMShaDoW)), backported to v0.6.0.
 - `0060-glm-keep-thinking` (earlier turns keep their reasoning, `TF_GLM_CLEAR_THINKING`): by
   [kky42](https://github.com/kky42), pull request #23.
+- `0069-glm-take-over-decide-then-copy` (a fresh conversation after a long one clones only the kept states that stay):
+  by [m-naoki-m](https://github.com/m-naoki-m), also proposed upstream as
+  [TensorFold PR #421](https://github.com/ashhart/TensorFold/pull/421).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
