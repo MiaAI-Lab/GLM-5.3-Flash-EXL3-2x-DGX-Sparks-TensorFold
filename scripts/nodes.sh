@@ -311,8 +311,11 @@ node_inventory() {
 # node's RoCE devices toward all its peers, in its sysfs order; the GID index when it is one for all of them), "peer <i>
 # <worker i's lowest address on its link to the head>", "missing <a> <b>" for two ranks without a common subnet, and
 # "ring <ranks...>" when the links form one ring through four or more ranks and no others (every rank linked to two),
-# in its order from rank 0 toward its lower-numbered neighbour, and "toward <r> <s> <hcas>" for every linked pair (r's
-# RoCE devices on the subnets it shares with s, in its sysfs order).
+# in its order from rank 0 toward its lower-numbered neighbour, "toward <r> <s> <hcas>" for every linked pair (r's
+# RoCE devices on the subnets it shares with s, in its sysfs order), and "prefix <len>": the shortest prefix length
+# (longer than the links' own) at which, on every link, each device's address and exactly one of the peer's share a
+# subnet and no two of a node's devices do (a port and its PCIe twin addressed .N and .10N in one /24: 26), so NCCL's
+# subnet-aware routing can tell the twins apart.
 pair_links() {
   python3 -c '
 import ipaddress, sys
@@ -346,6 +349,19 @@ for r in ranks:
         if id(e) in used and e[1] not in hcas:
             hcas.append(e[1]); gids.add(e[3])
     print("rank", r, default.get(r) or "-", ",".join(hcas) or "-", gids.pop() if len(gids) == 1 else "-")
+def splits(n):
+    for r in ranks:
+        for s in links[r]:
+            mine = [e for e in nodes.get(r, []) if linked(e, nodes.get(s, []))]
+            theirs = [o for o in nodes.get(s, []) if linked(o, mine)]
+            nets = [ipaddress.ip_interface(f"{e[2].ip}/{n}").network for e in mine]
+            if len(set(nets)) != len(nets) or any(sum(o[2].ip in net for o in theirs) != 1 for net in nets):
+                return False
+    return True
+own = max((e[2].network.prefixlen for r in ranks for e in nodes.get(r, [])), default=32)
+pre = next((n for n in range(own, 31) if splits(n)), None)
+if pre is not None:
+    print("prefix", pre)
 if len(ranks) > 3 and all(len(links[r]) == 2 for r in ranks):
     order = [ranks[0], min(links[ranks[0]])]
     while len(order) <= len(ranks):
@@ -368,6 +384,7 @@ if len(ranks) > 3 and all(len(links[r]) == 2 for r in ranks):
 # across the ring from the head gets the head's address on its route there (an address on lo the Sparks route between
 # them, say) for its rendezvous and NFS. FABRIC=mesh: every pair cabled.
 FABRIC=mesh
+RING_PREFIX=""   # pair_links' "prefix": NCCL_IB_SUBNET_PREFIX_LEN on a ring (its graph files)
 detect_links() {
   if (( TP == 2 )); then detect_link; return; fi
   local r i k peer kind a b c d pairs line missing="" names ring="" order=""
@@ -400,6 +417,7 @@ detect_links() {
       missing) missing+=" $a-$b" ;;
       ring) ring="$a $b $c $d" ;;
       toward) TOWARD["$a $b"]=$c ;;
+      prefix) RING_PREFIX=$a ;;
     esac
   done <<<"$pairs"
   ring=$(xargs <<<"$ring")
@@ -517,6 +535,10 @@ nccl_env_n() {
   local dev=$1 hcas=$2 gid=$3 ring=""   # $4: the node's NCCL graph file (FABRIC=ring)
   [[ "$FABRIC" != ring ]] || ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
   [[ -z "${4:-}" ]] || ring+=" -e NCCL_IB_MERGE_NICS=0 -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}:/nccl-graph.xml:ro"
+  # the prefix that keeps a port and its PCIe twin apart (pair_links), so each send goes out the device the graph means:
+  # NCCL's default puts both in one subnet and sends every channel on the first (measured: twins idle, prompt-sized
+  # all-gathers 16.7 GB/s; with the prefix both carry half, 25.6 GB/s, a decode-sized one 94 -> 69 us)
+  [[ -z "${4:-}" || -z "$RING_PREFIX" ]] || ring+=" -e NCCL_IB_SUBNET_PREFIX_LEN=${NCCL_IB_SUBNET_PREFIX_LEN:-$RING_PREFIX}"
   echo "-e NCCL_SOCKET_IFNAME=$dev -e NCCL_IB_HCA=$hcas ${gid:+-e NCCL_IB_GID_INDEX=$gid} $ring" \
        "-e NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1} -e NCCL_IB_SUBNET_AWARE_ROUTING=${NCCL_IB_SUBNET_AWARE_ROUTING:-1}" \
        "-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1" \
