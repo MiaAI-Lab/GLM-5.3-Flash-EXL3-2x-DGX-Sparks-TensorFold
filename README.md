@@ -20,9 +20,9 @@ vision, tool calling, `/tokenize` and `/metrics`.
 
 **Unreleased, two to four Sparks** (patches 0098-0109; 0099-0109 ported from the
 [GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold) by Mia's AI Lab): the RoCE
-all-gather relayed round a four-Spark ring, a faster prompt token selection and sparse attention, quick fills and the
-prompt stop, and, off until measured on the Sparks, each rank's DSA front on its own rows, two micro-batches a prompt
-chunk, a decode side stream and bf16 partials. The own-row front and the micro-batches are
+all-gather relayed round a four-Spark ring, a compacted top-k for the prompt's token selection, quick fills and the
+prompt stop, and, off until measured on the Sparks, the `msa.cu` prompt sparse attention, each rank's DSA front on its
+own rows, two micro-batches a prompt chunk, a decode side stream and bf16 partials. The own-row front and the micro-batches are
 [drowzeys](https://github.com/drowzeys)' designs, which drowzeys authored in
 [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05) (`compute_prompt_sp`,
 `SP_SELECT`, `PROMPT_OVERLAP`); the prompt kernels take design points from work drowzeys authored
