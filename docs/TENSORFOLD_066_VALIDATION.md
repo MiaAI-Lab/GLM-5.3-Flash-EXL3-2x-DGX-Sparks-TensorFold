@@ -4,7 +4,7 @@ This draft ports the public v1.8 recipe to TensorFold commit `cb2ebf0540f42604e2
 
 ## GPU observations
 
-One image was built and run on two independent tensor-parallel pairs (four DGX Sparks total). This is one build tested on two clusters, not four independent builds. Both used `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` revision `07135ec082f8f11f7a71e4244a4e5167a0f96277`, q4 dense weights, FP8 KV, four lanes, and DFlash2 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`.
+One Docker image built from this Mia recipe was run on two independent tensor-parallel pairs (four DGX Sparks total). This is one build tested on two clusters, not four independent builds. Both used a compatible EXL3 checkpoint, q4 dense weights, FP8 KV, four lanes, and DFlash2 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`. The default Mia checkpoints still need GPU smoke checks.
 
 - Both clusters passed 11/11 functional checks: health/model discovery, chat, SSE, thinking on/off, typed tool roundtrip, Responses, Anthropic messages/count_tokens, vision, prefix reuse, and four-lane queue/cancellation recovery. Thinking content emission was observed on the second pair. This does not establish compatibility with every API client.
 - Prefix-cache counters changed from 0 to 1,664 tokens. Four requests ran concurrently; a fifth queued, and cancellation recovered the lane.

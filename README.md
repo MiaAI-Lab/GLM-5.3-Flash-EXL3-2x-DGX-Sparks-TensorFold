@@ -25,7 +25,7 @@ video input**. The local recipe builds [TensorFold](https://github.com/ashhart/T
 - Tool calling, structured outputs (xgrammar), `/tokenize`, and `reasoning_effort` `low` / `high` / `max`
 - One command on the first Spark: `./start.sh` sets up both Sparks and starts both ranks; `./stop.sh` stops them
 
-The same v0.6.6 image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a public Neko EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The stock Mia and Mia Ablit checkpoints still need GPU smoke checks. The performance figures below were measured on the earlier v0.6.0 recipe.
+The same v0.6.6 image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a compatible EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The stock Mia and Mia Ablit checkpoints still need GPU smoke checks. The performance figures below were measured on the earlier v0.6.0 recipe.
 
 ## Performance
 

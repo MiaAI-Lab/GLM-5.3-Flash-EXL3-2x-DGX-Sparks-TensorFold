@@ -7,7 +7,7 @@ Every change to this recipe, newest first. Published releases below name their t
 - Consolidated the v1.8 public GLM features into `patches/v066/0001-glm-recipe-compat.patch` against TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. The earlier numbered v0.6.0 patches remain as history.
 - Kept the v1.8 shared-prefix, vision, cancellation, memory, and capacity changes. Adapted the new v0.6.6 scheduler shutdown path and forwarded `Retry-After` on nonstreamed Responses and Anthropic capacity refusals. The public Ablit checkpoint selector is unchanged.
 - The image hash now includes the exact TensorFold source, base image, extras, and active patch. The old v0.6.0 image digest is no longer used, and image builds are local by default until a tested v0.6.6 image is pinned.
-- The same image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a public Neko EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). Stock Mia and Mia Ablit GPU smoke checks, a clean-checkout build, and near-limit retrieval remain unverified. No overall performance improvement is claimed.
+- The same image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a compatible EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). Stock Mia and Mia Ablit GPU smoke checks, a clean-checkout build, and near-limit retrieval remain unverified. No overall performance improvement is claimed.
 
 ## v1.8 (2026-10-06): pictures read once, quoted markers, capacity refusals, and the take-over memory fix
 
