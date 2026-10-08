@@ -380,9 +380,10 @@ if len(ranks) > 3 and all(len(links[r]) == 2 for r in ranks):
 # addresses some setups route over the cables sit on lo. The rendezvous is MASTER_ADDR (config.sh).
 # Four Sparks have two CX7 ports each, so no switch means a ring: each Spark cabled to two others, the two across from
 # it reached only through a neighbour. That is FABRIC=ring when the ring runs in rank order (0-1-2-3-0, WORKER ..
-# WORKER3 around it): NCCL's ring all-gather then only sends to the next rank, over a cable (nccl_env_n), and a worker
-# across the ring from the head gets the head's address on its route there (an address on lo the Sparks route between
-# them, say) for its rendezvous and NFS. FABRIC=mesh: every pair cabled.
+# WORKER3 around it): NCCL's ring all-gather then only sends to the next rank, over a cable (nccl_env_n); COMM=roce
+# sends to the neighbours, which relay to the rank across (patch 0099, TF_ROCE_RING=1); and a worker across the ring
+# from the head gets the head's address on its route there (an address on lo the Sparks route between them, say) for
+# its rendezvous and NFS. FABRIC=mesh: every pair cabled.
 FABRIC=mesh
 RING_PREFIX=""   # pair_links' "prefix": NCCL_IB_SUBNET_PREFIX_LEN on a ring (its graph files)
 detect_links() {
@@ -435,8 +436,6 @@ detect_links() {
       for k in $(cut -d' ' -f2- <<<"$ring"); do order+=", $(worker_host "$k")"; done
       die "the Sparks are cabled as a ring, but the workers are not in its order (rank 0 to $((TP - 1)): this node$order around it): set WORKER .. $(wvar WORKER $((TP - 1))) in that order in scripts/local.sh (each with its own FABRIC_PEER, WORKER_WEIGHTS, NFS_SERVER and WORKER_HF_CACHE, if set)"
     fi
-    [[ "$COMM" == nccl ]] ||
-      die "COMM=roce sends to every peer directly, and on a ring of $TP Sparks two pairs have no cable: use COMM=nccl (./start-tp$TP-switchless.sh's default)"
     FABRIC=ring; missing=""
     for i in $(worker_ids); do
       [[ -z "${LINK_HEAD_ADDR[i]:-}" && -z "${WORKER_DOWN[$i]:-}" ]] || continue
@@ -562,6 +561,8 @@ nccl_env_n() {
   elif [[ "$FABRIC" == ring ]]; then
     ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
   fi
+  # COMM=roce on a ring: each rank's small gathers to its neighbours, relayed by them to the rank across (patch 0099)
+  [[ "$FABRIC" != ring ]] || ring+=" -e TF_ROCE_RING=1"
   # the prefix that keeps a port and its PCIe twin apart (pair_links), so each send goes out the device the graph means:
   # NCCL's default puts both in one subnet and sends every channel on the first (measured: twins idle, prompt-sized
   # all-gathers 16.7 GB/s; with the prefix both carry half, 25.6 GB/s, a decode-sized one 94 -> 69 us)
