@@ -1,0 +1,529 @@
+# A prompt chunk's sparse attention, faster at a rank's heads (both on the 2,048 selected tokens of every sparse row):
+#
+# - latent.sparse_onepass at up to 16 heads a rank (four Sparks): its one 16-row tile on 4 warps instead of 8, the same
+#   bits (measured on GB10, FP8 and bf16 caches, 1 to 16 heads); 6.6 -> 4.8 ms a 2,048-row chunk-layer at 32k tokens,
+#   7.9 -> 5.7 ms at 128k (FP8). More heads keep 8 warps and one 32-row tile (two 16-head programs a row read every key
+#   twice: slower at 128k).
+# - TF_GLM_MSA=1 (off by default): msa.cu, Mia's sparse attention for Flash's prompt rows on the FP8 latent cache, in
+#   place of sparse_onepass. One CUDA block a row; the rank's heads as one m16 tensor-core tile (up to 16, 4 warps) or
+#   two (17-32: two and three Sparks, 8 warps); each warp owns 128 latent columns of one m tile; a tile of 16 keys is
+#   loaded one tile ahead into registers and converted to bf16 once for every head of the row (FP8 code x the row's
+#   power-of-two scale, exact; with two m tiles the column group's two warps each convert half the keys into a
+#   double-buffered region and meet at a pair barrier); the m tile's four warps add their partial scores in warp order
+#   through shared memory; a log2-domain online softmax; O += P V on each warp's columns. A row's bits depend on its
+#   query, its token list and the cache only (checked on the GPU: repeated runs and any block of rows give the same
+#   bits), within bf16 rounding of exact attention (the same largest error against an fp32 reference as
+#   sparse_onepass), but they are other bits than sparse_onepass's, so it stays off until the needle checks run with
+#   it; a bf16 cache keeps sparse_onepass. TF_GLM_MSA joins the ranks' startup comparison.
+#
+# Measured on one GB10 (2,048 rows, 2,048 tokens a row, FP8, ms a chunk-layer; sparse_onepass with the change above ->
+# msa): 32 heads (TP=2) 9.5 -> 7.1 at 32k, 10.1 -> 9.1 at 128k; 22 heads (TP=3) 9.9 -> 6.8 and 9.9 -> 8.4; 16 heads
+# (TP=4) 4.8 -> 3.1 and 5.7 -> 4.6. Flash has 11 such layers a chunk.
+#
+# Provenance and credit: adapted from the GLM-5.3 recipe's kernel 2 (its patch 0150, Mia's AI Lab) to Flash's latent
+# (512 wide, no rotary part) and to two m tiles; that kernel takes design points from drowzeys' one-pass prompt
+# attention (github.com/drowzeys/TensorFold, branch glm53-tp4-2026-10-05, e91312a) and from BertholomusAI (Albert
+# Lee)'s prompt sparse attention (github.com/bertholomus/TensorFold, branch glm-dsa-tp4, 8f649f1). No code was copied
+# from either.
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e93d9b9..60322fa 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -679,6 +679,8 @@ class GlmEngine:
+         quant_code = DRAFT_QUANTS.index(draft_quant())
+         from tensorfold.cuda.sampling import union_cover
+ 
++        from .msa import ENABLED as MSA      # TF_GLM_MSA: other prompt bits than sparse_onepass's
++
+         verify_code = 0
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+@@ -697,7 +699,7 @@ class GlmEngine:
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos)]
++                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), int(MSA)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -711,7 +713,8 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
++                               "TF_GLM_MSA): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index e2cad87..8ecaf31 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
++from . import glue, kda as kda_mod, kv8, l2pf, latent, msa, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -692,7 +692,9 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+             tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+-            if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
++            if b.prefill and msa.ENABLED and msa.supported(qa, lc):    # TF_GLM_MSA=1: prompt rows on msa.cu
++                msa.prompt(qa, lc, tokens, counts, ol, scale)
++            elif b.prefill and latent.SPARSE_ONEPASS:   # prompt rows: one pass a row, no partials (their own bits)
+                 latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
+             else:
+                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 16358c9..d38a767 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -704,6 +704,10 @@ ONEPASS_TILE = (32, 32, 1)          # heads per program (a rank's 32), keys per
+ # warps, Triton pipeline stages, register prefetch of the next tile: speed only on bf16 caches (on FP8 codes the
+ # launch sets the bits too, fixed like the tile)
+ ONEPASS_LAUNCH = (8, 1, True)
++# a rank of up to 16 heads (four Sparks): its one 16-row tile on 4 warps, 1.4-1.6x faster a 2048-row chunk than on 8
++# (GB10, 8k-128k tokens), the same bits as the 8 warps' (FP8 and bf16, measured); more heads keep ONEPASS_LAUNCH, which
++# reads each key once a row for all of them (two 16-head programs a row on 4 warps read the keys twice: slower at 128k)
++ONEPASS_LAUNCH_16 = (4, 1, True)
+ 
+ 
+ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+@@ -719,7 +723,7 @@ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor,
+     if R == 0:
+         return
+     hbt, kt, split = tile or ONEPASS_TILE
+-    warps, stages, prefetch = launch or ONEPASS_LAUNCH
++    warps, stages, prefetch = launch or (ONEPASS_LAUNCH_16 if H <= 16 and tile is None else ONEPASS_LAUNCH)
+     hbt = max(16, min(hbt, triton.next_power_of_2(H)))            # tensor-core tiles need 16 rows
+     _sparse_onepass[(R, triton.cdiv(H, hbt), split)](qa, vals, scl, tokens, counts, out, W=tokens.shape[1], H=H,
+                                                      LW=LW, SCALE=scale, HBT=hbt, KTT=kt, SPLIT=split, STAGES=stages,
+diff --git tensorfold/families/glm5_next/cuda/msa.cpp tensorfold/families/glm5_next/cuda/msa.cpp
+new file mode 100644
+index 0000000..a3ac8d0
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/msa.cpp
+@@ -0,0 +1,26 @@
++// Mia's sparse attention for GLM-5.3-Flash's prompt rows (msa.cu): the binding. By Mia's AI Lab (Apache-2.0).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void msa_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, double);
++int msa_max_heads();
++
++void prompt(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++            at::Tensor out, double scale) {
++    auto ok = [](const at::Tensor& x, at::ScalarType t) {
++        return x.is_cuda() && x.scalar_type() == t && x.is_contiguous();
++    };
++    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(out, at::kBFloat16) && qa.dim() == 3 && out.sizes() == qa.sizes(),
++                "msa: contiguous bf16 queries and output [R, H, 512]");
++    TORCH_CHECK(ok(cache, at::kByte) && cache.dim() == 2, "msa: a contiguous FP8 latent cache (uint8 kv8 rows)");
++    TORCH_CHECK(ok(tokens, at::kInt) && ok(counts, at::kInt) && tokens.dim() == 2 &&
++                    tokens.size(0) >= qa.size(0) && counts.size(0) >= qa.size(0),
++                "msa: contiguous int32 token lists and counts for every row");
++    c10::cuda::CUDAGuard guard(qa.device());
++    msa_prompt_cuda(qa, cache, tokens, counts, out, scale);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("prompt", &prompt);
++    m.def("max_heads", &msa_max_heads);
++}
+diff --git tensorfold/families/glm5_next/cuda/msa.cu tensorfold/families/glm5_next/cuda/msa.cu
+new file mode 100644
+index 0000000..4d86b96
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/msa.cu
+@@ -0,0 +1,330 @@
++// Mia's sparse attention for GLM-5.3-Flash's prompt rows (TF_GLM_MSA=1): each row's absorbed queries [H, 512] over
++// its selected tokens of the 512-wide FP8 latent cache (TF_GLM_KV=fp8, kv8's rows), straight to the output. By Mia's AI
++// Lab (Apache-2.0); adapted from the GLM-5.3 recipe's kernel 2 (msa2.cu) to Flash's latent (no rotary part) and to
++// 17-32 heads a rank.
++//
++// One block a row. The heads are the mma's M in m16 tiles: one tile up to 16 heads (TP=4: 4 warps), two up to 32
++// (TP=2, TP=3: 8 warps), so a key tile is read and converted once for every head of the row. Warp w owns latent
++// columns 128 (w % 4) .. 128 (w % 4) + 127 of m tile w / 4 (heads 16 (w / 4) ..):
++//   - a tile's keys (16, in list order) are loaded one tile ahead into registers (ld.global) and converted to bf16
++//     (code x the row's power-of-two scale, exact in bf16) into the column group's shared region; with two m
++//     tiles the group's two warps each convert half the keys into a double-buffered region and meet at a barrier of
++//     the pair, so no other warp ever waits on those columns;
++//   - QK: the warp's 8 k steps of its m tile's scores (query fragments held in registers for the whole row); the four
++//     warps of an m tile add their partial scores through shared memory in warp order (one block barrier a tile);
++//   - every warp of the m tile then runs the same online softmax on the summed scores (the same m and l in each) and
++//     its 128 output columns of O += P V.
++// A row's bits depend on its query, its token list and the cache only: any chunking, any block of rows, any rank.
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_fp8.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++namespace msa {
++
++constexpr int LW = 512;                       // latent values a key
++constexpr int KT = 16;                        // keys a tile
++constexpr int WC = 128;                       // latent columns a warp
++constexpr int KROW = WC + 8;                  // a key's row in a column group's region (halves; 272 B: ldmatrix
++                                              // conflict-free)
++constexpr int CROW8 = LW + 16;                // an FP8 cache row: codes, fp32 scale, zeros (kv8)
++constexpr int SPL = KT / 8 * 4;               // partial scores a lane (8)
++
++template <int MT>
++struct Shape {
++    static constexpr int NW = 4 * MT;                                         // warps
++    static constexpr int NT = NW * 32;
++    static constexpr int KB = MT;                                             // key buffers a column group
++    static constexpr int COLS = WC * KT / 32 / MT;                            // columns a lane converts (64, 32)
++    static constexpr size_t SM_K = 0;                                         // [4][KB][KT][KROW] bf16 keys
++    static constexpr size_t SM_S = SM_K + (size_t)4 * KB * KT * KROW * 2;     // [2][NW][32][SPL] fp32 partials
++    static constexpr size_t SMEM = SM_S + (size_t)2 * NW * 32 * SPL * 4;
++};
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
++}
++__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
++}
++__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ float ex2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
++    return y;
++}
++__device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
++    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
++    return *reinterpret_cast<const uint32_t*>(&v);
++}
++// two e4m3 codes (low byte first) times a power of two s as a bf16 pair (exact)
++__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, float s) {
++    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(c & 0xffffu), __NV_E4M3);
++    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
++    return pack_bf16(f.x * s, f.y * s);
++}
++// the pair barrier of column group g (two m tiles: its two warps, 64 threads; ids 1-4, 0 is __syncthreads')
++__device__ __forceinline__ void pair_sync(int g) { asm volatile("bar.sync %0, 64;\n" :: "r"(g + 1) : "memory"); }
++
++// a lane's raw bytes of one tile: its key's COLS e4m3 codes of the warp's column group and the row's scale
++template <int MT>
++struct Raw {
++    static constexpr int N = Shape<MT>::COLS / 16;                                // 16-byte words
++    uint4 c[N];
++    float rs;
++};
++
++// the lane's key in a tile and its first column in the group: one m tile, 16 keys x 2 halves; two, each warp of the
++// pair 8 keys (8 mt ..) x 4 quarters
++template <int MT>
++__device__ __forceinline__ int lane_key(int lane, int mt) { return MT == 1 ? lane >> 1 : 8 * mt + (lane >> 2); }
++template <int MT>
++__device__ __forceinline__ int lane_col(int lane) { return MT == 1 ? 64 * (lane & 1) : 32 * (lane & 3); }
++
++template <int MT>
++__device__ __forceinline__ void load_raw(Raw<MT>& x, const uint8_t* __restrict__ cache, int tok, int col) {
++    if (tok < 0) {
++#pragma unroll
++        for (int i = 0; i < Raw<MT>::N; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
++        x.rs = 0.f;
++        return;
++    }
++    const uint8_t* row = cache + (long long)tok * CROW8;
++    const uint4* src = reinterpret_cast<const uint4*>(row + col);
++#pragma unroll
++    for (int i = 0; i < Raw<MT>::N; ++i) x.c[i] = __ldg(src + i);
++    x.rs = __ldg(reinterpret_cast<const float*>(row + LW));
++}
++
++// the lane's codes as bf16 values (code x row scale, exact) into its key's row of the group region
++template <int MT>
++__device__ __forceinline__ void convert(const Raw<MT>& x, __nv_bfloat16* __restrict__ krow) {
++#pragma unroll
++    for (int i = 0; i < Raw<MT>::N; ++i) {
++        const uint32_t wd[4] = {x.c[i].x, x.c[i].y, x.c[i].z, x.c[i].w};
++        uint32_t o[8];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            o[2 * j] = e4m3x2_bf16x2(wd[j], x.rs);
++            o[2 * j + 1] = e4m3x2_bf16x2(wd[j] >> 16, x.rs);
++        }
++        *reinterpret_cast<uint4*>(krow + 16 * i) = make_uint4(o[0], o[1], o[2], o[3]);
++        *reinterpret_cast<uint4*>(krow + 16 * i + 8) = make_uint4(o[4], o[5], o[6], o[7]);
++    }
++}
++
++// one tile of KT keys at t0: convert the lane's raw bytes (then load the next tile's into them: in flight while this
++// one computes), the warp's partial scores, their sum over the m tile's warps, the online softmax and the warp's
++// columns of O += P V
++template <int MT>
++__device__ __forceinline__ void tile(Raw<MT>& raw, int t0, int n, const int* __restrict__ toks,
++                                     const uint8_t* __restrict__ cache, __nv_bfloat16* Kg, float* Sp,
++                                     const uint32_t (&qf)[8][4], int& tok_next, int& buf, float (&o)[16][4],
++                                     float& m0, float& m1, float& l0, float& l1, float sl2) {
++    using S = Shape<MT>;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = lane & 3;
++    const int grp = warp & 3, mt = warp >> 2;
++    const int kb = MT == 1 ? 0 : (t0 / KT) & 1;                     // the group's key buffer of this tile
++    __nv_bfloat16* Kw = Kg + (size_t)kb * KT * KROW;
++    const int lk = lane_key<MT>(lane, mt), lc = lane_col<MT>(lane);
++    convert<MT>(raw, Kw + (size_t)lk * KROW + lc);
++    if constexpr (MT == 1)
++        __syncwarp();
++    else
++        pair_sync(grp);
++    if (t0 + KT < n) load_raw<MT>(raw, cache, tok_next, WC * grp + lc);
++    tok_next = t0 + 2 * KT + lk < n ? __ldg(toks + t0 + 2 * KT + lk) : -1;
++
++    // the warp's partial scores: its m tile's 16 heads x 16 keys over its 8 k steps (two chains a key n tile)
++    const __nv_bfloat16* bq = Kw + (size_t)((lane & 7) + ((lane >> 4) & 1) * 8) * KROW + ((lane >> 3) & 1) * 8;
++    const __nv_bfloat16* bv = Kw + (size_t)(lane & 15) * KROW + (lane >> 4) * 8;
++    float acc[2][2][4] = {};
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        uint32_t b[4];
++        ldsm_x4(b, bq + 16 * i);
++        mma_bf16(acc[0][i & 1], qf[i], b[0], b[1]);
++        mma_bf16(acc[1][i & 1], qf[i], b[2], b[3]);
++    }
++    float* mine = Sp + ((size_t)(buf * S::NW + warp) * 32 + lane) * SPL;
++    *reinterpret_cast<float4*>(mine) = make_float4(acc[0][0][0] + acc[0][1][0], acc[0][0][1] + acc[0][1][1],
++                                                   acc[0][0][2] + acc[0][1][2], acc[0][0][3] + acc[0][1][3]);
++    *reinterpret_cast<float4*>(mine + 4) = make_float4(acc[1][0][0] + acc[1][1][0], acc[1][0][1] + acc[1][1][1],
++                                                       acc[1][0][2] + acc[1][1][2], acc[1][0][3] + acc[1][1][3]);
++    __syncthreads();
++    // the scores: the m tile's four warps' partials in warp order (each of them the same sums); the buffer of the
++    // tile after next is this one again, written after the next barrier, which every warp passes after these reads
++    float s[2][4];
++    {
++        const float* base = Sp + ((size_t)(buf * S::NW + 4 * mt) * 32 + lane) * SPL;
++        float4 a0 = *reinterpret_cast<const float4*>(base), a1 = *reinterpret_cast<const float4*>(base + 4);
++#pragma unroll
++        for (int v = 1; v < 4; ++v) {
++            const float4 b0 = *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL);
++            const float4 b1 = *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL + 4);
++            a0.x += b0.x; a0.y += b0.y; a0.z += b0.z; a0.w += b0.w;
++            a1.x += b1.x; a1.y += b1.y; a1.z += b1.z; a1.w += b1.w;
++        }
++        s[0][0] = a0.x; s[0][1] = a0.y; s[0][2] = a0.z; s[0][3] = a0.w;
++        s[1][0] = a1.x; s[1][1] = a1.y; s[1][2] = a1.z; s[1][3] = a1.w;
++    }
++    buf ^= 1;
++    // online softmax (log2 domain): keys 8 j + 2 t (+ 1) of the tile; c0, c1 head g, c2, c3 head g + 8
++    float mx0 = -INFINITY, mx1 = -INFINITY;
++#pragma unroll
++    for (int j = 0; j < 2; ++j)
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            const bool ok = t0 + 8 * j + 2 * t + (q & 1) < n;
++            s[j][q] = ok ? s[j][q] * sl2 : -INFINITY;
++            if (q < 2) mx0 = fmaxf(mx0, s[j][q]);
++            else mx1 = fmaxf(mx1, s[j][q]);
++        }
++    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
++    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
++    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
++    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
++    const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);      // finite: the tile's first key is in the list
++    const float al0 = ex2(m0 - n0), al1 = ex2(m1 - n1);        // 0 at the first tile (m = -inf), 1 if no new max
++    m0 = n0;
++    m1 = n1;
++    float p[2][4];
++#pragma unroll
++    for (int j = 0; j < 2; ++j) {
++        p[j][0] = ex2(s[j][0] - n0);
++        p[j][1] = ex2(s[j][1] - n0);
++        p[j][2] = ex2(s[j][2] - n1);
++        p[j][3] = ex2(s[j][3] - n1);
++    }
++    float ps0 = ((p[0][0] + p[0][1]) + p[1][0]) + p[1][1];
++    float ps1 = ((p[0][2] + p[0][3]) + p[1][2]) + p[1][3];
++    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
++    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
++    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
++    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
++    l0 = l0 * al0 + ps0;
++    l1 = l1 * al1 + ps1;
++    const uint32_t pa[4] = {pack_bf16(p[0][0], p[0][1]), pack_bf16(p[0][2], p[0][3]), pack_bf16(p[1][0], p[1][1]),
++                            pack_bf16(p[1][2], p[1][3])};
++    // O = O alpha + P V over the warp's 128 columns (O alpha skipped when every alpha of the warp is 1: x 1 is exact)
++    if (__any_sync(0xffffffffu, al0 != 1.f || al1 != 1.f)) {
++#pragma unroll
++        for (int b = 0; b < 16; ++b) {
++            o[b][0] *= al0;
++            o[b][1] *= al0;
++            o[b][2] *= al1;
++            o[b][3] *= al1;
++        }
++    }
++#pragma unroll
++    for (int b = 0; b < 8; ++b) {
++        uint32_t v[4];
++        ldsm_x4_t(v, bv + 16 * b);
++        mma_bf16(o[2 * b], pa, v[0], v[1]);
++        mma_bf16(o[2 * b + 1], pa, v[2], v[3]);
++    }
++}
++
++template <int MT>
++__global__ void __launch_bounds__(Shape<MT>::NT, MT == 1 ? 3 : 1) msa_kernel(
++    const __nv_bfloat16* __restrict__ qa, const uint8_t* __restrict__ cache, const int* __restrict__ tokens,
++    const int* __restrict__ counts, __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
++    using S = Shape<MT>;
++    extern __shared__ __align__(16) unsigned char smem[];
++    const int r = blockIdx.x;
++    const int n = counts[r];
++    if (n <= 0) return;                            // rows without a sparse count are left alone
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int grp = warp & 3, mt = warp >> 2;
++    __nv_bfloat16* Kg = reinterpret_cast<__nv_bfloat16*>(smem + S::SM_K) + (size_t)grp * S::KB * KT * KROW;
++    float* Sp = reinterpret_cast<float*>(smem + S::SM_S);
++    const int* toks = tokens + (size_t)r * W;
++    const int lk = lane_key<MT>(lane, mt), lc = lane_col<MT>(lane);
++
++    Raw<MT> raw;
++    load_raw<MT>(raw, cache, lk < n ? __ldg(toks + lk) : -1, WC * grp + lc);
++    int tok_next = KT + lk < n ? __ldg(toks + KT + lk) : -1;
++
++    // the query fragments (A, m16 x k16, rows = the m tile's heads; heads >= H zero) of the warp's 8 k steps: latent
++    // columns 128 grp + 16 i
++    uint32_t qf[8][4];
++    const int h0 = 16 * mt + g, h1 = h0 + 8;
++    {
++        const bool ok0 = h0 < H, ok1 = h1 < H;
++        const uint32_t* q0 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + h0) * LW + WC * grp + 2 * t);
++        const uint32_t* q1 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + h1) * LW + WC * grp + 2 * t);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            qf[i][0] = ok0 ? __ldg(q0 + 8 * i) : 0u;
++            qf[i][1] = ok1 ? __ldg(q1 + 8 * i) : 0u;
++            qf[i][2] = ok0 ? __ldg(q0 + 8 * i + 4) : 0u;
++            qf[i][3] = ok1 ? __ldg(q1 + 8 * i + 4) : 0u;
++        }
++    }
++
++    float o[16][4];
++#pragma unroll
++    for (int b = 0; b < 16; ++b)
++#pragma unroll
++        for (int c = 0; c < 4; ++c) o[b][c] = 0.f;
++    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;      // rows g, g + 8 of the m tile (log2 domain)
++    const float sl2 = scale * 1.4426950408889634f;
++
++    int buf = 0;
++    for (int t0 = 0; t0 < n; t0 += KT)
++        tile<MT>(raw, t0, n, toks, cache, Kg, Sp, qf, tok_next, buf, o, m0, m1, l0, l1, sl2);
++    // out = O / l (bf16, heads < H)
++#pragma unroll
++    for (int b = 0; b < 16; ++b) {
++        const int col = WC * grp + 8 * b + 2 * t;
++        if (h0 < H)
++            *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h0) * LW + col) = pack_bf16(o[b][0] / l0, o[b][1] / l0);
++        if (h1 < H)
++            *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h1) * LW + col) = pack_bf16(o[b][2] / l1, o[b][3] / l1);
++    }
++}
++
++template <int MT>
++void launch(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++            at::Tensor& out, double scale) {
++    using S = Shape<MT>;
++    static bool ready = false;
++    if (!ready) {               // past 48 KiB of shared memory (two m tiles) the block must ask for it
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)S::SMEM));
++        ready = true;
++    }
++    msa_kernel<MT><<<(int)qa.size(0), S::NT, S::SMEM, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const uint8_t*>(cache.data_ptr()),
++        tokens.data_ptr<int>(), counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
++        (int)qa.size(1), (int)tokens.size(1), (float)scale);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace msa
++
++int msa_max_heads() { return 32; }
++
++void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& tokens, const at::Tensor& counts,
++                     at::Tensor& out, double scale) {
++    const int R = (int)qa.size(0), H = (int)qa.size(1);
++    TORCH_CHECK(H >= 1 && H <= 32, "msa: 1 to 32 heads a rank");
++    TORCH_CHECK(qa.size(2) == msa::LW, "msa: 512-wide absorbed queries");
++    TORCH_CHECK(cache.scalar_type() == at::kByte && cache.size(1) == msa::CROW8,
++                "msa: a 512-wide FP8 latent cache (kv8 rows of 528 bytes)");
++    if (R == 0) return;
++    if (H <= 16) msa::launch<1>(qa, cache, tokens, counts, out, scale);
++    else msa::launch<2>(qa, cache, tokens, counts, out, scale);
++}
+diff --git tensorfold/families/glm5_next/cuda/msa.py tensorfold/families/glm5_next/cuda/msa.py
+new file mode 100644
+index 0000000..89a470b
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/msa.py
+@@ -0,0 +1,48 @@
++"""TF_GLM_MSA=1: Mia's sparse attention (msa.cu) for a prompt chunk's sparse rows on the FP8 latent cache, in place of
++``latent.sparse_onepass``: one CUDA block a row, the rank's heads as one m16 tensor-core tile (up to 16: four Sparks)
++or two (up to 32: two and three Sparks), so a tile of keys is loaded and converted once for every head of the row;
++the next tile's keys in flight in registers; the codes converted to bf16 with their row's power-of-two scale (exact).
++Straight to the output, no partials. A row's bits depend on its query, its token list and the cache only (any
++chunking, any rank), but they are not ``sparse_onepass``'s: switching changes the prompt's bits once, so it stays off
++(``sparse_onepass``) until the needle checks have run with it.
++
++By Mia's AI Lab (Apache-2.0), adapted from the GLM-5.3 recipe's kernel 2 (its patch 0150), whose design points come
++from drowzeys' one-pass prompt attention (github.com/drowzeys/TensorFold, e91312a) and BertholomusAI (Albert Lee)'s
++prompt sparse attention (github.com/bertholomus/TensorFold, 8f649f1); no code of theirs."""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++HEADS = 32                     # query heads a rank at most (two m16 tiles)
++ENABLED = os.environ.get("TF_GLM_MSA", "0") == "1"
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_flash_msa_v2", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++                extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
++
++
++def supported(qa: torch.Tensor, cache: torch.Tensor) -> bool:
++    """A CUDA chunk of absorbed queries [R, <= 32, 512] over a 512-wide FP8 latent cache (TF_GLM_KV=fp8, kv8 rows;
++    a bf16 cache keeps ``sparse_onepass``, which reads its twice as wide rows faster than this kernel did)."""
++
++    return (qa.is_cuda and qa.dim() == 3 and qa.shape[-1] == 512 and 1 <= qa.shape[1] <= HEADS
++            and cache.dtype == torch.uint8 and cache.shape[-1] == 528)
++
++
++def prompt(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
++           scale: float) -> None:
++    """``latent.sparse_onepass``'s call: rows with counts > 0 attend their tokens (ascending, the first counts[r]
++    valid) into out[r]; other rows are left alone."""
++
++    if qa.shape[0]:
++        _ext().prompt(qa, cache, tokens, counts, out, float(scale))

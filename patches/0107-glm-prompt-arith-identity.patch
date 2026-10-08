@@ -1,0 +1,102 @@
+# The prompt kernels' choices that set a prompt's bits go into the ranks' startup comparison and into the prompt cache's
+# identity:
+#
+# - forward.prompt_arith_code(split): one int each for TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA, TF_GLM_EXL3_PROMPT,
+#   TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, TF_GLM_HC_MMA and TF_GLM_KDA_CHUNKED, the choices that change Flash's
+#   prompt bits. Left out because they keep every bit: TF_GLM_PROMPT_SELECT (0103), TF_GLM_EXL3_PASS / _ORDER / _ROWROT,
+#   the split's exchange, overlap, own-row front and micro-batches. No new env var, no new default.
+# - engine: the ranks' row ends in the code (TF_GLM_MSA stays where 0101 put it), so ranks started with different
+#   choices refuse to start, and the error names them; engine.odd_ranks is that comparison. The spill tier's folders
+#   (single-stream and --parallel) are keyed on the agreed settings, which hold the code: a kept state is never resumed
+#   under other arithmetic than made it (fp32 and bf16 partials never share a folder).
+#
+# Bits: nothing in the arithmetic changes; the spill tier's folders of older builds are not reused (the key grows).
+#
+# Tests (CPU): tests/cpu/test_prompt_arith_identity.py (the code moves with each choice and only with it, not with the
+# bit-identical ones; the comparison rejects a mismatch for each choice; SpillStore folders differ per choice).
+#
+# Provenance and credit: ported from the GLM-5.3 recipe's patch 0157 (Mia's AI Lab).
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e5e4ef3..53878f3 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -467,6 +467,14 @@ def bell_key(rank: int, n: int) -> str:
+     return f"tf_glm_request_{n}" if rank == 1 else f"tf_glm_request_r{rank}_{n}"
+ 
+ 
++
++def odd_ranks(rows: list[list[int]]) -> list[int]:
++    """The ranks whose startup settings (every int of their row but the last, the spare memory) differ from rank 0's:
++    the ranks' startup comparison (``mine`` in ``GlmEngine.__init__``), which refuses to start when any differ."""
++
++    return [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on ``world`` ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -679,6 +687,7 @@ class GlmEngine:
+         quant_code = DRAFT_QUANTS.index(draft_quant())
+         from tensorfold.cuda.sampling import union_cover
+ 
++        from .forward import prompt_arith_code      # the prompt kernels' choices that set its bits
+         from .msa import ENABLED as MSA      # TF_GLM_MSA: other prompt bits than sparse_onepass's
+ 
+         verify_code = 0
+@@ -699,14 +708,14 @@ class GlmEngine:
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), int(MSA)]
++                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), int(MSA)] + prompt_arith_code(self.split)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
+         rows = self._gather_ints(mine + [spare >> 20])
+-        odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
++        odd = odd_ranks(rows)
+         if odd:
+             raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+@@ -716,7 +725,8 @@ class GlmEngine:
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+-                               "TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA): "
++                               "TF_GLM_PROMPT_PARTIALS, TF_GLM_EXL3_PROMPT, TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, "
++                               "TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED, TF_GLM_MSA): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index c27b66a..948200a 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -887,6 +887,25 @@ def ffn_front(layer: LayerW, w: Weights, b: Buffers):
+     return None
+ 
+ 
++def prompt_arith_code(split=None) -> list[int]:
++    """The prompt kernels' choices that set a prompt's bits, one int each: in the ranks' startup comparison, so every
++    rank runs the same, and in the prompt cache's identity (the spill tier's folders are keyed on the engine's agreed
++    settings), so a kept state is never resumed under other arithmetic than made it. In order: TF_GLM_PROMPT_PARTIALS
++    (``split``'s: fp32 or bf16 partials), TF_GLM_MSA (msa.cu, not sparse_onepass's bits), TF_GLM_EXL3_PROMPT (the
++    routed experts' prompt kernels, not the decode kernels' bits), TF_GLM_SPARSE_ONEPASS (the one-pass sparse attention,
++    not the chunk programs' bits), TF_GLM_LATENT_MMA (the latent projections on the tensor cores, not the decode
++    kernels' bits), TF_GLM_HC_MMA (hc_pre's mixing dots on the tensor cores), TF_GLM_KDA_CHUNKED (KDA's chunked
++    form). Not in it, because they leave every bit as it was: TF_GLM_PROMPT_SELECT (0103), TF_GLM_EXL3_PASS / _ORDER /
++    _ROWROT, TF_GLM_PREFILL_OVERLAP, the split's exchange and its microbatches."""
++
++    from . import hcsplit
++    from .exl3_mm import prompt_kernels
++
++    partials = "fp32" if split is None else split.partials
++    return [hcsplit.PARTIALS.index(partials), int(msa.ENABLED), int(prompt_kernels()), int(latent.SPARSE_ONEPASS),
++            int(latent.PROMPT_MMA), int(glue.HC_MMA), int(kda_mod.CHUNKED)]
++
++
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+                   host_pos: int | None = None, sparse_np: int | None = None, mixer=None) -> None:
+     """``mixer``: the layer's KDA / DSA block as ``mixer(layer)`` instead of on ``st`` (a multi-stream window's

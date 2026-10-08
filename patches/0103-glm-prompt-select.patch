@@ -1,0 +1,186 @@
+# A prompt chunk's top-k pools a row (the indexer's top-512 of every visible pooled key) on a compacted
+# radix select, with the same pools (TF_GLM_PROMPT_SELECT, default on; 0: top_pools as before):
+#
+# - _select_compact: the first two radix passes over every score; the columns at or above the 16-bit prefix
+#   they find (the pools certainly chosen and the candidates, counted from the two histograms) are, when at
+#   most 2,048, compacted in pool order by a third read, and the last two passes and the output read only
+#   those. A row with more (many equal scores) reads every score as before. Three reads of a row's scores
+#   instead of five; the same digits, pools above the threshold and lowest ties. It reads only the scores, so
+#   it does not depend on the scoring kernel.
+# - The scores stay 0086's _scores (one row a program, SCORE_LOOP pool blocks). The GLM-5.3 recipe's 0151 and
+#   this port's first version also stacked two rows a tensor-core product (_scores_pair); that was written
+#   against the scoring before 0086 and is left out until it can be measured against 0086.
+#
+# Not measured on this stack (the first version, with _scores_pair, took a 2,048-row chunk-layer at 8k / 32k /
+# 128k tokens from 1.63 / 6.05 / 27.14 to 0.91 / 2.76 / 12.14 ms on one GB10). Flash has 11 such layers a
+# chunk; with 0102 each rank selects its own rows only. Tests: tests/cpu/test_prompt_select.py (the same pools
+# as top_pools with ties, -inf columns, rows of fewer visible pools than k, and the fallback over every score).
+#
+# Provenance and credit: the ideas of the GLM-5.3 recipe's patch 0151 (Mia's AI Lab), re-done for Flash's indexer
+# (pooled keys, 4 rows a key tile already): its re-tiled scoring is after drowzeys' f0f382d
+# (github.com/drowzeys/TensorFold, branch glm53-tp4-2026-10-05) and BertholomusAI (Albert Lee)'s shared key tiles
+# (github.com/bertholomus/TensorFold, branch glm-dsa-tp4); the radix top-k it builds on is upstream TensorFold's by
+# ashhart (094f5e4), with taussoe's Triton port (fb985b8). No code was copied from drowzeys' or bertholomus' forks.
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index 187f004..b7f528e 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -244,6 +244,104 @@ def _select_rows(S, OUT, NPS, POS, K: tl.constexpr, BLOCK: tl.constexpr, VIS: tl
+         equal_seen += tl.sum(eq, 0)
+ 
+ 
++@triton.jit
++def _digit_hist(row, NP, prefix, fixed, p: tl.constexpr, BLOCK: tl.constexpr, KEYS: tl.constexpr):
++    """The histogram of byte 3 - p of the order keys matching ``prefix`` on ``fixed`` among NP values at ``row``:
++    fp32 scores (their ``_order_key``), or with KEYS order keys already (int32 bits)."""
++    hist = tl.zeros((256,), dtype=tl.int32)
++    for c in range(0, NP, BLOCK):
++        i = c + tl.arange(0, BLOCK)
++        ok = i < NP
++        if KEYS:
++            u = tl.load(row + i, mask=ok, other=0).to(tl.uint32, bitcast=True)
++        else:
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++        match = ok & ((u & fixed) == prefix)
++        hist += tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=match)
++    return hist
++
++
++@triton.jit
++def _digit(hist, need, prefix, fixed, p: tl.constexpr):
++    """_select_rows' step from a pass's histogram: the digit of the K-th best, the count still needed below it, the
++    prefix and mask with it."""
++    bins = tl.arange(0, 256)
++    at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist           # values with this digit or a higher one
++    digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++    need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++    prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
++    fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
++    return digit, need, prefix, fixed
++
++
++@triton.jit
++def _select_compact(S, OUT, NP, CV, CI, CAP: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
++    """Program r: _select_rows' pools (VIS off: a prompt block's rows, NP scores each) with fewer reads of the scores
++    (TF_GLM_PROMPT_SELECT, 0103). The first two radix passes read every score; the columns at or above the 16-bit
++    prefix they find (the pools certainly chosen and the candidates: the prefix's bucket spans 1/128 of a score) are
++    then counted from the two histograms, and when at most CAP, compacted in pool order (order keys into CV, pools
++    into CI) by a third read; the last two passes and the output read those only. A row with more (many equal
++    scores, e.g. the -inf columns of a row with few pools) runs the last passes over every score, as _select_rows
++    does. The same digits, pools above the threshold and lowest ties as _select_rows: the same pools."""
++
++    r = tl.program_id(0).to(tl.int64)
++    row = S + r * NP
++    cv = CV + r * CAP
++    ci = CI + r * CAP
++    bins = tl.arange(0, 256)
++    zero = tl.zeros((), dtype=tl.uint32)
++    h0 = _digit_hist(row, NP, zero, zero, 0, BLOCK, False)
++    d0, need, prefix, fixed = _digit(h0, K, zero, zero, 0)
++    h1 = _digit_hist(row, NP, prefix, fixed, 1, BLOCK, False)
++    d1, need, prefix, fixed = _digit(h1, need, prefix, fixed, 1)
++    # columns whose top 16 bits are at least the prefix: above the first digit, or on it and at least the second
++    n = tl.sum(tl.where(bins > d0, h0, 0), 0) + tl.sum(tl.where(bins >= d1, h1, 0), 0)
++    written = 0
++    equal_seen = 0
++    if n <= CAP:
++        m = 0
++        for c in range(0, NP, BLOCK):
++            i = c + tl.arange(0, BLOCK)
++            ok = i < NP
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++            take = ok & ((u & fixed) >= prefix)
++            t = take.to(tl.int32)
++            at = m + tl.cumsum(t, 0) - t
++            tl.store(cv + at, u.to(tl.int32, bitcast=True), mask=take)
++            tl.store(ci + at, i.to(tl.int32), mask=take)
++            m += tl.sum(t, 0)
++        h2 = _digit_hist(cv, n, prefix, fixed, 2, BLOCK, True)
++        d2, need, prefix, fixed = _digit(h2, need, prefix, fixed, 2)
++        h3 = _digit_hist(cv, n, prefix, fixed, 3, BLOCK, True)
++        d3, need, prefix, fixed = _digit(h3, need, prefix, fixed, 3)
++        for c in range(0, n, BLOCK):
++            j = c + tl.arange(0, BLOCK)
++            ok = j < n
++            u = tl.load(cv + j, mask=ok, other=0).to(tl.uint32, bitcast=True)
++            pool = tl.load(ci + j, mask=ok, other=0)
++            eq = (ok & (u == prefix)).to(tl.int32)
++            take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
++            t = take.to(tl.int32)
++            tl.store(OUT + r * K + written + tl.cumsum(t, 0) - t, pool.to(tl.int64), mask=take)
++            written += tl.sum(t, 0)
++            equal_seen += tl.sum(eq, 0)
++    else:
++        h2 = _digit_hist(row, NP, prefix, fixed, 2, BLOCK, False)
++        d2, need, prefix, fixed = _digit(h2, need, prefix, fixed, 2)
++        h3 = _digit_hist(row, NP, prefix, fixed, 3, BLOCK, False)
++        d3, need, prefix, fixed = _digit(h3, need, prefix, fixed, 3)
++        for c in range(0, NP, BLOCK):
++            i = c + tl.arange(0, BLOCK)
++            ok = i < NP
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++            eq = (ok & (u == prefix)).to(tl.int32)
++            take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
++            t = take.to(tl.int32)
++            tl.store(OUT + r * K + written + tl.cumsum(t, 0) - t, i.to(tl.int64), mask=take)
++            written += tl.sum(t, 0)
++            equal_seen += tl.sum(eq, 0)
++
++
+ @triton.jit
+ def _visible_bound(NPS, P, r, K: tl.constexpr):
+     """Columns a decode row at position P + r needs: its complete pools, at least K, at most the NPS scored.
+@@ -273,6 +371,21 @@ def top_pools(scores: torch.Tensor, k: int, pos: torch.Tensor | None = None) ->
+     return out
+ 
+ 
++def select_compact(scores: torch.Tensor, k: int, scratch: torch.Tensor | None = None) -> torch.Tensor:
++    """``top_pools``' pools of prompt rows (no visible bounds) on _select_compact: each row's k best ascending, int64
++    [R, k]. ``scratch``: int32, at least 2 R COMPACT_CAP (allocated when None)."""
++    R, NP = scores.shape
++    if NP < k or not scores.is_contiguous():
++        return top_pools(scores, k)
++    if scratch is None or scratch.numel() < 2 * R * COMPACT_CAP:
++        scratch = torch.empty((2 * R * COMPACT_CAP,), dtype=torch.int32, device=scores.device)
++    out = torch.empty((R, k), dtype=torch.int64, device=scores.device)
++    if R:
++        _select_compact[(R,)](scores, out, NP, scratch[:R * COMPACT_CAP], scratch[R * COMPACT_CAP:2 * R * COMPACT_CAP],
++                              CAP=COMPACT_CAP, K=k, BLOCK=1024, num_warps=4)
++    return out
++
++
+ def pool_bucket(pos: int, R: int, np_max: int) -> int:
+     """Pools to score for rows pos .. pos + R - 1: the visible ones rounded up to a power of two (at least 1024), at most the capacity's."""
+     visible = (pos + R) // POOL + 1
+@@ -280,6 +393,10 @@ def pool_bucket(pos: int, R: int, np_max: int) -> int:
+ 
+ 
+ PROMPT_ROWS = 64          # windows from this many rows (prompt chunks, eager) take the prompt selection below
++# TF_GLM_PROMPT_SELECT (0103; default on): a prompt chunk's top-k on _select_compact (two passes over every score, the
++# rest over the compacted candidates). The same pools as _select_rows (0: that kernel). The scores are _scores' either way.
++PROMPT_SELECT = __import__("os").environ.get("TF_GLM_PROMPT_SELECT", "1") != "0"
++COMPACT_CAP = 2048        # candidates a row's last passes may take compacted (more: they read every score)
+ 
+ 
+ def pool_count(pos: int, R: int, np_max: int) -> int:
+@@ -380,6 +497,8 @@ def _prompt_blocks(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+     pkv, pks, rs, fp8 = kv8.parts(pk)
++    cand = (torch.empty((2 * B * COMPACT_CAP,), dtype=torch.int32, device=dev)
++            if PROMPT_SELECT and NP >= TOPK_POOLS else None)
+     for a in range(0, R, B):
+         n = min(B, R - a)
+         at = pos_dev if a == 0 else pos_dev + a
+@@ -388,7 +507,10 @@ def _prompt_blocks(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+                                                                    scores, at, n, NP, D ** -0.5, wscale, H=H,
+                                                                    HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+                                                                    L=SCORE_LOOP, RS=rs, FP8=fp8, num_warps=4)
+-        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
++        if cand is not None:
++            pools = select_compact(scores, TOPK_POOLS, cand)                            # ascending pool index
++        else:
++            pools = top_pools(scores, TOPK_POOLS)                                       # ascending pool index
+         if pools_out is not None:
+             pools_out[a:a + n].copy_(pools)
+         else:

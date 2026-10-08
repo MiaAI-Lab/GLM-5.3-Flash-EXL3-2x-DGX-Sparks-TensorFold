@@ -1,0 +1,565 @@
+# A row-split prompt chunk's DSA layers run their replicated front on each rank's own rows (TF_GLM_PROMPT_OWN_FRONT=1
+# with TF_GLM_HC_SPLIT=1; off by default until measured on the Sparks):
+#
+# - Why: with the row split each rank ends a layer holding the next layer's normed input for its own rows only and
+#   swapped them (hidden 4,096 x bf16: 8 KiB a row), so that every rank ran the next block on every row. KDA and the
+#   MoE need every row (split by heads and experts), but most of a DSA block's front is replicated: q_a / kv_a and their
+#   norms, the indexer's key / weight projection, its gate, its query projection and the top-k over every visible
+#   pooled key, which grows with the context. Every rank ran all of it on every row.
+# - own_front.front: before a DSA layer the glue keeps the normed rows on their owner (HcSplit.glue(share=False)); each
+#   rank runs the front on its own rows (forward.dsa_front, already run during the glue with TF_GLM_PREFILL_OVERLAP=2,
+#   plus the indexer's keys, weights, gates and queries) and shares the outputs: the index keys / weights (bf16) and
+#   gates (fp32), then the q_a / kv_a norms' rows (4 KiB a row); every rank writes every row's index keys, gates and
+#   pooled keys, selects its own rows' top-512 pools (sparse.select_pools) and shares them (512 int32 a row); every
+#   rank then makes every row's tokens from the pools (sparse.pool_tokens, select_tokens' formulas). own_front.rest:
+#   q_b for the rank's heads on the other rows, the latent write, absorb, dense attention, sparse attention, expand and
+#   o_proj, as before.
+# - hcsplit: HcSplit.share / wait (whole own shares, send/receive or the all-gather, on the side stream with the
+#   overlap) and glue(share=False); SplitSettings.own_front joins the ranks' startup comparison.
+# - sparse: _select_prompt's blocks factored into _prompt_blocks, select_pools and pool_tokens (the same kernels).
+# - forward: the prompt's sparse attention call in one place (sparse_prompt), used by dsa_rows and own_front.
+# - Kept on the unchanged path: several streams' prompts in one chunk (multi_prefill's mixer), chunks too short to
+#   split, decode and verify windows, TF_GLM_LATENT=0.
+#
+# Bits: every kernel is the unchanged path's on the same row; a row's pools depend on its query, weights and the
+# pooled keys at or before its position, written on every rank before any rank selects, and are the same in any block
+# of rows; partials are still summed rank 0 first; every rank writes its caches from the same shared bytes. Rows that
+# keep dense attention (count 0) may get other, unread, pools.
+#
+# Bytes a DSA layer's own rows send (instead of 8 KiB a row of normed rows): 4.8 KiB a row (index keys 320 B, gates
+# 512 B, the norms' rows 4,096 B), 6.8 KiB once the chunk has sparse rows (pools 2 KiB).
+#
+# GPU check (one GB10, a 2,048-row chunk, FP8 and bf16 pooled keys, 2.6k to 128k tokens): each rank's own-row pools at
+# TP=2 / 3 / 4 give exactly the whole chunk's tokens and counts. The selection a rank runs at 128k (FP8): 26.8 ms on
+# 2,048 rows, 13.6 / 8.7 / 6.3 ms on its 1,024 / 683 / 512 (32k: 6.0 -> 2.8 / 2.0 / 1.4 ms).
+#
+# Provenance and credit: ported from the GLM-5.3 recipe's patch 0147 (Mia's AI Lab) to Flash's DSA (pooled keys, no
+# rotary part; pools shared instead of token lists). The design (the replicated projections and the indexer's top-k on
+# a rank's own rows, their outputs gathered) follows drowzeys' sequence-parallel prompt path, which drowzeys authored:
+# github.com/drowzeys/TensorFold, branch glm53-tp4-2026-10-05, compute_prompt_sp with TF_GLM53_SP_SELECT. No code was
+# copied from it.
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 60322fa..39bf37f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -710,7 +710,8 @@ class GlmEngine:
+         if odd:
+             raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+-                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
++                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_PROMPT_OWN_FRONT, "
++                               "TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 8ecaf31..6b96075 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -692,16 +692,26 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+             tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+-            if b.prefill and msa.ENABLED and msa.supported(qa, lc):    # TF_GLM_MSA=1: prompt rows on msa.cu
+-                msa.prompt(qa, lc, tokens, counts, ol, scale)
+-            elif b.prefill and latent.SPARSE_ONEPASS:   # prompt rows: one pass a row, no partials (their own bits)
+-                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
++            if b.prefill:
++                sparse_prompt(qa, lc, tokens, counts, ol, scale)
+             else:
+                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+         return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+ 
+ 
++def sparse_prompt(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, ol: torch.Tensor,
++                  scale: float) -> None:
++    """A prompt chunk's sparse rows (counts > 0) over their tokens into ol; other rows left alone."""
++
++    if msa.ENABLED and msa.supported(qa, lc):         # TF_GLM_MSA=1: msa.cu
++        msa.prompt(qa, lc, tokens, counts, ol, scale)
++    elif latent.SPARSE_ONEPASS:                        # one pass a row, no partials (their own bits)
++        latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
++    else:
++        latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
++
++
+ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+                  select: bool = True) -> torch.Tensor | None:
+     """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
+@@ -880,11 +890,15 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+     ``mixer``: the layers' KDA / DSA blocks as ``mixer(layer, done)`` instead of on ``st`` (a chunk of several
+     streams' prompts, ``multi_prefill``)."""
+ 
++    from . import own_front
++
+     c = w.cfg
+     sp = b.split
+     layers = w.layers
+     sp.begin(R)
+     fronts = sp.settings.fronts
++    # TF_GLM_PROMPT_OWN_FRONT: DSA layers' replicated front on own rows, its outputs shared, not the normed rows
++    own = own_front.applies(w, st, b, mixer, host_pos)
+     try:
+         Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
+         first, h = layers[0], layers[0].attn_hc
+@@ -894,6 +908,9 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+         for i, layer in enumerate(layers):
+             if mixer is not None:
+                 mixer(layer, done)
++            elif own and own_front.takes(layer):
++                with prof.timed("dsa (total)"):
++                    own_front.dsa_block(layer, w, st, b, R, nch, host_pos, done)
+             else:
+                 _mixer(layer, w, st, b, R, nch, host_pos, None, done)
+             front = ffn_front(layer, w, b) if fronts else None
+@@ -904,7 +921,8 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+             front = mixer_front(nxt, w, b) if fronts and nxt is not None else None
+             with prof.timed("hc (layer end)"):
+                 sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
+-                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front)
++                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front,
++                        share=not (own and nxt is not None and own_front.takes(nxt)))
+             done = sp.own() if front is not None else None
+             yield layer.index
+     finally:
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 79b4f8c..2e60cd8 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -25,6 +25,11 @@ are still on the wire; the block then runs its front on the peer's rows once the
+ before. Without it the main stream waited for the last piece's swap with nothing to do. The fronts are row-independent
+ kernels (the prompt matmul gives every row range the same bits), so every bit is still the unsplit path's.
+ 
++TF_GLM_PROMPT_OWN_FRONT=1 (``own_front``): the glue before a DSA layer keeps the normed rows on their owner, whose
++attention block runs its replicated front (q_a / kv_a and their norms, the indexer's projections and its top-k) on
++them and shares the outputs (``share``: whole own shares, send/receive or the all-gather, on the side stream with the
++overlap) instead.
++
+ TF_GLM_HC_EXCHANGE: ``p2p`` (the default) swaps rows with ncclSend/ncclRecv; ``gather`` uses the NCCL all-gather
+ instead (whole halves, one piece: the partial halves out of place into the unused all-gather buffer, the bf16 rows in
+ place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric."""
+@@ -40,6 +45,7 @@ import torch
+ from . import glue
+ 
+ EXCHANGES = ("p2p", "gather")
++SHARES = 4               # own-row shares a layer keeps in flight at once (``HcSplit.share``: slots 0 .. SHARES - 1)
+ 
+ 
+ def _flag(env, name: str) -> bool:
+@@ -87,10 +93,13 @@ class SplitSettings:
+     min_rows: int = 64            # TF_GLM_HC_SPLIT_MIN_ROWS: shorter chunks (a prompt's tail) run unsplit
+     exchange: str = "p2p"         # TF_GLM_HC_EXCHANGE: p2p (ncclSend/ncclRecv) or gather (the all-gather)
+     fronts: bool = False          # TF_GLM_PREFILL_OVERLAP=2: the next block's front on own rows during the swaps
++    own_front: bool = False       # TF_GLM_PROMPT_OWN_FRONT=1: DSA's replicated front on own rows (``own_front``)
+ 
+     def __post_init__(self) -> None:
+         if self.fronts and not self.overlap:
+             raise ValueError("the blocks' fronts run during the overlapped swaps: they need the overlap")
++        if self.own_front and not self.split:
++            raise ValueError("TF_GLM_PROMPT_OWN_FRONT=1 runs on the row split's own rows: it needs TF_GLM_HC_SPLIT=1")
+ 
+     @classmethod
+     def from_env(cls, env=None) -> "SplitSettings":
+@@ -107,16 +116,17 @@ class SplitSettings:
+         if exchange not in EXCHANGES:
+             raise ValueError(f"TF_GLM_HC_EXCHANGE: {' or '.join(EXCHANGES)}, not {exchange!r}")
+         return cls(split, overlap, _int(env, "TF_GLM_OVERLAP_PIECES", 2, 1, 8),
+-                   _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange, fronts=level == "2")
++                   _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange, fronts=level == "2",
++                   own_front=_flag(env, "TF_GLM_PROMPT_OWN_FRONT"))
+ 
+     def piece_count(self) -> int:
+         return self.pieces if self.overlap and self.exchange == "p2p" else 1
+ 
+     def code(self) -> list[int]:
+         if not self.split:
+-            return [0, 0, 0, 0, 0]
++            return [0, 0, 0, 0, 0, 0]
+         return [1, int(self.overlap) + int(self.fronts), self.piece_count(), self.min_rows,
+-                EXCHANGES.index(self.exchange)]
++                EXCHANGES.index(self.exchange), int(self.own_front)]
+ 
+     def describe(self) -> str:
+         what = "rows split between the ranks"
+@@ -126,6 +136,8 @@ class SplitSettings:
+             what += f" on a second stream{f' in {n} pieces' if n > 1 else ''}"
+             if self.fronts:
+                 what += ", the next block's front on own rows meanwhile"
++        if self.own_front:
++            what += "; DSA's replicated front (q_a / kv_a, the indexer, its top-k) on own rows, its outputs shared"
+         return f"prompt chunks' hyper-connections: {what} (chunks of {self.min_rows}+ rows)"
+ 
+ 
+@@ -170,6 +182,9 @@ class HcSplit:
+             self.ev_part = [torch.cuda.Event() for _ in range(n)]
+             self.ev_glue = [torch.cuda.Event() for _ in range(n)]
+             self.ev_done = torch.cuda.Event()
++            # TF_GLM_PROMPT_OWN_FRONT: a layer's own-row shares (``share``): up to SHARES in flight on the side stream
++            self.ev_share_in = [torch.cuda.Event() for _ in range(SHARES)]
++            self.ev_share_out = [torch.cuda.Event() for _ in range(SHARES)]
+ 
+     def padded(self, R: int) -> int:
+         """R rounded up to a whole share a rank (two ranks: an odd chunk gets one pad row)."""
+@@ -276,6 +291,47 @@ class HcSplit:
+         theirs = self.theirs() + off
+         self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
+ 
++    def _swap_share(self, outs: list[torch.Tensor]) -> None:
++        """Every rank's whole share of rows [r H, r H + H) of each row buffer in ``outs`` to every rank (this rank's
++        out, the peers' in; pad rows travel too, never read): ``_swap_rows`` for the share in one piece."""
++
++        H, mine = self.H, self.mine()
++        if self.gather:                                 # rank order is row order
++            for t in outs:
++                self.all_gather(t[mine:mine + H].reshape(-1), t[:self.Rp].reshape(-1))
++            return
++        if self.world > 2:
++            self.w.comm.exchange_all({p: [t[mine:mine + H] for t in outs] for p in self.peers},
++                                     {p: [t[p * H:p * H + H] for t in outs] for p in self.peers})
++            return
++        theirs = self.theirs()
++        self.w.comm.exchange([t[mine:mine + H] for t in outs], [t[theirs:theirs + H] for t in outs], self.peer)
++
++    def share(self, outs: list[torch.Tensor], slot: int = 0):
++        """TF_GLM_PROMPT_OWN_FRONT: this rank's rows of ``outs`` (contiguous row buffers it wrote on the current
++        stream) to every peer and theirs in. With the overlap: on the side stream after the current stream's work so
++        far, returning the event the reader waits on (``wait``) before it reads the peers' rows; it must not write
++        ``outs`` before that either. Without: on the current stream, None. Every rank issues its shares (and the
++        glue's swaps) in one order, so the collectives match."""
++
++        if self.stream is None:
++            self._swap_share(outs)
++            return None
++        main = torch.cuda.current_stream()
++        ev_in, ev_out = self.ev_share_in[slot], self.ev_share_out[slot]
++        ev_in.record(main)
++        with torch.cuda.stream(self.stream):
++            self.stream.wait_event(ev_in)
++            self._swap_share(outs)
++            ev_out.record(self.stream)
++        return ev_out
++
++    @staticmethod
++    def wait(ev) -> None:
++        """The current stream waits for a ``share`` (None: it ran on the current stream)."""
++        if ev is not None:
++            torch.cuda.current_stream().wait_event(ev)
++
+     def partial(self, fill: Callable[[int, int], None]) -> None:
+         """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peers' rows sent to them and
+         their partials of this rank's rows received (``got``)."""
+@@ -331,17 +387,20 @@ class HcSplit:
+             glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi])
+ 
+     def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+-             front: Callable[[int, int], None] | None = None) -> None:
++             front: Callable[[int, int], None] | None = None, share: bool = True) -> None:
+         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
+         and the next hc_pre (``hc``, ``norm``); their rows swapped with the peers'. ``front(lo, hi)``
+         (TF_GLM_PREFILL_OVERLAP=2): the next block's row-independent start on this rank's rows of each piece, on the
+         main stream right after the piece's glue, while its swap (and the later pieces' partials) are on the wire;
+-        the caller runs it on the peers' rows (``own`` is what was done) after this returns."""
++        the caller runs it on the peers' rows (``own`` is what was done) after this returns. ``share`` False
++        (TF_GLM_PROMPT_OWN_FRONT, before a DSA layer): the normed rows stay this rank's own (the DSA block's own-row
++        front shares what the other ranks need); the taps and the final mean still travel."""
+ 
+         b, c = self.b, self.w.cfg
+         mine = self.mine()
+         main = torch.cuda.current_stream()
+-        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
++        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + \
++            ([b.normed] if hc is not None and share else [])
+         for j, (off, n) in enumerate(self.pieces):
+             lo, hi = mine + off, mine + off + n
+             if self.stream is not None:
+@@ -356,14 +415,16 @@ class HcSplit:
+                 glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                             b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+             if self.stream is None:
+-                self._swap_rows(j, outs)
++                if outs:
++                    self._swap_rows(j, outs)
+                 if front is not None:
+                     self._fill(front, lo, hi)
+                 continue
+-            self.ev_glue[j].record(main)
+-            with torch.cuda.stream(self.stream):
+-                self.stream.wait_event(self.ev_glue[j])
+-                self._swap_rows(j, outs)
++            if outs:
++                self.ev_glue[j].record(main)
++                with torch.cuda.stream(self.stream):
++                    self.stream.wait_event(self.ev_glue[j])
++                    self._swap_rows(j, outs)
+             if front is not None:
+                 self._fill(front, lo, hi)
+         if self.stream is not None:
+diff --git tensorfold/families/glm5_next/cuda/own_front.py tensorfold/families/glm5_next/cuda/own_front.py
+new file mode 100644
+index 0000000..0d7a9a5
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/own_front.py
+@@ -0,0 +1,190 @@
++"""TF_GLM_PROMPT_OWN_FRONT=1: a row-split prompt chunk's DSA layers run their replicated front on each rank's own rows.
++
++With the row split (``hcsplit``, TF_GLM_HC_SPLIT=1) each rank ends a layer holding the next layer's normed input for
++its own rows [r H, r H + H) only, and swaps those bf16 rows (hidden 4,096: 8 KiB a row) so that every rank can run the
++next block on every row. A KDA block and the MoE need every row (their projections are split by heads and experts),
++but most of a DSA block's front is replicated, not head-split: q_a / kv_a (one projection, ``a.proj``) and their
++RMSNorms, the indexer's key and weight projection (``kw``), its gate, its query projection (``qb``) and the top-k
++selection over every visible pooled key, which grows with the context. Every rank ran all of it on every row.
++
++Here, before a DSA layer, the glue keeps the normed rows on their owner (``HcSplit.glue(share=False)``); each rank runs
++that front on its own rows and the ranks share its outputs instead:
++
++1. own rows: q_a / kv_a and their norms (b.qr, b.lat) and q_b for this rank's heads (``forward.dsa_front``, already
++   run during the glue with TF_GLM_PREFILL_OVERLAP=2), with the indexer the index keys and weights (b.ikr) and gates
++   (b.igr), and when the chunk has sparse rows the index queries (b.qi);
++2. shared: b.ikr and b.igr's rows (with the indexer), then b.qr and b.lat's rows (4 KiB a row);
++3. every rank: every row's index key, gate and pooled key (``sparse.index_update``, as before: the same kernel on the
++   same rows), then this rank's rows' selection over those keys (``sparse.select_pools``), whose pools (512 int32 a
++   row) are shared in turn;
++4. every rank, every row, as before: q_b for its heads on the other ranks' rows, the latent write, absorb, dense
++   attention, then the tokens of every row from the pools (``sparse.pool_tokens``), sparse attention, expand and
++   o_proj.
++
++Every kernel is the unchanged path's on the same row (the projections, norms and writers keep rows apart; a row's
++pools depend only on its own query and weights and the pooled keys at or before its position, which every rank has
++written before any rank selects, and are the same in any block of rows: ``sparse.select_pools``), so the caches, the
++sparse rows' tokens and every output are the unchanged path's bit for bit, and identical on every rank: what each rank
++writes it computed from the same shared bytes. Rows that keep dense attention (count 0) may get other, unread, pools.
++
++Order: with the overlap (TF_GLM_PREFILL_OVERLAP=1 or 2) the shares run on the split's side stream, in one order on
++every rank (index keys, the rows, then the pools), so the index update and selection run while the rows are on the
++wire, and q_b, the latent write, absorb and dense attention while the pools are. Without it they run in place.
++
++Not for several streams' prompts in one chunk (``multi_prefill``'s mixer), chunks too short to split, decode and
++verify windows, nor without the latent cache (TF_GLM_LATENT=0): those keep the unchanged path.
++
++By Mia's AI Lab (Apache-2.0), ported from the GLM-5.3 recipe's patch 0147 to Flash's DSA (pooled keys, no rotary
++part). Design credit: drowzeys (github.com/drowzeys/TensorFold, branch glm53-tp4-2026-10-05, ``compute_prompt_sp`` with
++TF_GLM53_SP_SELECT) authored the sequence-parallel prompt front this follows (the replicated projections and the top-k
++on a rank's own rows, their outputs gathered); no code of theirs."""
++
++from __future__ import annotations
++
++import torch
++
++from . import glue, latent, prof, sparse
++
++
++def applies(w, st, b, mixer, host_pos) -> bool:
++    """Whether a row-split prompt chunk's DSA layers take the own-row front: TF_GLM_PROMPT_OWN_FRONT, one stream's
++    prompt on ``st`` (no ``mixer``), its position known on the host, the latent cache."""
++
++    sp = b.split
++    return (sp is not None and sp.settings.own_front and mixer is None and st is not None and host_pos is not None
++            and b.prefill and latent.ENABLED)
++
++
++def takes(layer) -> bool:
++    """A layer whose attention block runs here: DSA on the latent cache."""
++    return layer.kind != "kda" and layer.dsa.absorb is not None
++
++
++def _lists(b):
++    """The chunk's pools [alloc rows, TOPK_POOLS], tokens [alloc rows, TOKENS] and counts [alloc rows], int32, kept
++    with the prompt buffers (each rank writes its own rows' pools, the shares the others'; every rank the tokens)."""
++
++    t = getattr(b, "own_lists", None)
++    if t is None:
++        dev, rows = b.ids.device, b.alloc_rows
++        t = (torch.empty((rows, sparse.TOPK_POOLS), dtype=torch.int32, device=dev),
++             torch.empty((rows, sparse.TOKENS), dtype=torch.int32, device=dev),
++             torch.empty((rows,), dtype=torch.int32, device=dev))
++        b.own_lists = t
++    return t
++
++
++def _others(R: int, lo: int, hi: int) -> list[tuple[int, int]]:
++    """The row ranges of [0, R) outside this rank's [lo, hi)."""
++
++    return [(a, z) for a, z in ((0, min(lo, R)), (max(hi, 0), R)) if z > a]
++
++
++class Front:
++    """A layer's own-row front of one chunk (``front``), what ``rest`` needs: the rows, the flags, the shares' events
++    (None: they ran on the current stream)."""
++
++    __slots__ = ("lo", "hi", "sparse_rows", "all_sparse", "ev_rows", "ev_pools")
++
++    def __init__(self, **kw) -> None:
++        for k, v in kw.items():
++            setattr(self, k, v)
++
++
++def front(layer, w, st, b, R: int, host_pos: int, done: tuple[int, int] | None = None) -> Front:
++    """Steps 1 to 3 on the current stream: this rank's rows' replicated front, its shares, every row's index keys,
++    this rank's rows' selection and its share. ``done``: rows ``forward.dsa_front`` already ran on (the glue's
++    fronts, TF_GLM_PREFILL_OVERLAP=2)."""
++
++    from .forward import dsa_front, mm
++
++    c = w.cfg
++    a = layer.dsa
++    sp = b.split
++    ix = a.index
++    di = st.dsa_index[layer.index]
++    index = st.index[di] if st.index is not None else None
++    lo, hi = sp.own()
++    n = max(0, hi - lo)
++    all_sparse = host_pos >= c.dense_limit
++    sparse_rows = index is not None and host_pos + R - 1 >= c.dense_limit
++
++    # 1. the replicated front on this rank's rows
++    with prof.timed("dsa: own front"):
++        if n:
++            if done != (lo, hi):
++                dsa_front(layer, w, b, lo, hi)
++            if index is not None:
++                mm(b, b.normed[lo:hi], ix.kw, b.xs[lo:hi], b.ikr[lo:hi])
++                glue.router(b.normed[lo:hi], ix.gate, b.igr[lo:hi])
++            if sparse_rows:
++                mm(b, b.qr[lo:hi], ix.qb, b.xs_qr[lo:hi], b.qi[lo:hi])
++    # 2. shared: the index keys and gates first (the index update waits for them only), then the norms' rows
++    ev_keys = sp.share([b.ikr, b.igr], slot=0) if index is not None else None
++    ev_rows = sp.share([b.qr, b.lat], slot=1)
++    # 3. every row's index keys, then this rank's rows' pools, shared
++    ev_pools = None
++    if index is not None:
++        ik, ig, pk = index
++        sp.wait(ev_keys)
++        with prof.timed("dsa: indexer update"):
++            sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, st.pos_dev)
++        if sparse_rows:
++            pools, _, _ = _lists(b)
++            with prof.timed("dsa: select tokens"):
++                if n:
++                    at = st.pos_dev + lo if lo else st.pos_dev
++                    sparse.select_pools(b.qi[lo:hi], b.ikr[lo:hi, c.index_dim:], pk, host_pos + lo, n,
++                                        pk.shape[0] - 2, at, pools[lo:hi])
++            ev_pools = sp.share([pools], slot=2)
++    return Front(lo=lo, hi=hi, sparse_rows=sparse_rows, all_sparse=all_sparse, ev_rows=ev_rows, ev_pools=ev_pools)
++
++
++def rest(layer, w, st, b, R: int, nch: int | None, host_pos: int, f: Front):
++    """Step 4 on the current stream after ``front``: every row's attention for this rank's heads, kv_b's value rows
++    and o_proj; this rank's partials go out through the split (``forward.partials``: None returned)."""
++
++    from . import l2pf, qmm
++    from .forward import dense_attention, dense_rows, mm, out_proj, sparse_prompt
++
++    c = w.cfg
++    a = layer.dsa
++    sp = b.split
++    lc = st.kc[st.dsa_index[layer.index]]
++    pos_dev = st.pos_dev
++    HL = a.heads
++    # 4. every row: q_b on the other ranks' rows, the latent write, the queries
++    sp.wait(f.ev_rows)
++    with prof.timed("dsa: projections"):
++        for x, z in _others(R, f.lo, f.hi):
++            mm(b, b.qr[x:z], a.q_b, b.xs_qr[x:z], b.q[x:z].view(z - x, HL * c.qk_dim))
++    s = b.lat_s
++    with prof.timed("dsa: latent write"):
++        latent.latent_write(b.lat[:R], lc, pos_dev)
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=latent.PROMPT_MMA)
++    l2pf.site(layer.index, "o")
++    ol = s.ol[:R]
++    scale = c.qk_dim ** -0.5
++    if not f.all_sparse:
++        dense = dense_rows(c, R, host_pos) if f.sparse_rows else R
++        with prof.timed("dsa: dense attention"):
++            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
++                            hb=latent.head_block(R), starts=b.att_starts)
++    if f.sparse_rows:
++        pools, tokens, counts = _lists(b)
++        sp.wait(f.ev_pools)
++        with prof.timed("dsa: select tokens"):
++            sparse.pool_tokens(pools[:R], pos_dev, tokens[:R], counts[:R])
++        with prof.timed("dsa: sparse attention"):
++            sparse_prompt(qa, lc, tokens[:R], counts[:R], ol, scale)
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=latent.PROMPT_MMA).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
++
++
++def dsa_block(layer, w, st, b, R: int, nch: int | None, host_pos: int, done: tuple[int, int] | None = None):
++    """A DSA block of a row-split prompt chunk with its replicated front on this rank's rows (the module's steps, all
++    on the current stream); this rank's partials go out through the split (None returned)."""
++
++    return rest(layer, w, st, b, R, nch, host_pos, front(layer, w, st, b, R, host_pos, done))
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index 18b0e85..187f004 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -357,6 +357,19 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+       dot;
+     - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
+ 
++    width = TOPK_POOLS * POOL + POOL - 1
++    tokens = torch.empty((R, width), dtype=torch.int32, device=qi.device)
++    counts = torch.empty((R,), dtype=torch.int32, device=qi.device)
++    _prompt_blocks(qi, wts, pk, pos, R, np_max, pos_dev, tokens=tokens, counts=counts)
++    return tokens, counts
++
++
++def _prompt_blocks(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                   pos_dev: torch.Tensor, *, tokens: torch.Tensor | None = None, counts: torch.Tensor | None = None,
++                   pools_out: torch.Tensor | None = None) -> None:
++    """_select_prompt's blocks: each block's scores and top-k pools, then its tokens and counts (``tokens`` /
++    ``counts``), or the pools only, as int32 into ``pools_out`` [R, TOPK_POOLS] (``select_pools``)."""
++
+     dev = qi.device
+     NP = pool_count(pos, R, np_max)
+     # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
+@@ -366,9 +379,6 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+     H = wts.shape[1]
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+-    width = TOPK_POOLS * POOL + POOL - 1
+-    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
+-    counts = torch.empty((R,), dtype=torch.int32, device=dev)
+     pkv, pks, rs, fp8 = kv8.parts(pk)
+     for a in range(0, R, B):
+         n = min(B, R - a)
+@@ -379,9 +389,34 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+                                                                    HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+                                                                    L=SCORE_LOOP, RS=rs, FP8=fp8, num_warps=4)
+         pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+-        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
+-                      num_warps=4)
+-    return tokens, counts
++        if pools_out is not None:
++            pools_out[a:a + n].copy_(pools)
++        else:
++            pool_tokens(pools, at, tokens[a:a + n], counts[a:a + n])
++
++
++def select_pools(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                 pos_dev: torch.Tensor, out: torch.Tensor) -> None:
++    """The prompt selection's pools of R rows at positions pos .. pos + R - 1, int32 [R, TOPK_POOLS] ascending into
++    ``out`` (TF_GLM_PROMPT_OWN_FRONT: a rank's own rows of a chunk; ``pool_tokens`` then gives every row's tokens).
++    A row's pools are the same in any block of rows: its scores' bits do not depend on the other rows (``_scores``),
++    and the columns a block scores past the row's visible pools are -inf with the highest indices, below every column
++    of a counted row's best TOPK_POOLS (``_select_prompt``). Rows that keep dense attention (count 0) may get other
++    pools, which nothing reads."""
++
++    if out.dtype != torch.int32 or out.shape != (R, TOPK_POOLS) or not out.is_contiguous():
++        raise ValueError(f"select_pools: out must be contiguous int32 [{R}, {TOPK_POOLS}]")
++    if R:
++        _prompt_blocks(qi, wts, pk, pos, R, np_max, pos_dev, pools_out=out)
++
++
++def pool_tokens(pools: torch.Tensor, pos_dev: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor) -> None:
++    """Rows' tokens [R, TOKENS] and counts [R] from their pools [R, TOPK_POOLS] ascending (int64 or int32), the rows at
++    positions pos_dev .. pos_dev + R - 1: select_tokens' formulas (``_tokens``)."""
++
++    R = pools.shape[0]
++    if R:
++        _tokens[(R,)](pools, pos_dev, tokens, counts, W=TOKENS, K=TOPK_POOLS, PL=POOL, BLOCK=1024, num_warps=4)
+ 
+ 
+ @triton.jit

@@ -12,9 +12,10 @@
 # (the default), nothing changes.
 
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index f541a89..d8ffcad 100644
 --- tensorfold/cuda/comm.py
 +++ tensorfold/cuda/comm.py
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,7 @@ import os
  
  import torch
  
@@ -23,7 +24,7 @@ diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
  
  
  class _UniqueId(ctypes.Structure):
-@@ -40,6 +40,11 @@
+@@ -40,6 +40,11 @@ class NCCL:
          from torch.distributed import TCPStore
  
          self.rank, self.world = rank, world
@@ -35,7 +36,7 @@ diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
          self.lib = _library()
          lib = self.lib
          lib.ncclGetErrorString.restype = ctypes.c_char_p
-@@ -64,6 +69,45 @@
+@@ -64,6 +69,45 @@ class NCCL:
          self.comm = ctypes.c_void_p()
          torch.cuda.current_device()
          self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
@@ -81,7 +82,7 @@ diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
  
      def _check(self, code: int) -> None:
          if code != 0:
-@@ -135,6 +179,9 @@
+@@ -135,6 +179,9 @@ class NCCL:
              for s, r in zip(sends[p], recvs[p]):
                  if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
                      raise ValueError("exchange_all: each send and receive must be contiguous and alike")
@@ -91,7 +92,7 @@ diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
          stream = torch.cuda.current_stream().cuda_stream
          self._check(self.lib.ncclGroupStart())
          try:
-@@ -146,6 +193,86 @@
+@@ -146,6 +193,86 @@ class NCCL:
          finally:
              self._check(self.lib.ncclGroupEnd())
  

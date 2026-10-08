@@ -1,0 +1,42 @@
+# The RoCE all-gather's queue pairs wait for an ACK as NCCL does: timeout 20 (4.096 us x 2^20, ~4 s a try) instead of
+# b12x's 14 (~0.5 s in all over 7 retries), with TF_ROCE_IB_TIMEOUT (1-31) to override it. On the four-Spark ring a
+# momentary stall of one cable once failed an RDMA write and stopped the server while NCCL rode it out.
+# Ported from the GLM-5.3 recipe's patch 0155 (Mia's AI Lab).
+diff --git tensorfold/cuda/roce_proxy.c tensorfold/cuda/roce_proxy.c
+index fdcf1dc..b2c1501 100644
+--- tensorfold/cuda/roce_proxy.c
++++ tensorfold/cuda/roce_proxy.c
+@@ -11,6 +11,8 @@
+ // previous rank to the next, odd ones from the next to the previous), so every peer's flags arrive as before and the
+ // GPU side is unchanged. A rank posts its next payload only once it has relayed, and the NIC has finished reading,
+ // everything up to the one before: so a relayed slot is never overwritten while it is still being sent on.
++// TensorFold, 2026-10-05 (Mia's AI Lab): the queue pairs' ACK timeout is 20, NCCL's default (b12x's is 14), and
++// TF_ROCE_IB_TIMEOUT overrides it.
+ 
+ // RDMA proxy for the b12x RoCE one-shot all-reduce.
+ //
+@@ -370,6 +372,12 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     return 0;
+ }
+ 
++static uint8_t roce_ib_timeout(void) {
++    const char *v = getenv("TF_ROCE_IB_TIMEOUT");
++    int t = (v && *v) ? atoi(v) : 20;
++    return (uint8_t)((t >= 1 && t <= 31) ? t : 20);
++}
++
+ static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer, int rh) {
+     // local HCA h's QP for peer p <-> the peer's HCA rh's QP for this rank
+     roce_hca_t *hca = &c->hca[h];
+@@ -401,7 +409,10 @@ static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer, int
+     struct ibv_qp_attr rts;
+     memset(&rts, 0, sizeof(rts));
+     rts.qp_state = IBV_QPS_RTS;
+-    rts.timeout = 14;
++    // ACK timeout 4.096 us x 2^timeout a try, 7 retries: 14 (b12x's) gave up after ~0.5 s without ACKs, which a
++    // four-Spark ring's link once stalled for while NCCL (its default 20: ~4 s a try) rode it out; TF_ROCE_IB_TIMEOUT
++    // overrides it (1-31)
++    rts.timeout = roce_ib_timeout();
+     rts.retry_cnt = 7;
+     rts.rnr_retry = 7;
+     rts.sq_psn = 0;

@@ -1,0 +1,80 @@
+# A decode window's MoE shared expert on a second stream beside the router, the expert selection and the routed EXL3
+# experts (TF_GLM_SIDE=1; off by default until measured on the Sparks):
+#
+# - forward.Buffers: decode buffers get a second CUDA stream with TF_GLM_SIDE=1 (prompt buffers none).
+# - forward.moe_block (decode windows, an EXL3 checkpoint's 4-bit shared expert, TF_GLM_DENSE=q4): the shared expert
+#   (gate/up, SwiGLU, down into b.sy) is queued on the side stream after everything the main stream has queued, the
+#   routed experts run on the main stream, and the main stream waits for the side before the combine reads b.sy. Both
+#   are stream-event edges under CUDA graph capture, joined inside the block. 4-bit matmuls keep no split-K scratch, so
+#   the two streams share no buffer; BF16 / FP8 shared experts (whose matmuls share b.sk) keep one stream.
+#
+# Every kernel gets the same arguments as on one stream: the same bits. Tested on one GB10 (tests/gpu/
+# test_decode_side_stream_gpu.py: the tiny checkpoint with an EXL3 MoE layer, decode windows of 1, 4 and 16 rows,
+# eager and replayed from a CUDA graph, logits equal to one stream's, the shared expert seen on the side stream).
+#
+# Measured on one GB10 (one MoE layer of a decode window, CUDA-graph replays, a rank's shapes, random routing): one /
+# two streams 281.0 / 262.9 us at 1 row (TP=2), 890.1 / 906.3 at 4, 2936.2 / 2907.8 at 16; TP=4 135.0 / 121.3,
+# 466.0 / 456.3, 1583.7 / 1521.7. Flash has 42 MoE layers a window.
+#
+# Provenance and credit: ported from the GLM-5.3 recipe's patch 0144 (Mia's AI Lab), which takes its idea (the key path
+# beside the query path, the shared expert beside the routed experts on a second stream in decode) from BertholomusAI
+# (Albert Lee)'s commit f14e7f7 (github.com/bertholomus/TensorFold, branch glm-dsa-tp4, Apache 2.0). Only the shared
+# expert's part is done here; no code of theirs.
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index dc7f510..93407f1 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -21,6 +21,16 @@ from .weights import LayerW, Weights
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS  # noqa: E402
+ 
+ 
++def side_stream() -> bool:
++    """TF_GLM_SIDE (0105): 1 runs a decode window's MoE shared expert on a second stream beside the router and the
++    routed experts (4-bit shared experts, TF_GLM_DENSE=q4: their matmuls keep no split-K scratch to share); 0 (the
++    default until measured on the Sparks) one stream. The same kernels on the same buffers: the same bits."""
++    value = __import__("os").environ.get("TF_GLM_SIDE", "0").strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_SIDE: 0 or 1, not {value!r}")
++    return value == "1"
++
++
+ def prompt_split_k(w: Weights) -> bool:
+     """Whether a prompt chunk's projections take split-K partials: an EXL3 checkpoint's BF16 / FP8 ones do; 4-bit
+     ones (an MLX checkpoint, TF_GLM_DENSE=q4, read off the first layer's input projection) run without."""
+@@ -149,6 +159,8 @@ class Buffers:
+         self.top_k = c.top_k
+         # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
+         self.split = None
++        # TF_GLM_SIDE=1 (0105): a decode buffer's second stream, for the MoE's shared expert beside the routed experts
++        self.side = torch.cuda.Stream() if not prefill and side_stream() and torch.cuda.is_available() else None
+ 
+     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
+         self.tap_at = {}
+@@ -791,13 +803,26 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+ 
+-        if l2pf.ACTIVE is not None and done is None:
++        side = b.side if (b.side is not None and done is None and isinstance(m.shared.gu, qmm.Q4)
++                          and isinstance(m.shared.down, qmm.Q4)) else None
++        main = torch.cuda.current_stream() if side is not None else None
++        if side is not None:
++            # TF_GLM_SIDE: the shared expert on the side stream after everything queued so far (the normed rows),
++            # beside the router, the selection and the routed experts; joined before the combine reads b.sy. Its
++            # buffers (sgu, sact, sxs, sy) are its own; the same kernels and arguments: the same bits
++            side.wait_stream(main)
++            with torch.cuda.stream(side):
++                shared_front(layer, w, b, 0, R)
++            done = (0, R)
++        elif l2pf.ACTIVE is not None and done is None:
+             # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
+             # bits), while the L2 still holds what site "a" prefetched for it
+             shared_front(layer, w, b, 0, R)
+             done = (0, R)
+         with prof.timed("moe: routed (exl3)"):
+             exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
++        if side is not None:
++            main.wait_stream(side)
+ 
+         def fill(lo: int, hi: int) -> None:
+             for a, z in undone(hi, done):     # rows lo .. hi the front has not run on

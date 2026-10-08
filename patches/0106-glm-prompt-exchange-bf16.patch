@@ -1,0 +1,460 @@
+# A row-split prompt chunk's partials as bf16 (half the bytes), and the ring exchange's link all-gathers in place:
+#
+# - TF_GLM_PROMPT_PARTIALS=fp32|bf16 (default fp32 on every TP; opt-in, with TF_GLM_HC_SPLIT=1). bf16: each rank's
+#   partial of the peers' rows goes out as bf16 (p2p; staged in the all-gather buffer's unused part, also in a
+#   micro-batch half's region), and every rank's partial of a row is rounded to bf16 before the sum, which stays in fp32
+#   rank 0 first, then rounded to bf16 as before; the owner rounds its own partial as the others round theirs. An
+#   unsplit chunk (shorter than TF_GLM_HC_SPLIT_MIN_ROWS) and the all-gather exchange round the same way in hc_post
+#   (glue.hc_post / hc_post_pair / hc_post_ranks: round_parts; the kernel takes fp32 or bf16 partials), so a row's bits
+#   do not depend on the chunking, the exchange, the own-row front or the micro-batches. Decode windows, verify and the
+#   MTP head keep fp32 partials. The setting is in the ranks' startup comparison (SplitSettings.code).
+# - TF_NCCL_RING_INPLACE (default 1, with TF_NCCL_RING=1): the ring exchange's link all-gathers run in place (a rank
+#   packs what it sends into its own slot of the link's output, nothing zero-filled), each link's steps on its own
+#   stream, joined to the other link's only where relayed bytes pass; 0 keeps 0098's pack / all-gather / unpack steps.
+#   The same bytes arrive either way (0098's exchange is the same design as the GLM-5.3 recipe's 0142).
+#
+# Bits: bf16 partials change a prompt's bits once against fp32 (each partial rounded before the sum) and have not been
+# quality-checked on Flash, hence opt-in. fp32 is untouched: the kernel's fp32 path is the old arithmetic bit for bit.
+# The ring exchange moves bytes only: in place equals the steps byte for byte.
+#
+# Tests (CPU): tests/cpu/test_prompt_partials_bf16.py (the kernel against a torch reference: fp32 unchanged, rounded,
+# bf16; the settings; 2 / 3 / 4 ranks over gloo in the interpreter, p2p and all-gather: unsplit, split, micro-batch
+# halves, own-row front with layer-sliced halves leave the same bits, fp32 split == unsplit and differs from bf16, p2p
+# sends exactly half the partials' bytes less; the full matrix with TF_SLOW_TESTS=1) and tests/cpu/test_ring_inplace.py
+# (rings of 3 to 6 ranks, mixed dtypes and odd sizes: in place == the steps byte for byte, no local copy in place).
+#
+# Provenance and credit: ported from the GLM-5.3 recipe's patch 0153 (Mia's AI Lab) to Flash's hyper-connection glue.
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index d8ffcad..070329c 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -43,6 +43,9 @@ class NCCL:
+         # TF_NCCL_RING=1: the ranks are cabled as a ring in rank order, each only to the next and the previous, so
+         # exchange_all passes every message along the ring over two-rank links with the neighbours (_exchange_ring)
+         self.ring = os.environ.get("TF_NCCL_RING", "0").strip() == "1" and world > 2
++        # TF_NCCL_RING_INPLACE: 1 (the default) runs _exchange_ring's link all-gathers in place, each link's steps on
++        # its own stream (_ring_links); 0 keeps patch 0098's steps (_ring_steps). The same bytes arrive either way
++        self.inplace = os.environ.get("TF_NCCL_RING_INPLACE", "1").strip() != "0"
+         self.links: dict[int, ctypes.c_void_p] = {}
+         self.link_streams: dict[int, torch.cuda.Stream] = {}
+         self.lib = _library()
+@@ -201,7 +204,11 @@ class NCCL:
+         links 10 GB/s each way on one stream, 14 on two): a rank packs what it sends that neighbour, as bytes, and
+         gets back what the neighbour sends it. Every rank must name all the others, and the i-th tensor must have the same size
+         and dtype for every peer (row blocks of equal shares), so that a relaying rank knows each message's size.
+-        recvs end up with exactly exchange_all's bytes."""
++        recvs end up with exactly exchange_all's bytes.
++
++        TF_NCCL_RING_INPLACE=1 (the default, ``_ring_links``): each link's all-gather runs in place and each link's
++        steps run on its own stream, joined to the other link's only where bytes pass from one to the other.
++        TF_NCCL_RING_INPLACE=0: patch 0098's ``_ring_steps``."""
+ 
+         N, me = self.world, self.rank
+         peers = [p for p in range(N) if p != me]
+@@ -229,6 +236,91 @@ class NCCL:
+             return [(t, i, lo, hi, hops) for t in range(N) if t != src for i in range(k)
+                     for lo, hi, dr, hops in segments(src, t, i) if dr == direction and hops >= h and hi > lo]
+ 
++        if self.inplace:
++            self._ring_links(sends, recvs, spec, moving)
++        else:
++            self._ring_steps(sends, recvs, spec, moving)
++
++    def _ring_links(self, sends, recvs, spec, moving) -> None:
++        """_exchange_ring with fewer copies and joins (TF_NCCL_RING_INPLACE=1). Each step's link all-gather runs in
++        place: a rank packs what it sends straight into its own slot of the link's output (its slot is its rank on
++        the link: 0 on the link to the next rank, 1 on the one to the previous), so NCCL copies nothing locally, and
++        nothing is zero-filled (the two ends of a link name the same count: what one sends the other expects). Each
++        link's whole chain (pack, all-gather, the unpacking of its last-hop bytes) runs on the link's stream: step 1
++        after the caller's stream, a later step on link d after the other link's previous step (the bytes it relays
++        arrived there; an event, so not after that link's later steps) and after its own; the caller's stream waits
++        for both links at the end. Patch 0098 packed and unpacked on the caller's stream between steps, both links
++        joined there. Launch order on every rank is _ring_steps': the link to the previous rank first (rank 0: link 0
++        first), so that link kernels that cannot run at once never wait on each other round the ring."""
++
++        N, me = self.world, self.rank
++        main = torch.cuda.current_stream()
++        held: dict[tuple[int, int, int, int], torch.Tensor] = {}   # relayed bytes, by (s, t, i, lo)
++        order = sorted((1, -1), key=lambda d: (me - 1) % N if d == -1 else me)
++        done: dict[int, torch.cuda.Event] = {}         # each link's last step so far
++        used = set()
++        for h in range(1, N // 2 + 1):
++            step_done = {}
++            for direction in order:
++                src_out = (me - direction * (h - 1)) % N    # what leaves on this link: travelling `direction`
++                src_in = (me + direction * h) % N           # what arrives on it: travelling the other way
++                leave = moving(src_out, direction, h)
++                arrive = moving(src_in, -direction, h)
++                nbytes = lambda segs: sum((hi - lo) * spec[i][1].itemsize for t, i, lo, hi, hops in segs)
++                n_out = nbytes(leave)
++                L = max(n_out, nbytes(arrive))
++                if L == 0:
++                    continue
++                side = self.link_streams[direction]
++                if h == 1:
++                    side.wait_stream(main)
++                elif -direction in done:                    # the bytes it relays came in on the other link
++                    side.wait_event(done[-direction])
++                used.add(direction)
++                with torch.cuda.stream(side):
++                    out = []
++                    for t, i, lo, hi, hops in leave:
++                        if h == 1:
++                            out.append(sends[t][i].view(-1)[lo:hi].view(torch.int8))
++                        else:
++                            chunk = held.pop((src_out, t, i, lo))
++                            chunk.record_stream(side)           # the other link's buffer, read here
++                            out.append(chunk)
++                    both = torch.empty(2 * L, dtype=torch.int8, device="cuda")
++                    mine = both[:L] if direction == 1 else both[L:]
++                    if len(out) == 1:
++                        mine[:n_out].copy_(out[0])
++                    elif out:
++                        torch.cat(out, out=mine[:n_out])
++                    self._check(self.lib.ncclAllGather(mine.data_ptr(), both.data_ptr(), L, _DTYPES[torch.int8],
++                                                       self.links[direction], side.cuda_stream))
++                    theirs = both[L:] if direction == 1 else both[:L]   # the neighbour's slot
++                    at = 0
++                    for t, i, lo, hi, hops in arrive:
++                        n = (hi - lo) * spec[i][1].itemsize
++                        chunk = theirs[at:at + n]
++                        at += n
++                        if hops == h:                       # its last hop: this rank is t
++                            recvs[src_in][i].view(-1)[lo:hi].view(torch.int8).copy_(chunk)
++                        else:
++                            held[(src_in, t, i, lo)] = chunk
++                    ev = torch.cuda.Event()
++                    ev.record(side)
++                    step_done[direction] = ev
++            done.update(step_done)
++        if held:
++            raise RuntimeError("exchange_all (TF_NCCL_RING): relayed bytes left over")
++        # the caller's stream after both links (the sends and receives are the caller's: anything after this call on
++        # its stream, the reuse of their memory included, comes after the links' reads and writes)
++        for direction in order:
++            if direction in used:
++                main.wait_stream(self.link_streams[direction])
++
++    def _ring_steps(self, sends, recvs, spec, moving) -> None:
++        """Patch 0098's _exchange_ring (TF_NCCL_RING_INPLACE=0): each step packs on the caller's stream, runs both
++        links' all-gathers (a separate zero-filled input each), then unpacks on the caller's stream."""
++
++        N, me = self.world, self.rank
+         held: dict[tuple[int, int, int, int], torch.Tensor] = {}   # bytes this rank relays, by (s, t, i, lo)
+         main = torch.cuda.current_stream()
+         for h in range(1, N // 2 + 1):
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e513896..e5e4ef3 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -716,7 +716,7 @@ class GlmEngine:
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+-                               "TF_GLM_MSA): "
++                               "TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 93407f1..c27b66a 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -895,16 +895,21 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
++    # TF_GLM_PROMPT_PARTIALS=bf16: an unsplit prompt chunk (shorter than the split's minimum, or the all-gather) rounds
++    # each rank's partial to bf16 before the sum, as the row split sends them (``hcsplit``): a row's bits whatever its
++    # chunk. Decode windows, verify and the MTP head keep fp32 partials.
++    sp = getattr(b, "split", None)
++    rnd = bool(b.prefill and sp is not None and getattr(sp, "round", False))
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+     g = mixer(layer) if mixer is not None else _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
+     with prof.timed("hc"):
+-        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++        glue.hc_post(x, x, g, b.post[:R], b.comb[:R], round_parts=rnd)
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+     g = _ffn(layer, w, b, R)
+-    glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++    glue.hc_post(x, x, g, b.post[:R], b.comb[:R], round_parts=rnd)
+ 
+ 
+ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 993b71a..9d36de2 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -226,15 +226,23 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+ 
+ @triton.jit
+ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD: tl.constexpr,
+-             BLOCK: tl.constexpr):
+-    """Round rank-ordered partials to bf16 before combining the branch with residual streams in fixed order and rounding the output."""
++             BLOCK: tl.constexpr, ROUND: tl.constexpr):
++    """Sum the rank-ordered partials in fp32, round the sum to bf16, then combine the branch with the residual streams
++    in fixed order and round the output. ``ROUND`` (TF_GLM_PROMPT_PARTIALS=bf16, fp32 partials): each partial is rounded
++    to bf16 before the sum, as the row split sends them; bf16 partials (``G`` bf16) are that already."""
+ 
+     r = tl.program_id(0)
+     cb = tl.program_id(1)
+     d = cb * BLOCK + tl.arange(0, BLOCK)
+     acc = tl.load(G + r * D + d)
++    if ROUND:
++        acc = acc.to(tl.bfloat16)
++    acc = acc.to(tl.float32)
+     for k in tl.static_range(1, WORLD):
+-        acc = acc + tl.load(G + k * RS + r * D + d)
++        g = tl.load(G + k * RS + r * D + d)
++        if ROUND:
++            g = g.to(tl.bfloat16)
++        acc = acc + g.to(tl.float32)
+     branch = acc.to(tl.bfloat16).to(tl.float32)
+     x0 = tl.load(X + r * (S * D) + d).to(tl.float32)
+     x1 = tl.load(X + r * (S * D) + D + d).to(tl.float32)
+@@ -251,40 +259,55 @@ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD
+         tl.store(XOUT + r * (S * D) + s * D + d, v.to(tl.bfloat16))
+ 
+ 
++def _check_parts(*parts: torch.Tensor) -> None:
++    for t in parts:
++        if t.dtype not in (torch.float32, torch.bfloat16) or t.dtype != parts[0].dtype or not t.is_contiguous():
++            raise ValueError("hc_post: contiguous partials, all fp32 or all bf16")
++
++
++def _rounds(parts: torch.Tensor, round_parts: bool) -> bool:
++    """Whether the kernel rounds the partials: only fp32 ones (bf16 ones, TF_GLM_PROMPT_PARTIALS=bf16's, are rounded)."""
++    return bool(round_parts) and parts.dtype == torch.float32
++
++
+ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
+-            comb: torch.Tensor) -> None:
+-    """gathered: [world, R, D] fp32 partials (contiguous). x and xout may be the same tensor."""
++            comb: torch.Tensor, round_parts: bool = False) -> None:
++    """gathered: [world, R, D] fp32 partials (contiguous), or bf16 ones (TF_GLM_PROMPT_PARTIALS=bf16's row split),
++    summed in fp32, rank 0 first. x and xout may be the same tensor. ``round_parts``: fp32 partials rounded to bf16 each
++    before the sum (the bits of the bf16 partials; nothing for bf16 ones)."""
+ 
+     world, rows, d = gathered.shape
++    _check_parts(gathered)
+     s = x.shape[1] // d
+     block = min(1024, d)
+     _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
+-                                 num_warps=4)
++                                 ROUND=_rounds(gathered, round_parts), num_warps=4)
+ 
+ 
+ def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
+-                 comb: torch.Tensor) -> None:
+-    """``hc_post`` of two ranks' fp32 partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the same kernel
+-    with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum (rank 0
+-    first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
++                 comb: torch.Tensor, round_parts: bool = False) -> None:
++    """``hc_post`` of two ranks' fp32 (or both bf16) partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the
++    same kernel with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum
++    (rank 0 first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
+ 
+     rows, d = g0.shape
+-    if (g1.shape != g0.shape or g0.dtype != torch.float32 or g1.dtype != torch.float32
+-            or not (g0.is_contiguous() and g1.is_contiguous())):
+-        raise ValueError("hc_post_pair: two contiguous fp32 partials of one shape")
++    if g1.shape != g0.shape or g1.dtype != g0.dtype or g0.dtype not in (torch.float32, torch.bfloat16) \
++            or not (g0.is_contiguous() and g1.is_contiguous()):
++        raise ValueError("hc_post_pair: two contiguous partials of one shape, both fp32 or both bf16")
+     if not rows:
+         return
+     s = x.shape[1] // d
+     block = min(1024, d)
+     rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
+-    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
++    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block,
++                                 ROUND=_rounds(g0, round_parts), num_warps=4)
+ 
+ 
+ def hc_post_ranks(x: torch.Tensor, xout: torch.Tensor, first: torch.Tensor, stride: int, world: int,
+-                  post: torch.Tensor, comb: torch.Tensor) -> None:
++                  post: torch.Tensor, comb: torch.Tensor, round_parts: bool = False) -> None:
+     """``hc_post`` of ``world`` ranks' fp32 partials [R, D] that sit ``stride`` elements apart from rank 0's
+     (``first``): rows of one all-gathered [world, R', D] buffer (stride R' x D), the sum rank 0 first and every bit
+-    hc_post's (TF_GLM_HC_SPLIT past two ranks)."""
++    hc_post's (TF_GLM_HC_SPLIT past two ranks); ``round_parts`` as in ``hc_post``."""
+ 
+     rows, d = first.shape
+     if first.dtype != torch.float32 or not first.is_contiguous():
+@@ -294,7 +317,7 @@ def hc_post_ranks(x: torch.Tensor, xout: torch.Tensor, first: torch.Tensor, stri
+     s = x.shape[1] // d
+     block = min(1024, d)
+     _hc_post[(rows, d // block)](x, xout, first, post, comb, int(stride), D=d, S=s, WORLD=int(world), BLOCK=block,
+-                                 num_warps=4)
++                                 ROUND=bool(round_parts), num_warps=4)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index c040296..74d42ce 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -34,6 +34,16 @@ TF_GLM_PROMPT_MICROBATCH=1 (``microbatch``): a chunk runs as two halves, each ro
+ views of the prompt buffers, both on one side stream (``HcSplit(stream=...)``); a half's glue runs there too
+ (``glue_side``), under the other half's compute, and the main stream ``join``s it before that half's next block.
+ 
++TF_GLM_PROMPT_PARTIALS=bf16 (``partials``; default fp32): each rank's partial of a site goes out as bf16 instead of fp32
++(half the bytes of a layer's two partial exchanges, most of what a row-split layer sends), and every rank's partial of a
++row is rounded to bf16 before the sum, which stays in fp32 and rank 0 first: the owner rounds its own partial as the
++others round theirs (round-to-nearest-even in torch's casts and the kernels', the same), so the ranks hold the same
++bits. Unsplit prompt chunks (a prompt's tail shorter than TF_GLM_HC_SPLIT_MIN_ROWS) and the all-gather exchange round
++the same way in hc_post (``glue.hc_post``'s ``round_parts``), so a row's bits do not depend on the chunking, the
++micro-batches or the exchange; decode windows, verify and the MTP head keep fp32 partials. The prompt's bits change
++once against fp32 partials (each partial rounded to bf16 before the sum; the sum is rounded to bf16 as before), which
++has not been quality-checked on Flash: opt-in.
++
+ TF_GLM_HC_EXCHANGE: ``p2p`` (the default) swaps rows with ncclSend/ncclRecv; ``gather`` uses the NCCL all-gather
+ instead (whole halves, one piece: the partial halves out of place into the unused all-gather buffer, the bf16 rows in
+ place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric."""
+@@ -49,6 +59,7 @@ import torch
+ from . import glue
+ 
+ EXCHANGES = ("p2p", "gather")
++PARTIALS = ("fp32", "bf16")    # TF_GLM_PROMPT_PARTIALS: what a row-split prompt chunk's partials travel as
+ SHARES = 4               # own-row shares a layer keeps in flight at once (``HcSplit.share``: slots 0 .. SHARES - 1)
+ 
+ 
+@@ -100,6 +111,7 @@ class SplitSettings:
+     own_front: bool = False       # TF_GLM_PROMPT_OWN_FRONT=1: DSA's replicated front on own rows (``own_front``)
+     microbatch: bool = False      # TF_GLM_PROMPT_MICROBATCH=1: a chunk in two halves (``microbatch``)
+     micro_min: int = 2048         # TF_GLM_PROMPT_MICROBATCH_MIN_ROWS: halves of fewer rows run the chunk whole
++    partials: str = "fp32"        # TF_GLM_PROMPT_PARTIALS: fp32, or bf16 (rounded before the sum, half the bytes)
+ 
+     def __post_init__(self) -> None:
+         if self.fronts and not self.overlap:
+@@ -108,6 +120,11 @@ class SplitSettings:
+             raise ValueError("TF_GLM_PROMPT_OWN_FRONT=1 runs on the row split's own rows: it needs TF_GLM_HC_SPLIT=1")
+         if self.microbatch and not self.split:
+             raise ValueError("TF_GLM_PROMPT_MICROBATCH=1 row-splits each half: it needs TF_GLM_HC_SPLIT=1")
++        if self.partials not in PARTIALS:
++            raise ValueError(f"TF_GLM_PROMPT_PARTIALS: {' or '.join(PARTIALS)}, not {self.partials!r}")
++        if self.partials != "fp32" and not self.split:
++            raise ValueError("TF_GLM_PROMPT_PARTIALS=bf16 sends the row split's partials as bf16: it needs "
++                             "TF_GLM_HC_SPLIT=1")
+ 
+     @classmethod
+     def from_env(cls, env=None) -> "SplitSettings":
+@@ -123,20 +140,22 @@ class SplitSettings:
+         exchange = str(env.get("TF_GLM_HC_EXCHANGE", "") or "p2p").strip()
+         if exchange not in EXCHANGES:
+             raise ValueError(f"TF_GLM_HC_EXCHANGE: {' or '.join(EXCHANGES)}, not {exchange!r}")
++        partials = str(env.get("TF_GLM_PROMPT_PARTIALS", "") or "fp32").strip()
+         return cls(split, overlap, _int(env, "TF_GLM_OVERLAP_PIECES", 2, 1, 8),
+                    _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange, fronts=level == "2",
+                    own_front=_flag(env, "TF_GLM_PROMPT_OWN_FRONT"),
+                    microbatch=_flag(env, "TF_GLM_PROMPT_MICROBATCH"),
+-                   micro_min=_int(env, "TF_GLM_PROMPT_MICROBATCH_MIN_ROWS", 2048, 64, 16384))
++                   micro_min=_int(env, "TF_GLM_PROMPT_MICROBATCH_MIN_ROWS", 2048, 64, 16384), partials=partials)
+ 
+     def piece_count(self) -> int:
+         return self.pieces if self.overlap and self.exchange == "p2p" else 1
+ 
+     def code(self) -> list[int]:
+         if not self.split:
+-            return [0, 0, 0, 0, 0, 0, 0]
++            return [0, 0, 0, 0, 0, 0, 0, 0]
+         return [1, int(self.overlap) + int(self.fronts), self.piece_count(), self.min_rows,
+-                EXCHANGES.index(self.exchange), int(self.own_front), self.micro_min if self.microbatch else 0]
++                EXCHANGES.index(self.exchange), int(self.own_front), self.micro_min if self.microbatch else 0,
++                PARTIALS.index(self.partials)]
+ 
+     def describe(self) -> str:
+         what = "rows split between the ranks"
+@@ -150,6 +169,8 @@ class SplitSettings:
+             what += "; DSA's replicated front (q_a / kv_a, the indexer, its top-k) on own rows, its outputs shared"
+         if self.microbatch:
+             what += f"; chunks of {2 * self.micro_min}+ rows in two halves, one's exchanges under the other's compute"
++        if self.partials == "bf16":
++            what += "; partials rounded to bf16 before the sum and sent as bf16 (TF_GLM_PROMPT_PARTIALS)"
+         return f"prompt chunks' hyper-connections: {what} (chunks of {self.min_rows}+ rows)"
+ 
+ 
+@@ -177,6 +198,12 @@ class HcSplit:
+         self.peer = 1 - w.rank if two else None
+         self.peers = [r for r in range(world) if r != w.rank]
+         self.gather = not p2p
++        # TF_GLM_PROMPT_PARTIALS=bf16: every partial rounded to bf16 before the sum (``round``); with p2p also sent as
++        # bf16 (``half``: staged in the all-gather buffer's unused part, ``begin``). The all-gather exchange sends fp32
++        # and rounds in hc_post: the same bits
++        self.round = settings.partials == "bf16"
++        self.half = self.round and p2p
++        self.send16: torch.Tensor | None = None
+         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
+         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
+         self.active = False
+@@ -239,7 +266,19 @@ class HcSplit:
+         # block a piece (p2p), or every rank's whole partial [N, Rp, D] (gather, one piece)
+         d = b.part.shape[1]
+         N = self.world
+-        if N == 2 and self.gather:
++        if self.half:
++            # bf16: the peers' partials of this rank's rows first ([n, D] a piece at two ranks, [N, n, D] past two:
++            # Rp x D values in all), then this rank's bf16 partial of the peers' rows (``send16``, by row: Rp x D),
++            # in the all-gather buffer's room for world x rows x D fp32
++            g16 = b.gath.view(torch.bfloat16)
++            if 2 * self.Rp * d > g16.numel():
++                raise ValueError("TF_GLM_PROMPT_PARTIALS=bf16: the all-gather buffer cannot hold the chunk's staging")
++            if N == 2:
++                self.got = [g16[off * d:(off + n) * d].view(n, d) for off, n in self.pieces]
++            else:
++                self.got = [g16[N * off * d:N * (off + n) * d].view(N, n, d) for off, n in self.pieces]
++            self.send16 = g16[self.Rp * d:2 * self.Rp * d].view(self.Rp, d)
++        elif N == 2 and self.gather:
+             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
+                         for off, n in self.pieces]
+         elif N == 2:
+@@ -295,11 +334,21 @@ class HcSplit:
+             if self.gather:                             # every rank's whole partial (one piece)
+                 self.all_gather(b.part[:self.Rp].reshape(-1), self.got[0].reshape(-1))
+                 return
+-            self.w.comm.exchange_all({p: [b.part[p * self.H + off:p * self.H + off + n]] for p in self.peers},
+-                                     {p: [self.got[j][p]] for p in self.peers})
++            if self.half:                               # each peer's rows rounded to bf16 (on this stream)
++                sends = {}
++                for p in self.peers:
++                    lo = p * self.H + off
++                    sends[p] = [self.send16[lo:lo + n]]
++                    sends[p][0].copy_(b.part[lo:lo + n])
++            else:
++                sends = {p: [b.part[p * self.H + off:p * self.H + off + n]] for p in self.peers}
++            self.w.comm.exchange_all(sends, {p: [self.got[j][p]] for p in self.peers})
+             return
+         lo = self.theirs() + off
+         send = b.part[lo:lo + n]
++        if self.half:
++            send = self.send16[lo:lo + n]
++            send.copy_(b.part[lo:lo + n])
+         if self.gather:
+             d = send.shape[1]
+             self.all_gather(send.reshape(-1), b.gath[2 * off * d:2 * (off + n) * d])
+@@ -406,16 +455,18 @@ class HcSplit:
+         own = b.part[lo:hi]
+         if self.world == 2:
+             got = self.got[j]
++            if self.half:
++                own = own.to(torch.bfloat16)
+             g0, g1 = (own, got) if self.rank == 0 else (got, own)
+-            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
++            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi], round_parts=self.round)
+         elif self.gather:
+             whole = self.got[0]
+             glue.hc_post_ranks(x, x, whole[0, lo:hi], self.Rp * whole.shape[2], self.world, b.post[lo:hi],
+-                               b.comb[lo:hi])
++                               b.comb[lo:hi], round_parts=self.round)
+         else:
+             block = self.got[j]
+-            block[self.rank].copy_(own)
+-            glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi])
++            block[self.rank].copy_(own)                 # bf16: rounded as the peers rounded theirs
++            glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi], round_parts=self.round)
+ 
+     def glue_side(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+                   share: bool = True) -> None:

@@ -1,0 +1,464 @@
+# The one-shot RoCE all-gather (COMM=roce) on four Sparks cabled as a ring without a switch (TF_ROCE_RING=1, set by
+# scripts/nodes.sh on a ring): each rank writes its shard to its two neighbours, whose proxies relay it to the rank
+# across the ring, half its stripes each way (roce_proxy.c ABI 6, roce_set_ring); the GPU kernel and the bits are
+# unchanged. roce.py: plan_routes(ring=True), the relayed peer listed; the engine's startup line names it.
+# Ported from the GLM-5.3 recipe's patch 0143 (Mia's AI Lab), on b12x's RoCEnante transport (local-inference-lab).
+diff --git tensorfold/cuda/roce.py tensorfold/cuda/roce.py
+index 4ee4ac0..add8498 100644
+--- tensorfold/cuda/roce.py
++++ tensorfold/cuda/roce.py
+@@ -6,6 +6,10 @@ in fixed latency (~30-50 us). Here the GB10 GPU writes its shard into pinned hos
+ to the peer, and reads the peer's shard from its own pinned memory in place: one kernel, no NCCL proxy handoff.
+ ``RoceComm`` sends gathers of up to ``max_bytes`` a rank this way and the rest through NCCL, with the same output
+ layout (rank order), the same bits, and a device-side epoch so CUDA graphs replay it.
++
++TF_ROCE_RING=1 (four Sparks cabled as a ring in rank order, each to its two neighbours only; scripts/nodes.sh sets
++it): each rank writes its shard to its neighbours, and the neighbours' proxies relay it to the rank across the ring,
++half its stripes each way (roce_proxy.c's roce_set_ring); the GPU side and the bits are unchanged.
+ """
+ 
+ from __future__ import annotations
+@@ -76,13 +80,13 @@ def proxy_library() -> ctypes.CDLL:
+             ("roce_blob_bytes", u64, []),
+             ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, ctypes.POINTER(i), i, p, u64, u64,
+                                 ctypes.c_char_p, u64]),
+-            ("roce_set_routes", i, [p, i, i, ctypes.POINTER(i), ctypes.POINTER(i), i]),
++            ("roce_set_routes", i, [p, i, i, ctypes.POINTER(i), ctypes.POINTER(i), i]), ("roce_set_ring", i, [p]),
+             ("roce_local_blob", i, [p, p, u64]), ("roce_connect", i, [p, p, u64]), ("roce_start", i, [p]),
+             ("roce_stop", None, [p]), ("roce_failed", i, [p]), ("roce_error", ctypes.c_char_p, [p]),
+             ("roce_stat", u64, [p, i]), ("roce_hca_stat", u64, [p, i, i]), ("roce_destroy", None, [p])):
+         fn = getattr(lib, name)
+         fn.restype, fn.argtypes = res, args
+-    if lib.roce_abi_version() != 5:
++    if lib.roce_abi_version() != 6:
+         raise RuntimeError("unexpected RoCE proxy ABI version")
+     return lib
+ 
+@@ -145,13 +149,15 @@ def _ipv4_gid(hca: str) -> tuple[int, int, int] | None:
+     return index, ip, prefix
+ 
+ 
+-def plan_routes(addrs: list[list[tuple[int, int] | None]]) -> tuple[dict, int]:
++def plan_routes(addrs: list[list[tuple[int, int] | None]], ring: bool = False) -> tuple[dict, int]:
+     """Every rank's (IPv4, prefix) a listed HCA (None: unknown) -> ({(rank, peer): [(local HCA, peer HCA), ...]},
+     stripes a peer). HCAs pair when they share a subnet, each HCA once a peer, in name order on both sides (so the
+     two ends of a pair list the same pairs mirrored); every pair of ranks gets the fewest stripes any pair has,
+-    which must be at least one."""
++    which must be at least one. ``ring`` (four ranks cabled in rank order): the ranks across the ring (rank and
++    rank + 2) need no path; every neighbour does, and the routes leave the across pairs out."""
+ 
+     world = len(addrs)
++    across = (lambda r, p: ring and world == 4 and (p - r) % world == 2)
+ 
+     def net(a):
+         return None if a is None else (a[0] >> (32 - a[1]) if a[1] else 0, a[1])
+@@ -171,11 +177,15 @@ def plan_routes(addrs: list[list[tuple[int, int] | None]]) -> tuple[dict, int]:
+             pairs[(r, p)] = got
+     if world < 2:
+         return pairs, 0
++    if ring and world != 4:
++        raise RuntimeError(f"RoCE: TF_ROCE_RING needs four ranks, not {world}")
++    pairs = {k: v for k, v in pairs.items() if not across(*k)}
+     least = min(len(v) for v in pairs.values())
+     if least == 0:
+         missing = ", ".join(f"{r}-{p}" for (r, p), v in sorted(pairs.items()) if not v and r < p)
+         raise RuntimeError(f"RoCE: no HCA of rank(s) {missing} shares a subnet with the peer's: every pair of ranks "
+-                           "needs a direct path (a cable or a switch); use TF_GLM_COMM=nccl on a ring")
++                           "needs a direct path (a cable or a switch), or with TF_ROCE_RING=1 every neighbour of a "
++                           "ring of four in rank order")
+     return {k: v[:least] for k, v in pairs.items()}, least
+ 
+ 
+@@ -188,6 +198,9 @@ class RoceGather:
+         by subnet (``plan_routes``), so a triangle of direct cables reaches each peer over that pair's rails."""
+         lib = proxy_library()
+         self.lib, self.rank, self.world, self.max_bytes = lib, rank, world, int(max_bytes)
++        self.ring = os.environ.get("TF_ROCE_RING", "0").strip() == "1"
++        if self.ring and world != 4:
++            raise ValueError(f"TF_ROCE_RING=1: a ring of four ranks, not {world}")
+         self.slot_bytes = -(-self.max_bytes // SLOT_ALIGN) * SLOT_ALIGN
+         out = (ctypes.c_uint64 * 7)()
+         if lib.roce_layout(world, self.slot_bytes, out) != 0:
+@@ -245,12 +258,12 @@ class RoceGather:
+             addrs = [[None if int(r[5 + 2 * h]) < 0 else (int(r[4 + 2 * h]) & 0xFFFFFFFF, int(r[5 + 2 * h]))
+                       for h in range(MAX_HCAS)] for r in rows]
+             try:
+-                routes, self.n_flag = plan_routes(addrs)
++                routes, self.n_flag = plan_routes(addrs, self.ring)
+             except RuntimeError:
+                 self.close()
+                 raise
+             for p in range(world):
+-                if p == rank:
++                if p == rank or (rank, p) not in routes:
+                     continue
+                 local, remote = zip(*routes[(rank, p)])
+                 n = len(local)
+@@ -259,7 +272,12 @@ class RoceGather:
+                     why = lib.roce_error(self.ctx).decode(errors="replace")
+                     self.close()
+                     raise RuntimeError(f"RoCE routes: {why}")
+-            self.routes = {p: routes[(rank, p)] for p in range(world) if p != rank}
++            if self.ring and lib.roce_set_ring(self.ctx) != 0:
++                why = lib.roce_error(self.ctx).decode(errors="replace")
++                self.close()
++                raise RuntimeError(f"RoCE ring: {why}")
++            self.routes = {p: routes[(rank, p)] for p in range(world) if (rank, p) in routes}
++            self.across = [p for p in range(world) if p != rank and (rank, p) not in routes]
+         blobs = b"".join(bytes(r[4 + extra:].numpy().tobytes())[:blob_len] for r in rows)
+         self.spin = spin_limit()
+         _ext()                      # its first build (tens of seconds) here, before the verdict all-gather below
+@@ -310,8 +328,9 @@ class RoceGather:
+         lib, c = self.lib, self.ctx
+         hcas = " ".join(f"hca{h} completed {lib.roce_hca_stat(c, h, 0)} bytes {lib.roce_hca_stat(c, h, 1)}"
+                         for h in range(len(self.hcas)))
++        relayed = f", relayed {lib.roce_stat(c, 3)}" if self.ring else ""
+         return (f"doorbell {int(self.ctrl_words[0])}, posted {lib.roce_stat(c, 0)}, completed {lib.roce_stat(c, 1)}, "
+-                f"last {lib.roce_stat(c, 2)}; {hcas}; wait limit {self.spin / 1e6:g} s (TF_ROCE_WAIT_S)")
++                f"last {lib.roce_stat(c, 2)}{relayed}; {hcas}; wait limit {self.spin / 1e6:g} s (TF_ROCE_WAIT_S)")
+ 
+     def close(self) -> None:
+         if getattr(self, "ctx", None):
+diff --git tensorfold/cuda/roce_proxy.c tensorfold/cuda/roce_proxy.c
+index d8ba88c..fdcf1dc 100644
+--- tensorfold/cuda/roce_proxy.c
++++ tensorfold/cuda/roce_proxy.c
+@@ -5,6 +5,12 @@
+ // peer HCA) pairs (roce_set_route; default HCA h to the peer's HCA h, every HCA), so ranks cabled to each other
+ // directly (a triangle of Sparks: one /24 and two rails a pair) reach each peer over its own rails only. Flags are
+ // indexed by stripe (``n_flag`` stripes a peer, the same for every peer).
++// TensorFold, 2026-10-05, ABI 6 (Mia's AI Lab): a ring of four (roce_set_ring), for four Sparks cabled to their two
++// neighbours without a switch: a rank's payload goes to its neighbours only, each stripe with a length word before
++// its flag, and the proxy relays the neighbours' stripes to the rank across the ring (even stripes onward from the
++// previous rank to the next, odd ones from the next to the previous), so every peer's flags arrive as before and the
++// GPU side is unchanged. A rank posts its next payload only once it has relayed, and the NIC has finished reading,
++// everything up to the one before: so a relayed slot is never overwritten while it is still being sent on.
+ 
+ // RDMA proxy for the b12x RoCE one-shot all-reduce.
+ //
+@@ -49,7 +55,10 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 5
++#define ROCE_ABI_VERSION 6
++#define ROCE_LEN_OFFSET 64            // a stripe flag's length word (ring), in its ROCE_FLAG_STRIDE bytes
++#define ROCE_FWD_BIT ((uint64_t)1 << 32)   // wr_id of a relayed stripe
++#define ROCE_MAX_RELAY ROCE_MAX_HCAS
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+@@ -89,6 +98,15 @@ typedef struct {
+     int stripe_hca[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
+     int stripe_remote[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
+     int n_flag;                      // stripes (flags) a peer, the same for every peer and on every rank
++    // ring (roce_set_ring): relayed[p] for the peer across, reached through the neighbours; relay entry e sends
++    // stripe relay_stripe[e] of relay_src[e]'s payload on to relay_dst[e], last done for sequence relay_last[e]
++    int ring;
++    int relayed[ROCE_MAX_PEERS];
++    int n_relay;
++    int relay_src[ROCE_MAX_RELAY], relay_stripe[ROCE_MAX_RELAY], relay_dst[ROCE_MAX_RELAY];
++    uint32_t relay_last[ROCE_MAX_RELAY];
++    uint64_t fwd_outstanding;
++    uint64_t fwd_posted;
+     roce_hca_t hca[ROCE_MAX_HCAS];
+     uint8_t *region;
+     size_t region_bytes;
+@@ -310,6 +328,28 @@ int roce_set_routes(roce_ctx_t *c, int peer, int n, const int *local, const int
+     return 0;
+ }
+ 
++int roce_set_ring(roce_ctx_t *c) {
++    // after roce_set_routes to both neighbours, before roce_connect: four ranks in a ring in rank order, each cabled
++    // to rank - 1 and rank + 1 only
++    const int w = c->world, prev = (c->rank + w - 1) % w, next = (c->rank + 1) % w, across = (c->rank + 2) % w;
++    if (c->started || w != 4 || c->n_stripe[prev] != c->n_flag || c->n_stripe[next] != c->n_flag ||
++        c->n_flag > ROCE_MAX_RELAY) {
++        snprintf(c->err, sizeof(c->err), "RoCE ring: four ranks, routes to both neighbours with %d stripes each",
++                 c->n_flag);
++        return -1;
++    }
++    c->ring = 1;
++    c->relayed[across] = 1;
++    c->n_stripe[across] = 0;
++    c->n_relay = c->n_flag;
++    for (int s = 0; s < c->n_flag; s++) {
++        c->relay_stripe[s] = s;
++        c->relay_src[s] = (s % 2 == 0) ? prev : next;
++        c->relay_dst[s] = (s % 2 == 0) ? next : prev;
++    }
++    return 0;
++}
++
+ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     if (out_len < sizeof(roce_blob_t)) {
+         return -1;
+@@ -387,6 +427,9 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+             continue;
+         }
+         c->peer_addr[p] = all[p].region_addr;
++        if (c->relayed[p]) {
++            continue;
++        }
+         if (c->n_stripe[p] != c->n_flag) {
+             snprintf(c->err, sizeof(c->err), "rank %d has %d stripes, every peer needs %d", p, c->n_stripe[p],
+                      c->n_flag);
+@@ -414,11 +457,14 @@ static int drain_cq(roce_ctx_t *c, int h) {
+         if (wc[i].status != IBV_WC_SUCCESS) {
+             snprintf(c->err, sizeof(c->err),
+                      "RDMA write to rank %u failed: %s (vendor_err 0x%x, seq %u)",
+-                     (unsigned)wc[i].wr_id, ibv_wc_status_str(wc[i].status),
++                     (unsigned)(wc[i].wr_id & 0xffu), ibv_wc_status_str(wc[i].status),
+                      wc[i].vendor_err, c->last_seq);
+             return -1;
+         }
+-        c->hca[h].outstanding[wc[i].wr_id] -= 1;
++        c->hca[h].outstanding[wc[i].wr_id & 0xffu] -= 1;
++        if (wc[i].wr_id & ROCE_FWD_BIT) {
++            c->fwd_outstanding -= 1;
++        }
+         c->hca[h].writes_completed += 1;
+         c->writes_completed += 1;
+     }
+@@ -435,9 +481,10 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     uint32_t slot = seq & 1u;
+     uint8_t *send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
+     uint32_t seq_copy = seq;
++    uint32_t len_copy = nbytes;
+     uint32_t total_packs = nbytes / 16;
+     for (int p = 0; p < c->world; p++) {
+-        if (p == c->rank) {
++        if (p == c->rank || c->relayed[p]) {
+             continue;
+         }
+         uint32_t pack_offset = 0;
+@@ -489,6 +536,21 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             struct ibv_send_wr data_wr;
+             struct ibv_sge data_sge;
+             struct ibv_send_wr *first_wr = &flag_wr;
++            // ring: the payload's length ahead of the flag, for the neighbour that relays this stripe on
++            struct ibv_sge len_sge = {.addr = (uint64_t)(uintptr_t)&len_copy, .length = 4, .lkey = 0};
++            struct ibv_send_wr len_wr;
++            if (c->ring) {
++                memset(&len_wr, 0, sizeof(len_wr));
++                len_wr.wr_id = (uint64_t)p;
++                len_wr.next = &flag_wr;
++                len_wr.sg_list = &len_sge;
++                len_wr.num_sge = 1;
++                len_wr.opcode = IBV_WR_RDMA_WRITE;
++                len_wr.send_flags = IBV_SEND_INLINE;
++                len_wr.wr.rdma.remote_addr = flag_wr.wr.rdma.remote_addr + ROCE_LEN_OFFSET;
++                len_wr.wr.rdma.rkey = c->peer_rkey[s][p];
++                first_wr = &len_wr;
++            }
+             if (stripe_bytes != 0) {
+                 data_sge = (struct ibv_sge){
+                     .addr = (uint64_t)(uintptr_t)(send + byte_offset),
+@@ -497,7 +559,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+                 };
+                 memset(&data_wr, 0, sizeof(data_wr));
+                 data_wr.wr_id = (uint64_t)p;
+-                data_wr.next = &flag_wr;
++                data_wr.next = first_wr;
+                 data_wr.sg_list = &data_sge;
+                 data_wr.num_sge = 1;
+                 data_wr.opcode = IBV_WR_RDMA_WRITE;
+@@ -528,6 +590,136 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     return 0;
+ }
+ 
++// stripe s's [byte offset, bytes) of an n-byte payload split into n_stripe stripes (post_op's split)
++static void stripe_range(uint32_t nbytes, int n_stripe, int s, uint64_t *offset, uint32_t *bytes) {
++    const uint32_t total = nbytes / 16, base = total / (uint32_t)n_stripe, extra = total % (uint32_t)n_stripe;
++    uint32_t start = 0;
++    for (int i = 0; i < s; i++) {
++        start += base + ((uint32_t)i < extra ? 1u : 0u);
++    }
++    *offset = (uint64_t)start * 16;
++    *bytes = (base + ((uint32_t)s < extra ? 1u : 0u)) * 16;
++}
++
++// relay entry e's stripe of sequence seq (arrived here in recv[src][slot]) on to dst, at the same place there
++static int forward(roce_ctx_t *c, int e, uint32_t seq) {
++    const int src = c->relay_src[e], s = c->relay_stripe[e], dst = c->relay_dst[e];
++    const uint32_t slot = seq & 1u;
++    const uint64_t flag_index = (((uint64_t)src * ROCE_SLOTS + slot) * (uint64_t)c->n_flag + (uint64_t)s);
++    volatile uint32_t *len = (volatile uint32_t *)(c->region + c->flag_off + flag_index * ROCE_FLAG_STRIDE +
++                                                   ROCE_LEN_OFFSET);
++    const uint32_t nbytes = __atomic_load_n(len, __ATOMIC_ACQUIRE);
++    if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
++        snprintf(c->err, sizeof(c->err), "RoCE ring: rank %d's payload length %u (seq %u) is invalid", src, nbytes,
++                 seq);
++        return -1;
++    }
++    uint64_t offset;
++    uint32_t bytes;
++    stripe_range(nbytes, c->n_flag, s, &offset, &bytes);
++    const int h = c->stripe_hca[dst][s];
++    roce_hca_t *hca = &c->hca[h];
++    while (hca->outstanding[dst] >= ROCE_SEND_DEPTH / 4) {
++        if (drain_cq(c, h) != 0) {
++            return -1;
++        }
++        if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
++            snprintf(c->err, sizeof(c->err), "RoCE proxy stopped while relaying to rank %d", dst);
++            return -1;
++        }
++    }
++    uint32_t seq_copy = seq;
++    const uint64_t remote = c->peer_addr[dst];
++    struct ibv_sge flag_sge = {.addr = (uint64_t)(uintptr_t)&seq_copy, .length = 4, .lkey = 0};
++    struct ibv_send_wr flag_wr;
++    memset(&flag_wr, 0, sizeof(flag_wr));
++    flag_wr.wr_id = (uint64_t)dst | ROCE_FWD_BIT;
++    flag_wr.sg_list = &flag_sge;
++    flag_wr.num_sge = 1;
++    flag_wr.opcode = IBV_WR_RDMA_WRITE;
++    flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
++    flag_wr.wr.rdma.remote_addr = remote + c->flag_off + flag_index * ROCE_FLAG_STRIDE;
++    flag_wr.wr.rdma.rkey = c->peer_rkey[s][dst];
++    struct ibv_send_wr data_wr, *first_wr = &flag_wr;
++    struct ibv_sge data_sge;
++    if (bytes != 0) {
++        const uint64_t at = c->recv_off + ((uint64_t)src * ROCE_SLOTS + slot) * c->slot_bytes + offset;
++        data_sge = (struct ibv_sge){.addr = (uint64_t)(uintptr_t)(c->region + at), .length = bytes,
++                                    .lkey = hca->mr->lkey};
++        memset(&data_wr, 0, sizeof(data_wr));
++        data_wr.wr_id = (uint64_t)dst | ROCE_FWD_BIT;
++        data_wr.next = &flag_wr;
++        data_wr.sg_list = &data_sge;
++        data_wr.num_sge = 1;
++        data_wr.opcode = IBV_WR_RDMA_WRITE;
++        data_wr.wr.rdma.remote_addr = remote + at;
++        data_wr.wr.rdma.rkey = c->peer_rkey[s][dst];
++        first_wr = &data_wr;
++    }
++    struct ibv_send_wr *bad = NULL;
++    int rc = ibv_post_send(hca->qp[dst], first_wr, &bad);
++    if (rc != 0) {
++        set_err(c, "ibv_post_send(relay)", rc);
++        return -1;
++    }
++    hca->outstanding[dst] += 1;
++    hca->bytes_posted += bytes;
++    c->fwd_outstanding += 1;
++    c->fwd_posted += 1;
++    return 0;
++}
++
++// relay every stripe that has arrived (until: 0), or every one up to sequence ``until``, waiting for those (they
++// have arrived: this rank's kernel for that sequence waited on them); returns how many were relayed, -1 on failure
++static int relay(roce_ctx_t *c, uint32_t until) {
++    int done = 0;
++    for (int e = 0; e < c->n_relay; e++) {
++        for (;;) {
++            const uint32_t seq = c->relay_last[e] + 1;
++            if (until != 0 && (int32_t)(seq - until) > 0) {
++                break;
++            }
++            const uint64_t flag_index = (((uint64_t)c->relay_src[e] * ROCE_SLOTS + (seq & 1u)) * (uint64_t)c->n_flag +
++                                         (uint64_t)c->relay_stripe[e]);
++            volatile uint32_t *flag = (volatile uint32_t *)(c->region + c->flag_off + flag_index * ROCE_FLAG_STRIDE);
++            if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) != seq) {
++                if (until == 0) {
++                    break;
++                }
++                if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
++                    snprintf(c->err, sizeof(c->err), "RoCE proxy stopped waiting to relay rank %d's seq %u",
++                             c->relay_src[e], seq);
++                    return -1;
++                }
++                continue;
++            }
++            if (forward(c, e, seq) != 0) {
++                return -1;
++            }
++            c->relay_last[e] = seq;
++            done++;
++        }
++    }
++    return done;
++}
++
++// every relayed stripe read out by the NIC (its signaled flag completed)
++static int relays_drained(roce_ctx_t *c) {
++    while (c->fwd_outstanding != 0) {
++        for (int h = 0; h < c->n_hca; h++) {
++            if (drain_cq(c, h) != 0) {
++                return -1;
++            }
++        }
++        if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
++            snprintf(c->err, sizeof(c->err), "RoCE proxy stopped with %llu relays outstanding",
++                     (unsigned long long)c->fwd_outstanding);
++            return -1;
++        }
++    }
++    return 0;
++}
++
+ static void *proxy_main(void *arg) {
+     roce_ctx_t *c = (roce_ctx_t *)arg;
+     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+@@ -539,6 +731,16 @@ static void *proxy_main(void *arg) {
+     uint64_t idle = 0;
+     const struct timespec nap = {0, 20000};
+     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
++        if (c->ring) {
++            int n = relay(c, 0);
++            if (n < 0) {
++                atomic_store(&c->failed, 1);
++                return NULL;
++            }
++            if (n > 0) {
++                idle = 0;
++            }
++        }
+         uint32_t seq = __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE);
+         if (seq == c->last_seq) {
+             idle++;
+@@ -571,6 +773,12 @@ static void *proxy_main(void *arg) {
+         }
+         for (uint32_t s = c->last_seq + 1; pending > 0; s++, pending--) {
+             uint32_t nbytes = ctrl[4 + (s & 1u)];
++            // ring: sequence s - 1's relays posted and read out first, so no neighbour's s + 1 (which waits on
++            // this payload) can overwrite a slot that is still being relayed
++            if (c->ring && s != 1 && (relay(c, s - 1) < 0 || relays_drained(c) != 0)) {
++                atomic_store(&c->failed, 1);
++                return NULL;
++            }
+             if (post_op(c, s, nbytes) != 0) {
+                 atomic_store(&c->failed, 1);
+                 return NULL;
+@@ -590,6 +798,9 @@ int roce_start(roce_ctx_t *c) {
+         // the doorbell while the thread was stopped are still posted.
+         volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+         c->last_seq = ctrl[0];
++        for (int e = 0; e < c->n_relay; e++) {
++            c->relay_last[e] = c->last_seq;
++        }
+         c->started = 1;
+     }
+     atomic_store(&c->failed, 0);
+@@ -621,6 +832,8 @@ uint64_t roce_stat(roce_ctx_t *c, int which) {
+         return c->writes_completed;
+     case 2:
+         return c->last_seq;
++    case 3:
++        return c->fwd_posted;
+     default:
+         return 0;
+     }
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9ff932d..e93d9b9 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -553,6 +553,8 @@ class GlmEngine:
+                 routes = getattr(roce, "routes", None)
+                 via = ", ".join(roce.hcas) if routes is None else "; ".join(
+                     f"rank {p} over {'+'.join(roce.hcas[h] for h, _ in pairs)}" for p, pairs in sorted(routes.items()))
++                if getattr(roce, "ring", False):
++                    via += "; " + ", ".join(f"rank {p}" for p in roce.across) + " relayed by the neighbours (a ring)"
+                 print(f"[tensorfold] all-gathers up to {roce.max_bytes >> 10} KiB over RoCE ({via}; b12x's RoCEnante "
+                       "transport), larger ones over NCCL", flush=True)
+         cfg = Config.read(model_dir)

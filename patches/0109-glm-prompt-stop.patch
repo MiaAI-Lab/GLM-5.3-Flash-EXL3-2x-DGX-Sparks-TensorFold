@@ -1,0 +1,252 @@
+# A prompt whose client left stops at its next chunk instead of filling to its end (TF_GLM_PROMPT_STOP):
+#
+# - Why: a single-stream prompt ran every chunk to the end before a reply's stop vote (0070's StopVote, one round after
+#   the first token) could end the request, so a dropped long prompt held both ranks for the whole prefill. Under
+#   --parallel only sliced fills (TF_GLM_FILL_BUDGET_MS>0) noticed a client that left while its prompt filled.
+# - Single stream: decode.PromptStop (this rank's wish: rank 0 polls the request's `cancelled`, other ranks never wish)
+#   and decode.PromptStopped. After each prompt chunk but the last, prefill() asks the vote: every rank all-gathers its
+#   wish as one int32 (one tiny collective a chunk, a chunk runs for seconds) and all stop when any rank wishes, so all
+#   ranks stop after the same chunk. Engine.prompt_stop carries it; GlmEngine._run_once sets it for the request
+#   (rank 0's `on_tokens.cancelled`), catches PromptStopped, leaves `live` as the prompt's rows before the stop, remembers
+#   the states kept on the way and reports `prompt_stopped`; generate() then raises RequestCancelled.
+# - decode.prompt_stop_on: TF_GLM_PROMPT_STOP = 1 (default) or 0 (every prompt fills to its end); other values are an
+#   error. It joins the ranks' startup comparison (the vote is a collective: ranks with different settings would hang).
+# - Multi-stream (--parallel): MultiDecoder._iterate polls every filling stream's `cancelled` before its next chunk, not
+#   only with TF_GLM_FILL_BUDGET_MS>0 (the sliced path already did): a stream whose client left ends at once; rank 0
+#   polls, the FINISH it sends makes both ranks drop it.
+#
+# What Flash already had: the sliced-fill cancellation poll in _iterate (kept; now unconditional), queued-request
+# cancellation in the scheduler (_cancel_waiting), the reply's StopVote in decode, and `feed.cancelled` on the single
+# stream's on_tokens (cuda/server.py). It had no stop inside a prompt on the single-stream path.
+#
+# Bits: a stop only ends the prefill after a whole chunk, so the committed rows are those of a prefix run of the
+# prompt in the same chunking, and a later prompt that extends it resumes from them as from any prefix state. Without a
+# wish, or with TF_GLM_PROMPT_STOP=0, every chunk runs as before (the vote reads no model state).
+#
+# Tests (CPU, tests/cpu/test_prompt_stop.py in the recipe): the setting; the vote across 2 / 3 / 4 ranks as threads
+# (any rank's wish, a broken poll never wishes, sticky); all ranks stop after the same chunk; committed rows equal a
+# prefix run's and resume a longer prompt exactly; no stop without a wish, on the last chunk or with the setting off;
+# _run_once and generate() report the stop and raise RequestCancelled; the startup comparison; and a real tiny model
+# on two gloo ranks (the chunk forward in Triton's interpreter) whose stopped caches equal a prefix run's bit for bit.
+# The scheduler half is in test_multi_quick_fills.py (a filling stream whose client left ends before its next chunk,
+# with and without sliced fills).
+#
+# Provenance and credit: ported from the GLM-5.3 recipe's patch 0168 (Mia's AI Lab), after upstream TensorFold's prompt
+# stop at chunk boundaries by Ash Hart (ashhart), commit 05dfb7b, Apache 2.0. The multi-rank prompt vote and the
+# scheduler's cancelled fills are our code.
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 2e4b01e..9998a2e 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -62,6 +62,58 @@ class StopVote:
+         return self.agreed
+ 
+ 
++class PromptStopped(Exception):
++    """A prompt's prefill ended at a chunk boundary on a stop every rank agreed to (``PromptStop``); ``at``: the
++    rows committed (the caches hold the prompt's rows before it, a state like any prefix's)."""
++
++    def __init__(self, at: int) -> None:
++        super().__init__(f"the prompt's prefill stopped after {at} rows: the client left")
++        self.at = at
++
++
++def prompt_stop_on(env=None) -> bool:
++    """TF_GLM_PROMPT_STOP: "1" (default) a single-stream prompt votes after each chunk whether to stop (``PromptStop``);
++    "0" every prompt fills to its end. Every rank must agree (the vote is a collective)."""
++
++    import os
++
++    value = ((os.environ if env is None else env).get("TF_GLM_PROMPT_STOP", "1") or "1").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_PROMPT_STOP is 0 or 1, not {value!r}")
++    return value == "1"
++
++
++class PromptStop:
++    """A single-stream prompt's stop at chunk boundaries (after upstream TensorFold's 05dfb7b by Ash Hart (ashhart,
++    Apache-2.0): a cancelled prompt stops at its next chunk; the multi-rank vote is our code). ``poll`` (rank 0: the
++    request's ``cancelled``, the client gone; other ranks: None) is this rank's wish; ``__call__`` all-gathers every
++    rank's wish as one int32 each and stops when any rank wishes, so every rank stops after the same chunk, as
++    ``StopVote`` ends a decode. One tiny gather a chunk (a chunk runs for seconds); the rows of the chunks committed
++    stay a valid prefix state."""
++
++    def __init__(self, w, poll=None) -> None:
++        self.w, self.poll = w, poll
++        self.stop = False
++
++    def mine(self) -> bool:
++        try:
++            return bool(self.poll is not None and self.poll())
++        except Exception:                 # noqa: BLE001  (a broken poll never stops the ranks apart)
++            return False
++
++    def __call__(self) -> bool:
++        wish = self.mine()
++        comm = getattr(self.w, "comm", None)
++        if comm is not None and int(getattr(self.w, "world", 1)) > 1:
++            dev = self.w.device
++            flag = torch.tensor([int(wish)], dtype=torch.int32, device=dev)
++            got = torch.empty((self.w.world,), dtype=torch.int32, device=dev)
++            comm.all_gather(flag, got)
++            wish = bool(int(got.max().item()))
++        self.stop = self.stop or wish
++        return self.stop
++
++
+ def stopped(e) -> bool:
+     """Whether every rank agreed to end this run (``StopVote``); False outside a voting run."""
+ 
+@@ -200,6 +252,7 @@ class Engine:
+         self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
+         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
+         self.vote: StopVote | None = None               # a serial run's stop vote, carried by each verify sample
++        self.prompt_stop: PromptStop | None = None      # a single-stream prompt's stop vote at chunk boundaries
+         self.draft_n = w.head.n
+         self.graphs = None
+         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
+@@ -581,10 +634,15 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
+     else:
+         prof.active = True
+-        for start in range(begin, len(prompt), e.prefill_rows):
+-            last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter,
+-                                 feed=feed, mtp=use_mtp, head=sample)
+-        prof.active = False
++        vote = getattr(e, "prompt_stop", None)
++        try:
++            for start in range(begin, len(prompt), e.prefill_rows):
++                R = min(e.prefill_rows, len(prompt) - start)
++                last = prefill_chunk(e, prompt, start, R, drafter=drafter, feed=feed, mtp=use_mtp, head=sample)
++                if vote is not None and start + R < len(prompt) and vote():    # every rank: the same chunk
++                    raise PromptStopped(start + R)
++        finally:
++            prof.active = False
+         prof.report(len(prompt) - begin)
+     if not sample:
+         return None
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 53878f3..1fc3089 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -709,6 +709,9 @@ class GlmEngine:
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), int(MSA)] + prompt_arith_code(self.split)
++        from .decode import prompt_stop_on
++
++        mine.append(int(prompt_stop_on()))    # TF_GLM_PROMPT_STOP: the prompt chunks' vote is a collective
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -721,7 +724,7 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_PROMPT_OWN_FRONT, "
+                                "TF_GLM_PROMPT_MICROBATCH*, "
+-                               "TF_GLM_DRAFT_DUMP, "
++                               "TF_GLM_DRAFT_DUMP, TF_GLM_PROMPT_STOP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+@@ -1363,8 +1366,8 @@ class GlmEngine:
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                   feed=None, shared=()) -> dict[str, Any]:
+-        from .decode import (DepthPolicy, StopVote, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot,
+-                             whole)
++        from .decode import (DepthPolicy, PromptStop, PromptStopped, StopVote, dflash_decode, mtp_decode, prefill,
++                             prompt_stop_on, serial_decode, take_snapshot, whole)
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+@@ -1393,19 +1396,34 @@ class GlmEngine:
+         if point is not None and point < len(prompt):
+             stops.append(point)
+         resume, kept = hit, []
+-        for stop in stops:
+-            head = list(prompt[:stop])
+-            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
+-            resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                   drafter=drafter)
+-            resume.shared = stop != point                         # (a shared-prefix point; --spill-gib writes it)
+-            kept.append(resume)
+-        # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
+-        # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
+-        replay = whole(hit, prompt)
+-        end = point == len(prompt) and not replay
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed,
+-                        keep_head=end)
++        # TF_GLM_PROMPT_STOP: every rank votes after each prompt chunk whether rank 0's client has left
++        # (``decode.PromptStop``); all stop after the same chunk, the rows committed a prefix state like any other
++        poll = getattr(on_tokens, "cancelled", None) if self.rank == 0 else None
++        self.e.prompt_stop = PromptStop(self.w, poll) if prompt_stop_on() else None
++        try:
++            for stop in stops:
++                head = list(prompt[:stop])
++                prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
++                resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                       drafter=drafter)
++                resume.shared = stop != point                     # (a shared-prefix point; --spill-gib writes it)
++                kept.append(resume)
++            # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
++            # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
++            replay = whole(hit, prompt)
++            end = point == len(prompt) and not replay
++            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed,
++                            keep_head=end)
++        except PromptStopped as cut_short:
++            # the caches hold the prompt's rows before the stop; the states kept on the way stay (both ranks alike)
++            self.live = list(prompt[:self.e.st.pos]) if feed is None else []
++            for snap in kept:
++                snap.images = feed is not None
++                self._remember(snap)
++            stats.update(prefill_s=time.perf_counter() - t0, cached=cut, prompt_stopped=cut_short.at)
++            return stats
++        finally:
++            self.e.prompt_stop = None
+         prefill_s = time.perf_counter() - t0
+         if end:
+             snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+@@ -1553,6 +1571,10 @@ class GlmEngine:
+             self._spill_wait()
+         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+                           shared)
++        if stats.get("prompt_stopped"):                  # every rank stopped the prompt after the same chunk
++            from tensorfold.server.cancellation import RequestCancelled
++
++            raise RequestCancelled(f"the client left; its prompt stopped after {stats['prompt_stopped']} rows")
+         stats.update(policy=spec, drafts=draft)
+         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+             self.comm.check()
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 8f6675e..be189b3 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1714,16 +1714,17 @@ class MultiDecoder:
+         return bool(self.quick) and not lane.s.background and len(lane.s.prompt) - lane.st.pos <= self.quick
+ 
+     def _iterate(self) -> list[Stream]:
+-        if self.fill_budget:
+-            cancelled = []
+-            for lane in self.lanes.values():
+-                poll = getattr(lane.s.emit, "cancelled", None)
+-                if not lane.decoding and not lane.s.done and poll is not None and poll():
+-                    lane.s.done = True
+-                    lane.s.started = lane.s.finished = time.perf_counter()
+-                    cancelled.append(lane.s)
+-            if cancelled:
+-                return cancelled                 # finish() mirrors cancellation and retires partial groups
++        # a filling stream whose client has left ends before its next prompt chunk (sliced or not; rank 0 polls, the
++        # FINISH it sends makes every rank drop it): a dropped long prompt frees the server within a chunk
++        cancelled = []
++        for lane in self.lanes.values():
++            poll = getattr(lane.s.emit, "cancelled", None)
++            if not lane.decoding and not lane.s.done and poll is not None and poll():
++                lane.s.done = True
++                lane.s.started = lane.s.finished = time.perf_counter()
++                cancelled.append(lane.s)
++        if cancelled:
++            return cancelled                     # finish() mirrors cancellation and retires partial groups
+         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
+         if self.partial is not None and lane is not None:
