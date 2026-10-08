@@ -165,6 +165,46 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
   [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased
   onto the current patches, with both limits off by default and their drops kept out of the spill tier, by MiaAI-Lab.
+- `0098-cuda-ring-exchange`, `0099-cuda-roce-ring`, `0100-cuda-roce-ack-timeout` (four Sparks cabled as a ring: the split
+  prefill's exchanges round the ring, the RoCE all-gather relayed by the neighbours, the queue pairs' ACK timeout) and
+  the ring's `COMM=roce` in the scripts: `0098` is the same design as the [GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)'s patch 0142, `0099`
+  and `0100` are ported from its patches 0143 and 0155 (Mia's AI Lab), on b12x's RoCEnante proxy (`0006` above;
+  `NOTICE` lists the changes to its file).
+- `0101-glm-prompt-attention-msa` (`msa.cu`): adapted from the GLM-5.3 recipe's kernel 2 (patch 0150, Mia's AI Lab),
+  whose design points come from two authors: **[drowzeys](https://github.com/drowzeys)** authored the one-pass prompt
+  attention of commit [e91312a](https://github.com/drowzeys/TensorFold/commit/e91312a) in
+  [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold) (branch `glm53-tp4-2026-10-05`, Apache 2.0), and
+  **[BertholomusAI (Albert Lee)](https://github.com/bertholomus)** authored the prompt sparse attention of commit
+  [8f649f1](https://github.com/bertholomus/TensorFold/commit/8f649f1) in
+  [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) (branch `glm-dsa-tp4`, Apache 2.0); no code was
+  copied from either.
+- `0102-glm-prompt-own-front`, `0104-glm-prompt-microbatch`: the design (each rank's DSA front and top-k on its own
+  rows, outputs shared; a chunk in two halves whose exchanges run under the other half's compute) is **drowzeys**'
+  (`compute_prompt_sp`, `SP_SELECT`, `PROMPT_OVERLAP` in [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold)
+  (branch [`glm53-tp4-2026-10-05`](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05), Apache 2.0)),
+  which drowzeys authored; the code is ours, ported from the GLM-5.3 recipe's patches 0147 and 0148 (Mia's AI Lab).
+- `0103-glm-prompt-select`: built on the radix top-k of upstream TensorFold, authored by
+  [Ash Hart (ashhart)](https://github.com/ashhart) ([094f5e4](https://github.com/ashhart/TensorFold/commit/094f5e4)) and
+  ported to Triton for glm5_next by [taussoe](https://github.com/taussoe)
+  ([fb985b8](https://github.com/ashhart/TensorFold/commit/fb985b8)); its ideas are those of the GLM-5.3 recipe's patch
+  0151 (Mia's AI Lab), re-done for Flash's indexer: the re-tiled scoring idea is **drowzeys**' (commit
+  [f0f382d](https://github.com/drowzeys/TensorFold/commit/f0f382d)) and the shared key tiles are **BertholomusAI (Albert
+  Lee)**'s (commit [c1ca5d8](https://github.com/bertholomus/TensorFold/commit/c1ca5d8)); the code is ours, none copied
+  from the forks.
+- `0105-glm-decode-side-stream`: the idea (the shared expert beside the routed experts on a second stream in decode)
+  is **BertholomusAI (Albert Lee)**'s, commit [f14e7f7](https://github.com/bertholomus/TensorFold/commit/f14e7f7) in
+  [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) (branch `glm-dsa-tp4`, Apache 2.0); ported from the
+  GLM-5.3 recipe's patch 0144 (Mia's AI Lab), written anew here, no code of theirs.
+- `0106-glm-prompt-exchange-bf16` (bf16 partials, the ring exchange's in-place link all-gathers),
+  `0107-glm-prompt-arith-identity`: ported from the GLM-5.3 recipe's patches 0153 and 0157 (Mia's AI Lab).
+- `0108-glm-multi-quick-fills` (`TF_GLM_QUICK_ROWS`): ported from the GLM-5.3 recipe's patch 0167 (Mia's AI Lab); the
+  quick fills idea is **BertholomusAI (Albert Lee)**'s (`TF_GLM_QUICK_ROWS` in
+  [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold), branch `glm-dsa-tp4`, commit
+  [14b43b0](https://github.com/bertholomus/TensorFold/commit/14b43b0), Apache 2.0); the scheduler code is ours.
+- `0109-glm-prompt-stop` (`TF_GLM_PROMPT_STOP`): ported from the GLM-5.3 recipe's patch 0168 (Mia's AI Lab), after
+  upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
+  [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
+  scheduler's cancelled fills are our code.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

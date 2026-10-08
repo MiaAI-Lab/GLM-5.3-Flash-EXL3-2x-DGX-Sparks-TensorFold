@@ -14,9 +14,28 @@
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
 OpenAI-compatible API, with **4 concurrent requests**, the model's full **1,048,576-token context** and **image and
 video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 on both Sparks (one rank on each)
-in NVIDIA's PyTorch container, plus 97 patches (65 of v1.4, 3 for 3 Sparks, experimental, 1 for 4 Sparks on a ring, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests, 5 of v1.6: a shared system prompt keeps each conversation's history, the display reservation in the pool and the pool compacting before it evicts, by [ezoushen](https://github.com/ezoushen); queued requests whose client left dropped at once, by [desy0305](https://github.com/desy0305); `<|assistant|>` ending a reply; 1 of v1.7.1: a new agent run keeps its system prompt's state once the kept-state cap is full, diagnosed and the fix proposed by [meleesciony](https://github.com/meleesciony) in [issue #75](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/75); 1 fix since v1.7.1: a fresh conversation after a long one no longer runs out of memory; 5 of v1.8: pictures read once and quoted media markers, by [ThomasWadeZ](https://github.com/ThomasWadeZ), capacity refusals, by [johnwhited](https://github.com/johnwhited); and 12 of v1.9: the Anthropic Messages API, backported by [Eduardo Florencio](https://github.com/eduffd) from upstream work by [evilpsycho42](https://github.com/evilpsycho42), [ashhart](https://github.com/ashhart) and [Jordi Posthumus](https://github.com/JordiPosthumus); long-context decode and prefill and the display reservation on kindling spark-os, by [BadAd84](https://github.com/BadAd84); a spill tier for kept prompt states, by [Robert Wojciechowski](https://github.com/wojo); kept-state limits, by [Thomas Wade](https://github.com/ThomasWadeZ); the expert decode launch order, by [Lukasz Raczylo](https://github.com/lukaszraczylo); a loop guard, chunked bodies, Responses `include`, streamed admission and checked draft candidates; and 2 of v1.10: the reasoning-effort line at the prompt's tail, opt-in, reported by [jdecker76](https://github.com/jdecker76) in [issue #93](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/93); and the kept-state count as a share of the pool, diagnosed by [jdecker76](https://github.com/jdecker76) in [issue #84](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/84)): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
+in NVIDIA's PyTorch container, plus 108 patches (65 of v1.4, 3 for 3 Sparks, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests, 5 of v1.6: a shared system prompt keeps each conversation's history, the display reservation in the pool and the pool compacting before it evicts, by [ezoushen](https://github.com/ezoushen); queued requests whose client left dropped at once, by [desy0305](https://github.com/desy0305); `<|assistant|>` ending a reply; 1 of v1.7.1: a new agent run keeps its system prompt's state once the kept-state cap is full, diagnosed and the fix proposed by [meleesciony](https://github.com/meleesciony) in [issue #75](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/75); 1 fix since v1.7.1: a fresh conversation after a long one no longer runs out of memory; 5 of v1.8: pictures read once and quoted media markers, by [ThomasWadeZ](https://github.com/ThomasWadeZ), capacity refusals, by [johnwhited](https://github.com/johnwhited); and 12 of v1.9: the Anthropic Messages API, backported by [Eduardo Florencio](https://github.com/eduffd) from upstream work by [evilpsycho42](https://github.com/evilpsycho42), [ashhart](https://github.com/ashhart) and [Jordi Posthumus](https://github.com/JordiPosthumus); long-context decode and prefill and the display reservation on kindling spark-os, by [BadAd84](https://github.com/BadAd84); a spill tier for kept prompt states, by [Robert Wojciechowski](https://github.com/wojo); kept-state limits, by [Thomas Wade](https://github.com/ThomasWadeZ); the expert decode launch order, by [Lukasz Raczylo](https://github.com/lukaszraczylo); a loop guard, chunked bodies, Responses `include`, streamed admission and checked draft candidates; and 2 of v1.10: the reasoning-effort line at the prompt's tail, opt-in, reported by [jdecker76](https://github.com/jdecker76) in [issue #93](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/93); and the kept-state count as a share of the pool, diagnosed by [jdecker76](https://github.com/jdecker76) in [issue #84](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/84); and 12 unreleased, for two to four Sparks, below: the split prefill's exchanges round a four-Spark ring and the RoCE all-gather relayed round it with a longer ACK timeout, prompt sparse attention faster at a rank's heads and `msa.cu` (opt-in), each rank's DSA front on its own rows (opt-in), a compacted top-k for the prompt's token selection, two micro-batches a prompt chunk (opt-in), the MoE's shared expert on a decode side stream (opt-in), bf16 partials for the split (opt-in), the prompt kernels' choices in the ranks' startup comparison, quick fills of short prompts among decoding requests, and a prompt whose client left stopping at its next chunk): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
 faster prompt kernels, a one-shot RoCE all-gather between the Sparks, several requests over one shared cache pool,
 vision, tool calling, `/tokenize` and `/metrics`.
+
+**Unreleased, two to four Sparks** (patches 0098-0109; 0099-0109 ported from the
+[GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold) by Mia's AI Lab): the RoCE
+all-gather relayed round a four-Spark ring, a faster prompt token selection and sparse attention, quick fills and the
+prompt stop, and, off until measured on the Sparks, each rank's DSA front on its own rows, two micro-batches a prompt
+chunk, a decode side stream and bf16 partials. The own-row front and the micro-batches are
+[drowzeys](https://github.com/drowzeys)' designs, which drowzeys authored in
+[drowzeys/TensorFold](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05) (`compute_prompt_sp`,
+`SP_SELECT`, `PROMPT_OVERLAP`); the prompt kernels take design points from work drowzeys authored
+([e91312a](https://github.com/drowzeys/TensorFold/commit/e91312a), [f0f382d](https://github.com/drowzeys/TensorFold/commit/f0f382d))
+and work [BertholomusAI (Albert Lee)](https://github.com/bertholomus) authored
+([8f649f1](https://github.com/bertholomus/TensorFold/commit/8f649f1), [c1ca5d8](https://github.com/bertholomus/TensorFold/commit/c1ca5d8)
+in [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold), branch `glm-dsa-tp4`); the decode side stream
+is BertholomusAI's idea ([f14e7f7](https://github.com/bertholomus/TensorFold/commit/f14e7f7)) and so are the quick fills
+([14b43b0](https://github.com/bertholomus/TensorFold/commit/14b43b0)); the token selection is built on the radix top-k
+by [Ash Hart (ashhart)](https://github.com/ashhart) ([094f5e4](https://github.com/ashhart/TensorFold/commit/094f5e4)),
+with [taussoe](https://github.com/taussoe)'s Triton port ([fb985b8](https://github.com/ashhart/TensorFold/commit/fb985b8)),
+and the prompt stop follows Ash Hart's prompt stop at chunk boundaries in upstream TensorFold
+([05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b)). The code is Mia's AI Lab's ([`CREDITS.md`](CREDITS.md)).
 
 - Checkpoint: [`Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold), Mia's AI Lab's own EXL3 quantization (routed experts at 4 bits a weight,
   BF16 elsewhere, ~176 GB), calibrated for how TensorFold serves it
@@ -488,13 +507,16 @@ every configured worker), one for each way of connecting them:
 | No switch: a ring of direct cables | `./start-tp4-switchless.sh` | [Without a switch](#without-a-switch-start-tp4-switchlesssh) (measured below) |
 
 Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
-connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patch 0098 on a ring;
+connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patches 0098-0100 on a ring;
 the image is not published yet, so `prepare.sh` builds it on the first start. **Measured** on a four-Spark ring
 (2026-10-05, sparkDash, prose, thinking off): 83.2 tok/s one request (three Sparks 65.7), 115.5 / 133.9 / 147.1 tok/s at
 2 / 3 / 4 at once, time to first token 118 ms; prefill ~2,000-2,075 tok/s (8k and 30k-token prompts). Replies equal the
 gather exchange's byte for byte (four prompts, 14 to 20,474 tokens); the full exactness checks of three Sparks
 (concurrent == serial, drafted == serial, needles) have not been run at four. Its defaults are three Sparks'
-(`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`).
+(`PARALLEL=8`, `KV_POOL_GIB=32`, `COMM=nccl`), except that the ring now defaults to `COMM=roce` (patches 0099 and 0100).
+That is **not measured on the Sparks yet**, so the numbers above are `COMM=nccl`'s; `COMM=nccl ./start-tp4-switchless.sh`
+is the fallback. The switches that are off by default are off here too, until measured; the ones to try on the ring
+are listed in [Prompt and decode switches for two to four Sparks](#prompt-and-decode-switches-for-two-to-four-sparks).
 
 Both need what two Sparks need ([Requirements](#requirements)) on all four: ~110 GiB free GPU memory each, Docker with
 the NVIDIA runtime, `rsync`, and key-based ssh from the head (the Spark that runs the script and the API) to the three
@@ -581,8 +603,11 @@ no cable. Traffic between those goes through a neighbour.
 
 How the ring runs:
 
-- **Nothing goes across the ring.** NCCL carries every all-gather (`COMM=nccl`; `COMM=roce` is refused, as it sends
-  to every peer) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
+- **Nothing goes across the ring.** The small all-gathers go over RoCE to the two neighbours, whose proxies relay
+  each rank's share on to the Spark across, half its stripes each way (`COMM=roce`, the default here: patch 0099,
+  `TF_ROCE_RING=1`; not measured on the Sparks yet); the queue pairs wait for ACKs as long as NCCL does (patch 0100,
+  after a momentary stall of one cable once failed an RDMA write). NCCL carries the larger ones (and every one with
+  `COMM=nccl`) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
   (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges go
   round the ring (patch 0098, `TF_NCCL_RING=1`): each message the shorter way, a hop a step, over a two-rank NCCL
   link with each neighbour, the same bytes as `p2p` and overlapped (prefill ~2,000-2,075 tok/s, against ~1,720 with
@@ -600,6 +625,33 @@ How the ring runs:
   `lo`, that path runs over the CX7 links). An NFS export must allow that worker's source address on the route back.
 - `WORKER3` has its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`. On a ring
   `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
+
+## Prompt and decode switches for two to four Sparks
+
+Patches 0101-0106 speed up the parts of a prompt chunk that did not shrink with more Sparks, and one part of decode.
+Nothing of 0099-0109 has been measured end to end on the Sparks yet: only CPU tests (`scripts/test-cpu.sh`) and
+single-GB10 microbenchmarks (quoted below, kernels at a rank's shapes) exist. So the switches that cost memory, change
+the schedule or change the bits are off. To try on the ring (`SPLIT=1`, the default), one at a time, in
+`scripts/local.sh` or the environment:
+
+| Setting | Default | What it does | Measured (one GB10, a rank's shapes) |
+| --- | --- | --- | --- |
+| `TF_GLM_PROMPT_SELECT` | `1` | the prompt's top-k over the indexer's scores on a compacted radix select: three reads of a row's scores instead of five, the same pools (patch 0103); `0`: the old kernel | not measured on this stack; the first version, which also stacked two rows in the scoring, took a 2,048-row chunk-layer's selection from 1.63 / 6.05 / 27.14 to 0.91 / 2.76 / 12.14 ms at 8k / 32k / 128k |
+| (none) | on | the prompt sparse attention's one 16-head tile on 4 warps at four Sparks (patch 0101); the same bits | 6.6 -> 4.8 ms a 2,048-row chunk-layer at 32k tokens, 7.9 -> 5.7 at 128k |
+| `TF_GLM_PROMPT_OWN_FRONT` | `0` | with `SPLIT=1`, each rank runs the DSA layers' replicated front (q_a / kv_a, the indexer and its top-k) on its own rows and shares the outputs (patch 0102); the same bits | the selection at 128k: 26.8 ms a chunk-layer on 2,048 rows -> 13.6 / 8.7 / 6.3 ms on a rank's rows at 2 / 3 / 4 Sparks |
+| `TF_GLM_PROMPT_MICROBATCH` (with `TF_GLM_PREFILL_ROWS=4096`), `TF_GLM_PROMPT_MICROBATCH_MIN_ROWS` | `0`, `2048` | with `SPLIT=1`, a chunk in two halves, each half's exchanges and glue on the side stream under the other's compute (patch 0104); the same bits; ~0.9 GiB more prompt buffers a Spark at four; at three also `TF_GLM_PROMPT_MICROBATCH_MIN_ROWS=1920` (halves of 1,920 + 2,176 rows) | the routed experts cost 23-73% more a row in 1,024-row calls than in 2,048-row ones, so halves of fewer than 2,048 rows run the chunk whole |
+| `TF_GLM_PROMPT_PARTIALS` | `fp32` | `bf16` (needs `SPLIT=1`): the split's partials go out as bf16, half the bytes (patch 0106); a prompt's bits change once and are not quality-checked on Flash | not measured |
+| `TF_GLM_MSA` | `0` | the prompt sparse attention on `msa.cu` (FP8 KV; patch 0101): other prompt bits, so off until the needle checks (`tools/needle.py`) have run with it | 32 / 22 / 16 heads a rank: 9.5 / 9.9 / 4.8 -> 7.1 / 6.8 / 3.1 ms a chunk-layer at 32k |
+| `TF_GLM_SIDE` | `0` | decode: the MoE's shared expert on a second stream beside the routed experts (patch 0105; `DENSE=q4`); the same bits | one MoE layer 281 -> 263 us at one row (two Sparks' shapes), 135 -> 121 (four's), about even at 4-16 rows |
+| `TF_NCCL_RING_INPLACE` | `1` | on a ring (`TF_NCCL_RING=1`), the exchange's link all-gathers run in place, each link on its own stream (patch 0106); `0` keeps 0098's pack / all-gather / unpack steps; the same bytes | not measured |
+| `TF_GLM_QUICK_ROWS` | `1024` | under `--parallel`, a foreground prompt with at most this many rows left goes before the next decode round (patch 0108); `0`: off; the same replies | not measured on the Sparks |
+| `TF_GLM_PROMPT_STOP` | `1` | a prompt whose client left stops at its next chunk instead of filling to its end (patch 0109); `0`: every prompt fills to its end | not measured on the Sparks |
+
+Patch 0107 puts these prompt-arithmetic choices (`TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` and four more kernel
+settings) into the ranks' startup comparison and into the kept prompt states' identity, so ranks started with different
+choices refuse to start and a state is never resumed under other arithmetic. The own-row front and the halves were
+checked bit for bit against the unsplit path at two, three and four ranks on CPU and, with real CUDA streams, on one
+GPU (`scripts/test-gpu.sh`). **Three Sparks and a switch: not tested on hardware**, only those tests at three ranks.
 
 ## Configuration
 
@@ -636,7 +688,15 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
-| `COMM` | `roce` | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link; `nccl`: NCCL for all |
+| `COMM` | `roce` (`nccl` at `TP=3` and on a four-Spark switch) | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link (on a four-Spark ring relayed by the neighbours, patch 0099, `TF_ROCE_RING=1`, set on a ring; not measured on the Sparks yet); `nccl`: NCCL for all |
+| `TF_ROCE_IB_TIMEOUT` | `20` | the RoCE all-gather's ACK timeout (4.096 us x 2^value a try; NCCL's; b12x's was 14), 1 to 31 (patch 0100) |
+| `TF_GLM_PROMPT_SELECT` | `1` | the prompt's top-k on a compacted radix select, the same pools (patch 0103); `0`: the old kernel |
+| `TF_GLM_PROMPT_OWN_FRONT` / `TF_GLM_PROMPT_MICROBATCH` / `TF_GLM_PROMPT_MICROBATCH_MIN_ROWS` | `0` / `0` / `2048` | with `SPLIT=1`: each rank's DSA front on its own rows (patch 0102); a chunk in two halves (patch 0104, meant with `TF_GLM_PREFILL_ROWS=4096`; halves of fewer rows run the chunk whole). [Prompt and decode switches](#prompt-and-decode-switches-for-two-to-four-sparks) |
+| `TF_GLM_PROMPT_PARTIALS` | `fp32` | `bf16`: the split's partials as bf16, half the bytes; needs `SPLIT=1`, other prompt bits (patch 0106) |
+| `TF_GLM_MSA` / `TF_GLM_SIDE` | `0` / `0` | `msa.cu` for the prompt's sparse attention, other bits (patch 0101); the MoE's shared expert on a decode side stream (patch 0105) |
+| `TF_NCCL_RING_INPLACE` | `1` | with `TF_NCCL_RING=1` (a ring): the exchange's link all-gathers in place (patch 0106); `0`: 0098's steps |
+| `TF_GLM_QUICK_ROWS` | `1024` | with `--parallel`: a foreground prompt with at most this many rows left goes before the next decode round (patch 0108); `0`: off |
+| `TF_GLM_PROMPT_STOP` | `1` | a prompt whose client left stops at its next chunk (patch 0109); `0`: off |
 | `SPLIT` | `1` | prompt chunks' hyper-connection work split between the Sparks, its exchanges overlapped with the next rows' work; when a rank's first NCCL connection fails with it (NCCL error 2, issue #36), `start.sh` tries once more, then starts with `SPLIT=0` and says so |
 | `KDA_CHUNKED` | `1` | KDA prompt chunks in chunked (WY) form, one CUDA kernel |
 | `TF_GLM_L2PF` | `1` | L2 prefetch in decode: the weights the next kernels read brought into L2 during each layer's all-gathers; `0`: off |
@@ -766,6 +826,11 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Sampling | `0034-cuda-nucleus-union` | a top_p draw from both ranks' candidates together, the same draw with fewer whole-shard reads (`TENSORFOLD_NUCLEUS_UNION`, on in the recipe; `NUCLEUS_UNION=0` turns it off) | default sampling (temperature 1, top_p 0.95) decodes at greedy's pace, not a third of it |
 | Server | `0003-glm-vision`, `0050-glm-many-media`, `0056-glm-tool-result-media`, `0036-glm-tool-calls`, `0051-glm-tool-history-recovery`, `0053-glm-whole-tool-calls`, `0055-glm-open-tool-calls`, `0037-cuda-tokenize`, `0023-server-effort-max`, `0057-server-thinking-alias`, `0044-cuda-context-errors`, `0045-cuda-metrics`, `0058-server-client-gone-poll`, `0059-server-refused-bodies`, `0061-server-smooth-stream` | GLM's image and video processors and vision tower; up to 50 pictures and 4 clips a request in 96 MiB bodies, in user messages and tool results; GLM tool calls for agent clients; a past tool call whose arguments are not a JSON object left out of the prompt with its result and logged, instead of HTTP 400 (agents replay history, so a 400 ended the conversation); each call sent whole once written, a call the token limit cuts never sent, one the model ends without `</tool_call>` closed when it parses (else text), a missing `<arg_key>` put back; `/tokenize` and `/detokenize`; `reasoning_effort: "max"`; `chat_template_kwargs.thinking` read as `enable_thinking` (from Alexbob0's #25); the `param` field and GLM's own refusals on TensorFold v0.6.0's `context_length_exceeded` errors, and `/health`'s figures in its Prometheus `/metrics`; the client-gone check past 1,023 descriptors (TensorFold PR #218, jayleaton); a refused POST's body read before the reply (TensorFold v0.6.1's #181 fix); smooth streaming from a playout buffer (`STREAM_SMOOTH`) | the API features above |
 | 3 Sparks (experimental) | `0066-glm-tp-n`, `0067-glm-tp3-split-pad`, `0068-glm-tpn-split-buffer-rows` | the engine on 2 or 3 ranks (`--tp`): heads, expert columns, vocabulary and DFlash2 KV groups split in whole units, the remainder to the lowest ranks; the row split (`SPLIT`) and its early connection to every peer; RoCE all-gathers over per-peer routes (b12x's proxy modified for more than two Sparks); prompt buffers and the memory estimate hold the split's pad row at three ranks | [3 Sparks](#3-sparks-experimental); two Sparks unchanged |
+| 4 Sparks, ring | `0098-cuda-ring-exchange`, `0099-cuda-roce-ring`, `0100-cuda-roce-ack-timeout` | the split prefill's exchanges round the ring over two-rank NCCL links (`TF_NCCL_RING=1`); the one-shot RoCE all-gather on a ring of four, each rank writing to its two neighbours, whose proxies relay to the rank across (`TF_ROCE_RING=1`); the queue pairs' ACK timeout as NCCL's (`TF_ROCE_IB_TIMEOUT`) | 0098, four Sparks: an 8 MiB block a peer 2.6-2.75 ms against 4.6-5.0 for `gather`; 0099 and 0100: not measured on the Sparks yet; the same bits |
+| Prompt, 2-4 Sparks | `0101-glm-prompt-attention-msa`, `0102-glm-prompt-own-front`, `0103-glm-prompt-select`, `0104-glm-prompt-microbatch` | the prompt sparse attention's 16-head tile on 4 warps, and `msa.cu` (`TF_GLM_MSA`, off); the DSA front on own rows (`TF_GLM_PROMPT_OWN_FRONT`, off); a compacted top-k (`TF_GLM_PROMPT_SELECT`, on); two micro-batches a chunk (`TF_GLM_PROMPT_MICROBATCH`, off) | kernels on one GB10: [Prompt and decode switches](#prompt-and-decode-switches-for-two-to-four-sparks); the same bits except `msa.cu` |
+| Decode, side stream | `0105-glm-decode-side-stream` | the MoE's shared expert on a second stream in decode windows (`TF_GLM_SIDE`, off) | one MoE layer 281 -> 263 us at one row (two Sparks' shapes); the same bits |
+| Prompt, partials and identity | `0106-glm-prompt-exchange-bf16`, `0107-glm-prompt-arith-identity` | the split's partials as bf16 (`TF_GLM_PROMPT_PARTIALS=bf16`, off) and the ring exchange's in-place link all-gathers (`TF_NCCL_RING_INPLACE`, on); the prompt kernels' choices in the ranks' startup comparison and the kept states' identity | not measured on the Sparks yet; fp32 and the exchange keep the bits |
+| Scheduling | `0108-glm-multi-quick-fills`, `0109-glm-prompt-stop` | a short foreground prompt goes before the next decode round (`TF_GLM_QUICK_ROWS`, 1,024); a prompt whose client left stops at its next chunk (`TF_GLM_PROMPT_STOP`, on) | not measured on the Sparks yet; the same replies |
 | Eight requests at once | `0069-glm-eight-streams` | up to 8 concurrent requests (`PARALLEL` 1 to 8): the batched verify window's segment tables (and the segmented kernels' launch grids) sized for the streams, four as before up to four; the multi-stream DFlash2 drafter, scheduler and memory estimate for 5 to 8 streams; the shared verify window's rows set by `TF_GLM_MULTI_WINDOW` (32 as before; 64 by default past 4 requests) and counted at start | 8 at once: +27% prose, +32% code over 4 on two Sparks (+36% / +28% on three); `PARALLEL` 1 to 4 unchanged ([Performance](#performance)) |
 | Serial stop | `0070-glm-serial-stop` | at `PARALLEL=1`, a request whose client left, or that hit a stop string or a gate cut, ends on both ranks after the same round (rank 0's stop rides on the round's sample all-gather; issue #38); `--parallel` above 1 without DFlash2 refused at start with the options | same replies |
 | Pool room | `0074-glm-compact-before-evict` | a request or a growing stream whose rows the pool has free, but not in one range, gets them by moving other caches (each at most once) instead of evicting kept prompts until a range opens; eviction only while the free rows fall short (by ezoushen, issue #61) | two conversations taking turns at a nearly full pool keep each other's kept state (`tools/pool_pressure.py`: the other's next turn 0% -> 100% resumed) |
@@ -826,6 +891,10 @@ move the same bits. Three defaults are not exact against the checkpoint in bf16,
 close to the serial kernel but not its bits.
 `DENSE=bf16 KV=bf16 KDA_CHUNKED=0` serves the checkpoint as it is, with a shorter window ([KV pool and memory](#kv-pool-and-memory)).
 
+The CPU tests (`scripts/test-cpu.sh`: Triton's interpreter, 2 / 3 / 4 ranks over gloo) and GPU tests
+(`scripts/test-gpu.sh`: one Spark's GPU, `TEST_GPU_GIB` caps their memory, not while the server runs there) in `tests/`
+check patches 0098-0109 without a server.
+
 The checks in `tools/` talk to the running server (`API_URL`, default `http://127.0.0.1:8888`; or just `PORT`),
 from the head or another machine (`API_URL=http://<head-address>:8888 tools/needle.py`). Performance is measured
 with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#performance)).
@@ -847,14 +916,16 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
 start-tp4.sh  the same on four Sparks on a switch (experimental, patches 0066-0068)
-start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a switch (experimental, patch 0098 too)
+start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a switch (experimental, patches 0098-0100 too)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
 patches/      patches baked into the image
+tests/        CPU tests (cpu/, scripts/test-cpu.sh) and GPU tests (gpu/, scripts/test-gpu.sh) of patches 0098-0109
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a
-              full pool) and patches 0072's, 0073's and 0074's checks
+              full pool), patches 0072's, 0073's and 0074's checks, and make-patches.sh (patches/ from a development
+              tree with a commit a patch)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
@@ -892,4 +963,22 @@ turboderp, the
 DFlash2 drafter by
 [IncoAI](https://huggingface.co/incoai), b12x's RoCE transport by local-inference-lab, and code from
 [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) by Jay Leaton (tool calling, L2 prefetch,
-expert loads). The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+expert loads). Patches 0099-0109 are ported from the
+[GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold) (Mia's AI Lab):
+
+- [drowzeys](https://github.com/drowzeys) authored the designs of the own-row prompt front (0102) and the two
+  micro-batches (0104), `compute_prompt_sp`, `SP_SELECT` and `PROMPT_OVERLAP` in
+  [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05) (branch `glm53-tp4-2026-10-05`, Apache 2.0), and the one-pass
+  prompt attention ([e91312a](https://github.com/drowzeys/TensorFold/commit/e91312a)) and re-tiled scoring ([f0f382d](https://github.com/drowzeys/TensorFold/commit/f0f382d)) whose design
+  points 0101 and 0103 take; the code is ours.
+- [BertholomusAI (Albert Lee)](https://github.com/bertholomus) authored the prompt sparse attention
+  ([8f649f1](https://github.com/bertholomus/TensorFold/commit/8f649f1)) and shared key tiles ([c1ca5d8](https://github.com/bertholomus/TensorFold/commit/c1ca5d8)) whose design points 0101 and
+  0103 take, the decode side stream ([f14e7f7](https://github.com/bertholomus/TensorFold/commit/f14e7f7)) that 0105 re-implements, and the quick fills
+  ([14b43b0](https://github.com/bertholomus/TensorFold/commit/14b43b0)) of 0108, in
+  [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) (branch `glm-dsa-tp4`, Apache 2.0); the code is ours.
+- [Ash Hart (ashhart)](https://github.com/ashhart) authored the radix top-k of upstream TensorFold
+  ([094f5e4](https://github.com/ashhart/TensorFold/commit/094f5e4)) that 0103 builds on, ported to Triton by
+  [taussoe](https://github.com/taussoe) ([fb985b8](https://github.com/ashhart/TensorFold/commit/fb985b8)), and the prompt
+  stop at chunk boundaries ([05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b)) that 0109 follows.
+
+The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).

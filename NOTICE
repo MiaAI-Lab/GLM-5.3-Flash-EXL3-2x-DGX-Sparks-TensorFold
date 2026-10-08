@@ -56,6 +56,10 @@ b12x
   HCAs that share its subnet), proxy ABI 5; with no routes set it behaves as b12x's file. Its header lists these
   changes. tensorfold/cuda/roce.cu reimplements b12x's CuTe DSL all-gather kernel (b12x/comm/roce/_allgather_cute.py
   at the same commit) in CUDA C++, with the same stages and memory orderings.
+  patches/0099-cuda-roce-ring.patch modifies roce_proxy.c further (ABI 6): on four Sparks cabled as a ring, a rank's
+  payload goes to its two neighbours only, each stripe with a length word before its flag, and the proxy relays the
+  neighbours' stripes to the rank across the ring. patches/0100-cuda-roce-ack-timeout.patch sets the queue pairs' ACK
+  timeout to 20 (b12x's is 14), with TF_ROCE_IB_TIMEOUT to override it.
 
 glm53-tensorfold-spark
   https://github.com/jayleaton/glm53-tensorfold-spark
@@ -100,6 +104,32 @@ glm53-tensorfold-spark
   by Robert Wojciechowski (wojo, https://github.com/wojo). Its multi-rank design (an NVMe tier for kept prompt states,
   one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
   that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
+
+GLM-5.3 recipe (Mia's AI Lab; patches 0098-0109)
+  https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold, Apache License, Version 2.0.
+  patches/0098 to 0109 port or follow that recipe's patches 0142, 0143, 0155, 0150, 0147, 0151, 0148, 0144, 0153,
+  0157, 0167 and 0168 (Mia's AI Lab's own code) to GLM-5.3-Flash. Some take their design from the TensorFold forks
+  below, whose code none of them copies; 0103 builds on TensorFold's radix top-k by Ash Hart (ashhart, 094f5e4) and
+  taussoe (fb985b8, its Triton port for glm5_next); 0109 follows upstream TensorFold's prompt stop at chunk boundaries
+  by Ash Hart (ashhart, 05dfb7b).
+
+drowzeys/TensorFold (a TensorFold fork; design only)
+  https://github.com/drowzeys/TensorFold (branch glm53-tp4-2026-10-05), by drowzeys, Apache License, Version 2.0.
+  patches/0102-glm-prompt-own-front.patch and patches/0104-glm-prompt-microbatch.patch: the design of that branch's
+  compute_prompt_sp with SP_SELECT (a DSA layer's replicated front and top-k on a rank's own rows, their outputs
+  shared) and PROMPT_OVERLAP (two micro-batches a chunk, each one's exchanges under the other's compute).
+  patches/0101-glm-prompt-attention-msa.patch and patches/0103-glm-prompt-select.patch: design points of its one-pass
+  prompt attention (commit e91312a) and re-tiled indexer scoring (commit f0f382d). No code is taken from it; the code
+  is ours.
+
+bertholomus/TensorFold (a TensorFold fork; design only)
+  https://github.com/bertholomus/TensorFold (branch glm-dsa-tp4), by BertholomusAI (Albert Lee), Apache License,
+  Version 2.0.
+  patches/0101-glm-prompt-attention-msa.patch and patches/0103-glm-prompt-select.patch: design points of its prompt
+  sparse attention (commit 8f649f1) and shared key tiles (commit c1ca5d8); patches/0105-glm-decode-side-stream.patch:
+  its decode side stream's idea (commit f14e7f7), the shared expert beside the routed experts;
+  patches/0108-glm-multi-quick-fills.patch: its quick fills idea (TF_GLM_QUICK_ROWS, commit 14b43b0). No code is taken
+  from it; the code is ours.
 
 Contributions to this project (Apache-2.0, through its issues and pull requests)
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.

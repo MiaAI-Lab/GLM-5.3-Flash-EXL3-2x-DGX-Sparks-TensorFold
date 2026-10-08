@@ -3,11 +3,18 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## Unreleased: 4 Sparks (experimental), on a switch or a ring without one
+## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
-Image: not published yet; `prepare.sh` builds it locally, for two and three Sparks too (the patches' hash no longer matches
-the pinned image until a new one is published and pinned). The
-TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring exchange.
+Image: not published yet; `prepare.sh` builds it locally (108 patches: v1.10's 96 plus `0098`-`0109`), for two and three
+Sparks too (the patches' hash no longer matches the pinned image until a new one is published and pinned). The
+TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring exchange, 0099 the RoCE all-gather
+round the ring. Patches 0099-0109 come from the GLM-5.3 recipe (Mia's AI Lab). **Nothing of 0099-0109 has been measured
+end to end on the Sparks**: only CPU tests and single-GB10 microbenchmarks (kernels at a rank's shapes) exist. On by
+default: 0099-0100 (the ring's RoCE, set by `./start-tp4-switchless.sh`; any RoCE for 0100), 0101's 4-warp launch and
+0103 (both keep the bits), 0106's in-place ring exchange (`TF_NCCL_RING_INPLACE`, with `TF_NCCL_RING=1`), 0107, 0108
+(`TF_GLM_QUICK_ROWS=1024`) and 0109 (`TF_GLM_PROMPT_STOP=1`). Off: `msa.cu` (0101, other bits), the own-row front (0102),
+the halves (0104), the decode side stream (0105) and bf16 partials (0106, other bits). Not run on three Sparks (no
+triangle here) nor on a switch.
 
 ### Added
 - **`./start-tp4.sh`** (on a switch) and **`./start-tp4-switchless.sh`** (on a ring): `./start.sh` with `TP=4` and
@@ -15,8 +22,9 @@ TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring 
   Each stops, naming the other, when the Sparks are connected the other way (`FABRIC_EXPECT`). On a switch every pair
   shares a subnet and runs as three Sparks do (not measured yet). Without a switch four Sparks are cabled as a ring (two
   CX7 ports each): `scripts/nodes.sh` finds the ring from the subnets the nodes share and needs the workers in its
-  order; NCCL then runs `NCCL_ALGO=Ring`, the split prefill exchanges by all-gather (`TF_GLM_HC_EXCHANGE=gather`), and
-  `COMM=roce` is refused, so nothing is sent between the two pairs of Sparks without a cable. The worker across the ring
+  order; NCCL then runs `NCCL_ALGO=Ring` and the split prefill exchanges by all-gather (`TF_GLM_HC_EXCHANGE=gather`;
+  patch 0098 sends them round the ring), and `COMM=roce` relays through the neighbours (patch 0099), so nothing is sent
+  between the two pairs of Sparks without a cable. The worker across the ring
   gets the head's address on its route there for its rendezvous and NFS. Each rank also gets an NCCL graph file
   (`NCCL_GRAPH_FILE`, NIC fusion off): on a ring cabled port to like port NCCL listens on the port toward the previous
   rank, and subnet-aware routing sends toward the next; NCCL's own pick (or its fused devices) puts part of the traffic
@@ -29,8 +37,75 @@ TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring 
   instead of `gather`'s all-gather of every rank's whole partial. Measured on four Sparks: an 8 MiB block a peer 2.7 ms
   against 4.6; prefill 8k / 30k tokens 1,698 / 1,729 -> 2,031-2,075 / 1,999-2,048 tok/s; replies byte-identical to
   `gather` (four prompts, 14 to 20,474 tokens). Off the ring nothing changes.
+- **Patch `0099-cuda-roce-ring`** (`TF_ROCE_RING=1`, set by `scripts/nodes.sh` on a ring): the one-shot RoCE
+  all-gather (`COMM=roce`) on four Sparks cabled as a ring. Each rank writes its shard to its two neighbours, whose
+  proxies relay it to the Spark across, half its stripes each way (b12x's proxy, ABI 6); the GPU kernel and the bits are
+  unchanged. Ported from the GLM-5.3 recipe's patch 0143. Not measured on the Sparks yet.
+- **Patch `0100-cuda-roce-ack-timeout`**: the RoCE all-gather's queue pairs wait for an ACK as NCCL does (timeout 20,
+  ~4 s a try; `TF_ROCE_IB_TIMEOUT`, 1-31) instead of b12x's 14 (~0.5 s in all): on the four-Spark ring a momentary
+  stall of one cable once failed an RDMA write and stopped the server. From the recipe's patch 0155.
+- **Patch `0101-glm-prompt-attention-msa`**: a prompt chunk's sparse attention (2,048 tokens a sparse row) faster at
+  a rank's heads. At up to 16 heads (four Sparks) the one-pass kernel's 16-row tile on 4 warps instead of 8: the same
+  bits, 6.6 -> 4.8 ms a 2,048-row chunk-layer at 32k tokens, 7.9 -> 5.7 at 128k (one GB10, FP8 cache).
+  `TF_GLM_MSA=1` (off): `msa.cu`, a CUDA kernel for the FP8 cache, a rank's heads as one or two m16 tensor-core tiles
+  so each key tile is read and converted once for every head; 32 heads (two Sparks) 9.5 -> 7.1 ms at 32k and 10.1 ->
+  9.1 at 128k, 22 heads (three) 9.9 -> 6.8 and 9.9 -> 8.4, 16 heads (four) 4.8 -> 3.1 and 5.7 -> 4.6. Its bits are
+  not the default kernel's (within bf16 rounding of exact attention, deterministic, the same for any chunking), so it
+  stays off until the needle checks run with it. From the recipe's kernel 2 (patch 0150), adapted to Flash's 512-wide
+  latent and to two m tiles; its design points are drowzeys' and BertholomusAI (Albert Lee)'s (CREDITS.md).
+- **Patch `0102-glm-prompt-own-front`** (`TF_GLM_PROMPT_OWN_FRONT=1` with `SPLIT=1`; off): each rank runs the DSA
+  layers' replicated front (q_a / kv_a and their norms, the indexer's projections and its top-k selection, which grows
+  with the context) on its own rows of the row split and shares the outputs (index keys, gates, the norms' rows, then
+  512 pools a row) instead of the normed rows: 4.8 KiB a row instead of 8, 6.8 once rows are sparse. The same bits. The
+  selection alone on one GB10 (FP8, a 2,048-row chunk-layer) at 128k: 26.8 ms on 2,048 rows, 13.6 / 8.7 / 6.3 ms on a
+  rank's rows at two / three / four Sparks (32k: 6.0 -> 2.8 / 2.0 / 1.4). From the recipe's patch 0147; the design is
+  drowzeys' (CREDITS.md).
+- **Patch `0103-glm-prompt-select`** (`TF_GLM_PROMPT_SELECT`, on: the same pools; `0` the old kernel): the prompt's
+  top-k pools a row on a compacted radix select: the first two radix passes over every score, the columns at or above
+  their 16-bit prefix compacted when at most 2,048, the last passes on those: three reads of a row's scores instead of
+  five. It leaves out the recipe's two-row scoring kernel (`_scores_pair`, written against the scoring before `0086`), so
+  the old 2x timing does not apply: **not measured on this stack** (the first version, with `_scores_pair`, took a
+  2,048-row chunk-layer's selection from 1.63 / 6.05 / 27.14 to 0.91 / 2.76 / 12.14 ms at 8k / 32k / 128k on one GB10).
+  The ideas of the recipe's patch 0151, on the radix top-k by Ash Hart (ashhart) with taussoe's Triton port, after
+  drowzeys' and BertholomusAI (Albert Lee)'s tiling (CREDITS.md).
+- **Patch `0104-glm-prompt-microbatch`** (`TF_GLM_PROMPT_MICROBATCH=1` with `SPLIT=1` and `TF_GLM_PREFILL_ROWS=4096`;
+  off): a chunk runs as two halves, each half's partials' exchange, glue and row swap on the side stream under the
+  other half's compute. The same bits. Halves of fewer than 2,048 rows (`TF_GLM_PROMPT_MICROBATCH_MIN_ROWS`) run the
+  chunk whole: on one GB10 the routed experts cost 23-73% more a row in 1,024-row calls than in 2,048-row ones
+  (2,048-row ones 4-31% more than 4,096-row ones), while the 4-bit prompt matmuls cost the same a row from 1,024 to
+  4,096 rows. From the recipe's patch 0148 (adapted to KDA: half B continues half A's state); the design is drowzeys'
+  (CREDITS.md).
+- **Patch `0105-glm-decode-side-stream`** (`TF_GLM_SIDE=1`; off): a decode window's MoE shared expert on a second
+  stream beside the routed experts (4-bit shared experts). The same bits. One MoE layer on one GB10 (graph replays):
+  281.0 -> 262.9 us at one row on two Sparks' shapes, 135.0 -> 121.3 on four's; about even at 4 to 16 rows. From the
+  recipe's patch 0144, after BertholomusAI (Albert Lee)'s f14e7f7 (CREDITS.md).
+- **Patch `0106-glm-prompt-exchange-bf16`**: `TF_GLM_PROMPT_PARTIALS=bf16` (off; needs `SPLIT=1`): the split's partials
+  go out as bf16, half the bytes; a prompt's bits change once against fp32 and are not quality-checked on Flash.
+  `TF_NCCL_RING_INPLACE` (on, with `TF_NCCL_RING=1`): the ring exchange's link all-gathers run in place, each link on its
+  own stream; the same bytes. From the recipe's patch 0153. Not measured on the Sparks yet.
+- **Patch `0107-glm-prompt-arith-identity`**: the prompt kernels' choices that set a prompt's bits go into the ranks'
+  startup comparison and the kept states' identity (the spill tier's folders of older builds are not reused). From the
+  recipe's patch 0157.
+- **Patch `0108-glm-multi-quick-fills`** (`TF_GLM_QUICK_ROWS`, 1,024; `0` off): under `--parallel` a foreground prompt
+  with little left to fill goes before the next decode round, so a burst of short prompts reaches its first tokens
+  sooner. Only the order of whole chunks and rounds changes; replies equal. From the recipe's patch 0167; the idea is
+  BertholomusAI (Albert Lee)'s (CREDITS.md). Not measured on the Sparks yet.
+- **Patch `0109-glm-prompt-stop`** (`TF_GLM_PROMPT_STOP`, on): a prompt whose client left stops at its next chunk
+  (a vote across the ranks), instead of filling to its end; under `--parallel` every filling stream's client is polled
+  before its next chunk. From the recipe's patch 0168, after Ash Hart (ashhart)'s prompt stop in upstream TensorFold
+  (05dfb7b). Not measured on the Sparks yet.
+- **Tests** (`tests/`, new): `scripts/test-cpu.sh` (Triton's interpreter, 2 / 3 / 4 ranks over gloo) and
+  `scripts/test-gpu.sh` (one GPU; `TEST_GPU_GIB` caps its memory); `tools/make-patches.sh` writes `patches/` from a
+  development tree with a commit a patch and checks that they rebuild it.
 
 ### Changed
+- `./start-tp4-switchless.sh` defaults to `COMM=roce` (patch 0099: the small all-gathers to the neighbours, relayed to
+  the Spark across; `scripts/nodes.sh` no longer refuses it on a ring and sets `TF_ROCE_RING=1`), as does `scripts/config.sh`
+  for `TP=4` on a ring. **Not measured on the Sparks yet**; `COMM=nccl ./start-tp4-switchless.sh` gives the previous
+  setup. `./start-tp4.sh` (a switch) and `./start-tp3.sh` keep `nccl`.
+- `scripts/config.sh` passes `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PROMPT_PARTIALS`,
+  `TF_GLM_SIDE` and `TF_GLM_MSA` through (all off); `start.sh`'s `SPLIT=0` fallback resets the first three (they need
+  the split).
 - Past two Sparks `COMM` defaults to `nccl` in `scripts/config.sh` too (as `start-tp3.sh` already set it), so
   `TP=3 scripts/prepare.sh` and `TP=4 scripts/prepare.sh` agree with the start scripts. Two Sparks unchanged.
 
