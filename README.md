@@ -506,8 +506,32 @@ every configured worker), one for each way of connecting them:
 
 Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
 connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patches 0098-0100 on a ring;
-the image is not published yet, so `prepare.sh` builds it on the first start. **Measured** on a four-Spark ring
-(2026-10-08, sparkDash, thinking off, one boot each; decode tok/s is one stream's, then all streams' together at 4 and 8):
+the image is not published yet, so `prepare.sh` builds it on the first start.
+
+**Four Sparks, measured with sparkDash** (a ring, `./start-tp4-switchless.sh` with its defaults: 8 streams,
+1,048,576-token window, FP8 KV cache, 4-bit dense weights, DFlash2 plus copy drafts, vision on; 2026-10-09)
+
+| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 95.2 tok/s | 95.2 tok/s | 122 ms | 138.6 tok/s | 138.6 tok/s | 143 ms |
+| 2 | 133.2 tok/s | 68.4 tok/s | 201 ms | 185.1 tok/s | 93.7 tok/s | 263 ms |
+| 4 | 163.3 tok/s | 44.0 tok/s | 281 ms | 224.5 tok/s | 57.6 tok/s | 299 ms |
+| 8 | 222.4 tok/s | 29.2 tok/s | 330 ms | 286.0 tok/s | 37.9 tok/s | 495 ms |
+
+| Prompt | Prefill | Time to first token |
+| ---: | ---: | ---: |
+| 8,218 tokens | 2,568.8 tok/s | 3.33 s |
+| 16,409 tokens | 2,574.4 tok/s | 6.51 s |
+| 32,789 tokens | 2,583.3 tok/s | 12.83 s |
+| 65,556 tokens | 2,568.0 tok/s | 25.66 s |
+| 131,097 tokens | 2,530.7 tok/s | 51.94 s |
+| 262,170 tokens | 2,462.7 tok/s | 106.59 s |
+
+Against three Sparks ([3 Sparks](#3-sparks-experimental)): prose decode 77.6 -> 95.2 tok/s for one request and 146.2
+-> 163.3 tok/s for four at once; prefill 1,881.7 -> 2,530.7 tok/s at 131k tokens and 1,654.5 -> 2,462.7 at 262k.
+
+**How the defaults were chosen**, on the same ring (2026-10-08, sparkDash, thinking off, one boot each; decode tok/s is
+one stream's, then all streams' together at 4 and 8):
 
 | Build | Decode, prose: 1 / 4 / 8 at once | Decode, code: 1 / 4 / 8 at once | Prefill: 8k / 32k / 131k tokens |
 | --- | --- | --- | --- |
