@@ -148,10 +148,11 @@ export TF_GLM_DENSE="$DENSE"
 # 16 KiB gather against NCCL's 45; decode +6% (prose 44.2 -> 46.9, code 48.7 -> 51.6). NCCL keeps the rest. nccl: NCCL
 # for all. Same bits. Three Sparks and four on a switch default to nccl (start-tp3.sh, start-tp4.sh); roce on a triangle
 # sends each peer over the devices that share its subnet (the TP-N engine's RoCE; TF_ROCE_HCA lists them all, the GID
-# is found per device). A ring of four (start-tp4-switchless.sh, README "4 Sparks") defaults to nccl too; COMM=roce
-# there writes to the two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1; not measured on the
-# Sparks yet, so opt-in). TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the queue pairs' ACK timeout.
-_comm=roce; [[ "$TP" == 2 ]] || _comm=nccl
+# is found per device). A ring of four (start-tp4-switchless.sh, README "4 Sparks") defaults to roce: it writes to the
+# two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1); decode at one stream prose 85.7 -> 96.2
+# tok/s, code 131.3 -> 145.3, four streams +11-15%, prefill unchanged (one boot each, 2026-10-08). Same bits.
+# TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the queue pairs' ACK timeout.
+_comm=nccl; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) ]] && _comm=roce
 COMM="${COMM:-$_comm}"
 export TF_GLM_COMM="$COMM"
 # The largest all-gather in KiB that goes over RoCE (patch 0006 reads it; a setting, no patch of its own): 512 (default;
@@ -186,24 +187,36 @@ export TF_GLM_HC_SPLIT="$SPLIT" TF_GLM_PREFILL_OVERLAP="$([[ "$SPLIT" == 1 ]] &&
 # With SPLIT=1: each rank runs the DSA layers' replicated front (q_a / kv_a, the indexer's projections and its top-k
 # selection, which grows with the context) on its own rows of the split and shares the outputs instead of the normed
 # rows (patch 0102; the same bits). On one GB10 the selection alone takes 26.8 ms a 2,048-row chunk-layer at 128k
-# tokens, 6.3 ms on a TP=4 rank's 512 rows. Off until measured on the Sparks: 1 to try it.
-export TF_GLM_PROMPT_OWN_FRONT="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_OWN_FRONT:-0}" || echo 0)"
+# tokens, 6.3 ms on a TP=4 rank's 512 rows. On by default at TP=4: with TF_GLM_SIDE below, prefill on four Sparks (a
+# ring) 8k 2,271 -> 2,313 tok/s, 32k 2,243 -> 2,329, 131k 2,110 -> 2,288 (one boot each). Off at two and three until
+# measured there: 1 to try it.
+_tp4=0; [[ "$TP" == 4 ]] && _tp4=1
+export TF_GLM_PROMPT_OWN_FRONT="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_OWN_FRONT:-$_tp4}" || echo 0)"
 # With SPLIT=1: a prompt chunk runs as two halves, each half's exchanges and glue on the side stream under the other
 # half's compute (patch 0104; the same bits). Halves of fewer than 2,048 rows run the chunk whole, so it takes
 # 4,096-row chunks: TF_GLM_PROMPT_MICROBATCH=1 with TF_GLM_PREFILL_ROWS=4096 (~0.9 GiB more prompt buffers a Spark at
-# four; at three the halves are 1,920 + 2,176 rows, so also TF_GLM_PROMPT_MICROBATCH_MIN_ROWS=1920). Off until
-# measured on the Sparks.
-export TF_GLM_PROMPT_MICROBATCH="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_MICROBATCH:-0}" || echo 0)"
+# four; at three the halves are 1,920 + 2,176 rows, so also TF_GLM_PROMPT_MICROBATCH_MIN_ROWS=1920). On by default
+# at TP=4, with 4,096-row chunks: prefill on four Sparks (a ring) 8k 2,313 -> 2,546 tok/s, 32k 2,329 -> 2,561, 131k
+# 2,288 -> 2,510 (one boot each; the KV pool keeps its size). Off at two and three until measured there.
+export TF_GLM_PROMPT_MICROBATCH="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_MICROBATCH:-$_tp4}" || echo 0)"
+_rows_auto=""
+if [[ "$TF_GLM_PROMPT_MICROBATCH" == 1 && -z "${TF_GLM_PREFILL_ROWS:-}" ]]; then
+  export TF_GLM_PREFILL_ROWS=4096; _rows_auto=1
+fi
 # With SPLIT=1: the split's partials of the peers' rows as bf16, half the bytes (patch 0106); a prompt's bits change
-# once against fp32 and are not quality-checked on Flash. fp32 (default); bf16 to try it, needs SPLIT=1.
+# once against fp32 and are not quality-checked on Flash. fp32 (default); bf16 to try it, needs SPLIT=1. On four
+# Sparks (a ring, with the TP=4 defaults) prefill +9% (131k 2,527 -> 2,765 tok/s), decode unchanged; all four
+# reference replies changed, one long-prompt answer worse (one boot, 2026-10-08), so it stays opt-in.
 export TF_GLM_PROMPT_PARTIALS="$([[ "$SPLIT" == 1 ]] && echo "${TF_GLM_PROMPT_PARTIALS:-fp32}" || echo fp32)"
 # Decode windows run the MoE's shared expert on a second stream beside the routed experts (patch 0105; DENSE=q4; the
 # same bits): one MoE layer 281 -> 263 us at one row on two Sparks, 135 -> 121 us on four, about even at 4-16 rows
-# (one GB10, synthetic). Off until measured on the Sparks: TF_GLM_SIDE=1 to try it.
-export TF_GLM_SIDE="${TF_GLM_SIDE:-0}"
+# (one GB10, synthetic). On by default at TP=4 (measured with TF_GLM_PROMPT_OWN_FRONT above; decode on four Sparks
+# within run-to-run noise). Off at two and three until measured there: TF_GLM_SIDE=1 to try it.
+export TF_GLM_SIDE="${TF_GLM_SIDE:-$_tp4}"
 # Prompt rows' sparse attention on msa.cu (patch 0101; FP8 KV): a 2,048-row chunk-layer at 32k tokens 9.5 -> 7.1 ms
 # at TP=2, 4.8 -> 3.1 ms at TP=4. Other prompt bits than the default kernel, so off until the needle checks (tools/
-# needle.py) have run with it: 1 to try it.
+# needle.py) have run with it: 1 to try it. On four Sparks (a ring, with the TP=4 defaults) prefill +2.6% (131k 2,527
+# -> 2,592 tok/s), decode unchanged, one of four reference replies changed (one boot, 2026-10-08).
 export TF_GLM_MSA="${TF_GLM_MSA:-0}"
 # KDA prompt chunks in chunked (WY) form, one CUDA kernel of 32-row sub-chunks (patches 0012, 0014, 0039): prefill
 # 50k 29.3 -> 26.4 s, 149k 91.1 -> 84.5 s (one boot each); prompt states then sit on a 64-token grid.

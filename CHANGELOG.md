@@ -8,17 +8,20 @@ Every change to this recipe, newest first. Each release names the image it serve
 Image: not published yet; `prepare.sh` builds it locally (106 patches: v1.10's 96 plus ten of `0098`-`0109`, with two numbers unused until they are renumbered at the final rebase), for two and three
 Sparks too (the patches' hash no longer matches the pinned image until a new one is published and pinned). The
 TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring exchange, 0099 the RoCE all-gather
-round the ring. Patches 0099-0109 come from the GLM-5.3 recipe (Mia's AI Lab). **Nothing of 0099-0109 has been measured
-end to end on the Sparks**: only CPU tests and single-GB10 microbenchmarks (kernels at a rank's shapes) exist. On by
-default: 0100 (any RoCE), 0101's 4-warp launch (keeps the bits), 0106's in-place ring exchange (`TF_NCCL_RING_INPLACE`,
-with `TF_NCCL_RING=1`), 0107 and 0109 (`TF_GLM_PROMPT_STOP=1`). Off: the ring's RoCE (0099: `COMM=roce`, opt-in, as a ring
-defaults to `COMM=nccl`), `msa.cu` (0101, other bits), the own-row front (0102),
-the halves (0104), the decode side stream (0105) and bf16 partials (0106, other bits). Not run on three Sparks (no
-triangle here) nor on a switch.
+round the ring. Patches 0099-0109 come from the GLM-5.3 recipe (Mia's AI Lab). **Measured on a four-Spark ring**
+(2026-10-08, one boot each; README "4 Sparks"): against the TP=4 build before (v1.7.1 with 0076), prefill 8k / 32k /
+131k 2,128 / 2,070 / 1,865 -> 2,563 / 2,570 / 2,527 tok/s (+20 / +24 / +35%), decode at one stream prose 84.8 -> 96.2
+tok/s, code 129.5 -> 145.3, and four greedy replies the same token for token. On by default: 0100 (any RoCE), 0101's
+4-warp launch (keeps the bits), 0106's in-place ring exchange (`TF_NCCL_RING_INPLACE`, with `TF_NCCL_RING=1`), 0107 and
+0109 (`TF_GLM_PROMPT_STOP=1`); at four Sparks also the own-row front (0102), the halves (0104, with 4,096-row chunks)
+and the decode side stream (0105), and on a ring the RoCE relay (0099, `COMM=roce`). Off: `msa.cu` (0101: prefill
++2.6% at four, one of four replies changed) and bf16 partials (0106: prefill +9% at four, all four replies changed);
+at two and three Sparks also 0102, 0104 and 0105, not measured there. Not run on three Sparks (no triangle here) nor on
+a switch.
 
 ### Added
 - **`./start-tp4.sh`** (on a switch) and **`./start-tp4-switchless.sh`** (on a ring): `./start.sh` with `TP=4` and
-  `COMM=nccl`, with `WORKER3` (rank 3) and its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3`, `WORKER_HF_CACHE3`.
+  `COMM=nccl` (on a switch) or `COMM=roce` (on a ring), with `WORKER3` (rank 3) and its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3`, `WORKER_HF_CACHE3`.
   Each stops, naming the other, when the Sparks are connected the other way (`FABRIC_EXPECT`). On a switch every pair
   shares a subnet and runs as three Sparks do (not measured yet). Without a switch four Sparks are cabled as a ring (two
   CX7 ports each): `scripts/nodes.sh` finds the ring from the subnets the nodes share and needs the workers in its
@@ -87,12 +90,14 @@ triangle here) nor on a switch.
   development tree with a commit a patch and checks that they rebuild it.
 
 ### Changed
-- `COMM=roce ./start-tp4-switchless.sh` (patch 0099: the small all-gathers to the neighbours, relayed to the Spark
-  across; `scripts/nodes.sh` no longer refuses it on a ring and sets `TF_ROCE_RING=1`) is opt-in: a ring defaults to
-  `COMM=nccl`, as `./start-tp4.sh` (a switch) and `./start-tp3.sh` do, until the relay is **measured on the Sparks**.
+- `./start-tp4-switchless.sh` defaults to `COMM=roce` (patch 0099: the small all-gathers to the neighbours, relayed
+  to the Spark across; `scripts/nodes.sh` no longer refuses it on a ring and sets `TF_ROCE_RING=1`): decode at one
+  stream prose 85.7 -> 96.2 tok/s, code 131.3 -> 145.3, at four streams +11-15%, the same replies. `COMM=nccl` sends
+  every all-gather over NCCL; `./start-tp4.sh` (a switch) and `./start-tp3.sh` keep `COMM=nccl`.
 - `scripts/config.sh` passes `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PROMPT_PARTIALS`,
-  `TF_GLM_SIDE` and `TF_GLM_MSA` through (all off); `start.sh`'s `SPLIT=0` fallback resets the first three (they need
-  the split).
+  `TF_GLM_SIDE` and `TF_GLM_MSA` through. At `TP=4` the first two and `TF_GLM_SIDE` default to on, with
+  `TF_GLM_PREFILL_ROWS=4096` for the halves (the KV pool keeps its size); elsewhere all are off. `start.sh`'s `SPLIT=0`
+  fallback resets the first three (they need the split) and the 4,096-row chunks it chose.
 - Past two Sparks `COMM` defaults to `nccl` in `scripts/config.sh` too (as `start-tp3.sh` already set it), so
   `TP=3 scripts/prepare.sh` and `TP=4 scripts/prepare.sh` agree with the start scripts. Two Sparks unchanged.
 

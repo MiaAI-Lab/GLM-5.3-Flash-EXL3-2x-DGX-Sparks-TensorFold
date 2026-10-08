@@ -167,7 +167,7 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   onto the current patches, with both limits off by default and their drops kept out of the spill tier, by MiaAI-Lab.
 - `0098-cuda-ring-exchange`, `0099-cuda-roce-ring`, `0100-cuda-roce-ack-timeout` (four Sparks cabled as a ring: the split
   prefill's exchanges round the ring, the RoCE all-gather relayed by the neighbours, the queue pairs' ACK timeout) and
-  the ring's opt-in `COMM=roce` in the scripts: `0098` is the same design as the [GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)'s patch 0142, `0099`
+  the ring's default `COMM=roce` in the scripts: `0098` is the same design as the [GLM-5.3 recipe](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)'s patch 0142, `0099`
   and `0100` are ported from its patches 0143 and 0155 (Mia's AI Lab), on b12x's RoCEnante proxy (`0006` above;
   `NOTICE` lists the changes to its file).
 - `0101-glm-prompt-attention-msa` (`msa.cu`): adapted from the GLM-5.3 recipe's kernel 2 (patch 0150, Mia's AI Lab),

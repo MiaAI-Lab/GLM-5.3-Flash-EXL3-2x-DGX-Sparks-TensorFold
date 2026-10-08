@@ -479,6 +479,7 @@ for attempt in 1 2 3 4; do
       warn "it failed again: starting with SPLIT=0 (prompt chunks unsplit: the same replies, long prompts fill slower); SPLIT=0 in .env skips these tries (issue #36)"
       SPLIT=0
       export TF_GLM_HC_SPLIT=0 TF_GLM_PREFILL_OVERLAP=0 TF_GLM_PROMPT_OWN_FRONT=0 TF_GLM_PROMPT_MICROBATCH=0 TF_GLM_PROMPT_PARTIALS=fp32
+      [[ -n "${_rows_auto:-}" ]] && unset TF_GLM_PREFILL_ROWS
       env_args
     fi
     ./stop.sh >/dev/null
