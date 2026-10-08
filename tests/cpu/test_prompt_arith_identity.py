@@ -3,7 +3,7 @@ comparison and in the prompt cache's identity. On CPU, no model:
 
 - the code changes with every choice that changes Flash's prompt bits (TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA,
   TF_GLM_EXL3_PROMPT, TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED), one int each, and
-  not with the ones that leave every bit as it was (TF_GLM_PROMPT_SELECT, TF_GLM_EXL3_PASS / _ORDER / _ROWROT, the
+  not with the ones that leave every bit as it was (TF_GLM_EXL3_PASS / _ORDER / _ROWROT, the
   split's exchange, overlap, own-row front and micro-batches);
 - the startup comparison (``engine.odd_ranks`` on the rows the ranks gather) rejects ranks started with different
   settings, for each choice, and passes equal ones; the engine's row ends in the code and its error names them;
@@ -15,7 +15,7 @@ import inspect
 
 import pytest
 
-from tensorfold.families.glm5_next.cuda import engine, forward, glue, kda, latent, msa, sparse
+from tensorfold.families.glm5_next.cuda import engine, forward, glue, kda, latent, msa
 from tensorfold.families.glm5_next.cuda.hcsplit import SplitSettings
 
 SPLIT = {"TF_GLM_HC_SPLIT": "1"}
@@ -67,7 +67,6 @@ def test_code_changes_with_each_choice(switch, name):
 
 def test_code_ignores_choices_that_keep_every_bit(monkeypatch):
     base = code()
-    monkeypatch.setattr(sparse, "PROMPT_SELECT", not sparse.PROMPT_SELECT)         # 0103: the same scores and pools
     for var, val in (("TF_GLM_EXL3_PASS", "128"), ("TF_GLM_EXL3_ORDER", "0"), ("TF_GLM_EXL3_ROWROT", "0")):
         monkeypatch.setenv(var, val)                                               # the same bits (their docstrings)
     assert code() == base
