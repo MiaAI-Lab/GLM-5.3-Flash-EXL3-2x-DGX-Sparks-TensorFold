@@ -409,3 +409,15 @@ SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
 if [[ "$SPILL_GIB" != 0 ]]; then
   STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
 fi
+
+# NVMe KV tier (patch 0109-glm-kv-tier, off by default; needs PARALLEL above 1): every kept prompt state is also
+# written to local disk on each Spark as it is kept, a new turn only its new blocks, so it comes back instead of a new
+# prefill after it left the pool, a restart, or a crash. KV_TIER_GIB: the cap per Spark (0: off). KV_TIER_DIR: the
+# same absolute path on every Spark (mounted at /kvtier; files owned by your user). KV_TIER_MIN_TOKENS: shorter states
+# are not written. KV_TIER_MIN_FREE_GIB: no write leaves less free on that disk. KV_TIER_BACKLOG_GIB: at most this much
+# waiting to be written. One disk tier at a time: not with SPILL_GIB. README: NVMe KV tier.
+KV_TIER_GIB="${KV_TIER_GIB:-0}"
+KV_TIER_DIR="${KV_TIER_DIR:-$HOME/.cache/tensorfold-kvtier}"
+KV_TIER_MIN_TOKENS="${KV_TIER_MIN_TOKENS:-8192}"
+KV_TIER_MIN_FREE_GIB="${KV_TIER_MIN_FREE_GIB:-50}"
+KV_TIER_BACKLOG_GIB="${KV_TIER_BACKLOG_GIB:-16}"

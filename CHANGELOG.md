@@ -3,6 +3,23 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased
+
+- **NVMe KV tier** (patch `0109-glm-kv-tier`, `KV_TIER_GIB`, off by default; by [BadAd84](https://github.com/BadAd84)):
+  a second disk tier beside the spill tier (`0088`), one of the two at a time. Every kept prompt state of
+  `KV_TIER_MIN_TOKENS`+ tokens is written to local disk on each Spark when it is kept, not when it leaves the pool, in
+  blocks of 2,048 tokens named by a hash chain over the token ids, so a new turn writes only its new blocks and a
+  crash, a `kill -9` or a watchdog restart loses at most the writes still queued. Writes go through a bounded pinned
+  ring between rounds (at most 4 blocks a round); a load reads ahead on 8 threads and copies between the other
+  streams' rounds (`TF_GLM_KV_TIER_LOAD_MS`, 40 ms). Every file is fsynced before its rename, each block, the ids and
+  the small state carry a CRC-32 checked on every read (a failure on any Spark drops the state on every Spark and the
+  request prefills), and the folders are keyed on the build and the agreed settings as the spill tier's. In
+  production on three Sparks since 2026-10-03. Against the spill tier on one image (a ~620k conversation, ~23k-token
+  turns): after a `kill -9` of every rank the next turn resumed (21.2 s) where the spill tier at its default
+  high-water prefilled again (458 s); a turn wrote 0.2 GiB a Spark where the spill tier writing early (0.05) wrote 3.9
+  GiB; a turn branching from a shared history resumed (19-21 s) where the spill tier prefilled again. CPU check:
+  `tools/kv_tier_check.py`.
+
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
 Image: `v0.6.0-a1897d591f70` (`sha256:bc34d7d63f978cf601f42863b284bc95a567c50c10e9adb0866a635be568bf5f`), 96 patches (v1.9.1's plus `0096`, `0097`). Tested live on two

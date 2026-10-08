@@ -340,6 +340,53 @@ than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that 
 under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and credits: `NOTICE`,
 `CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to TensorFold itself.
 
+## Disk tier: the NVMe KV tier (optional)
+
+A second disk tier for the same kept prompt states, with another design (patch `0109-glm-kv-tier`). The spill tier
+writes a state when it leaves the pool, or early past `SPILL_HIGHWATER`; this one writes every state when it is kept.
+So the latest turn of every conversation is on disk even after a crash, a `kill -9` or a watchdog restart, and a later
+turn writes only what is new. Set `KV_TIER_GIB` (200 here) and `KV_TIER_DIR`, the same absolute path on every Spark;
+it needs `PARALLEL` above 1. Use one tier at a time: `start.sh` refuses `KV_TIER_GIB` beside `SPILL_GIB`.
+
+- **Blocks.** A state's rows go to disk in blocks of 2,048 tokens, each named by a hash chain over the token ids and
+  the state's lineage (the computation it belongs to: the same ids prefilled another way are other blocks). A later
+  turn of a conversation names the blocks its earlier turns wrote and writes only the new ones: a +20k turn of a 600k
+  conversation writes ~10 blocks, not the whole state. A small file per state holds its ids, recurrent state and
+  DFlash2 window; its index file is written last.
+- **Writes.** When a state is kept, only its small state is copied off the GPU; its rows wait in the pool. Between
+  rounds every rank copies at most 4 blocks into a pinned ring (`TF_GLM_KV_TIER_STAGE_MIB`, 256 MiB) and a writer
+  thread writes them. Rows about to be freed or overwritten are copied first. At idle the ranks write what is left.
+- **Loads.** A load starts only when every rank has the state complete. It reads ahead on 8 threads; while other
+  streams decode it copies between their rounds, at most `TF_GLM_KV_TIER_LOAD_MS` (40 ms) a slice, and the request
+  waits first in line. With nothing else decoding it loads at once.
+- **Integrity.** Every file is fsynced before its rename, and the folders before a state's index file. Each block,
+  the ids and the small state carry a CRC-32, checked on every read. A file that fails on any Spark (a checksum, a
+  size, a missing file): every Spark drops the state and the request prefills. Folders are keyed like the spill
+  tier's (the build, the weights, the settings every rank agreed on, prefill rows among them); other builds' folders
+  are removed at start, the newest `TF_GLM_KV_TIER_KEEP_BUILDS` (1) kept. Files are owned by you and readable only by
+  you.
+- **Limits.** `KV_TIER_GIB` a Spark (least recently used states go first, then blocks no state names);
+  `KV_TIER_MIN_FREE_GIB` (50): no write leaves less free; `KV_TIER_BACKLOG_GIB` (16) waiting to be written;
+  `KV_TIER_MIN_TOKENS` (8,192). Counters are in `/health` (`kv_tier_*`).
+
+Three Sparks, TP=3 (`start-tp3.sh`), `PARALLEL=4`, kindling spark-os, one image apart from the tier (v1.10 with `0098`;
+the spill tier at `SPILL_GIB=60`), every arm from an empty tier. One conversation that grows like an agent's: a cold
+~596k-token turn, then turns of ~23k new tokens. Not run at TP=2.
+
+| Case | Spill tier, `SPILL_HIGHWATER` 0.70 (default) | Spill tier, 0.05 | NVMe KV tier |
+| --- | --- | --- | --- |
+| The next turn after every rank was `kill -9`ed | prefilled again (642,693 tokens, 458 s) | resumed (619,392 cached, 21.2 s) | resumed (619,392 cached, 21.2 s) |
+| The next turn after a clean restart | resumed (19.5 s) | resumed (19.6 s) | resumed (19.6 s) |
+| A turn branching from a shared ~596k history, after a crash or a clean restart | prefilled again (387-416 s) | prefilled again (384-417 s) | resumed (18.8-21.0 s) |
+| Disk written a Spark by one ~23k turn and its write-back | 0.01-0.02 GiB (nothing yet) | 3.91-3.93 GiB (the whole state) | 0.20-0.22 GiB (its new blocks) |
+| A Spark's tier after three turns and a clean stop | 4.1 GB | 12 GB | 4.2 GB |
+
+The integrity checks' own cost, offline on one GB10 (a 596,096-token state, 3.44 GiB a rank): the write takes 1.74 s against 1.12 s into the page cache without them (1.98 against 3.06 GiB/s), about the 1.80 s the old write needed until its bytes were on the disk; a load from the page cache 0.19 s against 0.18 s, from the NVMe 0.75 s against 0.80 s (medians of 3). The writes run on the writer thread, never the engine loop.
+
+`tools/kv_tier_check.py` checks the tier on the CPU, in the image (no GPU or server): writes, shared blocks, loads in
+slices on two ranks, the fsync order, a full disk leaving no temporary file, every failed check ending in a prefill,
+the folder key. `tools/kv_tier_mutants.sh` runs it against 66 mutants of the patch; each must make it fail.
+
 ## Worker weights over NFS
 
 By default the worker keeps its own copy of the checkpoint and DFlash2 (~166 GiB, copied over the link by
@@ -509,6 +556,9 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
 | `SPILL_GIB` / `SPILL_DIR` / `SPILL_HIGHWATER` | `0` / `~/.cache/tensorfold-spill` / `0.70` | the spill tier: kept prompt states on local disk, up to `SPILL_GIB` GiB a Spark (0: off), written early past `SPILL_HIGHWATER` of the pool ([Spill tier](#spill-tier-optional)) |
+| `KV_TIER_GIB` / `KV_TIER_DIR` | `0` / `~/.cache/tensorfold-kvtier` | the NVMe KV tier (patch `0109`): every kept prompt state also on local disk when it is kept, up to `KV_TIER_GIB` GiB a Spark (0: off; needs `PARALLEL` above 1; not with `SPILL_GIB`) ([Disk tier](#disk-tier-the-nvme-kv-tier-optional)) |
+| `KV_TIER_MIN_TOKENS` / `KV_TIER_MIN_FREE_GIB` / `KV_TIER_BACKLOG_GIB` | `8192` / `50` / `16` | the NVMe KV tier: shorter states are not written; no write leaves less than this many GiB free on that disk; at most this many GiB waiting to be written (past either, a state is skipped before any copy and counted in `/health`) |
+| `TF_GLM_KV_TIER_LOAD_MS` / `TF_GLM_KV_TIER_STAGE_MIB` / `TF_GLM_KV_TIER_KEEP_BUILDS` | `40` / `256` / `1` | the NVMe KV tier: the most a load's slice may hold the other streams (`0`: whole loads); the pinned ring its writes go through; other builds' folders kept at start. Set the same on every Spark |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -656,6 +706,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Anthropic Messages | `0084-anthropic-messages` | Anthropic's `/v1/messages` (also `/messages`, with `/count_tokens` suffixes), translated to the same chat completion the OpenAI route serves — text and image blocks, `tool_use` / `tool_result`, thinking, `stop_sequences`, `output_config` effort/JSON schema — with Anthropic SSE streaming and bodies capped at 32 MiB (upstream v0.6.3, by [evilpsycho42](https://github.com/evilpsycho42) and [ashhart](https://github.com/ashhart), request bodies by [Jordi Posthumus](https://github.com/JordiPosthumus); backported by [Eduardo Florencio](https://github.com/eduffd)) | Claude Code and the Anthropic SDKs work against the server directly, without a translating proxy |
 | Checked draft candidates | `0092-glm-draft-candidates-checked` | the drafter checks each block pass's candidate ids against the vocabulary; on an id outside it (issue #80: a float's bits read as an id) it logs the value, copies the rows again once the device is idle, and fails only if they are still bad | a rare drafter `IndexError` is retried (and its cause logged) instead of killing a rank |
 | Spill tier | `0088-glm-spill-tier` | kept prompt states written to local disk on every Spark when they leave the pool (early, in the background, past `SPILL_HIGHWATER`) and read back beside decoding streams, also after a clean restart (`SPILL_GIB`, off by default; authored by Robert Wojciechowski, [wojo](https://github.com/wojo), #78) | [Spill tier](#spill-tier-optional) |
+| NVMe KV tier | `0109-glm-kv-tier` | every kept prompt state also written to local disk on every Spark when it is kept, in blocks a later turn shares, through a bounded pinned ring between rounds; read back in slices beside decoding streams after an eviction, a restart or a crash; every file fsynced and CRC-checked, a failed check a prefill (`KV_TIER_GIB`, off by default; not with `SPILL_GIB`; by [BadAd84](https://github.com/BadAd84)) | [Disk tier](#disk-tier-the-nvme-kv-tier-optional) |
 | Kept-state count | `0097-glm-kept-entries-share` | `TF_GLM_CACHE_SHARE_PCT` (the kept-state count as a share of the pool's memory; a ceiling at three quarters of it, so the reservation stays inside the estimate) and the kept states' key arrays built once, not at every admission (issue #84, @jdecker76) |
 | Kept-state limits | `0089-glm-kept-state` | `TF_GLM_KEPT_BYTES_GIB` (a byte budget for the kept states, with the freed blocks handed back to the driver) and `TF_GLM_KEEP_PER_CHAT` (a per-conversation quota of turn-boundary states), both off by default; `/health` `kept_bytes`, `kept_mix` (authored by Thomas Wade, [ThomasWadeZ](https://github.com/ThomasWadeZ), #65) | with both at 0, nothing changes |
 | Responses `include` | `0093-responses-include` | `/v1/responses` accepts OpenAI's `include` values and ignores them (reasoning already comes as text, nothing is encrypted); an unknown value or a non-list is still a 400 (issue #73) | the AI SDK's `include: ["reasoning.encrypted_content"]` no longer fails every request |
@@ -716,6 +767,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/kv_tier_check.py` | patch 0109's checks on the CPU, run in the image (`docker run ... --entrypoint python`, see the file): the tier's writes, shared blocks and limits, loads in slices on two in-process ranks, the fsync order, a full disk (no temporary file left), every failed check (a damaged, short or missing file on either rank) ending in a prefill, the folder key |
+| `tools/kv_tier_mutants.sh <0109 patch> <kv_tier_check.py> [image]` | runs `kv_tier_check.py` (CPU, in the image) on the patched code, on the stock code and on 66 mutants of the patch: exit 0 only when the patched code passes and the stock code and every mutant fail |
 
 ## Repository layout
 

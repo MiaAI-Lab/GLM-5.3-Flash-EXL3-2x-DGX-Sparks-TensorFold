@@ -1,0 +1,1278 @@
+# NVMe KV tier (TF_GLM_KV_TIER; KV_TIER_GIB, off by default): with --parallel above 1, every kept prompt state of
+# KV_TIER_MIN_TOKENS+ tokens is also written to local disk on every rank when it is kept, in blocks of 2,048 tokens
+# named by a hash chain over the token ids (a later turn writes only its new blocks), staged through a bounded pinned
+# ring between rounds. A request that extends a state the pool no longer holds (evicted, a restart, a crash) reads it
+# back in slices between the other streams' rounds. Every file is fsynced before its rename; each block, the ids and
+# the small state carry a CRC-32 checked on every read (a failure on any rank drops the state on every rank and the
+# request prefills). Folders keyed on the build and the settings the ranks agree on, as the spill tier's. One disk
+# tier at a time: a start with --spill-gib as well stops. New tensorfold/families/glm5_next/cuda/kvtier.py, hooks in
+# multi.py and the engine's rank check. By BadAd84.
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 9ff932d..a55b2ba 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -701,6 +701,9 @@ class GlmEngine:
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
++        from .kvtier import settings as kvtier_settings      # TF_GLM_KV_TIER: every rank or none
++
++        mine = mine + [int(bool(kvtier_settings()[0]))]      # checked alike, not in the spill tier's key (``agreed``)
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+         if odd:
+@@ -709,7 +712,8 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
++                               "TF_GLM_KV_TIER): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/kvtier.py tensorfold/families/glm5_next/cuda/kvtier.py
+new file mode 100644
+index 0000000..4d021ad
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kvtier.py
+@@ -0,0 +1,886 @@
++"""TF_GLM_KV_TIER=<dir>: kept prompt states on this rank's local disk (NVMe), so a conversation resumes from disk after
++it left the device pool (evicted) or the server restarted, instead of being prefilled again. One disk tier at a time:
++the spill tier (``--spill-gib``, ``tensorfold.cuda.spill``) keeps the same kept prompts in files of its own,
++so a start with both configured stops (``make``).
++
++The multi-stream decoder (``multi.MultiDecoder``, ``--parallel`` above 1) keeps prompt states in its pool: rows of the
++per-token caches (``pool.Arena``) plus a small state (``decode.Snapshot``: KDA recurrences, conv windows, the indexer
++rings' tail, the head's logits row, DFlash2's window). Here every rank writes its own share of such a state:
++
++- the rows, in blocks of ``BLOCK`` tokens named by a hash chained over the token ids and salted with the state's
++  lineage (``block_hashes``): a block is written once and shared by every later state of the same computation, so a
++  new turn writes only its new rows. The lineage (``MultiDecoder``: a stream inherits its kept state's, a fresh prefill
++  starts a new one) keeps states of the same ids computed apart (other prompt chunking: other bits) from sharing
++  blocks: a reloaded state is always rows, recurrences and windows of ONE computation;
++- a point: the state's small tensors and ids (``points/<key>.pt``), then ``points/<key>.json`` naming its blocks -
++  written LAST, so a point with its json is complete on this rank.
++
++Every file is written to a temporary name, fsynced and renamed, and the directories are fsynced before a point's json
++is renamed (on the writer thread, never the engine loop), so after a crash or a power loss a point with its json has
++every file it names, whole. The json carries a CRC-32 of each block it names, of its ids and of its small state; a load
++checks each file it reads against them on the reader threads. A file that fails (a checksum, a size, a
++missing file) fails the load on that rank; the ranks agree (``KV_CHECK``) and every rank drops the point and the
++request prefills: a damaged file never becomes a reply. Files and folders are readable by their owner only and take
++the owner of the tier's directory (a server run as root in a container writes them as you), as the spill tier's do.
++
++Writes go through one bounded host buffer: when a state is kept, only its small state is copied to the host;
++its rows stay in the pool, pinned there until written (``persist`` queues a ``_Job``). Between rounds every rank
++copies the next blocks of its waiting states into free slots of a pinned staging ring (``pump``, on the engine loop)
++and the writer thread writes each slot to its file, then frees it; at idle the ranks finish their states first
++(``drain``). Rows about to be freed or overwritten while still waiting (their extent shrunk, removed or taken over
++below them: ``release``) are copied to the host at once. Each rank's disk is its own;
++rank 0 only resumes from a point every rank confirms it holds
++complete (``MultiDecoder._query``, a collective), then every rank loads its share (``KV_LOAD``, ``KV_PART``s,
++``KV_CHECK``, ``KV_END``: a ``Loading``, in slices between rounds while other streams decode). Reloaded rows are the bytes that were saved, so a
++resumed reply is the reply of the conversation that was kept.
++
++``TF_GLM_KV_TIER_GIB`` (default 200) caps what this rank keeps: least recently used points go first, then the blocks no
++point names. ``TF_GLM_KV_TIER_MIN`` (default 8192): shorter states are not written (they prefill in seconds).
++``TF_GLM_KV_TIER_MIN_FREE_GIB`` (default 0: off): a state is not written while writing it, with the queue already
++waiting, would leave less than this free on the tier's filesystem (the disk is shared; a full root blinds the box).
++The directory holds one subdirectory per engine fingerprint (model, rank layout, cache format and plane shapes, the
++build - the family's and tensorfold.cuda's sources, the runtime, the weights - and the settings every rank agreed at
++start, as the spill tier keys its folders), so a changed configuration or image never reads states it cannot use or
++would compute otherwise. ``TF_GLM_KV_TIER_KEEP_BUILDS`` (default 1): this rank's other fingerprints' subdirectories
++kept at start, the most recently started first; older ones are removed.
++
++``TF_GLM_KV_TIER_LOAD_MS`` (default 40; 0: whole loads): while other streams decode, a load copies at most this long
++between two of their rounds; the blocks it copies were read ahead on the reader threads meanwhile.
++``TF_GLM_KV_TIER_STAGE_MIB`` (default 256, at least two blocks' worth): the pinned staging ring the writes go through,
++the host memory they hold apart from the small states."""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import os
++import queue
++import shutil
++import threading
++import time
++import zlib
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from .pool import ALIGN
++
++
++def _host(t: torch.Tensor) -> torch.Tensor:
++    """``t.cpu()``: the same bytes and layout, but the host pages are touched on the CPU before the copy. A copy from
++    the GPU into fresh pageable memory makes the driver fault every page in on the way (measured ~0.1 GiB/s against
++    ~35 GiB/s into touched pages), and persist runs on the engine loop: at a long prompt's end the whole state's copy
++    held every stream for seconds."""
++
++    if t.device.type == "cpu":
++        return t.cpu()
++    out = torch.empty_like(t, device="cpu")      # the layout .cpu() gives (preserve_format)
++    out.fill_(0)
++    out.copy_(t)
++    return out
++
++
++BLOCK = ALIGN                        # tokens a block (extents start on multiples of it, so blocks align with rows)
++# a load reads this many blocks ahead, each on its own thread: cold NVMe reads scale with the reads in flight (one
++# reader ~2.1 GiB/s, eight ~5.3 on a GB10's disk), while the copies to the pool stay in order
++# on the caller. Speed only: the same bytes reach the same rows.
++READERS = 8
++# a load keeps this many blocks read ahead of its copies (in flight on the readers, or read and waiting), also
++# between its slices, so the disk works while the other streams decode: ~16 x 12.7 MB of host memory on GLM-5.3-Flash
++AHEAD = 2 * READERS
++# at most this many blocks a pump (one call between two rounds, ~4 x 12.7 MB of gathers and copies on the
++# engine loop). The writer frees slots while a pump runs, so a pump bounded only by free slots can stage a whole state
++# in one call (on a loaded GB10 one pump ran 49.6 s; the suspected cause of a ~950 ms stall at a cold 256k fill's end)
++PUMP_BLOCKS = 4
++# the files' format (in the fingerprint: another format is another subdirectory) and the bytes a file is read
++# back in for its CRC-32 (zlib's, ~6 GiB/s on a GB10 core)
++FORMAT = 2
++CHUNK = 8 << 20
++
++
++class Corrupt(Exception):
++    """A tier file that does not match its point (a CRC-32, a size): the load fails, the point is dropped."""
++
++
++def _fsync_dir(path) -> None:
++    """A directory's entries (renames, removals) to the disk."""
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def _crc_file(path, sync: bool = False) -> int:
++    """A file's CRC-32, read in ``CHUNK``s; ``sync``: then fsynced (a file just written: read back from the page
++    cache)."""
++    crc, buf = 0, bytearray(CHUNK)
++    mv = memoryview(buf)
++    with open(path, "rb", buffering=0) as f:
++        while k := f.readinto(buf):
++            crc = zlib.crc32(mv[:k], crc)
++        if sync:
++            os.fsync(f.fileno())
++    return crc
++
++
++def _own(path, owner) -> None:
++    """``path`` readable by its owner only (a folder 0700, a file 0600: they hold prompts' tokens), and owned by
++    ``owner`` (uid, gid), if any: a server run as root in a container writes its files as the owner of the tier's
++    directory. As the spill tier's files."""
++    os.chmod(path, 0o700 if os.path.isdir(path) else 0o600)
++    if owner is not None:
++        try:
++            os.chown(path, *owner)
++        except OSError:
++            pass
++
++
++def _put(path: Path, write, owner=None) -> int:
++    """``write(tmp)`` writes a file under a temporary name (removed at start if a crash cuts it off), fsynced, then
++    renamed to ``path``; its CRC-32 (of the bytes written, read back). A write that fails (a full disk) removes its
++    temporary file and raises."""
++    tmp = path.parent / f".{path.name}"
++    try:
++        write(tmp)
++        _own(tmp, owner)
++        crc = _crc_file(tmp, sync=True)
++        os.replace(tmp, path)
++    except BaseException:
++        tmp.unlink(missing_ok=True)
++        raise
++    return crc
++
++
++def _read_block(path, crc: int) -> np.ndarray:
++    """A reader thread: a block's bytes, checked against its CRC-32."""
++    data = np.fromfile(path, dtype=np.uint8)
++    if zlib.crc32(data) != crc:
++        raise Corrupt(f"{path.name}: its CRC-32 does not match its point ({data.size} bytes)")
++    return data
++
++
++def _read_small(path, crc: int) -> dict:
++    """A reader thread: a point's small state, its file checked against its CRC-32 first."""
++    if _crc_file(path) != crc:
++        raise Corrupt(f"{path.name}: its CRC-32 does not match its point")
++    return torch.load(path, map_location="cpu", weights_only=False)
++
++
++def load_ms(env=None) -> float:
++    """TF_GLM_KV_TIER_LOAD_MS: the most a slice of a load from the tier may hold the engine loop while other streams
++    decode (default 40 ms; 0: a load copies all its blocks at once)."""
++    env = os.environ if env is None else env
++    raw = str(env.get("TF_GLM_KV_TIER_LOAD_MS", "") or "").strip() or "40"
++    try:
++        ms = float(raw)
++    except ValueError:
++        ms = -1.0
++    if not ms >= 0 or ms == float("inf"):
++        raise ValueError(f"TF_GLM_KV_TIER_LOAD_MS: finite milliseconds >= 0 (0: whole loads), not {raw!r}")
++    return ms
++
++
++def stage_mib(env=None) -> int:
++    """TF_GLM_KV_TIER_STAGE_MIB: the pinned staging ring tier writes go through (default 256 MiB, at least
++    two slots of one block each whatever is set)."""
++    env = os.environ if env is None else env
++    raw = str(env.get("TF_GLM_KV_TIER_STAGE_MIB", "") or "").strip() or "256"
++    try:
++        mib = int(raw)
++    except ValueError:
++        mib = -1
++    if mib < 1:
++        raise ValueError(f"TF_GLM_KV_TIER_STAGE_MIB: whole MiB >= 1, not {raw!r}")
++    return mib
++
++
++def _nbytes(small: dict) -> int:
++    """Host bytes of a small state's tensors."""
++    out = 0
++    for v in small.values():
++        for t in (v if isinstance(v, (list, tuple)) else [v]):
++            for x in (t if isinstance(t, (list, tuple)) else [t]):
++                if isinstance(x, torch.Tensor):
++                    out += x.numel() * x.element_size()
++    return out
++
++
++class _Job:
++    """A kept state waiting to be written: its rows ``new`` [(start, end, hash)] still in the pool at
++    ``where.base`` (its extent, which may move), the next block to stage, its small state's host copy."""
++
++    def __init__(self, key, n, ids, lineage, names, new, small, size, where, small_bytes) -> None:
++        self.key, self.n, self.ids, self.lineage, self.names, self.new = key, n, ids, lineage, names, new
++        self.small, self.size, self.where, self.small_bytes = small, size, where, small_bytes
++        self.next = 0
++        self.cut: list[str] = []                    # its tail block, copied when kept (``persist``)
++        self.failed: Exception | None = None
++
++
++def settings(env=None) -> tuple[str, float, int, int]:
++    """(directory or "", cap in GiB, least tokens a written state holds, least tokens a load must save over the
++    pool's own kept prefix - TF_GLM_KV_TIER_GAIN, default 8192: reading a state's rows costs more than prefilling a
++    few hundred tokens)."""
++    env = os.environ if env is None else env
++    root = str(env.get("TF_GLM_KV_TIER", "") or "").strip()
++    cap = float(env.get("TF_GLM_KV_TIER_GIB", "") or 200)
++    least = int(env.get("TF_GLM_KV_TIER_MIN", "") or 8192)
++    gain = int(env.get("TF_GLM_KV_TIER_GAIN", "") or 8192)
++    if cap <= 0 or least < 1 or gain < 1:
++        raise ValueError("TF_GLM_KV_TIER_GIB must be above 0, TF_GLM_KV_TIER_MIN and _GAIN at least 1")
++    return root, cap, least, gain
++
++
++def block_hashes(ids: np.ndarray, lineage: str = "") -> list[tuple[int, int, str]]:
++    """(start, end, hash) for each block of ``ids``: whole blocks, then the tail block [k * BLOCK, n) if any. A hash
++    covers the lineage and every token up to its block's end (chained), and the tail's also its length, so equal
++    hashes mean equal prefixes of one computation."""
++    out, h, n = [], lineage.encode(), len(ids)
++    for s in range(0, n, BLOCK):
++        e = min(n, s + BLOCK)
++        d = hashlib.sha256(h + ids[s:e].astype(np.int32).tobytes() + (b"" if e - s == BLOCK else str(e).encode()))
++        out.append((s, e, d.hexdigest()[:32]))
++        if e - s == BLOCK:
++            h = d.digest()
++    return out
++
++
++def point_key(ids: np.ndarray) -> str:
++    return f"{block_hashes(ids)[-1][2][:16]}-{len(ids)}"         # the ids alone: a state, whichever computation
++
++
++def key_ints(key: str) -> list[int]:
++    """A key as three int32s for an op payload: its 64-bit hash (two halves) and its length."""
++    h, n = key.split("-")
++    v = int(h, 16)
++    hi, lo = (v >> 32) & 0xFFFFFFFF, v & 0xFFFFFFFF
++    return [hi - (1 << 32) if hi >= 1 << 31 else hi, lo - (1 << 32) if lo >= 1 << 31 else lo, int(n)]
++
++
++def ints_key(hi: int, lo: int, n: int) -> str:
++    return f"{((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF):016x}-{n}"
++
++
++def _plane_rows(p, s: int, e: int) -> tuple[int, int]:
++    """Rows of plane ``p`` (relative to an extent's base) that tokens [s, e) of a state occupy: every row holding one
++    of them, rounded up - a pooled-key row still filling at the state's end (e % div) holds its tokens so far. Never
++    the row past them: with e a multiple of div it holds only later tokens, and at an extent's end it is the next
++    extent's first row (``pool``: pad rows are read, never written)."""
++    return s // p.div, -(-e // p.div)
++
++
++class Tier:
++    """This rank's store: an index of its complete points, a writer thread, and loads into the pool."""
++
++    def __init__(self, root: str, cap_gib: float, least: int, rank: int, fingerprint: dict, gain: int = 8192) -> None:
++        tag = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
++        self.dir = Path(root) / f"glm-{tag}-r{rank}"
++        self.points, self.blocks = self.dir / "points", self.dir / "blocks"
++        self.cap, self.least, self.gain, self.rank = int(cap_gib * 2 ** 30), int(least), int(gain), rank
++        Path(root).mkdir(parents=True, exist_ok=True)
++        st = os.stat(root)                            # files take the directory's owner
++        self.owner = (st.st_uid, st.st_gid) if os.geteuid() == 0 and st.st_uid != 0 else None
++        self.pruned_builds = self._prune_builds(int(os.environ.get("TF_GLM_KV_TIER_KEEP_BUILDS", "") or 1))
++        self.points.mkdir(parents=True, exist_ok=True)
++        self.blocks.mkdir(parents=True, exist_ok=True)
++        (self.dir / "fingerprint.json").write_text(json.dumps(fingerprint, indent=1, sort_keys=True))
++        for p in (self.dir, self.points, self.blocks, self.dir / "fingerprint.json"):
++            _own(p, self.owner)
++        for d in (self.dir, self.dir.parent):          # the folders themselves to the disk
++            _fsync_dir(d)
++        for d in (self.points, self.blocks):           # a write cut off before its rename: never complete, removed
++            for f in d.glob(".*"):
++                f.unlink(missing_ok=True)
++        self.lock = threading.Lock()
++        self.index: dict[str, dict] = {}            # key -> {"n", "lineage", "blocks", "small_crc", "ids", "used"}
++        self.have_blocks: dict[str, int] = {}       # block on disk -> its CRC-32, from the points naming it
++        present = {p.stem for p in self.blocks.glob("*.bin")}
++        for meta in self.points.glob("*.json"):
++            try:
++                m = json.loads(meta.read_text())
++                key, blocks, crcs = str(m["key"]), list(m["blocks"]), [int(c) for c in m["crcs"]]
++                raw = (self.points / f"{key}.ids.npy").read_bytes()
++                if (len(crcs) != len(blocks) or not all(b in present for b in blocks)
++                        or zlib.crc32(raw) != m["ids_crc"] or not (self.points / f"{key}.pt").exists()):
++                    continue
++                self.index[key] = {"n": int(m["n"]), "lineage": str(m.get("lineage", "")), "blocks": blocks,
++                                   "small_crc": int(m["small_crc"]), "ids": np.load(io.BytesIO(raw)),
++                                   "used": meta.stat().st_mtime}
++                self.have_blocks.update(zip(blocks, crcs))
++            except Exception:                        # a torn, damaged or foreign point: skipped, removed below
++                continue
++        # files no complete point names (a point a crash cut short, its blocks; a damaged point) are removed,
++        # so every block left has its CRC-32 from a point
++        for f in self.points.iterdir():
++            if f.name.split(".")[0] not in self.index:
++                f.unlink(missing_ok=True)
++        for b in present - self.have_blocks.keys():
++            (self.blocks / f"{b}.bin").unlink(missing_ok=True)
++        self.inflight: set[str] = set()
++        self.jobs: queue.Queue = queue.Queue()
++        self.backlog = 0                             # row bytes of states waiting or queued, not yet written
++        self.backlog_max = int(float(os.environ.get("TF_GLM_KV_TIER_BACKLOG_GIB", "") or 16) * 2 ** 30)
++        self.min_free = int(float(os.environ.get("TF_GLM_KV_TIER_MIN_FREE_GIB", "") or 0) * 2 ** 30)
++        self.stats = {"written_points": 0, "written_bytes": 0, "skipped_backlog": 0, "skipped_last_mb": 0,
++                      "skipped_disk": 0, "loads": 0, "loaded_tokens": 0, "load_s": 0.0, "load_copy_s": 0.0,
++                      "load_parts": 0, "staged_blocks": 0, "released_blocks": 0, "load_failed": 0,
++                      "crc_failed": 0, "dropped_points": 0}
++        self._readers = ThreadPoolExecutor(READERS, thread_name_prefix="kvtier-reader")   # load()'s reads
++        self._hasher = ThreadPoolExecutor(1, thread_name_prefix="kvtier-crc")     # a block's CRC-32 beside its write
++        # states whose rows wait in the pool (the engine loop's), the pinned staging ring (``ring``: made
++        # at start by ``make``; a slot holds one block's rows), its free slots (the writer gives them back) and the
++        # host bytes held
++        self.pending: list[_Job] = []
++        self.stage_mib = stage_mib()
++        self.slots: list[torch.Tensor] = []
++        self.dev_slot: torch.Tensor | None = None
++        self.free_slots: queue.Queue = queue.Queue()
++        self.held = 0
++        threading.Thread(target=self._writer, name="kvtier-writer", daemon=True).start()
++
++    # -- write ----------------------------------------------------------------------------------------------------------
++    def wants(self, n: int) -> bool:
++        return n >= self.least
++
++    def persist(self, snap, arena, extent) -> None:
++        """Both ranks, when ``snap`` (n tokens, rows at its extent's rows [base, base + n); ``extent`` the pool's
++        ``Extent``, or a fixed base) is kept: a host copy of its small state, and the rows this disk lacks left where
++        they are, queued as a job (``pump`` stages them, the writer writes them). Every rank decides the same way from
++        its own disk, so a rank whose copy was lost simply writes it again."""
++        ids = np.asarray(snap.ids, dtype=np.int32)
++        n = len(ids)
++        key = point_key(ids)
++        with self.lock:
++            if key in self.index or key in self.inflight:
++                if key in self.index:
++                    self.index[key]["used"] = time.time()
++                return
++        lineage = str(getattr(snap, "lineage", "") or "")
++        hashes = block_hashes(ids, lineage)
++        new = [(s, e, h) for s, e, h in hashes if h not in self.have_blocks and h not in self.inflight]
++        # the queue's bytes are reserved BEFORE anything is copied: on a unified-memory GPU (GB10) a state queued only
++        # to be dropped by the backlog cap would pin its rows, and its small state's copy is host memory too
++        size = 0
++        for s, e, _ in new:
++            for p in arena.planes:
++                a, b = _plane_rows(p, s, e)
++                size += (b - a) * p.tensor[0].numel() * p.tensor.element_size()
++        free = shutil.disk_usage(self.dir).free if self.min_free else 0
++        with self.lock:
++            if self.min_free and free - self.backlog - size < self.min_free:
++                self.stats["skipped_disk"] += 1          # the free-disk floor: before any host copy, as the cap below
++                self.stats["skipped_last_mb"] = size >> 20
++                return
++            if self.backlog + size > self.backlog_max:
++                self.stats["skipped_backlog"] += 1
++                self.stats["skipped_last_mb"] = size >> 20
++                return
++            self.backlog += size
++            self.inflight.add(key)
++            self.inflight.update(h for _, _, h in new)
++        where = extent if hasattr(extent, "base") else _At(extent)
++        try:
++            small = {"rec": _host(snap.rec), "conv": _host(snap.conv),
++                     "tail": [(_host(sl), _host(r)) for sl, r in (snap.tail or [])],
++                     "head": _host(snap.head) if snap.head is not None else None,
++                     "drafter_end": int(snap.drafter_end), "lineage": lineage,
++                     "drafter_rows": [_host(r) for r in snap.drafter_rows] if snap.drafter_rows is not None else None}
++            # a block the state's end cuts (a tail): its last pooled-key rows are still filling and change as the
++            # stream goes on, so it is copied now (at most one block)
++            cut = [(h, _host(torch.cat(self._parts(where, arena, s, e)))) for s, e, h in new[-1:] if e - s < BLOCK]
++        except BaseException:
++            with self.lock:                            # the reservation is released if the copy itself fails
++                self.backlog -= size
++                self.inflight.discard(key)
++                self.inflight.difference_update(h for _, _, h in new)
++            raise
++        job = _Job(key, n, ids, lineage, [h for _, _, h in hashes], new[:len(new) - len(cut)], small, size, where,
++                   _nbytes(small))
++        job.cut = [h for h, _ in cut]
++        with self.lock:
++            self.held += job.small_bytes + sum(r.numel() for _, r in cut)
++        for h, data in cut:
++            self.jobs.put(("rows", job, h, data))
++        self.pending.append(job)
++
++    # -- the bounded write path (the engine loop's) -------------------------------------------------------------------
++    def ring(self, arena) -> None:
++        """The pinned staging ring (once: ``make`` at start, else the first write): slots of one block's rows each, as
++        many as TF_GLM_KV_TIER_STAGE_MIB holds (at least two), and the device buffer a block is gathered in."""
++        if self.slots:
++            return
++        dev = arena.planes[0].tensor.device
++        per = sum(-(-BLOCK // p.div) * p.tensor[0].numel() * p.tensor.element_size() for p in arena.planes)
++        count = max(2, (self.stage_mib << 20) // per)
++        pin = dev.type == "cuda"
++        self.slots = [torch.empty(per, dtype=torch.uint8, pin_memory=pin) for _ in range(count)]
++        for s in self.slots:
++            s.fill_(0)                                 # touched now: never a page fault on a copy
++        self.dev_slot = torch.empty(per, dtype=torch.uint8, device=dev)
++        for i in range(count):
++            self.free_slots.put(i)
++
++    def _slot(self, arena) -> int | None:
++        """A free staging slot, or None while the writer holds them all."""
++        self.ring(arena)
++        try:
++            return self.free_slots.get_nowait()
++        except queue.Empty:
++            return None
++
++    @staticmethod
++    def _parts(where, arena, s: int, e: int) -> list[torch.Tensor]:
++        """Tokens [s, e) of a state as each plane's rows, where its extent is NOW (``where.base``: it may have
++        moved)."""
++        base = where.base
++        parts = []
++        for p in arena.planes:
++            a, b = _plane_rows(p, s, e)
++            t = p.tensor[base // p.div + a:base // p.div + b]
++            parts.append(t.contiguous().view(-1).view(torch.uint8))
++        return parts
++
++    def pump(self, arena, limit: int | None = PUMP_BLOCKS) -> None:
++        """Between rounds (the engine loop, every rank): the waiting states' next blocks, oldest state first, into free
++        staging slots - one device gather and one copy to pinned memory each, on the current stream (after whatever
++        wrote the rows) - handed to the writer with an event it waits for. A state whose blocks are all handed goes to
++        the writer whole (its point). Never waits: what finds no free slot waits for the next call; at most ``limit``
++        blocks a call (None: as many as the slots allow, ``drain``)."""
++        if limit is None:
++            limit = 1 << 62
++        while self.pending:
++            job = self.pending[0]
++            while job.next < len(job.new):
++                if limit <= 0:
++                    return
++                slot = self._slot(arena)
++                if slot is None:
++                    return
++                limit -= 1
++                s, e, h = job.new[job.next]
++                parts = self._parts(job.where, arena, s, e)
++                nb = sum(t.numel() for t in parts)
++                torch.cat(parts, out=self.dev_slot[:nb])
++                self.slots[slot][:nb].copy_(self.dev_slot[:nb], non_blocking=True)
++                ev = None
++                if self.dev_slot.device.type == "cuda":
++                    ev = torch.cuda.Event()
++                    ev.record()
++                job.next += 1
++                self.jobs.put(("block", job, h, (slot, nb, ev)))
++                with self.lock:
++                    self.stats["staged_blocks"] += 1
++            self.pending.pop(0)
++            self.jobs.put(("point", job, None, None))
++
++    def drain(self, arena) -> None:
++        """Every waiting state to the writer now (the ranks are about to idle: nothing would pump), through the same
++        slots, waiting for the writer to free them."""
++        while self.pending:
++            self.pump(arena, None)
++            if self.pending:
++                time.sleep(0.001)
++
++    def release(self, extent, keep: int, arena) -> None:
++        """``extent``'s rows from ``keep`` on are about to be freed or overwritten: the waiting states there that reach
++        past ``keep`` get the rest of their blocks copied to the host now (the
++        same bytes), queued for the writer."""
++        for job in self.pending:
++            if job.where is not extent or job.n <= keep or job.next >= len(job.new):
++                continue
++            rows = []
++            for s, e, h in job.new[job.next:]:
++                rows.append((h, _host(torch.cat(self._parts(job.where, arena, s, e)))))
++            job.next = len(job.new)
++            with self.lock:
++                self.held += sum(r.numel() for _, r in rows)
++                self.stats["released_blocks"] += len(rows)
++            for h, data in rows:
++                self.jobs.put(("rows", job, h, data))
++
++    def _write_block(self, h: str, data: np.ndarray) -> None:
++        """The writer: a block to a temporary name, its CRC-32 computed meanwhile on another thread (zlib lets the GIL
++        go), fsynced, renamed. The directory is fsynced before a point naming it is (``_writer``). A write that fails
++        (a full disk) removes its temporary file and raises."""
++        tmp = self.blocks / f".{h}.bin"
++        hashed = self._hasher.submit(zlib.crc32, data)
++        try:
++            try:
++                with open(tmp, "wb") as f:
++                    f.write(memoryview(data))
++                    f.flush()
++                    os.fsync(f.fileno())
++            finally:
++                crc = hashed.result()                  # never let the hasher read a slot the writer gave back
++            _own(tmp, self.owner)
++            os.replace(tmp, self.blocks / f"{h}.bin")
++        except BaseException:
++            tmp.unlink(missing_ok=True)
++            raise
++        with self.lock:
++            self.have_blocks[h] = crc
++
++    def _writer(self) -> None:
++        while True:
++            kind, job, h, item = self.jobs.get()
++            if kind == "block":                       # a staging slot: its copy done, written, the slot freed
++                slot, nb, ev = item
++                try:
++                    if ev is not None:
++                        ev.synchronize()
++                    if not job.failed:
++                        self._write_block(h, self.slots[slot][:nb].numpy())
++                except Exception as exc:              # a full or failing disk: the state is just not kept on disk
++                    job.failed = exc
++                finally:
++                    self.free_slots.put(slot)
++                continue
++            if kind == "rows":                        # a released block's host copy
++                try:
++                    if not job.failed:
++                        self._write_block(h, item.numpy())
++                except Exception as exc:
++                    job.failed = exc
++                finally:
++                    with self.lock:
++                        self.held -= item.numel()
++                continue
++            key, n, ids, lineage, names, small, size = (job.key, job.n, job.ids, job.lineage, job.names, job.small,
++                                                        job.size)
++            try:
++                if job.failed:
++                    raise job.failed
++                with self.lock:                       # every block it names on disk now, with its CRC-32
++                    crcs = [self.have_blocks.get(b) for b in names]
++                if None in crcs:
++                    raise RuntimeError(f"{crcs.count(None)} of its blocks are no longer on disk")
++                _fsync_dir(self.blocks)               # the blocks' renames before the point that names them
++                ids_crc = _put(self.points / f"{key}.ids.npy", lambda p: np.save(p, ids), self.owner)
++                small_crc = _put(self.points / f"{key}.pt", lambda p: torch.save(small, p), self.owner)
++                _fsync_dir(self.points)
++                meta = {"key": key, "n": n, "lineage": lineage, "blocks": names, "crcs": crcs, "ids_crc": ids_crc,
++                        "small_crc": small_crc}
++                _put(self.points / f"{key}.json", lambda p: p.write_text(json.dumps(meta)), self.owner)
++                _fsync_dir(self.points)
++                with self.lock:
++                    self.index[key] = {"n": n, "lineage": lineage, "blocks": names, "small_crc": small_crc, "ids": ids,
++                                       "used": time.time()}
++                    self.stats["written_points"] += 1
++                    self.stats["written_bytes"] += size
++            except Exception as exc:                  # a full or failing disk: the state is just not kept on disk
++                print(f"[tensorfold] kv tier rank {self.rank}: writing {key} failed: {exc}", flush=True)
++            finally:
++                job.small = None
++                with self.lock:
++                    self.backlog -= size
++                    self.held -= job.small_bytes
++                    self.inflight.discard(key)
++                    self.inflight.difference_update([h for _, _, h in job.new] + job.cut)
++            try:                                      # after this job left inflight: its blocks are named or free
++                self._prune()
++            except Exception as exc:
++                print(f"[tensorfold] kv tier rank {self.rank}: pruning failed: {exc}", flush=True)
++
++    def _bytes(self) -> int:
++        return sum(f.stat().st_size for d in (self.points, self.blocks) for f in d.iterdir() if f.is_file())
++
++    def _prune(self) -> None:
++        """Least recently used points out until under 90% of the cap, then the blocks no point names."""
++        if self._bytes() <= self.cap:
++            return
++        with self.lock:
++            order = sorted(self.index.items(), key=lambda kv: kv[1]["used"])
++        for key, _ in order:
++            with self.lock:
++                self.index.pop(key, None)
++            for suffix in (".json", ".pt", ".ids.npy"):
++                (self.points / f"{key}{suffix}").unlink(missing_ok=True)
++            with self.lock:
++                named = {b for m in self.index.values() for b in m["blocks"]} | self.inflight
++                gone = [b for b in self.have_blocks if b not in named]
++                for b in gone:
++                    self.have_blocks.pop(b, None)
++            for b in gone:
++                (self.blocks / f"{b}.bin").unlink(missing_ok=True)
++            if self._bytes() <= 0.9 * self.cap:
++                return
++
++    # -- read -----------------------------------------------------------------------------------------------------------
++    def best(self, prompt: list[int], longer_than: int, grid: int, head_ok) -> str | None:
++        """Rank 0: the key of the longest complete point that is a prefix of ``prompt`` and longer than
++        ``longer_than`` tokens: strictly shorter than the prompt, or all of it when it kept its head's row
++        (``head_ok(key)``); on the prompt grid when there is one."""
++        p = np.asarray(prompt, dtype=np.int32)
++        with self.lock:
++            cands = sorted(((m["n"], k, m["ids"]) for k, m in self.index.items()), reverse=True)
++        for n, k, ids in cands:
++            if n <= longer_than:
++                return None
++            if n > len(p) or (grid and n % grid):
++                continue
++            if n == len(p) and not head_ok(k):
++                continue
++            if np.array_equal(p[:n], ids):
++                return k
++        return None
++
++    def has(self, key: str) -> bool:
++        """Whether this rank holds ``key`` complete (its json, small state, ids and every block on disk)."""
++        with self.lock:
++            m = self.index.get(key)
++            return m is not None and all(b in self.have_blocks for b in m["blocks"])
++
++    def head_saved(self, key: str) -> bool:
++        try:
++            return torch.load(self.points / f"{key}.pt", map_location="cpu", weights_only=False)["head"] is not None
++        except Exception:
++            return False
++
++    def loading(self, key: str, arena, extent, device) -> "Loading":
++        """Both ranks: kept state ``key``'s load into ``extent`` (anything with a ``base``), its reads started."""
++        return Loading(self, key, arena, extent, device)
++
++    def load(self, key: str, arena, base: int, device) -> tuple[list[int], dict] | None:
++        """``key``'s rows into the pool rows from ``base`` and its small state on the host, all at once;
++        (ids, small), or None when a file failed its checks."""
++        ld = Loading(self, key, arena, _At(base), device)
++        ld.step(ld.total)
++        return ld.finish()
++
++    def forget(self, key: str, bad=()) -> None:
++        """Every rank, when a load of ``key`` failed its checks on a rank (``MultiDecoder._load_end``): the
++        point leaves the index and the disk, so do the blocks in ``bad`` (this rank's that failed) and every point
++        naming one of them, then the dropped points' blocks that no point, waiting state or write in flight names."""
++        with self.lock:
++            drop = {key} | {k for k, m in self.index.items() if any(b in bad for b in m["blocks"])}
++            cands = set(bad) | {b for k in drop if k in self.index for b in self.index[k]["blocks"]}
++            for k in drop:
++                self.index.pop(k, None)
++            named = {b for m in self.index.values() for b in m["blocks"]} | self.inflight
++            named |= {b for job in self.pending for b in job.names}
++            gone = set(bad) | {b for b in cands if b not in named}
++            for b in gone:
++                self.have_blocks.pop(b, None)
++            self.stats["dropped_points"] += len(drop)
++        for k in drop:
++            for suffix in (".json", ".pt", ".ids.npy"):
++                (self.points / f"{k}{suffix}").unlink(missing_ok=True)
++        for b in gone:
++            (self.blocks / f"{b}.bin").unlink(missing_ok=True)
++
++    def _prune_builds(self, keep: int) -> int:
++        """This rank's subdirectories of other fingerprints (another build, settings or layout): the ``keep``
++        most recently started stay (``fingerprint.json`` is written at every start), older ones are removed, as the
++        spill tier's ``--spill-keep-builds``. How many were removed."""
++
++        def started(d: Path) -> float:
++            f = d / "fingerprint.json"
++            return (f if f.exists() else d).stat().st_mtime
++
++        others = sorted((d for d in self.dir.parent.glob(f"glm-*-r{self.rank}") if d.is_dir() and d != self.dir),
++                        key=started, reverse=True)[max(0, keep):]
++        for d in others:
++            shutil.rmtree(d, ignore_errors=True)
++        return len(others)
++
++    def health(self) -> dict:
++        with self.lock:
++            return {"kv_tier_points": len(self.index), "kv_tier_backlog_mb": self.backlog >> 20,
++                    "kv_tier_held_mb": (self.held + sum(s.numel() for s in self.slots)) >> 20,
++                    **{f"kv_tier_{k}": (round(v, 2) if isinstance(v, float) else v) for k, v in self.stats.items()}}
++
++
++class _At:
++    """A fixed base (``Tier.load``, or ``persist`` given one): a ``Loading`` / ``pump`` reads ``base`` at every
++    block."""
++
++    def __init__(self, base: int) -> None:
++        self.base = int(base)
++
++
++class Loading:
++    """One kept state's load from this rank's disk into a pool extent, in slices: ``step(upto)`` copies the
++    blocks before ``upto`` that are not in yet, in order, each to the extent's base AT THAT MOMENT - the extent may
++    move between slices (``MultiDecoder._move`` carries ``rows``, the tokens loaded so far), so every block lands where
++    its rows are. The reads run ahead on the tier's reader threads (``AHEAD`` blocks, in flight or read), between
++    slices too, and the small state's read with them; ``finish`` returns (ids, small). The same
++    bytes reach the same rows, whatever the slices.
++
++    Every file is checked as it is read, on the reader threads - a block against its CRC-32 and then the rows
++    it fills, the small state against its CRC-32. A file that fails (or is missing) fails the load (``failed``; its
++    blocks in ``bad``): the later blocks are neither read nor copied, and ``finish`` returns None."""
++
++    def __init__(self, tier: Tier, key: str, arena, extent, device) -> None:
++        self.t0 = time.perf_counter()
++        self.tier, self.key, self.arena, self.extent, self.device = tier, key, arena, extent, device
++        self.failed: str | None = None
++        self.bad: set[str] = set()
++        self.hashes, self.names, self.crcs, self.small = [], [], [], None
++        self.next, self.copy_s, self.parts = 0, 0.0, 0
++        self.got = None                               # ``finish``'s result, kept for the KV_END (multi)
++        self.ahead: dict = {}
++        with tier.lock:
++            m = tier.index.get(key)
++            if m is not None:
++                m["used"] = time.time()
++        if m is None:                                 # pruned since every rank confirmed it: this rank's load fails
++            self.n, self.ids, self.total = 0, np.zeros(0, dtype=np.int32), 0
++            self._fail("no longer on this rank's disk")
++            return
++        self.n, self.ids = m["n"], m["ids"]
++        self.hashes = block_hashes(self.ids, m.get("lineage", ""))
++        self.total = len(self.hashes)
++        if [h for _, _, h in self.hashes] != m["blocks"]:
++            self._fail("its block list does not match its ids and lineage")
++            return
++        self.names = [tier.blocks / f"{h}.bin" for _, _, h in self.hashes]
++        with tier.lock:
++            self.crcs = [tier.have_blocks.get(h) for _, _, h in self.hashes]
++        self._read_ahead()
++        self.small = tier._readers.submit(_read_small, tier.points / f"{key}.pt", m["small_crc"])
++
++    def _fail(self, why: str, block: str | None = None) -> None:
++        """This rank's load failed its checks: nothing more is read."""
++        if self.failed is None:
++            self.failed = why
++        if block is not None:
++            self.bad.add(block)
++        self.close()
++
++    def _read_ahead(self) -> None:
++        for j in range(self.next, min(self.next + AHEAD, self.total)):
++            if j not in self.ahead:
++                self.ahead[j] = self.tier._readers.submit(_read_block, self.names[j], self.crcs[j])
++
++    @property
++    def done(self) -> bool:
++        return self.next >= self.total
++
++    @property
++    def rows(self) -> int:
++        """Tokens of the state in its extent so far (its first ``rows``)."""
++        return self.hashes[self.next - 1][1] if self.next else 0
++
++    def ready(self) -> int:
++        """Blocks from the next one on whose reads are done (a slice of them waits for nothing)."""
++        j = self.next
++        while j < self.total and j in self.ahead and self.ahead[j].done():
++            j += 1
++        return j - self.next
++
++    def step(self, upto: int) -> None:
++        """Blocks [next, upto) into the extent, in order (each waits for its read and its checks); skipped once the
++        load failed."""
++        t = time.perf_counter()
++        upto = min(int(upto), self.total)
++        self.parts += upto > self.next
++        while self.next < upto:
++            if self.failed is not None:
++                self.next = upto
++                break
++            i = self.next
++            s, e, h = self.hashes[i]
++            self._read_ahead()
++            try:
++                data = self.ahead.pop(i).result()
++            except Exception as exc:                  # missing, unreadable, or not its CRC-32
++                if isinstance(exc, Corrupt):
++                    with self.tier.lock:
++                        self.tier.stats["crc_failed"] += 1
++                self._fail(f"block {h}: {exc}", h)
++                continue
++            raw = torch.from_numpy(data).to(self.device)
++            base = self.extent.base
++            spans, at = [], 0
++            for p in self.arena.planes:
++                a, b = _plane_rows(p, s, e)
++                dst = p.tensor[base // p.div + a:base // p.div + b]
++                nb = dst.numel() * dst.element_size()
++                spans.append((dst, at, nb))
++                at += nb
++            if at != raw.numel():                     # checked before any row is written
++                self._fail(f"block {h}: {raw.numel()} bytes, the planes take {at}", h)
++                continue
++            for dst, a0, nb in spans:
++                dst.view(-1).view(torch.uint8).copy_(raw[a0:a0 + nb])
++            self.next = i + 1
++        if self.failed is None:
++            self._read_ahead()
++        self.copy_s += time.perf_counter() - t
++
++    def finish(self) -> tuple[list[int], dict] | None:
++        """Every block in: the small state (read and checked meanwhile), the point's use recorded; (ids, small), or
++        None when a file failed its checks on this rank (``failed``)."""
++        if not self.done:
++            raise RuntimeError(f"kv tier point {self.key}: finished with {self.total - self.next} blocks not loaded")
++        t = time.perf_counter()
++        small = None
++        if self.failed is None:
++            try:
++                small = self.small.result()
++            except Exception as exc:                  # missing, unreadable, or not its CRC-32
++                if isinstance(exc, Corrupt):
++                    with self.tier.lock:
++                        self.tier.stats["crc_failed"] += 1
++                self._fail(f"small state: {exc}")
++        if self.failed is not None:
++            with self.tier.lock:
++                self.tier.stats["load_failed"] += 1
++            return None
++        os.utime(self.tier.points / f"{self.key}.json", None)
++        self.copy_s += time.perf_counter() - t
++        with self.tier.lock:
++            self.tier.stats["loads"] += 1
++            self.tier.stats["loaded_tokens"] += self.n
++            self.tier.stats["load_s"] += time.perf_counter() - self.t0
++            self.tier.stats["load_copy_s"] += self.copy_s
++            self.tier.stats["load_parts"] += self.parts
++        return self.ids.tolist(), small               # the same ints as [int(v) for v in ids], in C (~15 ms at 596k)
++
++    def close(self) -> None:
++        """Abandoned (an iteration failed, or a file failed its checks): reads not started are cancelled."""
++        for f in list(self.ahead.values()) + ([self.small] if self.small is not None else []):
++            f.cancel()
++        self.ahead.clear()
++
++
++def make(decoder) -> Tier | None:
++    """The decoder's tier when TF_GLM_KV_TIER names a directory, else None."""
++    root, cap, least, gain = settings()
++    if not root:
++        return None
++    if getattr(decoder.g, "spill_cfg", None) is not None:
++        raise ValueError("TF_GLM_KV_TIER and --spill-gib are two disk tiers for the same kept prompt states, each with "
++                         "its own files and ops: configure one (unset TF_GLM_KV_TIER, or drop --spill-gib)")
++    from tensorfold.cuda.spill import build_id, weights_id
++
++    g, w = decoder.g, decoder.w
++    arena = decoder.arena
++    drafter_dir = getattr(g, "drafter_dir", None)
++    fingerprint = {"model": str(Path(str(g.model_dir)).resolve().name), "world": int(w.world), "rank": int(w.rank),
++                   "kv": str(getattr(decoder.e.caches, "kv", "")), "grid": int(decoder.grid), "block": BLOCK,
++                   # a plane's ROW shape, not its row count: the pool's size follows the memory free at each start
++                   # (v1.5 sizes it below KV_POOL_GIB), and a state's rows read back into any pool of that row shape
++                   "planes": [[list(p.tensor.shape[1:]), str(p.tensor.dtype), p.div, p.pad] for p in arena.planes],
++                   "rec": list(decoder.e.slots.rec.shape[2:]), "conv": list(decoder.e.slots.conv.shape[1:]),
++                   "drafter": [int(getattr(g.drafter, a, 0) or 0) for a in ("ring", "window", "block")]
++                   if g.drafter is not None else None,
++                   # what the stored bits depend on beyond the layout, as the spill tier keys its folders -
++                   # the build (the family's and tensorfold.cuda's sources, TensorFold, torch, CUDA, GPU, driver,
++                   # the weights' paths: ``spill.build_id``), this rank's weight files, the dense format and the
++                   # settings every rank agreed at start (the engine's ``agreed``: prefill rows among them) - and the
++                   # files' format. Another image or setting: another subdirectory, never a resume of other bits
++                   "format": FORMAT, "build": build_id(g.model_dir, drafter_dir),
++                   "weights": weights_id(g.model_dir, drafter_dir), "dense": os.environ.get("TF_GLM_DENSE", ""),
++                   "agreed": repr(getattr(g, "agreed", None))}
++    tier = Tier(root, cap, least, int(w.rank), fingerprint, gain)
++    tier.ring(arena)                                  # the write ring now, not on the engine loop later
++    if w.rank == 0:
++        print(f"[tensorfold] kv tier: {tier.dir} ({len(tier.index)} kept states on disk, cap {cap:g} GiB, states of "
++              f"{least}+ tokens{f'; removed {tier.pruned_builds} older builds' if tier.pruned_builds else ''})",
++              flush=True)
++    return tier
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 775b2a5..9ab63f9 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -50,16 +50,17 @@ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.server.errors import CapacityError  # TFCAP-0075
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill, sliced_fill
++from . import kvtier, multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, SPILL, LOADED, \
+-    TOUCH = range(1, 18)
++    TOUCH, KV_QUERY, KV_LOAD, KV_PART, KV_END, KV_CHECK = range(1, 23)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+        IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART", LOAD: "LOAD",
+-       FLUSH: "FLUSH", SPILL: "SPILL", LOADED: "LOADED", TOUCH: "TOUCH"}
++       FLUSH: "FLUSH", SPILL: "SPILL", LOADED: "LOADED", TOUCH: "TOUCH", KV_QUERY: "KV_QUERY", KV_LOAD: "KV_LOAD",
++       KV_PART: "KV_PART", KV_END: "KV_END", KV_CHECK: "KV_CHECK"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -458,6 +459,7 @@ class Lane:
+     copy_rounds: int = 0
+     copy_drafted: int = 0
+     copy_accepted: int = 0
++    lineage: str = ""            # TF_GLM_KV_TIER: the computation its rows belong to (``kvtier``)
+ 
+ 
+ class NoRoom(RuntimeError):
+@@ -565,6 +567,15 @@ class MultiDecoder:
+         self.dflash_code = encode_policy(DFLASH_POLICY)
+         if self.fill_budget:
+             self.fill_costs = self._time_prompt_layers()
++        # TF_GLM_KV_TIER: kept prompt states also on this rank's disk (``kvtier``), resumed from there when
++        # the pool no longer holds them (evicted, or the server restarted)
++        self.tier = kvtier.make(self)
++        self.boot = os.urandom(6).hex()                  # this process's lineages (fresh prefills) are its own
++        # the kept state loading from the tier in slices between rounds ((kvtier.Loading, its kid) or None),
++        # the most a slice may take while other streams decode, and rank 0's measured copy time a block (its slices)
++        self.loading = None
++        self.load_ms = kvtier.load_ms()
++        self.load_block_ms = 2.0
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -603,6 +614,7 @@ class MultiDecoder:
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
++                **(self.tier.health() if self.tier is not None else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -785,7 +797,8 @@ class MultiDecoder:
+         if not self.lanes:
+             return True                  # everything can be evicted; a prompt past the pool fails in ``admit``
+         need = self._need(len(s.prompt))
+-        room = self.pool.free_rows() + sum(x.size for x in self.pool.extents if x.owner is None)
++        room = self.pool.free_rows() + sum(x.size for x in self.pool.extents
++                                           if x.owner is None and not self._loads_into(x))
+         return room >= need + ALIGN * sum(l.decoding for l in self.lanes.values())
+ 
+     def admit(self, s: Stream) -> None:
+@@ -830,6 +843,8 @@ class MultiDecoder:
+         if slot is None:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+         hit = self._resume(key) if draft and key is not None else None
++        if self.tier is not None and draft and s.vision is None:
++            hit = self._from_disk(prompt, hit)
+         encoded_from = len(hit.ids) if hit is not None else 0
+         if s.vision is not None:              # encoded before anything is sent: a failure stops here
+             feed = self._encode(s.vision, encoded_from)
+@@ -962,6 +977,8 @@ class MultiDecoder:
+                 raise RuntimeError(f"stream {a['sid']} takes over extent {x.eid} at [{x.base}, {x.end}), "
+                                    f"rank 0 said [{a['base']}, {a['base'] + a['size']})")
+             self._rewrites(x, cut)
++            if self.tier is not None:         # rows past the resume point get rewritten: unwritten states
++                self.tier.release(x, cut, self.arena)   # there take their host copies first
+         else:
+             x = self.pool.add(a["base"], a["size"])
+             if hit is not None:
+@@ -985,6 +1002,8 @@ class MultiDecoder:
+         self.next_sid = max(self.next_sid, a["sid"] + 1)
+         self.next_order += 1
+         s.sid, s.cached = a["sid"], cut
++        # the computation its rows belong to (``kvtier``): its kept state's, or a new one for a fresh prefill
++        lane.lineage = getattr(hit, "lineage", None) or f"{self.boot}-{a['sid']}"
+         # the slot's state: the kept prompt's, or fresh
+         st.reset()
+         if self.drafts is not None:
+@@ -1064,6 +1083,7 @@ class MultiDecoder:
+         # rank 0's key: a text prompt's is its ids (shared, not a second list); rank 1 keeps none
+         snap.key = None if lane.key is None else snap.ids if not lane.images else lane.key[:n]
+         snap.images = lane.images
++        snap.lineage = lane.lineage      # TF_GLM_KV_TIER: the computation its rows belong to (``kvtier``)
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+@@ -1085,6 +1105,13 @@ class MultiDecoder:
+                 self._drop(c, spill=False)
+         while len(self.kept) > max(1, self.g.cache_entries):
+             self._drop(cap_victim(self.kept))
++        # TF_GLM_KV_TIER: this rank's share of the state to its disk too. Not pictures: the tier keys by ids,
++        # which a keyed state's do not carry; a non-dflash state in a drafting engine no stream could resume.
++        # Before the bytes cap below, which rank 0 alone decides (rank 1 drops at its EVICT, after its own ``_keep``):
++        # every rank queues the state at the same point.
++        if (self.tier is not None and not lane.images and self.tier.wants(n)
++                and (snap.drafter_rows is not None or self.drafts is None)):
++            self.tier.persist(snap, self.arena, lane.extent)      # its rows wait in the extent
+         # The entry cap is not a memory budget. Long conversations make each kept state own hundreds of MB outside
+         # the pool (copies of the DFlash2 window), so 64 entries reached tens of GiB on the hosts (free memory to
+         # 0.1 GB) and never came back. With TF_GLM_KEPT_BYTES_GIB set, rank 0 drops states past it, by the cap's
+@@ -1146,10 +1173,14 @@ class MultiDecoder:
+         if x.owner is not None:
+             return
+         if not x.kept:
++            if self.tier is not None:          # unwritten rows about to be freed: host copies first
++                self.tier.release(x, 0, self.arena)
+             self.pool.remove(x)
+             return
+         size = align_up(max(len(k.ids) for k in x.kept))
+         if size < x.size:
++            if self.tier is not None:
++                self.tier.release(x, size, self.arena)
+             self.pool.resize(x, size)
+ 
+     def _evict(self, c, spill: bool = True) -> None:
+@@ -1158,6 +1189,142 @@ class MultiDecoder:
+         self._emit(EVICT, [c.kid, int(spill)])
+         self._drop(c, spill=spill)
+ 
++    # -- kept prompts on disk (TF_GLM_KV_TIER) ----------------------------------------------------------------------------
++    def _from_disk(self, prompt: list[int], hit):
++        """Rank 0: a kept state on disk longer than ``hit`` (the pool's), loaded on every rank as a kept prompt once
++        every rank confirms it holds it complete (a KV_QUERY); else ``hit``. The load (a KV_LOAD, KV_PARTs, a KV_CHECK,
++        a KV_END) runs whole now when no other stream decodes; else in slices between their rounds (they go on
++        decoding), while this request waits first in line (``NoRoom``: the scheduler holds it) - it then resumes from
++        the loaded state, a kept prompt like any other (``_resume``). One load at a time: a request meanwhile waits
++        too. A load that fails its checks on any rank leaves ``hit``: the request prefills past it."""
++
++        if self.loading is not None:
++            raise NoRoom("a kept state is loading from the NVMe tier")
++        t = self.tier
++        have = len(hit.ids) if hit is not None else 0
++        key = t.best(prompt, max(have + t.gain - 1, t.least - 1), self.grid, t.head_saved)
++        if key is None or not self._query(key):
++            return hit
++        n = int(key.split("-")[1])
++        size = align_up(n)
++        base = self._room(size, [hit.extent] if hit is not None else [])
++        if base is None:
++            return hit
++        kid = self.next_kid
++        self._emit(KV_LOAD, [kid, base, size, *kvtier.key_ints(key)])
++        self._load_begin(kid, base, size, key)
++        if self.load_ms and self._busy():
++            self._flush()                             # every rank starts reading now, a round before the first slice
++            raise NoRoom("a kept state is loading from the NVMe tier")
++        got = self._load_step()
++        return got if got is not None else hit
++
++    def _query(self, key: str) -> bool:
++        """Rank 0: whether every rank holds ``key`` complete: a KV_QUERY sent now, answered by every rank in a gather."""
++
++        self._emit(KV_QUERY, kvtier.key_ints(key))
++        self._flush()
++        return all(r[0] for r in self.g._gather_ints([int(self.tier.has(key))]))
++
++    def _busy(self) -> bool:
++        return any(l.decoding and not l.paused and not l.s.done for l in self.lanes.values())
++
++    def _loads_into(self, x) -> bool:
++        return self.loading is not None and self.loading[0].extent is x
++
++    def _load_step(self):
++        """Rank 0: the loading state's next slice: a KV_PART (its blocks up to a point: every rank copies them at once,
++        so it is sent before rank 0 copies), then once every block is in a KV_CHECK (every rank reports whether its
++        files passed their checks) and a KV_END with the verdict. While other streams decode, a slice is the
++        blocks rank 0 has read already, as many as TF_GLM_KV_TIER_LOAD_MS of copies take (at least one; none while its
++        next read is still on the disk); else, or once rank 0's own load failed, every block left. The loaded kept
++        prompt, or None (not loaded yet, or failed)."""
++
++        ld, kid = self.loading
++        busy = self.load_ms and self._busy() and ld.failed is None
++        k = min(ld.ready(), max(1, int(self.load_ms / self.load_block_ms))) if busy else ld.total - ld.next
++        if k > 0:
++            self._emit(KV_PART, [kid, ld.next + k])
++            self._flush()
++            t = time.perf_counter()
++            self._load_part(kid, ld.next + k)
++            if busy:                                  # its blocks were read: copies only
++                self.load_block_ms = max(0.05, 1000 * (time.perf_counter() - t) / k)
++        if not ld.done:
++            return None
++        self._emit(KV_CHECK, [kid])
++        self._flush()
++        rows = self.g._gather_ints([int(self._load_check(kid))])
++        ok = all(r[0] for r in rows)
++        if not ok:
++            print(f"[tensorfold] kv tier: kept state {ld.key} failed its checks on rank(s) "
++                  f"{[r for r, row in enumerate(rows) if not row[0]]}: dropped on every rank, the request prefills",
++                  flush=True)
++        self._emit(KV_END, [kid, int(ok)])
++        self._flush()
++        return self._load_end(kid, ok)
++
++    def _load_begin(self, kid: int, base: int, size: int, key: str) -> None:
++        """Both ranks: kept state ``key``'s load from this rank's disk into a new extent [base, base + size) begins (its
++        reads start); its kept prompt id ``kid`` is taken now, so prompts kept while it loads take later ones."""
++
++        if self.loading is not None:
++            raise RuntimeError(f"rank {self.rank}: a load began while kept prompt {self.loading[1]} still loads")
++        x = self.pool.add(base, size)
++        self.next_kid = max(self.next_kid, kid + 1)
++        self.loading = (self.tier.loading(key, self.arena, x, self.w.device), kid)
++
++    def _loader(self, kid: int):
++        if self.loading is None or self.loading[1] != kid:
++            raise RuntimeError(f"rank {self.rank}: kept prompt {kid} is not loading")
++        return self.loading[0]
++
++    def _load_part(self, kid: int, upto: int) -> None:
++        """Both ranks: the loading state's blocks before ``upto`` into its extent (where it is now)."""
++        self._loader(kid).step(upto)
++
++    def _load_check(self, kid: int) -> bool:
++        """Both ranks (KV_CHECK): every block is in; the small state is read and every file checked. Whether
++        this rank's load is whole (its result kept for KV_END)."""
++
++        ld = self._loader(kid)
++        ld.got = ld.finish()
++        if ld.got is None:
++            print(f"[tensorfold] kv tier rank {self.rank}: kept state {ld.key} failed its checks: {ld.failed}",
++                  flush=True)
++        return ld.got is not None
++
++    def _load_end(self, kid: int, ok: bool):
++        """Both ranks: the loaded state becomes kept prompt ``kid`` (superseded or least-recently-used kept prompts make
++        way past TF_GLM_CACHE_ENTRIES, as ``_keep``). Unless a rank's load failed its checks (``ok`` false, KV_CHECK's
++        verdict): then every rank drops the point from its disk and frees the extent; None."""
++
++        from .decode import Snapshot
++
++        ld = self._loader(kid)
++        self.loading = None
++        x = ld.extent
++        if not ok:
++            self.tier.forget(ld.key, ld.bad)
++            self._settle(x)                           # nothing kept there: removed
++            return None
++        ids, small = ld.got
++        dev = self.w.device
++        snap = Snapshot(ids, small["rec"].to(dev), small["conv"].to(dev), None, -1, int(small["drafter_end"]),
++                        tail=[(sl.to(dev), r.to(dev)) for sl, r in small["tail"]],
++                        head=small["head"].to(dev) if small["head"] is not None else None)
++        snap.drafter_rows = ([r.to(dev) for r in small["drafter_rows"]] if small["drafter_rows"] is not None
++                             else None)
++        snap.kid, snap.extent = kid, x
++        snap.lineage = str(small.get("lineage", "") or f"disk-{ld.key}")
++        snap.key, snap.images, snap.shared = snap.ids, False, False   # a text state: resumed by its ids (``_resume``)
++        snap.own, snap.chat = False, 0           # as a spill restore: no conversation's quota (patch 0089)
++        x.kept.append(snap)
++        self.kept.append(snap)
++        while len(self.kept) > max(1, self.g.cache_entries):
++            self._drop(cap_victim(self.kept))
++        return snap
++
+     # -- the spill tier (``tensorfold serve --spill-gib``; cuda/spill.py) ----------------------------------------------
+     # Every call below runs on both ranks in the same order (rank 0 decides, rank 1 follows its ops); rank 0 sends what
+     # it has queued before each of the tier's all-gathers (``_sync``). Rows a pending write reads, or a read is filling,
+@@ -1560,6 +1727,8 @@ class MultiDecoder:
+         used = max([len(k.ids) for k in x.kept], default=0)
+         if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
+             used = max(used, x.loading.n)
++        if self._loads_into(x):                       # a state loading in slices: the rows it holds so far
++            used = max(used, self.loading[0].rows)
+         if x.owner is not None:
+             used = max(used, self.lanes[x.owner].st.pos)
+         if self.partial is not None:
+@@ -1689,6 +1858,10 @@ class MultiDecoder:
+         return self.lanes[s.sid]
+ 
+     def _iterate(self) -> list[Stream]:
++        if self.tier is not None and self.tier.pending:   # waiting tier writes, a slice through the ring
++            self.tier.pump(self.arena)
++        if self.loading is not None:                 # a kept state loading from the tier: its next slice
++            self._load_step()
+         if self.fill_budget:
+             cancelled = []
+             for lane in self.lanes.values():
+@@ -2189,11 +2362,15 @@ class MultiDecoder:
+                 s.out and s.out[-1] in self._ends(lane)) else DONE
+             self._emit(FINISH, [lane.sid, reason])
+             self._finish(lane.sid)
++        if not self.lanes and self.loading is not None and self.broken is None:
++            self._load_step()                         # nothing decodes: every block left, before the ranks idle
+         if not self.lanes and not self.idle and self.broken is None:
+             self.decode_due = self.short_round_due = False
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True
++            if self.tier is not None:                # nothing pumps while idle: every waiting write now
++                self.tier.drain(self.arena)
+         _unwatch(self.watchdog)
+         self.iteration_since = None
+ 
+@@ -2245,6 +2422,9 @@ class MultiDecoder:
+             self.partial.close()
+             self.partial = None
+         self.lanes = {}
++        if self.loading is not None:
++            self.loading[0].close()
++            self.loading = None
+         if self.broken is None:
+             self.broken = RuntimeError("an iteration failed")
+         return live
+@@ -2313,6 +2493,19 @@ class MultiDecoder:
+                 self._do_flush(p)
+             elif op == SPILL:
+                 self._spill(self._kept_by_id(p[0]), keep=self._kept_keys())
++            elif op == KV_QUERY:
++                key = kvtier.ints_key(*p[:3])
++                self.g._gather_ints([int(self.tier is not None and self.tier.has(key))])
++            elif op == KV_LOAD:
++                if self.tier is None:
++                    raise RuntimeError("rank 0 sent a KV_LOAD, but this rank was started without TF_GLM_KV_TIER")
++                self._load_begin(p[0], p[1], p[2], kvtier.ints_key(*p[3:6]))
++            elif op == KV_PART:
++                self._load_part(p[0], p[1])
++            elif op == KV_CHECK:                      # this rank's verdict on its files, gathered
++                self.g._gather_ints([int(self._load_check(p[0]))])
++            elif op == KV_END:
++                self._load_end(p[0], bool(p[1]))
+             elif op == MOVE:
+                 self._move(self.pool.get(p[0]), p[1], p[2])
+             elif op == GROW:
+@@ -2355,8 +2548,12 @@ class MultiDecoder:
+                 if self.lanes:
+                     raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
+                 self.idle = True
++                if self.tier is not None:            # nothing pumps while idle: every waiting write now
++                    self.tier.drain(self.arena)
+             else:
+                 raise RuntimeError(f"rank 1: unknown op {op}")
++        if self.tier is not None and self.tier.pending:   # waiting tier writes, a slice through the ring
++            self.tier.pump(self.arena)
+ 
+     def _stop_bound(self, lane: Lane, stop: int) -> int:
+         """The stop rank 0 sent, if it passes no kept point (else where it should have stopped)."""

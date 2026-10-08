@@ -109,6 +109,19 @@ if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0088: the spill tier 
   SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
                --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
 fi
+if [[ "$KV_TIER_GIB" != 0 ]]; then                 # patch 0109: the NVMe KV tier (scripts/config.sh)
+  [[ "$SPILL_GIB" == 0 ]] || die "KV_TIER_GIB and SPILL_GIB are two disk tiers for the same kept prompt states: set one of them to 0"
+  [[ "$PARALLEL" != 1 ]] || die "KV_TIER_GIB keeps the shared pool's prompt states, which needs PARALLEL above 1"
+  [[ "$KV_TIER_DIR" == /* ]] || die "KV_TIER_DIR must be an absolute path (the same on every Spark), not $KV_TIER_DIR"
+  for v in KV_TIER_GIB KV_TIER_MIN_FREE_GIB KV_TIER_BACKLOG_GIB; do
+    [[ "${!v}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v is a number of GiB, not ${!v}"
+  done
+  [[ "$KV_TIER_MIN_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "KV_TIER_MIN_TOKENS is a token count, not $KV_TIER_MIN_TOKENS"
+fi
+# the tier's directory and limits come from scripts/config.sh (below, the same on every rank), not the environment;
+# its other TF_GLM_KV_TIER_* knobs (README) reach every rank like any TF_GLM_* setting
+! env | grep -qE '^TF_GLM_KV_TIER(_GIB|_MIN|_MIN_FREE_GIB|_BACKLOG_GIB)?=' ||
+  die "set KV_TIER_GIB, KV_TIER_DIR, KV_TIER_MIN_TOKENS, KV_TIER_MIN_FREE_GIB, KV_TIER_BACKLOG_GIB (scripts/config.sh), not their TF_GLM_KV_TIER* variables"
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
 arg_value() {
@@ -325,6 +338,13 @@ if [[ "$SPILL_GIB" != 0 ]]; then                   # the spill tier's directory 
   # (files take the owner of SPILL_DIR on each Spark. No --init on these containers: a rank past 0 runs as PID 1
   # without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
   RUN_ARGS+=(-v "$SPILL_DIR":/spill -e TF_SPILL_FLUSH_S="$SPILL_FLUSH_S")
+fi
+if [[ "$KV_TIER_GIB" != 0 ]]; then                 # the NVMe KV tier's directory on every rank, files owned by you
+  mkdir -p "$KV_TIER_DIR"
+  for i in $(worker_ids); do worker "$i" "mkdir -p '$KV_TIER_DIR'" || die "could not create KV_TIER_DIR on worker $i"; done
+  RUN_ARGS+=(-v "$KV_TIER_DIR":/kvtier -e TF_GLM_KV_TIER=/kvtier -e TF_GLM_KV_TIER_GIB="$KV_TIER_GIB"
+             -e TF_GLM_KV_TIER_MIN="$KV_TIER_MIN_TOKENS" -e TF_GLM_KV_TIER_MIN_FREE_GIB="$KV_TIER_MIN_FREE_GIB"
+             -e TF_GLM_KV_TIER_BACKLOG_GIB="$KV_TIER_BACKLOG_GIB")
 fi
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)

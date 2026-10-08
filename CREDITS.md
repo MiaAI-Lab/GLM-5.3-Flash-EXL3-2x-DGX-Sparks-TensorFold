@@ -134,6 +134,14 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [BadAd84](https://github.com/BadAd84).
 - `0086-glm-prompt-scores-loop` (the prompt scoring, one row and many pool blocks a program): by
   [BadAd84](https://github.com/BadAd84).
+- `0109-glm-kv-tier` (the NVMe KV tier, `KV_TIER_GIB`: kept prompt states written to local disk when they are kept, in
+  shared blocks): by [BadAd84](https://github.com/BadAd84), written independently of the spill tier (2026-10-02). The
+  idea of a per-rank NVMe tier for GLM on TensorFold is older: the NVMe session tier of
+  [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) (patch 0250) by Jay Leaton;
+  the code is new. Ideas it takes from Robert Wojciechowski's ([wojo](https://github.com/wojo)) spill tier (`0088`):
+  the free-disk floor (`KV_TIER_MIN_FREE_GIB`), every file fsynced before its rename, a CRC-32 checked on every read,
+  folders keyed on the build (it calls `spill.build_id` and `spill.weights_id`) and the agreed settings, other builds'
+  folders pruned at start, and files owned by the folder's owner.
 - `0087-glm-display-kv-dispram` (`DISPLAY_KV_BACKEND=dispram`: `0072`'s display reservation on kindling spark-os): by
   [BadAd84](https://github.com/BadAd84). It maps the span through `dispram`, the display-carveout lender of
   [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
