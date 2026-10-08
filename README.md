@@ -945,7 +945,7 @@ files are downloaded from Hugging Face and are not part of this repository:
 - **The base model** [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is under the license on its model
   card.
 - **The DFlash2 drafter** is under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/),
-  non-commercial use only (commercial licensing: contact@inco.ai); `DRAFTER=mtp` serves without it.
+  non-commercial use only: see [DFlash2's license](#dflash2s-license) below.
 
 **Third-party software in the image.** The prebuilt image (and the one `scripts/prepare.sh` builds) is based on
 NVIDIA's PyTorch container `nvcr.io/nvidia/pytorch:26.07-py3`, redistributed as a value-added runtime image. The NVIDIA
@@ -954,6 +954,16 @@ and the [Product-Specific Terms for NVIDIA AI Products](https://www.nvidia.com/e
 which the container prints at every start; by pulling or running the image you accept them. The image also contains
 PyAV (BSD) with its FFmpeg libraries (LGPL) and xgrammar (Apache 2.0). The Apache License above covers this
 repository's own work only.
+
+### DFlash2's license
+
+The default drafter, [DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) by
+[IncoAI](https://huggingface.co/incoai), is licensed CC BY-NC-ND 4.0, as its
+[model card](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) states: **non-commercial use only**, no derivatives
+(the license's [legal code](https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode); commercial licensing:
+contact@inco.ai). `DRAFTER=mtp` avoids that license: the checkpoint's own MTP head drafts instead, and with
+`DRAFTER=mtp` set before the first `./start.sh` DFlash2 is never downloaded. But the server then decodes one request
+at a time (`PARALLEL=1`) and loses DFlash2's 5-10% decode gain.
 
 ## Credits
 
