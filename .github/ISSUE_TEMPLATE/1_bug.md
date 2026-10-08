@@ -98,8 +98,8 @@ curl -s http://<head-address>:8888/v1/chat/completions \
         * "no RoCE device or RoCE v2 GID for the link" -> WORKER is reached over another
           network: set FABRIC_PEER to the worker's CX7 address.
         * `start.sh` refuses port 8888 -> something else listens there; set PORT.
-        * prepare.sh fails applying a patch -> TF_VERSION was changed; the patches are
-          made for v0.6.0.
+        * prepare.sh fails applying a patch -> check TF_REVISION; the active patch is
+          made for TensorFold v0.6.6.
         * First start takes long -> the CUDA kernels compile once on each Spark (cached in
           ~/.cache/tensorfold-glm53); that is expected, not a hang.
 -->

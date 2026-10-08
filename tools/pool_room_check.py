@@ -2,7 +2,7 @@
 """Checks for patch 0074 (the shared pool compacts before it evicts), run inside the image that scripts/prepare.sh
 built:
 
-    docker run --rm --entrypoint python -v "$PWD/tools/pool_room_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
+    docker run --rm --entrypoint python -v "$PWD/tools/pool_room_check.py:/c.py" tensorfold-glm53:v0.6.6 /c.py
 
 MultiDecoder's room-making (_grow, _room) on the real Pool and a CPU arena, no GPU or model: a conversation whose
 extent cannot grow in place and a new request, each while the pool's free rows cover them in several ranges (nothing

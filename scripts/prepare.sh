@@ -3,8 +3,8 @@
 # Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit, which needs HF_TOKEN) with TensorFold (two ranks; with TP=3, both
 # workers the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2):
 #   1. preflight checks: docker and the GPU on both nodes, key-based ssh to the worker, the RoCE link, disk space
-#   2. the image on the head: TensorFold plus patches/*.patch on NVIDIA's PyTorch container, pulled prebuilt from
-#      $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else built locally
+#   2. the image on the head: TensorFold plus patches/v066/*.patch on NVIDIA's PyTorch container, pulled prebuilt from
+#      $GHCR_IMAGE when PULL=1 and a matching tag is reachable, else built locally
 #   3. the same image on the worker: pulled there, else streamed from the head (docker save | ssh docker load)
 #   4. download the checkpoint on the head into the Hugging Face cache (~164 GiB, resumable), and DFlash2 too when
 #      DRAFTER=dflash2, at their pinned revisions (MODEL_REVISION, DFLASH2_REVISION)
@@ -154,10 +154,10 @@ done
 log "Disk: $(free_gb "$HF_CACHE") GB free under $HF_CACHE here$disk"
 
 # ---------------------------------------------------------------- 2. image (head)
-# Local fixes in ./patches (unified diffs against site-packages, applied with patch -p0) are baked into the image.
-# The image is rebuilt when they (or IMAGE_EXTRAS) change; the TensorFold install layer stays cached, so that takes seconds.
+# Local fixes in ./patches/v066 (unified diffs against site-packages, applied with patch -p0) are baked into the image.
+# The image is rebuilt when its source, patches, extras, or base image change.
 prebuilt=$(prebuilt_image)            # the pinned digest (config.sh's IMAGE_TAG / IMAGE_DIGEST), else the hash's tag
-if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
+if [[ $REBUILD -eq 0 && "${PULL:-0}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
   log "Pulling the prebuilt image $prebuilt (PULL=0 builds instead)"
   if docker pull "$prebuilt" &&
      [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
@@ -169,11 +169,11 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]
 fi
 if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
-  log "Building $IMAGE (TensorFold $TF_VERSION, patches $PATCHES_HASH: $(compgen -G 'patches/*.patch' | wc -l) patches, plus $IMAGE_EXTRAS)"
+  log "Building $IMAGE (TensorFold $TF_VERSION @ $TF_REVISION, patches $PATCHES_HASH: $(compgen -G 'patches/v066/*.patch' | wc -l) patches, plus $IMAGE_EXTRAS)"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
-    --build-arg TF_SPEC="git+${TF_REPO}@${TF_VERSION}" --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg EXTRAS="$IMAGE_EXTRAS" \
-    -f - patches <<'DOCKERFILE'
+    --build-arg TF_SPEC="$TF_SPEC" --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg EXTRAS="$IMAGE_EXTRAS" \
+    -f - patches/v066 <<'DOCKERFILE'
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 FROM ${BASE_IMAGE}
 ARG TF_SPEC
@@ -201,7 +201,7 @@ for i in $(worker_ids); do
   wfree=$(worker_free_gb "$i" "${WORKER_DOCKER_ROOT[i]}")
   (( wfree >= IMAGE_FREE_GB )) ||
     die "only ${wfree} GB free under $w's Docker root (${WORKER_DOCKER_ROOT[i]}); the image needs ~${IMAGE_FREE_GB} GB (IMAGE_FREE_GB)"
-  if [[ "${PULL:-1}" == 1 ]] && worker "$i" docker pull "$prebuilt" >/dev/null 2>&1 &&
+  if [[ "${PULL:-0}" == 1 ]] && worker "$i" docker pull "$prebuilt" >/dev/null 2>&1 &&
      [[ "$(worker_image_ident "$i" "$prebuilt")" == "$image_id" ]]; then
     worker "$i" docker tag "$prebuilt" "$IMAGE"
     log "Using $prebuilt as $IMAGE on $w"

@@ -1,6 +1,6 @@
 """CPU-only GLM queue lifecycle regression using the real scheduler classes.
 
-Run after applying the recipe patches to TensorFold v0.6.0:
+Run after applying the active recipe patch to TensorFold v0.6.6:
   python3 -B tools/test_queued_cancellation.py --source-root /path/to/src
 Use --expect-stock before patch 0073 to reproduce the original full-lanes
 gap. No Torch/CUDA, sockets, package installation or source writes are needed.
@@ -84,6 +84,7 @@ def main():
     Cancelled = module("tensorfold.server.cancellation", root / "server/cancellation.py").RequestCancelled
     ns = dict(queue=queue, threading=threading, itertools=itertools, Any=Any, Callable=Callable,
               Stream=Stream, time=time, _unwatch=lambda _: None)
+    ns["CapacityError"] = module("queue_errors", root / "server/errors.py").CapacityError
     source = (root / "families/glm5_next/cuda/multi.py").read_text(encoding="utf-8")
     classes(source, {"NoRoom"}, ns)
     classes((root / "cuda/scheduler.py").read_text(encoding="utf-8"), {"Waiting", "Scheduler"}, ns)
@@ -91,7 +92,7 @@ def main():
 
     def scheduler(holders=0, capacity=4):
         obj = object.__new__(ns["GlmScheduler"])
-        obj.decoder, obj.max_streams = Decoder(), capacity
+        obj.decoder, obj.max_streams, obj.max_in_system = Decoder(), capacity, None
         obj.waiting, obj.held, obj.boxes, obj.yields, obj.gather_s = ns["Waiting"](), None, {}, 0, 0
         for _ in range(holders):
             stream = Stream([1], 100)
@@ -444,6 +445,28 @@ def main():
         thread.join(2)
         ns["queue"] = queue
     checks.append("delivery failure after decoder finish is not swallowed by terminal stats")
+
+    obj = scheduler(4)
+    obj.max_in_system = 4
+    try:
+        obj._check_admission(False)
+    except ns["CapacityError"]:
+        pass
+    else:
+        raise AssertionError("full foreground lanes were admitted")
+    obj._check_admission(True)
+    checks.append("foreground capacity refusal leaves background admission available")
+
+    obj = scheduler(1)
+    obj.waiting.stop()
+    assert obj.waiting.foreground_count() == 0
+    obj._cancel_waiting()
+    obj._admit()
+    assert obj.waiting.qsize() == 1
+    obj.decoder.streams.clear()
+    assert obj._iteration() is False
+    checks.append("shutdown sentinel survives queue cleanup and stops an idle GLM scheduler")
+
     print(json.dumps({"status": "PASS", "tests": len(checks), "checks": checks, "device_calls": 0,
                       "source_sha256": hashlib.sha256(source.replace("\r\n", "\n").encode()).hexdigest()}, indent=2))
 

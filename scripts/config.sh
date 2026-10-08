@@ -66,21 +66,20 @@ case "$MODEL_ID" in
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.0}"
+TF_VERSION="${TF_VERSION:-v0.6.6}"
+TF_REVISION="${TF_REVISION:-cb2ebf0540f42604e2759b2ddef497861e928248}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
+TF_SPEC="git+${TF_REPO}@${TF_REVISION}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
-# pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
-# they are part of the image's hash, so a change rebuilds it like a patch does
+# pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs).
 IMAGE_EXTRAS="av==18.1.0 xgrammar>=0.2.8,<0.3"
-image_hash() { (cat patches/*.patch 2>/dev/null; echo "$IMAGE_EXTRAS") | sha256sum | cut -c1-12; }
+image_hash() { (cat patches/v066/*.patch || return 1; printf '%s\n' "$IMAGE_EXTRAS" "$TF_SPEC" "$TF_VERSION" "$BASE_IMAGE") | sha256sum | cut -c1-12; }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold}"
-# The published image of this release's patches, pinned: prepare.sh pulls it by digest (a tag can be moved, a digest
-# cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
-# $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
-# The same image serves two and three Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-31557ed1cef6}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:cbb4b3c66273e2965dd40a7227e7a5243db333fe250113fb3987462ad4f12588}"
+# No v0.6.6 image is pinned here. PULL=0 builds locally; PULL=1 tries a matching image first.
+# IMAGE_TAG and IMAGE_DIGEST may pin a published image once its source and patch hash match.
+IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
@@ -94,7 +93,7 @@ PORT="${PORT:-8888}"
 DRAFTER="${DRAFTER:-dflash2}"        # dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
                                      # use only), +5-10% decode over mtp; mtp: the checkpoint's own MTP head
 # The checkpoint's MTP head beside DFlash2 (TensorFold's TF_GLM_MTP): auto (default) leaves it out while DFlash2
-# drafts every request; TensorFold v0.6.0's own default, 1, would load it (1.77 GiB a Spark) with PARALLEL=1.
+# drafts every request; TensorFold v0.6.6's own default, 1, would load it (1.77 GiB a Spark) with PARALLEL=1.
 export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 # Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). A picture
 # takes at most TENSORFOLD_GLM_IMAGE_TOKENS tokens (2048), a clip TENSORFOLD_GLM_VIDEO_TOKENS (16384) over at most
