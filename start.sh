@@ -95,6 +95,11 @@ DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0084: the spill tier (scripts/config.sh)
+  [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
+  SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
+               --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
+fi
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
 arg_value() {
@@ -301,6 +306,13 @@ env_args() {
 env_args
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
+if [[ "$SPILL_GIB" != 0 ]]; then                   # the spill tier's directory on every rank, files owned by you
+  mkdir -p "$SPILL_DIR"
+  for i in $(worker_ids); do worker "$i" "mkdir -p '$SPILL_DIR'" || die "could not create SPILL_DIR on worker $i"; done
+  # (files take the owner of SPILL_DIR on each Spark. No --init on these containers: a rank past 0 runs as PID 1
+  # without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
+  RUN_ARGS+=(-v "$SPILL_DIR":/spill -e TF_SPILL_FLUSH_S="$SPILL_FLUSH_S")
+fi
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)
 # No token goes into the containers: the ranks read only the local cache (HF_HUB_OFFLINE=1), and with HF_HUB_OFFLINE=0

@@ -118,6 +118,19 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [johnwhited](https://github.com/johnwhited) (#48); the admission check and the abort-on-delivery-failure semantics
   follow [vLLM](https://github.com/vllm-project/vllm) v1's `check_admission` and generate-abort behaviour
   (Apache 2.0) as a reference.
+- `0084-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): by [wojo](https://github.com/wojo). The
+  idea of persisting session state on NVMe per rank comes from MiaAI-Lab's GLM-5.3-Flash vLLM kit
+  ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232) by
+  [gabewillen](https://github.com/gabewillen); the idea only, no code from that AGPL-3.0 project); the multi-rank
+  design follows patch 0250 of
+  [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) (Apache 2.0); the file
+  conventions and flag names follow TensorFold's MLX spill ([PR #68](https://github.com/ashhart/TensorFold/pull/68) by
+  [gilby](https://github.com/gilby)) and [issue #155](https://github.com/ashhart/TensorFold/issues/155) by
+  [raymondkpwong](https://github.com/raymondkpwong); which kept
+  prompts leave first is `0063-glm-kept-cap-superseded-first` (PR #32 by [Alexbob0](https://github.com/Alexbob0));
+  checking every file on read, private file modes, a per-Spark weights fingerprint and naming a rank whose settings
+  differ follow the session tier of [JSpark3](https://github.com/jakejharris/jspark3) v2.0.1 by
+  [jakejharris](https://github.com/jakejharris). The code is new.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

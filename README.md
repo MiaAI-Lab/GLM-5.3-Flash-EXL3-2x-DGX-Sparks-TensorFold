@@ -296,6 +296,41 @@ with that window and says so (free memory on both Sparks for the full one). Othe
 | `KV=bf16 DRAFTER=mtp` | 524,288 | one request at a time |
 | `CONTEXT=0` | the largest that fits | no memory is left to keep other conversations' prompts |
 
+## Spill tier (optional)
+
+The KV pool keeps a few conversations' prompt states (`TF_GLM_CACHE_ENTRIES`, and what the pool holds); one that
+leaves it, and every one after a restart, costs a full prefill on its next turn (~2 minutes at 200k tokens). With
+`SPILL_GIB=64` (and `SPILL_DIR`, the same absolute path on every Spark) a kept state that leaves the pool is written to
+that directory on each Spark, and a later request that extends it reads it back instead (patch `0084-glm-spill-tier`).
+With `PARALLEL` above 1, past `SPILL_HIGHWATER` (0.70) of the pool the states eviction would take next are written
+early, in the background, so an eviction frees its rows at once; a clean stop writes what is kept (`SPILL_FLUSH_S`,
+60 s). A restore reads on a background thread while the other requests keep decoding.
+
+Two Sparks, `PARALLEL=4`, `SPILL_GIB=64`, `SPILL_HIGHWATER=0.70` against v1.5 (two runs each; first-token means;
+"resumed" = at least half the prompt came from a kept state, in the pool or on disk):
+
+| Workload | v1.5 | Spill tier |
+| --- | --- | --- |
+| 15 conversations of 200k tokens resent after others pushed them out | 7-10 of 15 resumed, 40-64 s | 15 of 15, 0.6 s |
+| The same 15 after a clean restart | 1 of 15, 110 s | 15 of 15, 0.8 s |
+| 4 of them returning at once | 117-135 s | 4.3-5.8 s |
+| 2 agents, 24 requests of 60k shared + 40k own, resent | 23 s | 0.5 s |
+| A 200k prompt back while 3 streams decode: its first token; their tok/s meanwhile | 199-202 s; 78-80 -> 25 | 2.2-2.4 s; 78-80 -> 60-65 |
+| Cold prefill, 8k to 256k tokens (nothing to resume) | 1,623-1,966 tok/s | within 2% (1,595-1,933) |
+| Decode, tok/s (prose x1 / x4, structured x1 / x4), full pool | 44.0 / 90.9 / 86.6 / 176.8 | 44.0 / 90.7 / 86.6 / 177.1 |
+
+A restored state gives the same tokens as a fresh prefill (256 greedy tokens, `draft: false`, compared after a clean
+restart and after `kill -9`). Every 8 MiB of a file carries a CRC-32 that is checked on each read; a file that fails it
+is dropped on every Spark and the prompt is prefilled. With `PARALLEL` above 1, prompts with images or video are
+stored too, under their pictures' content: a request resumes one only with the same pictures in the same places.
+
+Files: one per stored prompt, about 6.7 KB a token a Spark (1.34 GB at 200k tokens), owned by you and readable only by
+you (they hold your prompts' tokens); the oldest go first past `SPILL_GIB`, and also when a write would leave less
+than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that room, the write is skipped). Prompts
+under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and
+credits: `NOTICE`, `CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to
+TensorFold itself.
+
 ## Worker weights over NFS
 
 By default the worker keeps its own copy of the checkpoint and DFlash2 (~166 GiB, copied over the link by
@@ -462,6 +497,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `COPY` / `COPY_MAX` | `1` / `15` | copy drafts: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round |
 | `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
+| `SPILL_GIB` / `SPILL_DIR` / `SPILL_HIGHWATER` | `0` / `~/.cache/tensorfold-spill` / `0.70` | the spill tier: kept prompt states on local disk, up to `SPILL_GIB` GiB a Spark (0: off), written early past `SPILL_HIGHWATER` of the pool ([Spill tier](#spill-tier-optional)) |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -585,6 +621,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Capacity status | `0081-tfcap-capacity-status` | every capacity refusal renders the same way: 429 with `Retry-After: 5` (was a bare 503 at two sites, a 400 on the generate path) (by johnwhited, #48) | a refused request's client can back off instead of stacking |
 | Admission control | `0082-tfcap-admission-cap` | `TF_GLM_MAX_QUEUED` (unset: queue, as before; a number: past the lanes plus that many queued foreground requests, refuse) turns saturation into a refusal instead of an invisible queue (by johnwhited, #48) | with `TF_GLM_MAX_QUEUED=0`, the fifth request on four lanes: 429 at once with `Retry-After: 5`; unset, it queues as before |
 | Delivery abort | `0083-tfcap-delivery-abort` | a stream whose delivery callback raises (broken pipe, reset, timeout) ends at once and frees its lane, instead of the exception escaping and the lane leaking until generation ends (by johnwhited, #48) | a client that dies mid-reply no longer holds a lane |
+| Spill tier | `0084-glm-spill-tier` | kept prompt states written to local disk on every Spark when they leave the pool (early, in the background, past `SPILL_HIGHWATER`) and read back beside decoding streams, also after a clean restart (`SPILL_GIB`, off by default) | [Spill tier](#spill-tier-optional) |
 | Concurrent fill | `0062-glm-sliced-fill` | a new prompt's chunks run in layer slices (`FILL_BUDGET_MS`) with decode rounds between them, drafted as usual (`FILL_DRAFTS`), both ranks on the same layer boundaries; the chunk's buffers kept between slices, grouped fills, cache moves and cancellation mid-fill; whole forwards when nothing else decodes | with smooth streaming, the other replies' pauses during a 25k-token fill 630-690 ms -> 81-149 ms (table below) |
 
 Concurrent prompt fill and smooth streaming on two Sparks (`PARALLEL=4`, DFlash2, 1,024-row chunks): three 400-token

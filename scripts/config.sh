@@ -351,3 +351,18 @@ prepared_state() {
   done
   echo "$line"
 }
+
+# Spill tier (patch 0084-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
+# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
+# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
+# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
+# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
+SPILL_GIB="${SPILL_GIB:-0}"
+SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
+SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
+SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
+SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
+SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
+if [[ "$SPILL_GIB" != 0 ]]; then
+  STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
+fi
