@@ -3,7 +3,7 @@
 #
 # - forward.prompt_arith_code(split): one int each for TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA, TF_GLM_EXL3_PROMPT,
 #   TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, TF_GLM_HC_MMA and TF_GLM_KDA_CHUNKED, the choices that change Flash's
-#   prompt bits. Left out because they keep every bit: TF_GLM_PROMPT_SELECT (0103), TF_GLM_EXL3_PASS / _ORDER / _ROWROT,
+#   prompt bits. Left out because they keep every bit: TF_GLM_EXL3_PASS / _ORDER / _ROWROT,
 #   the split's exchange, overlap, own-row front and micro-batches. No new env var, no new default.
 # - engine: the ranks' row ends in the code (TF_GLM_MSA stays where 0101 put it), so ranks started with different
 #   choices refuse to start, and the error names them; engine.odd_ranks is that comparison. The spill tier's folders
@@ -71,7 +71,7 @@ index e5e4ef3..53878f3 100644
                                 "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                 "every rank the same flags")
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index c27b66a..948200a 100644
+index c27b66a..3775bba 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -887,6 +887,25 @@ def ffn_front(layer: LayerW, w: Weights, b: Buffers):
@@ -86,7 +86,7 @@ index c27b66a..948200a 100644
 +    routed experts' prompt kernels, not the decode kernels' bits), TF_GLM_SPARSE_ONEPASS (the one-pass sparse attention,
 +    not the chunk programs' bits), TF_GLM_LATENT_MMA (the latent projections on the tensor cores, not the decode
 +    kernels' bits), TF_GLM_HC_MMA (hc_pre's mixing dots on the tensor cores), TF_GLM_KDA_CHUNKED (KDA's chunked
-+    form). Not in it, because they leave every bit as it was: TF_GLM_PROMPT_SELECT (0103), TF_GLM_EXL3_PASS / _ORDER /
++    form). Not in it, because they leave every bit as it was: TF_GLM_EXL3_PASS / _ORDER /
 +    _ROWROT, TF_GLM_PREFILL_OVERLAP, the split's exchange and its microbatches."""
 +
 +    from . import hcsplit

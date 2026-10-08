@@ -219,11 +219,11 @@ index 53878f3..1fc3089 100644
          if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
              self.comm.check()
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 8f6675e..be189b3 100644
+index 775b2a5..ced0e68 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -1714,16 +1714,17 @@ class MultiDecoder:
-         return bool(self.quick) and not lane.s.background and len(lane.s.prompt) - lane.st.pos <= self.quick
+@@ -1689,16 +1689,17 @@ class MultiDecoder:
+         return self.lanes[s.sid]
  
      def _iterate(self) -> list[Stream]:
 -        if self.fill_budget:

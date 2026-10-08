@@ -148,11 +148,10 @@ export TF_GLM_DENSE="$DENSE"
 # 16 KiB gather against NCCL's 45; decode +6% (prose 44.2 -> 46.9, code 48.7 -> 51.6). NCCL keeps the rest. nccl: NCCL
 # for all. Same bits. Three Sparks and four on a switch default to nccl (start-tp3.sh, start-tp4.sh); roce on a triangle
 # sends each peer over the devices that share its subnet (the TP-N engine's RoCE; TF_ROCE_HCA lists them all, the GID
-# is found per device). A ring of four (start-tp4-switchless.sh, README "4 Sparks") defaults to roce: each rank writes
-# to its two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1; not measured on the Sparks yet:
-# COMM=nccl ./start-tp4-switchless.sh is the fallback). TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the
-# queue pairs' ACK timeout.
-_comm=roce; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) ]] || _comm=nccl
+# is found per device). A ring of four (start-tp4-switchless.sh, README "4 Sparks") defaults to nccl too; COMM=roce
+# there writes to the two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1; not measured on the
+# Sparks yet, so opt-in). TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the queue pairs' ACK timeout.
+_comm=roce; [[ "$TP" == 2 ]] || _comm=nccl
 COMM="${COMM:-$_comm}"
 export TF_GLM_COMM="$COMM"
 # The largest all-gather in KiB that goes over RoCE (patch 0006 reads it; a setting, no patch of its own): 512 (default;
