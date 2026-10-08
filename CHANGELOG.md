@@ -5,9 +5,9 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one
 
-Image: not published yet; `prepare.sh` builds it locally (77 patches, `a8f84374f3c2`), on two and three Sparks too
-(the patches' hash no longer matches the pinned `v0.6.0-1692d2df78d2` until a new image is published and pinned). The
-TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0076 adds the ring exchange.
+Image: not published yet; `prepare.sh` builds it locally, for two and three Sparks too (the patches' hash no longer matches
+the pinned image until a new one is published and pinned). The
+TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring exchange.
 
 ### Added
 - **`./start-tp4.sh`** (on a switch) and **`./start-tp4-switchless.sh`** (on a ring): `./start.sh` with `TP=4` and
@@ -23,7 +23,7 @@ TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0076 adds the ring 
   on a port without that peer. `RING_GRAPH=0` leaves NCCL to pick. Measured on four Sparks (2026-10-05): a decode-sized
   all-gather 109 us against 184 with fused devices; sparkDash prose 82.0 tok/s one request (three Sparks 65.7), 142.5 at
   4 at once, time to first token 117 ms. README: 4 Sparks.
-- **Patch `0076-cuda-ring-exchange`**: on a ring (`TF_NCCL_RING=1`, set by `scripts/nodes.sh`) the split prefill's
+- **Patch `0098-cuda-ring-exchange`**: on a ring (`TF_NCCL_RING=1`, set by `scripts/nodes.sh`) the split prefill's
   send/receive exchange passes each message the shorter way round the ring, over a two-rank NCCL link with each
   neighbour (its own graph file, its own stream), the rank opposite half each way: the same bytes as `p2p`, overlapped,
   instead of `gather`'s all-gather of every rank's whole partial. Measured on four Sparks: an 8 MiB block a peer 2.7 ms

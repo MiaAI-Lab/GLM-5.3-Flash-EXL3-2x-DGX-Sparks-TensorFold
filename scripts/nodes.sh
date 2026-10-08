@@ -496,7 +496,7 @@ ring_graphs() {
       path=$(worker "$r" 'mkdir -p "$HOME/.local/state/glm53-tensorfold" && echo "$HOME/.local/state/glm53-tensorfold/nccl-graph-rank'"$r"'"') ||
         die "could not reach $(worker_host "$r") to write its NCCL graphs"
     fi
-    # the ring (rank r of TP), and the two-rank links of patch 0076's ring exchange: to the previous rank (this rank
+    # the ring (rank r of TP), and the two-rank links of patch 0098's ring exchange: to the previous rank (this rank
     # is the link's rank 1) and to the next (its rank 0)
     for spec in "$path.xml $r $prev" "$path-link-prev.xml 1 $prev" "$path-link-next.xml 0 $next"; do
       set -- $spec
@@ -548,7 +548,7 @@ nccl_env() {
 # same on all of a node's devices; else NCCL picks each device's RoCE v2 IPv4 entry itself.
 # On a ring (FABRIC=ring) nothing may go to the ranks across it, which no cable reaches: NCCL_ALGO=Ring, whose
 # all-gather sends only to the next rank (PAT, which NCCL may pick with one GPU a node, also sends two ranks away),
-# and the split prefill's exchanges: with the graph files (ring_graphs) over patch 0076's ring exchange
+# and the split prefill's exchanges: with the graph files (ring_graphs) over patch 0098's ring exchange
 # (TF_NCCL_RING=1: each message passed round the ring over two-rank links with the neighbours, the same bytes as p2p,
 # overlapped; an 8 MiB block a peer 2.7 ms against 4.6), else as all-gathers (TF_GLM_HC_EXCHANGE=gather: p2p sends to
 # every peer; three times the bytes, no overlap).

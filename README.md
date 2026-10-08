@@ -488,7 +488,7 @@ every configured worker), one for each way of connecting them:
 | No switch: a ring of direct cables | `./start-tp4-switchless.sh` | [Without a switch](#without-a-switch-start-tp4-switchlesssh) (measured below) |
 
 Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
-connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patch 0076 on a ring;
+connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patch 0098 on a ring;
 the image is not published yet, so `prepare.sh` builds it on the first start. **Measured** on a four-Spark ring
 (2026-10-05, sparkDash, prose, thinking off): 83.2 tok/s one request (three Sparks 65.7), 115.5 / 133.9 / 147.1 tok/s at
 2 / 3 / 4 at once, time to first token 118 ms; prefill ~2,000-2,075 tok/s (8k and 30k-token prompts). Replies equal the
@@ -584,7 +584,7 @@ How the ring runs:
 - **Nothing goes across the ring.** NCCL carries every all-gather (`COMM=nccl`; `COMM=roce` is refused, as it sends
   to every peer) with `NCCL_ALGO=Ring`: its ring follows the ranks, so each rank only sends to the next, over a cable
   (PAT, which NCCL may pick with one GPU a node, also sends to ranks two away). The split prefill's exchanges go
-  round the ring (patch 0076, `TF_NCCL_RING=1`): each message the shorter way, a hop a step, over a two-rank NCCL
+  round the ring (patch 0098, `TF_NCCL_RING=1`): each message the shorter way, a hop a step, over a two-rank NCCL
   link with each neighbour, the same bytes as `p2p` and overlapped (prefill ~2,000-2,075 tok/s, against ~1,720 with
   `gather`'s all-gather of every rank's whole partial; `RING_GRAPH=0` goes back to that). NCCL's
   devices, GIDs and bootstrap socket are found as at three Sparks, and each rank gets an NCCL graph file
@@ -847,7 +847,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 start.sh      set up (first run) and start both ranks
 start-tp3.sh  the same on three Sparks (experimental, patches 0066-0068)
 start-tp4.sh  the same on four Sparks on a switch (experimental, patches 0066-0068)
-start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a switch (experimental, patch 0076 too)
+start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a switch (experimental, patch 0098 too)
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
