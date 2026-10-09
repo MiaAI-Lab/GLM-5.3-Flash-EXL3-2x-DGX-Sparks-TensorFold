@@ -1,8 +1,14 @@
 # TensorFold v0.6.6 validation
 
-This draft ports the public v1.8 recipe to TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. Only `patches/v066/0001-glm-recipe-compat.patch` is applied; the historical v0.6.0 patches remain inactive. No private checkpoint or private abliteration implementation is included.
+This draft ports the public v1.10 recipe to TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. Only `patches/v066/0001-glm-recipe-compat.patch` is applied; the historical v0.6.0 patches remain inactive. No private checkpoint or private abliteration implementation is included.
 
-## GPU observations
+## Current merged runtime
+
+The upstream merge includes the v1.9/v1.10 sparse-kernel loops, display backend, spill tier, kept-state limits, decode launch order, loop guard, draft candidate checks, Responses include values, streamed admission, effort-tail and cache-share options. Anthropic routes and chunked request framing are native to the pinned TensorFold source. The active patch identity is `0a998e123165`. This runtime differs from the earlier tested image and needs a fresh build and GPU validation. The upstream second-rail probe, repeated-character smoke check, defaults, credits and license documentation are retained.
+
+## Earlier GPU observations (prior runtime)
+
+These observations apply to the earlier recipe build identity `eda0320be7fc`, before the v1.9/v1.10 merge. They do not validate the current active patch.
 
 One Docker image built from this Mia recipe was run on two independent tensor-parallel pairs (four DGX Sparks total). This is one build tested on two clusters, not four independent builds. Both used a compatible EXL3 checkpoint, q4 dense weights, FP8 KV, four lanes, and DFlash2 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`. The default Mia checkpoints still need GPU smoke checks.
 
@@ -16,7 +22,7 @@ A 949,712-token probe on the first pair reached the client's 1,100-second timeou
 
 ## Local checks
 
-The draft candidate passed exact-commit patch application without offsets/fuzz and a reverse dry-run, parsing of 418 TensorFold Python files and changed tools, 23 dependency-free scheduler/cancellation/capacity/shutdown regressions with zero device calls, image identity guards, all recipe shell syntax checks, and the runtime tool PNG self-check. Port preparation also recorded nonstreamed Responses and Anthropic 429/Retry-After checks. These source checks do not establish GPU behavior for other checkpoints.
+The merged candidate passed exact-commit patch application without offsets/fuzz and a reverse dry-run, parsing of 420 TensorFold Python files and all public Python tools/tests, 27 dependency-free scheduler/cancellation/capacity/shutdown/spill regressions with zero device calls, all recipe shell syntax checks, loop-guard, Responses include, chunked-body and streamed-admission regressions. The sampled nucleus-union CPU test matched 180 draws over 60 cases. Effort-tail template checks passed across five settings with chat and tool histories. These source checks do not establish GPU behavior. Earlier preparation also recorded build identity and nonstreamed Responses/Anthropic Retry-After checks.
 
 To repeat the bounded runtime checks on an idle test server:
 
@@ -30,7 +36,7 @@ The runtime tool prints scalar results, not prompts or replies. Long-context mod
 
 ## Remaining gates
 
-- Stock Mia and gated Mia Ablit checkpoint GPU smoke checks.
+- Fresh merged-runtime build and stock Mia/gated Mia Ablit checkpoint GPU smoke checks, including sampled decoding with the new nucleus-union default.
 - A full Docker build from a clean recipe checkout, followed by a maintainer-published image if prebuilt distribution is desired. The default remains `PULL=0`; no legacy digest is reused.
 - Near-limit retrieval and a repeatable isolated performance comparison.
-- Broader Responses/Anthropic streaming-client coverage, TP above two, and alternative dense/KV/drafter configurations.
+- Broader Responses/Anthropic streaming-client coverage, TP above two, alternative dense/KV/drafter configurations, and GPU equivalence checks for the sparse-kernel and spill/display options.

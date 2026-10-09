@@ -2,12 +2,170 @@
 
 Every change to this recipe, newest first. Published releases below name their tested image. The current v0.6.6 port builds locally and has no image pinned yet.
 
-## Unreleased (2026-10-07): TensorFold v0.6.6 port
+## Unreleased (2026-10-08): TensorFold v0.6.6 port
 
-- Consolidated the v1.8 public GLM features into `patches/v066/0001-glm-recipe-compat.patch` against TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. The earlier numbered v0.6.0 patches remain as history.
-- Kept the v1.8 shared-prefix, vision, cancellation, memory, and capacity changes. Adapted the new v0.6.6 scheduler shutdown path and forwarded `Retry-After` on nonstreamed Responses and Anthropic capacity refusals. The public Ablit checkpoint selector is unchanged.
+- Consolidated the v1.10 public GLM features into `patches/v066/0001-glm-recipe-compat.patch` against TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. The earlier numbered v0.6.0 patches remain as history.
+- Kept the public shared-prefix, vision, cancellation, memory, and capacity changes, including v1.9/v1.10 spill, kept-state limits, sparse-kernel loops, draft checks, streamed admission, effort-tail and cache-share options. Adapted the new v0.6.6 scheduler shutdown path and forwarded `Retry-After` on nonstreamed Responses and Anthropic capacity refusals. The public Ablit checkpoint selector is unchanged.
 - The image hash now includes the exact TensorFold source, base image, extras, and active patch. The old v0.6.0 image digest is no longer used, and image builds are local by default until a tested v0.6.6 image is pinned.
-- The same image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a compatible EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). Stock Mia and Mia Ablit GPU smoke checks, a clean-checkout build, and near-limit retrieval remain unverified. No overall performance improvement is claimed.
+- The earlier v1.8-based image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a compatible EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The latest v1.10-based runtime, stock Mia and Mia Ablit GPU smoke checks, a clean-checkout build, and near-limit retrieval remain unverified. No overall performance improvement is claimed.
+
+## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
+
+Image: `v0.6.0-a1897d591f70` (`sha256:bc34d7d63f978cf601f42863b284bc95a567c50c10e9adb0866a635be568bf5f`), 96 patches (v1.9.1's plus `0096`, `0097`). Tested live on two
+Sparks: with defaults, the rail probe keeps both rails (`roceP2p1s0f1 <-> roceP2p1s0f1 ... used`, the Link line names
+2 rails), the smoke test and `tools/toolcheck.py` pass. Switching effort or thinking mid-conversation on a ~19.7k-token
+history, `cached_tokens`: flag off high->low, high->off, off->high 0%, same mode 100%; `TF_GLM_EFFORT_TAIL=1` 99-100% for
+every switch, `toolcheck` passes, and effort still sets the reasoning length (4 questions, low / high / max: 388 / 769 /
+1,720 completion tokens, all answers correct). `TF_GLM_CACHE_SHARE_PCT=25` starts with the estimate unchanged (88.09 GiB)
+and logs its count (32: each state reserves ~91 MiB of a ~7.5 GiB budget here).
+
+- **A second rail is tested before it is used (#66).** At two Sparks the launcher added the cabled port's PCIe twin by name
+  (v1.6) without checking that it reaches the peer; a twin that is up with a GID but unaddressed, on another subnet or at another
+  MTU ended in `vendor_err 0x81` (transport retry exceeded) in the first all-gather. `start.sh` now sends a full-size
+  unfragmentable ping from each second rail's own address to the peer's matching rail, both ways, and drops a rail that does not
+  answer with a `WARN` naming both devices, addresses and MTUs (one rail then, as `NCCL_RAILS=1`). The Link line also prints the
+  GID indexes and the rail count passed to `NCCL_IB_HCA` / `TF_ROCE_HCA` (#88). TP=3/4 and the ring are unchanged (they pair
+  devices by subnet). Scripts only, no patch.
+- **Effort line at the tail, opt-in** (patch `0096-effort-tail`, issue #93, reported and measured by jdecker76
+  ([@jdecker76](https://github.com/jdecker76))): the checkpoint's template renders `<|system|>Reasoning Effort: X` at token
+  3, so a conversation that switches effort or thinking on/off missed the kept prompt entirely (0% cached on ~26k tokens)
+  and prefilled again. `TF_GLM_EFFORT_TAIL=1` renders the line just before `<|assistant|><think>` instead (thinking off
+  has none, as before); the reporter's emulation kept 98 to 99% cached across max, low and off. Off by default and then
+  byte-identical to before: the model saw the line first in training, so run the quality A/B in the README before relying
+  on it. `GlmTokenizer` and the CUDA server's template both honour it, and every rank reads it with the other `TF_GLM_*`
+  switches. CPU test: `tools/test_effort_tail.py` (`--source-root` the patched `src`; `--expect-stock` shows the
+  difference on the unpatched source).
+- **Kept-state count follows a share of the pool** (patch `0097-glm-kept-entries-share`, issue #84, diagnosed by
+  @jdecker76): `TF_GLM_CACHE_ENTRIES` (32) is a count, but each kept state is a reservation (~91 MiB measured on two Sparks; KDA recurrent
+  state, conv window, DFlash2 window copy; flat in the context length) taken from the pool's budget, so finished
+  one-shot conversations pushed live ones out with millions of pool tokens free. `TF_GLM_CACHE_SHARE_PCT` (default 0:
+  off) makes the count at least that share of the budget (on two Sparks at the defaults the budget is ~7.5 GiB and 32 states already take ~38%, so
+  50 gives ~42 states and the 75% ceiling ~63); the same count sizes the reservation, so the
+  start-up estimate is unchanged and the pool shrinks by it. Any count is cut to three quarters of the budget, logged
+  (past it the states would own memory the estimate never counted). Every admission also rebuilt an int64 array of
+  every kept state's ids to find shared prefixes (112 ms for 32 states of 200k tokens): built once per state now.
+  Check: `tools/kept_cap_check.py`.
+
+## v1.9.1 (2026-10-08): the spill tier's free-disk floor makes room
+
+Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad373cc644422295c4fe9f07`), 94 patches (v1.9's, with `0088` updated). Tested live on two Sparks: with
+`SPILL_GIB=32` and a floor above the disk's free space, the write is refused (`no_space`) on both ranks without an error; with the
+50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
+29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
+
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+  a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
+  skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
+  unless `SPILL_GIB` is set.
+
+## v1.9 (2026-10-08): the Anthropic Messages API, long-context speed, a spill tier, a loop guard and protocol fixes
+
+Image: `v0.6.0-bd91ecd14811` (`sha256:43a8e61cbd4288a07e69cb8677c40faa187d93f3a748111f51064f9e9f23e828`), 94 patches, for two and three Sparks (v1.8's plus `0084`-`0095`). Tested live on two
+Sparks before release: the smoke test, `tools/anthropiccheck.py` (all ok, chunked bodies included),
+`tools/toolcheck.py`, a chunked `/v1/chat/completions` body, `/v1/responses` with `include`, the 400 framing on a
+kept-alive connection, and default sampling at greedy's speed (512 tokens, thinking off: 44.1 tok/s greedy, 43.5
+sampled at temperature 1, top_p 0.95), needles at 194,851 and 502,691 tokens correct (prefill 111.2 s and 333.7 s),
+`tools/end_of_turn.py` 4 of 48 cut, and in the image `tools/select_split_check.py` and `tools/scores_loop_check.py`
+(0085, 0086: all pass), `tools/display_kv_check.py`, `tools/kept_state_check.py` and `tools/pool_room_check.py`.
+The new switches are off by default (`TF_GLM_LOOP_GUARD`, `SPILL_GIB`,
+`TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `TF_GLM_EXL3_DEC_ORDER`, `DISPLAY_KV_BACKEND=dispram`); their
+contributors' measurements are in the PRs.
+
+- **Chunked request bodies** (patch `0094-chunked-request-bodies`, issues #67 and #74): a `Transfer-Encoding: chunked`
+  request (AI SDK clients, Chatbox, proxies) has no `Content-Length`, so v0.6.0 read it as an empty body ("messages
+  must be a list" 400) and parsed the unread chunks as the next request on the keep-alive connection (the stdlib
+  answers that in HTTP/0.9 mode: an HTML error page with no status line). The chat, completions, tokenizer and
+  Responses routes, the MLX-style server and the 404 path now read bodies through `request_body.read_body`, the reader
+  patch `0084` brings from upstream TensorFold's 977f2cc by Jordi Posthumus (@JordiPosthumus); each route keeps its
+  own limit (96 MiB for chat). A body with both `Content-Length` and `Transfer-Encoding`, or another transfer coding,
+  is now a 400 with the connection closed. CPU test: `tools/test_chunked_bodies.py` (`--source-root` the patched
+  `src`; `--expect-stock` shows the failure on the unpatched source).
+- **Streamed requests are refused at saturation** (patch `0095-stream-admission`, issue #50): with `TF_GLM_MAX_QUEUED`
+  set, a streamed request to a full server is answered 429 + `Retry-After: 5` before the stream opens; `0082` checked
+  inside `submit`, after the 200 and headers had gone out, so streaming clients saw 200 and an error event. A request
+  admitted between the check and `submit` still gets the old error event. CPU test: `tools/test_stream_admission.py`.
+- **Responses `include`** (patch `0093-responses-include`, issue #73): `/v1/responses` accepts OpenAI's `include`
+  values and ignores them (once logged per value); an unknown value or a non-list is still a 400. CPU test:
+  `tools/test_responses_include.py`.
+- **Default sampling at greedy's pace** (issue #91): `scripts/config.sh` now sets `TENSORFOLD_NUCLEUS_UNION=1`
+  (patch `0034`; `NUCLEUS_UNION=0` restores stock). The merged nucleus test gives the same draws; stock sent almost
+  every sampled step to a whole-vocabulary CPU sort (~15 tok/s against greedy's ~58). CPU test:
+  `tools/test_nucleus_union.py`. To measure on the Sparks: sampled against greedy tok/s on 2 and 3 Sparks.
+- **The drafter checks its candidate ids** (patch `0092-glm-draft-candidates-checked`, issue #80): an id outside the
+  vocabulary (a float's bits read as an id) is logged with its value and the rows are copied again once the device is
+  idle; only a second bad read fails, as before. A mitigation: the root cause of #80 is not yet found, and the log line
+  tells a late copy from a rank mismatch.
+- **Anthropic Messages API** (patch `0084-anthropic-messages`, PR #90 by Eduardo Florencio, @eduffd): upstream TensorFold
+  v0.6.3's `/v1/messages` (also `/messages`, with `/count_tokens`) by evilpsycho42 and ashhart, with Jordi Posthumus's
+  request body reading, backported to v0.6.0; a tool_result's images ride the following user message (patch `0056`),
+  capacity refusals answer `overloaded_error`. Claude Code and the Anthropic SDKs talk to the server directly. Live
+  checks: `tools/anthropiccheck.py`.
+- **`TF_GLM_LOOP_GUARD=1`** (patch `0091-glm-loop-guard`, off by default; issues #89, #94): a think block that collapsed
+  into repeating itself (an exact cycle of up to 16 tokens held for 256, or one token taking half of the last 256) is
+  closed with the thinking budget's close, per request, and the model answers from there; `usage.tensorfold.loop_guard`
+  counts it. Paraphrase loops still need `--thinking-budget`. CPU test: `tools/test_loop_guard.py`.
+- **The start's smoke test fails on one repeated character** (#76, #81, #86): a collapsed model that answers "!!!!" no
+  longer passes as OK.
+- **Expert decode launch order** (patch `0090-glm-expert-launch-order`, by Lukasz Raczylo, @lukaszraczylo, PR #95):
+  `TF_GLM_EXL3_DEC_ORDER=1` (or `2`) maps the decode expert kernel's block grid so that the eight 128-column blocks of
+  one k slice run together and read contiguous memory; the same bits for every value. Off by default (`0`, the old
+  order). The author's run: one request +2.2%, four at once noisy. The patch's variable is its own: the PR's `TF_GLM_EXL3_ORDER` is
+  patch `0020`'s prompt order (default on, any value but `0`), so `true` would have raised and `1` would have turned
+  the new order on for existing users.
+- **Hermes Agent** (`docs/hermes-agent.md`, `tools/hermes_benchmark.py`, `tests/test_hermes_benchmark.py`, by Steve
+  Darlow, @kerpopule, PR #52): how to use the server as Hermes Agent's custom endpoint, and a stdlib harness that times
+  synthetic requests against an idle server (any `--model` id; `/health` fields read as the server reports them).
+- **Long-context decode** (patch `0085-glm-select-split-loop`): the DSA indexer's split top-k selection
+  (`select_split`, in `0029`'s segmented decode windows) ran its last pass as one `CP x 256` tile per chunk program,
+  masked to the chunks before it. `CP` comes from the selection scratch, which `verify.py` sizes for the whole KV
+  pool (5,791,744 rows at `PARALLEL=4` on three Sparks: 512 chunks a row), not the row's context, so every program
+  loaded and summed the full table: on rank 0 at 226k, 5.3 ms a launch and 92% of the growth of one request's decode
+  round from 35k (nsys: the selection 9.3 -> 56.9 ms of a round's GPU time, everything else +4.3). The pass now sums
+  only the earlier chunks' histograms, 16 at a time (`SPLIT_BLK`). The whole selection call, scoring included, at 16
+  rows: 0.96 -> 0.10 ms at 35k, 5.79 -> 0.28 at 226k, 15.68 -> 0.64 at 590k, 27.87 -> 1.08 at 1.04M; four requests x
+  8 rows at 590k 32.46 -> 1.27 (11 layers a round). Integer sums in another order: the tokens and counts are
+  identical (`tools/select_split_check.py`: 149 checks against the kernel before the patch and a torch oracle).
+  Live on three Sparks (`PARALLEL=4`), one request: decode at 35k / 226k / 590k 182.6 / 111.2 / 66.2 ->
+  203.0 / 191.0 / 184.4 tok/s, replies byte-identical.
+- **Long-context cold prefill** (patch `0086-glm-prompt-scores-loop`): what grows with context in a cold prefill is
+  the indexer's prompt scoring and selection (nsys on rank 0, two cold prompts of 35k and 226k tokens: the whole
+  prefill 585 -> 687 us of kernel time a prompt token, `_scores` 16.3 -> 103.6 of it, `_select_rows` 3.0 ->
+  25.6, everything else flat). `0009`'s `_scores` ran 4 rows and one 64-pool block a program and reloaded each
+  row's 8 KB of queries for every block; it now takes one row and 32 blocks a program (`SCORE_LOOP`), the row's
+  queries and head weights loaded once, each block computed exactly as a 1-row program did. A 512-row block at
+  row positions 35k / 113k / 300k: 1.354 / 4.298 / 11.304 -> 0.867 / 2.766 / 7.250 ms (8 warps, or one dot over
+  all rows' heads, is faster still but changes the head sum's rounding). Every score bit and selection
+  identical (`tools/scores_loop_check.py`, 37 checks). Live on three Sparks: the same prompts cold, 35k 17.87 ->
+  17.47 s, 226k 138.27 -> 126.60 s, replies byte-identical. `TF_GLM_SCORE_RB` is retired.
+- **`DISPLAY_KV_BACKEND=dispram`** (patch `0087-glm-display-kv-dispram`; default `drm`, unchanged): `DISPLAY_KV_MIB` on
+  [kindling spark-os](https://github.com/kindlingai/kindling-spark-os). There `nvidia_drm` runs without modeset, so
+  `0072`'s DRM dumb buffer fails (`DRM_IOCTL_MODE_CREATE_DUMB`: ENOSYS) and the span never forms; kindling's
+  `dispramd` owns the reservation and lends it through its client's `map_glued` (ordinary device memory with the
+  reservation's slice right above it, one virtual range - the layout `0072`'s `map_span` builds). The backend takes
+  the span from there and everything carved from it is `0072`'s, unchanged. Fails closed like the DRM path: no client,
+  no daemon, or a slice shorter than the span stops the start. `start.sh` checks `/run/dispram/dispram.sock` and
+  `/opt/kindling/dispram/python` on the head and mounts both into every rank. Measured on three Sparks (TP=3,
+  `PARALLEL=4`, `KV_POOL_GIB=30`): 2032 MiB adds 317,440 pool tokens; `tools/display_kv_check.py`'s GPU check
+  passes 53/53 through the dispram span (display -> device copies 46.3 GiB/s); decode and prefill as without the span
+  (structured / prose / code 140.4 / 74.3 / 112.5 tok/s against 141.2 / 74.2 / 112.5; drafted replies equal serial
+  ones 7/7); an NVMe-backed restart and eviction test with the span on resumed byte-identical replies.
+- **Spill tier** (patch `0088-glm-spill-tier`; `SPILL_GIB`, `SPILL_DIR`, `SPILL_HIGHWATER`; off by default): a kept
+  prompt state that leaves the KV pool is written to local disk on each Spark and read back when a later request
+  extends it, also after a clean restart, instead of a new prefill. Past `SPILL_HIGHWATER` (0.70) of the pool the
+  states eviction would take next are written early, in the background, so an eviction frees its rows at once; a
+  restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
+  CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
+  content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
+  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
+  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  Numbers: README, "Spill tier".
+- **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
+  default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's
+  victim order drops states, rank 0 deciding, and freed blocks go back to the driver once 512 MB has piled up), and a
+  per-conversation quota of turn-boundary states, so one long chat cannot fill the entries alone. States dropped by
+  either limit are not written to the spill tier (`0088`). `/health` gains `kept_bytes`, `kept_bytes_cap` and
+  `kept_mix`. Authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ), PR #65); the PR's copy-over-cut
+  part is `0071` already and is not included.
 
 ## v1.8 (2026-10-06): pictures read once, quoted markers, capacity refusals, and the take-over memory fix
 

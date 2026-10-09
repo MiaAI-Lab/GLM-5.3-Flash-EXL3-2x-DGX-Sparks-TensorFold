@@ -1,0 +1,142 @@
+# TF_GLM_LOOP_GUARD=1 ends a think block that has collapsed into repeating itself (issues #89 and #94; upstream
+# ashhart/TensorFold#210 proposed a guard for the Zig engine only, closed unmerged). Per request, on the tokens the target committed, while
+# the think block is open: an exact cycle of at most 16 tokens that held for 256 tokens ("maybe maybe maybe ..."), or
+# one token taking half of the last 256 (a block that is mostly "the"). The next round's tokens are then replaced by the
+# thinking budget's close (newline, </think>, blank line) through the same gate, so the model answers from there. Off by
+# default (TF_GLM_LOOP_GUARD=0): nothing is built and no request changes. Requests that do not think never arm it.
+# The reply's usage stats carry loop_guard: N when it fired. It does not catch paraphrase loops, which only
+# --thinking-budget bounds. Earlier turns' looped reasoning is still resent by agents: TF_GLM_CLEAR_THINKING=1 drops it.
+
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -4,6 +4,7 @@
+ import hashlib
+ import inspect
+ import json
++import os
+ import threading
+ import time
+ from dataclasses import dataclass
+@@ -19,6 +20,7 @@
+ from tensorfold.server.stopping import matched_stop, stop_options
+ from tensorfold.server.tool_policy import ToolCallPolicy
+ from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
++from tensorfold.engine.loop_guard import LoopGuard
+ from tensorfold.engine.tool_draft import ToolCallStreamer
+ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+@@ -506,9 +508,11 @@
+             options["probabilities"] = probabilities
+         if takes_stop_eos:
+             options["stop_eos"] = not prepared.ignore_eos
+-        shaped = prepared.grammar is not None or prepared.think_budget > 0
++        guarded = chat and thinking and os.environ.get("TF_GLM_LOOP_GUARD", "0") == "1"
++        shaped = prepared.grammar is not None or prepared.think_budget > 0 or guarded
+         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+         budget = self._think_budget(prepared, think_end)
++        guard = LoopGuard(self._think_close(prepared, think_end), think_end) if guarded and think_end is not None else None
+         # priority "background" (or a session-title request): after the others, as on the Mac
+         background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
+         concurrent = getattr(self.engine, "concurrent", False)
+@@ -517,7 +521,7 @@
+             options["background"] = True            # the engine's scheduler orders its lanes and prompts
+         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
+         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
+-        gates = [g for g in (gate, budget, Yield(turns) if yielding else None) if g is not None]
++        gates = [g for g in (gate, budget, guard, Yield(turns) if yielding else None) if g is not None]
+ 
+         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
+ 
+@@ -579,6 +583,8 @@
+         if stopped["client"]:                                        # as the Mac server: nothing more is written
+             raise RequestCancelled("the client left during the reply")
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
++        if guard is not None and guard.fires:
++            stats["loop_guard"] = guard.fires               # the think block collapsed and was closed (TF_GLM_LOOP_GUARD)
+         # the model's end token (not a stop string or the token limit) ended the reply: a call it ended inside is
+         # closed when it then parses (#22), else its markup is the reply's text; it is never dropped
+         ended = bool(out) and out[-1] in ends and not stopped["stop"]
+@@ -639,10 +645,18 @@
+ 
+         if prepared.think_budget <= 0 or think_end is None:
+             return None
++        return ThinkBudget(prepared.think_budget, self._think_close(prepared, think_end), think_end)
++
++    def _think_close(self, prepared: PreparedRequest, think_end: int | None) -> list[int]:
++        """The tokens that close a think block the server ends: a newline, </think> and a blank line (</think> alone
++        under a grammar)."""
++
++        if think_end is None:
++            return []
+         close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
+         if prepared.grammar is None:
+             close += self.tok.encode("\n\n", add_special_tokens=False).ids
+-        return ThinkBudget(prepared.think_budget, close, think_end)
++        return close
+ 
+     def _glm_calls(self) -> bool:
+         """Whether this model writes GLM's ``<arg_key>``/``<arg_value>`` calls (streamed while they are written): its
+--- tensorfold/engine/loop_guard.py
++++ tensorfold/engine/loop_guard.py
+@@ -0,0 +1,61 @@
++"""A think block stuck repeating itself ends: the same gate hook as the thinking budget, one guard per request."""
++from __future__ import annotations
++
++from collections import Counter, deque
++from typing import Sequence
++
++WINDOW = 256      # committed think tokens a collapse has to fill
++PERIOD = 16       # longest exact cycle (in tokens) that counts as a loop
++DOMINANT = 0.5    # share of the window one token id may take before the block counts as collapsed
++
++
++class LoopGuard:
++    """Watches the committed tokens of one request while its think block is open. Once they collapse, the next
++    round's first token becomes ``close`` (the thinking budget's close; ``ThinkBudget.cut``'s contract). Two collapses
++    count:
++
++    * an exact cycle of at most PERIOD tokens that held for WINDOW tokens in a row ("maybe maybe maybe ...");
++    * one token id taking at least DOMINANT of the last WINDOW tokens, the cycle broken by other text ("the" in
++      every other word of a degenerate block).
++
++    Nothing is watched after ``think_end``. The fire latches until the close is committed; ``fires`` counts them.
++    The guard holds no engine state and is made per request, so concurrent lanes are independent, and the server's
++    gate runs on rank 0 as the budget's does."""
++
++    def __init__(self, close: Sequence[int], think_end: int) -> None:
++        self.close, self.think_end = [int(t) for t in close], int(think_end)
++        self.open, self.fired, self.fires = True, False, 0
++        self.recent: deque[int] = deque(maxlen=WINDOW)
++        self.counts: Counter[int] = Counter()
++        self.run = [0] * (PERIOD + 1)       # run[p]: consecutive tokens equal to the one p before
++        self.last: deque[int] = deque(maxlen=PERIOD)
++
++    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
++        """(0, close) once the block collapsed: the next round's tokens are not the reply, the close is."""
++
++        if self.open and self.fired and len(tokens):
++            return 0, list(self.close)
++        return None
++
++    def observe(self, token: int) -> None:
++        token = int(token)
++        if not self.open:
++            return
++        if token == self.think_end:
++            self.open = False
++            return
++        if self.fired:
++            return                           # the close's own tokens arrive here; they are not the model's
++        for p in range(1, len(self.last) + 1):
++            self.run[p] = self.run[p] + 1 if self.last[-p] == token else 0
++        self.last.append(token)
++        if len(self.recent) == WINDOW:
++            self.counts[self.recent[0]] -= 1
++        self.recent.append(token)
++        self.counts[token] += 1
++        if len(self.recent) == WINDOW and (any(r >= WINDOW for r in self.run) or self.counts[token] >= DOMINANT * WINDOW):
++            self.fired = True
++            self.fires += 1
++
++
++__all__ = ["LoopGuard"]

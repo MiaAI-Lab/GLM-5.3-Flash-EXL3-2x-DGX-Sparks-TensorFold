@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Checks for patch 0072 (DISPLAY_KV_MIB), run inside the image that scripts/prepare.sh built:
+"""Checks for patches 0072 (DISPLAY_KV_MIB) and 0087 (DISPLAY_KV_BACKEND=dispram), run inside the image that
+scripts/prepare.sh built:
 
     docker run --rm --gpus all --entrypoint python -v "$PWD/tools/display_kv_check.py:/c.py" tensorfold-glm53:v0.6.6 \
       /c.py [--gpu]
 
 Without --gpu: the setting, the refusal while a display is connected, how many latent planes the span takes, the span's mapping and unwinding (a fake for every
-DRM and CUDA driver call), the planes carved from a span, and the pool's row copies of spanned planes against stock
-ones. With --gpu, on a Spark whose display reservation is free (the server stopped, or started with DISPLAY_KV_MIB=0):
-the real span, written and read back by the GPU across both halves, and a pool copy across the boundary. Exit code 1
-when a check fails.
+DRM and CUDA driver call), the planes carved from a span, the pool's row copies of spanned planes against stock
+ones, and 0087's backend switch and refusals (a fake dispram client). With --gpu, on a Spark whose display reservation
+is free (the server stopped, or started with DISPLAY_KV_MIB=0): the real span, written and read back by the GPU across
+both halves, and a pool copy across the boundary. On kindling spark-os, run the GPU half through dispramd: add
+-e TF_GLM_DISPLAY_KV_BACKEND=dispram and start.sh's mounts (-v /run/dispram:/run/dispram -v
+/opt/kindling/dispram/python:/opt/dispram:ro -e PYTHONPATH=/opt/dispram). Exit code 1 when a check fails.
 """
 import os
 import sys
@@ -20,6 +23,8 @@ from tensorfold.families.glm5_next.cuda import kv8
 
 MIB = 2 ** 20
 failures = []
+# the backend the --gpu half maps the real span through (patch 0087); the fake driver checks below use drm
+GPU_BACKEND = os.environ.pop(dk.BACKEND_ENV, None)
 
 
 def check(name, cond, detail=""):
@@ -34,6 +39,9 @@ def raises(call, *args, match=""):
     except (ValueError, RuntimeError) as exc:
         return match in str(exc)
     return False
+
+# patch 0087: with DISPLAY_KV_BACKEND unset the span is the DRM path's, which every fake driver check below drives
+check("the backend is drm unless DISPLAY_KV_BACKEND says otherwise", dk.backend() == "drm")
 
 
 # -- the setting --------------------------------------------------------------------------------------------------------
@@ -234,11 +242,85 @@ for dtype, shape in ((torch.uint8, (64, 528)), (torch.bfloat16, (64, 512))):
         check(f"spanned rows copy as stock, by a kernel: {dtype} {src}->{dst} x{n}", same and by_kernel,
               f"stock kernel calls {stock_calls}, spanned {len(calls) - stock_calls}")
 
+# -- patch 0087: the reservation from kindling's dispramd (DISPLAY_KV_BACKEND=dispram) --------------------------------
+import importlib                                                                                         # noqa: E402
+
+importlib.reload(dk)                        # the real map_span again (the sections above replaced it)
+
+
+def backend(value):
+    if value is None:
+        os.environ.pop(dk.BACKEND_ENV, None)
+    else:
+        os.environ[dk.BACKEND_ENV] = value
+    return dk.backend()
+
+
+check("backend drm by default", backend(None) == "drm")
+check("backend dispram, case and spaces as typed", backend("dispram") == "dispram" and backend(" DisPram ") == "dispram")
+check("backend refuses anything else", raises(backend, "dumb", match="drm or dispram"))
+
+
+class FakeDispram:
+    """kindling's client: available() is the daemon answering; map_glued(nbytes, device) -> (pointer, the ordinary
+    bytes, the reservation bytes lent above them)."""
+
+    def __init__(self, up=True, lend=None):
+        self.up, self.lend, self.calls = up, lend, []
+
+    def available(self):
+        return self.up
+
+    def map_glued(self, nbytes, index):
+        self.calls.append((nbytes, index))
+        return 0x7000_0000_0000, nbytes - self.lend, self.lend
+
+
+def via_dispram(client, call):
+    """call() with ``client`` as the importable dispram module (None: not importable) and CUDA's device calls faked."""
+    saved = sys.modules.get("dispram"), torch.cuda.current_device, torch.cuda.synchronize
+    sys.modules["dispram"] = client
+    torch.cuda.current_device, torch.cuda.synchronize = (lambda: 0), (lambda *a: None)
+    try:
+        return call()
+    finally:
+        if saved[0] is None:
+            sys.modules.pop("dispram", None)
+        else:
+            sys.modules["dispram"] = saved[0]
+        torch.cuda.current_device, torch.cuda.synchronize = saved[1], saved[2]
+
+
+ordinary, display = 64 * MIB, 1792 * MIB
+check("no client: refused", raises(lambda: via_dispram(None, lambda: dk._map_span_dispram(ordinary, display)),
+                                   match="not importable"))
+check("daemon down: refused", raises(lambda: via_dispram(FakeDispram(up=False, lend=display),
+                                                         lambda: dk._map_span_dispram(ordinary, display)),
+                                     match="does not answer"))
+check("a slice short of the span: refused", raises(lambda: via_dispram(FakeDispram(lend=display - 16 * MIB),
+                                                                       lambda: dk._map_span_dispram(ordinary, display)),
+                                                   match="short of"))
+client = FakeDispram(lend=display)
+span = via_dispram(client, lambda: dk._map_span_dispram(ordinary, display))
+check("the span is the client's one range", span.size == ordinary + display and client.calls == [(ordinary + display, 0)])
+backend("dispram")
+dk.connected_outputs = lambda sysfs, card: []                                            # noqa: E731
+dk.SYSTEM = lambda: (_ for _ in ()).throw(AssertionError("the DRM path ran"))           # noqa: E731
+client = FakeDispram(lend=display)
+span = via_dispram(client, lambda: dk.map_span(ordinary, display))
+check("map_span takes the dispram path, never DRM", span.size == ordinary + display and len(client.calls) == 1)
+dk.connected_outputs = lambda sysfs, card: ["HDMI-A-1"]                                 # noqa: E731
+check("a connected display is refused with dispram too",
+      raises(lambda: via_dispram(FakeDispram(lend=display), lambda: dk.map_span(ordinary, display)),
+             match="display connected"))
+backend(None)
+
 # -- the real span on this node ---------------------------------------------------------------------------------------
 if "--gpu" in sys.argv:
-    import importlib
-
     importlib.reload(dk)
+    if GPU_BACKEND:
+        os.environ[dk.BACKEND_ENV] = GPU_BACKEND
+        print(f"---- the real span through {dk.backend()}", flush=True)
     os.environ[dk.ENV] = "1792"
     rows = 1 << 18                 # small planes, so the span takes many and a live server keeps its headroom
     planes = dk.latent_planes(17, rows, 512, "fp8", "cuda", dk.credit())

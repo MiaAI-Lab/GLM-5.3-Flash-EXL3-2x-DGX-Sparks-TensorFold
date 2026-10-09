@@ -1,0 +1,272 @@
+# The kept-state pool: a byte budget with hand-back, and a per-conversation quota. Both off by default.
+# (1) The pool counted bookmark slots but never weighed what they own, and dropping one returned nothing: a few
+#     long conversations drove the hosts to 0.1 GB free. TF_GLM_KEPT_BYTES_GIB (default 0: no cap) bounds the kept
+#     states together by bytes, least-recently-used past that; with it set, freed device memory is handed back to
+#     the driver once 512 MB has piled up (returning per drop measurably slowed decoding).
+# (2) A bookmark after every model reply let one long conversation eat every slot, and conversations taking
+#     turns kept chilling each other out: TF_GLM_KEEP_PER_CHAT (default 0: no limit) makes a conversation keep a
+#     few of its own at its turn boundaries at most, while the shared system-prompt state and mid-prefill pauses do
+#     not count against the quota.
+# With the spill tier (0088) on, neither limit writes the states it drops to disk: they are superseded turns or
+# over a memory budget, not states leaving a full pool (the entry cap's drops still spill).
+# /health reports the per-conversation state table (kept_mix) and the byte budget (kept_bytes, kept_bytes_cap).
+# Authored by Thomas Wade (@ThomasWadeZ), PR #65 (Apache-2.0); the PR's third part, copying the resumed rows instead
+# of cutting the donor, is patch 0071 already and is not part of this patch. Rebased onto 0071-0088 and made
+# off by default by the maintainer.
+
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -180,6 +180,42 @@
+     return share
+ 
+ 
++def keep_per_chat(value: str | None = None) -> int:
++    """TF_GLM_KEEP_PER_CHAT: the kept states one conversation holds at its own turn boundaries (0, the default: no limit, what
++    TensorFold does). Only that conversation's own prompt-end states count; states a shared prefix kept, which every
++    conversation resumes from, are not touched."""
++
++    value = (os.environ.get("TF_GLM_KEEP_PER_CHAT", "") if value is None else value).strip()
++    if value == "":
++        return 0
++    if not value.isdecimal():
++        raise ValueError(f"TF_GLM_KEEP_PER_CHAT: 0 (no limit) or a count, not {value!r}")
++    return int(value)
++
++
++KEEP_PER_CHAT = keep_per_chat()
++
++
++def kept_bytes_cap() -> int:
++    """TF_GLM_KEPT_BYTES_GIB: how much device memory the kept prompts own outside the pool, together (0, the default: no cap).
++
++    A kept state holds tensors of its own besides its pool rows -- above all a copy of its DFlash2 window
++    (``draft_window``), which every later block pass at its end reads. The entry cap alone does not bound them: with
++    TF_GLM_CACHE_ENTRIES=64 and long conversations the copies reached tens of GiB on the hosts (their free memory fell
++    to 0.1 GB), because nothing dropped them except the entry count and nothing returned the freed blocks to the
++    driver. The single-stream path bounds the same memory by bytes (``engine._held_bytes`` against ``cache_bytes``);
++    this is that bound for --parallel, where ``cache_bytes`` is 0 and the pool is assumed to hold everything."""
++
++    value = os.environ.get("TF_GLM_KEPT_BYTES_GIB", "").strip()
++    if not value:
++        return 0
++    gib = float(value)
++    return 0 if gib <= 0 else int(gib * 2 ** 30)
++
++
++KEPT_BYTES_CAP = kept_bytes_cap()
++
++
+ def cap_victim(kept: list):
+     """The kept prompt to drop past TF_GLM_CACHE_ENTRIES (``kept``: least recently used first). An extent's kept
+     prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
+@@ -405,6 +441,7 @@
+     head: Any = None                   # a replay's first-token logits row (its kept prompt's, ``decode.whole``)
+     key: list[int] | None = None       # rank 0: the prompt's ids with its pictures' keys in their rows (kept states)
+     images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
++    chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
+     decoding: bool = False
+     paused: bool = False
+     t0: float = 0.0
+@@ -421,6 +458,7 @@
+     """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
+ 
+     window = MAX_WINDOW                 # rows of a round's windows together (TF_GLM_MULTI_WINDOW; set by __init__)
++    kept_bytes_cap = 0                  # TF_GLM_KEPT_BYTES_GIB in bytes (0: off; set by __init__)
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None,
+@@ -435,6 +473,7 @@
+         self.e = e = engine.e
+         self.w = e.w
+         self.rank = engine.rank
++        self.kept_bytes_cap = KEPT_BYTES_CAP     # ours: what the kept states own outside the pool, together
+         self.count = streams
+         if e.slots.count < streams:
+             raise ValueError(f"the engine holds {e.slots.count} stream slots, not {streams}")
+@@ -507,6 +546,7 @@
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
+         self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
+         self.next_sid = self.next_kid = self.next_order = 0
++        self.next_chat = 0
+         self.outbox: list[int] = []
+         self.idle = True
+         self.broken: Exception | None = None
+@@ -535,7 +575,23 @@
+                             "filling": sum(not l.decoding for l in lanes),
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+-                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                "kept_prompts": len(self.kept),
++                "kept_bytes": self._held_bytes(), "kept_bytes_cap": self.kept_bytes_cap,
++                # what the slots are holding. own = a conversation's turn-boundary state (capped by
++                # TF_GLM_KEEP_PER_CHAT); shared = a shared-prefix point or a mid-prefill pause state (not capped);
++                # by_chat shows one conversation id per entry, so a long session that keeps forking its prefix
++                # (compaction) and minting new ids is visible instead of guessed at.
++                "kept_mix": {
++                    "own": sum(1 for c in self.kept if getattr(c, "own", False)),
++                    "shared": sum(1 for c in self.kept if not getattr(c, "own", False)),
++                    "chats": len({getattr(c, "chat", 0) for c in self.kept}),
++                    "rows": sum(len(c.ids) for c in self.kept),
++                    "by_chat": sorted(([n, sum(1 for c in self.kept if getattr(c, "chat", 0) == n),
++                                        max(len(c.ids) for c in self.kept if getattr(c, "chat", 0) == n)]
++                                       for n in {getattr(c, "chat", 0) for c in self.kept}),
++                                      key=lambda r: -r[1])[:8],
++                },
++                **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+@@ -905,8 +961,15 @@
+         code = a["code"]
+         dflash = code[0] >= 10 and self.drafts is not None
+         policy = decode_policy(code, g.costs) if code[0] else None
++        # the conversation this stream belongs to: the chain it resumed from when that state is a turn's own, else a
++        # new one (a shared-prefix state belongs to everyone, so resuming from it starts no chain)
++        if hit is not None and getattr(hit, "own", False) and getattr(hit, "chat", 0):
++            chat = hit.chat
++        else:
++            self.next_chat += 1
++            chat = self.next_chat
+         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
+-                    constraint=constraint, images=a["images"])
++                    constraint=constraint, images=a["images"], chat=chat)
+         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
+             lane.key = a["keyed"]
+         self.next_sid = max(self.next_sid, a["sid"] + 1)
+@@ -970,9 +1033,11 @@
+     def _touch(self, c) -> None:
+         self.kept = [k for k in self.kept if k is not c] + [c]
+ 
+-    def _keep(self, lane: Lane, n: int, head=None) -> None:
++    def _keep(self, lane: Lane, n: int, head=None, own: bool = False) -> None:
+         """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
+-        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay)."""
++        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay);
++        ``own``: the prompt's own end state -- its conversation's turn boundary, capped by TF_GLM_KEEP_PER_CHAT --
++        rather than a shared-prefix state another conversation resumes from."""
+ 
+         from .decode import take_snapshot
+ 
+@@ -993,13 +1058,58 @@
+         self.next_kid += 1
+         snap.extent = lane.extent
+         snap.shared = n in lane.shared
++        snap.own, snap.chat = bool(own), int(lane.chat)
+         # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
+         for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
+             self._drop(c, spill=False)
+         lane.extent.kept.append(snap)
+         self.kept.append(snap)
++        if own and KEEP_PER_CHAT:
++            # this conversation's older turn states: a replay of a prompt that far back is all they serve, and holding
++            # every one of them is how one long conversation fills the whole cache by itself. Least recently used
++            # first (self.kept's order, a resumed state moved last), so an edited or retried branch -- whose states
++            # are shorter than the line it left -- keeps its own. Superseded turns are not worth the disk tier:
++            # dropped without a spill (the same on both ranks).
++            mine = [c for c in self.kept if getattr(c, "own", False) and getattr(c, "chat", 0) == snap.chat]
++            for c in mine[:-KEEP_PER_CHAT]:
++                self._drop(c, spill=False)
+         while len(self.kept) > max(1, self.g.cache_entries):
+             self._drop(cap_victim(self.kept))
++        # The entry cap is not a memory budget. Long conversations make each kept state own hundreds of MB outside
++        # the pool (copies of the DFlash2 window), so 64 entries reached tens of GiB on the hosts (free memory to
++        # 0.1 GB) and never came back. With TF_GLM_KEPT_BYTES_GIB set, rank 0 drops states past it, by the cap's
++        # victim order, and tells rank 1 with EVICT (the same rank-0-decides path the takeover uses); the freed blocks
++        # go back to the driver in _drop. A state dropped for its bytes is not written to the spill tier.
++        if self.rank == 0 and self.kept_bytes_cap:
++            while len(self.kept) > 1 and self._held_bytes() > self.kept_bytes_cap:
++                victim = cap_victim(self.kept)
++                if victim is None:
++                    break
++                self._evict(victim, spill=False)
++
++    def _release(self) -> None:
++        """Hand cached-but-unused blocks back to the driver, but only when torch is actually hoarding them (with
++        TF_GLM_KEPT_BYTES_GIB set).
++
++        `engine._remember`/`_take_over` call empty_cache after dropping states, and the parallel path never did -- the
++        free memory the hosts lost (down to 0.1 GB) never came back. Calling it on every drop is too blunt though:
++        measured by the author, that cost ~16% of decode speed (50.5 against 60.4 tok/s), because every round then had
++        to ask the driver for its blocks again. So pay it only when the allocator holds a lot of unused memory."""
++
++        try:
++            if torch.cuda.memory_reserved() - torch.cuda.memory_allocated() < (512 << 20):
++                return
++            torch.cuda.empty_cache()
++        except Exception:
++            pass
++
++    def _held_bytes(self) -> int:
++        """What every kept prompt owns outside the pool (its KDA states, conv windows, a kept DFlash2 window, the
++        indexer rings' tail, a kept head row and any saved rows) -- the memory the entry cap does not bound."""
++
++        from .decode import snapshot_bytes
++
++        return sum(snapshot_bytes(c) for c in self.kept)
+ 
+     def _drop(self, c, spill: bool = True) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept. With the
+@@ -1007,6 +1117,11 @@
+ 
+         if spill and self.disk is not None:
+             self._spill(c, leaving=True)
++        held = 0
++        if self.kept_bytes_cap:
++            from .decode import snapshot_bytes
++
++            held = snapshot_bytes(c)
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+@@ -1014,6 +1129,8 @@
+         c.tail = c.head = None
+         c.drafter_rows = None
+         self._settle(x)
++        if held >= (64 << 20):
++            self._release()
+ 
+     def _settle(self, x) -> None:
+         if x.owner is not None:
+@@ -1037,7 +1154,7 @@
+     # never move or go before the copy ends: the pool's remove / move / resize are wrapped (``_guard_pool``). A kept
+     # prompt's fields go through ``spill.encode``; its pool rows go as named row tensors into a new extent's rows.
+     _SPILL_SKIP = ("ids", "rows", "nbytes", "pending", "mtp_len", "kid", "extent", "key", "images", "shared",
+-                   "spill_key", "superseded")
++                   "spill_key", "superseded", "own", "chat")
+ 
+     def _spill_store(self):
+         cfg = getattr(self.g, "spill_cfg", None)
+@@ -1378,6 +1495,7 @@
+         snap.key = keyed if keyed is not None else ids if self.rank == 0 else None
+         snap.images = keyed is not None
+         snap.shared = False
++        snap.own, snap.chat = False, 0           # a restored state counts against no conversation's quota
+         snap.extent = x
+         x.kept.append(snap)
+         self.kept.append(snap)
+@@ -1826,10 +1944,10 @@
+                         return None
+             if stop < n:
+                 if stop in lane.stops:
+-                    self._keep(lane, stop)
++                    self._keep(lane, stop, own=stop == lane.point)
+                 return None
+             if lane.point == n and not replay:
+-                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
++                self._keep(lane, n, head=out[:1].clone(), own=True)    # before a grammar's mask writes into the row
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
+@@ -1894,10 +2012,10 @@
+             n = len(lane.s.prompt)
+             if stop < n:
+                 if stop in lane.stops:
+-                    self._keep(lane, stop)
++                    self._keep(lane, stop, own=stop == lane.point)
+                 continue
+             if lane.point == n:
+-                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
++                self._keep(lane, n, head=out[:1].clone(), own=True)    # before a grammar's mask writes into the row
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)

@@ -1,0 +1,46 @@
+diff --git tensorfold/server/responses_translate.py tensorfold/server/responses_translate.py
+index a5c1122..d1c020a 100644
+--- tensorfold/server/responses_translate.py
++++ tensorfold/server/responses_translate.py
+@@ -155,6 +155,30 @@ def _format(text: Any) -> dict[str, Any] | None:
+     raise RequestError("text.format must be text, json_object or json_schema")
+ 
+ 
++# OpenAI's ``include`` values. Each asks for more output this server has nothing to add to: reasoning comes as text in
++# its reasoning item and nothing is encrypted, no tool runs on the server, and the logprobs are the empty lists they
++# always are. Clients (the AI SDK sends reasoning.encrypted_content on every reasoning-model request) set them by
++# habit, so they are accepted and ignored; a value OpenAI does not define is still refused, as OpenAI does.
++INCLUDE = frozenset({"reasoning.encrypted_content", "message.output_text.logprobs", "message.input_image.image_url",
++                     "file_search_call.results", "web_search_call.results", "web_search_call.action.sources",
++                     "code_interpreter_call.outputs", "computer_call_output.output.image_url"})
++_included: set[str] = set()
++
++
++def _include(given: Any) -> None:
++    if given is None:
++        return
++    if not isinstance(given, list) or not all(isinstance(v, str) for v in given):
++        raise RequestError("include must be a list of strings")
++    unknown = [v for v in given if v not in INCLUDE]
++    if unknown:
++        raise RequestError(f"include has no value {', '.join(map(repr, unknown))}: the values are {', '.join(sorted(INCLUDE))}")
++    for value in given:
++        if value not in _included:                    # said once a value, not on every request
++            _included.add(value)
++            print(f"[tensorfold] responses: include {value!r} is accepted and has no effect here", flush=True)
++
++
+ def translate(body: Any, store: Store) -> Request:
+     """A Responses request as the chat completion that runs it; RequestError where it asks what this server lacks."""
+ 
+@@ -164,9 +188,7 @@ def translate(body: Any, store: Store) -> Request:
+     for name, reason in REFUSED.items():
+         if body.get(name):
+             raise RequestError(reason)
+-    if body.get("include"):
+-        raise RequestError(f"include is not supported ({', '.join(map(str, body['include']))}): reasoning comes as "
+-                           "text in its reasoning item, and nothing is encrypted")
++    _include(body.get("include"))
+     if body.get("truncation") not in (None, "disabled"):
+         raise RequestError('truncation must be "disabled": a prompt too long for the context is refused')
+     if body.get("top_logprobs"):

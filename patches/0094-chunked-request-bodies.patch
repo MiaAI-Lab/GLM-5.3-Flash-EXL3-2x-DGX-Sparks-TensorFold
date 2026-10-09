@@ -1,0 +1,125 @@
+# Chunked request bodies (Transfer-Encoding: chunked) on POST routes, issues #67 and #74. v0.6.0 reads a body only by
+# Content-Length: a chunked request (what a proxy or an HTTP client streaming its body sends) has none, so the body was
+# read as empty ("messages must be a list" 400) and its unread chunks were parsed as the next request on the
+# keep-alive connection (the stdlib answers that in HTTP/0.9 mode: an HTML error page with no status line).
+# The reader is not written here: it is tensorfold/server/request_body.py read_body(), upstream TensorFold's 977f2cc
+# by Jordi Posthumus (JordiPosthumus), which patch 0084 adds for the Anthropic route (chunked incl. extensions and
+# trailers, strict sizes, Content-Length + Transfer-Encoding refused, size limit enforced while reading, the connection
+# closed on any framing error). This patch only uses it at the remaining body-reading sites, each keeping its own limit:
+# chat/completions and the tokenizer routes in cuda/http.py (96 MiB: up to 50 pictures or 4 clips as data URLs),
+# the MLX-style server/http.py (32 MiB), /v1/responses (32 MiB), and the 404 path's _discard_body (32 MiB). Requires 0084.
+# Behaviour change: a body with both Content-Length and Transfer-Encoding, or any other transfer coding, is now a 400
+# with Connection: close (read_body's rule) instead of being read by Content-Length.
+
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -12,6 +12,7 @@
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.http import Server
++from tensorfold.server.request_body import read_body
+ from tensorfold.server.stacks import Rearming
+ 
+ if TYPE_CHECKING:
+@@ -65,13 +66,9 @@
+             """Read a refused request's body, so it cannot reach the next request on this connection."""
+ 
+             try:
+-                length = int(self.headers.get("Content-Length", 0))
+-            except ValueError:
+-                length = -1
+-            if 0 <= length <= 32 * 1024**2:
+-                self.rfile.read(length)
+-            else:
+-                self.close_connection = True
++                read_body(self)                  # Content-Length or chunked; a refusal has closed the connection
++            except RequestError:
++                pass
+ 
+         def _stream_error(self, error: dict[str, Any]) -> None:
+             """End an open stream with an error event and ``[DONE]``, as the MLX server does."""
+@@ -111,12 +108,10 @@
+                 self._discard_body()
+                 return self._json(404, {"error": "not found"})
+             try:
+-                length = int(self.headers.get("Content-Length", 0))
+-                if not 0 <= length <= 96 * 1024**2:          # up to 50 pictures or 4 clips as data URLs
+-                    self.close_connection = True             # the unread body must not reach the next request
+-                    return self._json(400, {"error": {"message": "request body exceeds the 96 MiB limit",
+-                                                      "type": "invalid_request_error"}})
+-                body = json.loads(self.rfile.read(length) or b"{}")
++                # up to 50 pictures or 4 clips as data URLs; Content-Length or chunked (patch 0094)
++                body = json.loads(read_body(self, limit=96 * 1024**2) or b"{}")
++            except RequestError as exc:
++                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+             except (json.JSONDecodeError, UnicodeDecodeError):
+                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+             if tokenizer:                                   # vLLM's /tokenize and /detokenize
+diff --git tensorfold/server/http.py tensorfold/server/http.py
+--- tensorfold/server/http.py
++++ tensorfold/server/http.py
+@@ -12,6 +12,7 @@
+ 
+ from tensorfold.engine import grammar
+ from tensorfold.server import anthropic, responses
++from tensorfold.server.request_body import read_body
+ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
+                                      tool_choice_requires_call)
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+@@ -104,13 +105,9 @@
+             """Read a refused request's body, so it cannot reach the next request on this connection."""
+ 
+             try:
+-                length = int(self.headers.get("Content-Length", "0"))
+-            except ValueError:
+-                length = -1
+-            if 0 <= length <= 32 * 1024**2:
+-                self.rfile.read(length)
+-            else:
+-                self.close_connection = True
++                read_body(self)                  # Content-Length or chunked; a refusal has closed the connection
++            except RequestError:
++                pass
+ 
+         def _route(self) -> str:
+             # Tolerate query strings, trailing slashes and client URLs with or without the /v1 prefix.
+@@ -198,11 +195,7 @@
+                 return
+ 
+             try:
+-                length = int(self.headers.get("Content-Length", "0"))
+-                if not 0 <= length <= 32 * 1024**2:
+-                    self.close_connection = True         # the unread body must not reach the next request
+-                    raise RequestError("request body exceeds the 32 MiB limit")
+-                body = parse_numbers(json.loads(self.rfile.read(length) or b"{}"))
++                body = parse_numbers(json.loads(read_body(self) or b"{}"))     # Content-Length or chunked (patch 0094)
+                 validate_modalities(body)
+                 probability_options(body)
+                 named = reply_model(app, body)          # the id the request asked for, as vLLM names it
+diff --git tensorfold/server/responses.py tensorfold/server/responses.py
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -14,6 +14,7 @@
+ from typing import Any, Callable
+ 
+ from tensorfold.server.errors import RequestError
++from tensorfold.server.request_body import read_body
+ from tensorfold.server.responses_translate import Reply, _id, messages, translate
+ 
+ LIMIT = 32 * 1024**2
+@@ -182,12 +183,9 @@
+ 
+     store = store_for(app)
+     try:
+-        length = int(handler.headers.get("Content-Length") or 0)
+-        if not 0 <= length <= LIMIT:
+-            handler.close_connection = True           # the unread body must not reach the next request
+-            raise RequestError("request body exceeds the 32 MiB limit")
++        data = read_body(handler, limit=LIMIT)        # Content-Length or chunked (patch 0094)
+         try:
+-            body = json.loads(handler.rfile.read(length) or b"{}")
++            body = json.loads(data or b"{}")
+         except (ValueError, UnicodeDecodeError):
+             raise RequestError("the request body is not JSON") from None
+         request = translate(body, store)

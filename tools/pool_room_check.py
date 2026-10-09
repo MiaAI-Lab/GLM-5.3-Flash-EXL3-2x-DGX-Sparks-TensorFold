@@ -34,6 +34,7 @@ def decoder(blocks):
     m.arena = Arena(rows, [Plane(torch.zeros(rows, dtype=torch.int32)), Plane(torch.zeros(rows // 4, dtype=torch.int32), 4)])
     m.ops = []
     m._emit = lambda op, p: m.ops.append((op, list(p)))
+    m.disk = None                        # patch 0088's spill tier: off
     return m
 
 

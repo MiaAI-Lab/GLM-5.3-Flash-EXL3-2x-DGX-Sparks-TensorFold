@@ -109,6 +109,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
 - `0077-glm-kept-cap-shared-by-recency` (a new agent run keeps its system prompt's state once the kept-state cap is
   full): the diagnosis, and the fix of evicting shared-prefix states by recency only, by
   [meleesciony](https://github.com/meleesciony) in [issue #75](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/75); the code is our own.
+- `0097-glm-kept-entries-share` (the kept-state count as a share of the pool's memory, `TF_GLM_CACHE_SHARE_PCT`): the
+  diagnosis (a count cap against a pool sized in tokens, with the reporter's measured eviction pattern and the 128
+  workaround) is by [jdecker76](https://github.com/jdecker76) in [issue #84](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/84); the code is our own.
 - `0078-glm-take-over-decide-then-copy` (a fresh conversation after a long one clones only the kept states that stay):
   by [m-naoki-m](https://github.com/m-naoki-m), also proposed upstream as
   [TensorFold PR #421](https://github.com/ashhart/TensorFold/pull/421).
@@ -118,6 +121,50 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [johnwhited](https://github.com/johnwhited) (#48); the admission check and the abort-on-delivery-failure semantics
   follow [vLLM](https://github.com/vllm-project/vllm) v1's `check_admission` and generate-abort behaviour
   (Apache 2.0) as a reference.
+- `0084-anthropic-messages`: TensorFold v0.6.3's Anthropic Messages API (commits 8cca6e3 and ba18743, merged as
+  e9fade0, with ced6139's request framing) by [evilpsycho42](https://github.com/evilpsycho42) and
+  [ashhart](https://github.com/ashhart), and its request body reading (`server/request_body.py`, commit 977f2cc) by
+  Jordi Posthumus ([JordiPosthumus](https://github.com/JordiPosthumus)); backported to v0.6.0 by Eduardo Florencio
+  ([eduffd](https://github.com/eduffd)) in [PR #90](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/90).
+- `0094-chunked-request-bodies` (chunked request bodies on the chat, completions, tokenizer and Responses routes and the
+  MLX-style server, issues #67, #74): uses the reader `tensorfold/server/request_body.py` (`read_body`, TensorFold
+  commit 977f2cc), authored by Jordi Posthumus ([JordiPosthumus](https://github.com/JordiPosthumus)) and brought in by
+  `0084`; the call sites are ours. TensorFold's own chunked-body issue is ashhart/TensorFold#244.
+- `0085-glm-select-split-loop` (the split selection's last pass over the earlier chunks only): by
+  [BadAd84](https://github.com/BadAd84).
+- `0086-glm-prompt-scores-loop` (the prompt scoring, one row and many pool blocks a program): by
+  [BadAd84](https://github.com/BadAd84).
+- `0087-glm-display-kv-dispram` (`DISPLAY_KV_BACKEND=dispram`: `0072`'s display reservation on kindling spark-os): by
+  [BadAd84](https://github.com/BadAd84). It maps the span through `dispram`, the display-carveout lender of
+  [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
+  dispram ships here: the ranks import the host's client (`python/dispram.py`, GPL-3.0 with a bundling exception)
+  mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
+- `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`: the launch order of the expert decode kernel's blocks): by
+  Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo)), in
+  [PR #95](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/95).
+- `docs/hermes-agent.md`, `tools/hermes_benchmark.py` and `tests/test_hermes_benchmark.py` (the Hermes Agent custom-endpoint
+  guide and the synthetic speed harness with its tests): by Steve Darlow ([kerpopule](https://github.com/kerpopule)),
+  in [PR #52](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/52).
+- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by Robert Wojciechowski
+  ([wojo](https://github.com/wojo)): `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
+  server, in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
+  builds on, by its authors: the idea of persisting session state on NVMe per rank was proposed in MiaAI-Lab's
+  GLM-5.3-Flash vLLM kit ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232)
+  by [gabewillen](https://github.com/gabewillen); the idea only, no code from that AGPL-3.0 project); the multi-rank
+  design (one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch
+  0250 of [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) by Jay Leaton
+  (Apache 2.0); the file conventions and flag names are those of TensorFold's MLX spill
+  ([PR #68](https://github.com/ashhart/TensorFold/pull/68) by [gilby](https://github.com/gilby)) and
+  [issue #155](https://github.com/ashhart/TensorFold/issues/155) by
+  [raymondkpwong](https://github.com/raymondkpwong); the order in which kept prompts leave is
+  `0063-glm-kept-cap-superseded-first` (PR #32 by [Alexbob0](https://github.com/Alexbob0)); checking every file on
+  read, private file modes, a per-Spark weights fingerprint and naming a rank whose settings differ are those of the
+  session tier of [JSpark3](https://github.com/jakejharris/jspark3) v2.0.1 by
+  [jakejharris](https://github.com/jakejharris). The code is new.
+- `0089-glm-kept-state` (a byte budget for the kept states and a per-conversation quota, `TF_GLM_KEPT_BYTES_GIB` and
+  `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
+  [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased
+  onto the current patches, with both limits off by default and their drops kept out of the spill tier, by MiaAI-Lab.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

@@ -1,0 +1,131 @@
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import sys
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -184,13 +185,23 @@
+     return qmm.matmul(x, w, xs, f32=f32)
+ 
+ 
+-def merge_candidates(g: torch.Tensor, proj: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++class BadCandidates(RuntimeError):
++    """A block pass's host rows hold a candidate id outside the vocabulary (a float's bits read as an id)."""
++
++
++def merge_candidates(g: torch.Tensor, proj: torch.Tensor, k: int,
++                     vocab: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+     """A block pass's host rows -> (ids [depth, k], logits, projected rows): ``g`` [ranks, depth, 2 * k] (each rank's
+     top-k values, then ids as fp32 bits), merged by value then id over the ranks; ``proj`` [depth, selector rank]."""
+ 
+     values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+     tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+                        dim=1).numpy().astype(np.int64)
++    if vocab is not None and tokens.size and (int(tokens.min()) < 0 or int(tokens.max()) >= vocab):
++        bad = tokens[(tokens < 0) | (tokens >= vocab)]
++        raise BadCandidates(f"{bad.size} of {tokens.size} candidate ids are outside the vocabulary of {vocab} "
++                            f"(first {int(bad[0])} = 0x{int(bad[0]) & 0xFFFFFFFF:08x}, as a float "
++                            f"{float(np.array([int(bad[0]) & 0xFFFFFFFF], dtype=np.uint32).view(np.float32)[0]):.4g})")
+     if g.shape[0] > 1:
+         order = np.lexsort((tokens, -values), axis=-1)[:, :k]
+         values = np.take_along_axis(values, order, axis=1)
+@@ -491,15 +502,24 @@
+         else:
+             self._block_compute()
+         # one pinned copy of candidates and projected rows (two .cpu() calls were two syncs and two pageable copies)
+-        if self.cand_ready is not None:
+-            self.cand_host.copy_(self.cand, non_blocking=True)
+-            self.cand_ready.record()
+-            self.cand_ready.synchronize()
+-        else:
+-            self.cand_host.copy_(self.cand)
+-        g = self.cand_host[:self.cand_n].view(self.gathered, self.block - 1, 2 * self.top_k)[:, :depth]
+-        proj = self.cand_host[self.cand_n:].view(self.block - 1, -1)[:depth]
+-        return merge_candidates(g, proj, self.top_k)
++        vocab = self.succ.shape[0]
++        for attempt in (0, 1):
++            if self.cand_ready is not None:
++                self.cand_host.copy_(self.cand, non_blocking=True)
++                self.cand_ready.record()
++                self.cand_ready.synchronize()
++            else:
++                self.cand_host.copy_(self.cand)
++            g = self.cand_host[:self.cand_n].view(self.gathered, self.block - 1, 2 * self.top_k)[:, :depth]
++            proj = self.cand_host[self.cand_n:].view(self.block - 1, -1)[:depth]
++            try:
++                return merge_candidates(g, proj, self.top_k, vocab)
++            except BadCandidates as e:
++                if attempt:
++                    raise
++                print(f"[tensorfold] drafter: {e}; copying the rows again once the device is idle", file=sys.stderr,
++                      flush=True)
++                torch.cuda.synchronize()
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+               sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -20,6 +20,7 @@
+ 
+ from __future__ import annotations
+ 
++import sys
+ from dataclasses import dataclass
+ from typing import Sequence
+ 
+@@ -32,7 +33,7 @@
+ from tensorfold.engine.exact_sampling import Sampling
+ 
+ from . import glue
+-from .dflash2 import NO_LIMIT, Drafter, _dconv, _mm, merge_candidates
++from .dflash2 import NO_LIMIT, BadCandidates, Drafter, _dconv, _mm, merge_candidates
+ 
+ 
+ @triton.jit
+@@ -389,20 +390,28 @@
+             g.replay()
+         else:
+             self._block_compute(S)
+-        if self.cand_ready is not None:
+-            self.cand_host.copy_(self.cand, non_blocking=True)
+-            self.cand_ready.record()
+-            self.cand_ready.synchronize()
+-        else:
+-            self.cand_host.copy_(self.cand)
+         d = self.d
+         m, k = self.block - 1, d.top_k
+-        g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
+-        p_all = self.cand_host[self.cand_n:].view(St * m, -1)
+-        out = []
+-        for s, (_, _, depth) in enumerate(reqs):
+-            out.append(merge_candidates(g_all[:, s * m:s * m + depth], p_all[s * m:s * m + depth], k))
+-        return out
++        vocab = d.succ.shape[0]
++        for attempt in (0, 1):
++            if self.cand_ready is not None:
++                self.cand_host.copy_(self.cand, non_blocking=True)
++                self.cand_ready.record()
++                self.cand_ready.synchronize()
++            else:
++                self.cand_host.copy_(self.cand)
++            g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
++            p_all = self.cand_host[self.cand_n:].view(St * m, -1)
++            try:
++                return [merge_candidates(g_all[:, s * m:s * m + depth], p_all[s * m:s * m + depth], k, vocab)
++                        for s, (_, _, depth) in enumerate(reqs)]
++            except BadCandidates as e:
++                if attempt:
++                    raise
++                print(f"[tensorfold] drafter: {e} ({S} streams); copying the rows again once the device is idle",
++                      file=sys.stderr, flush=True)
++                torch.cuda.synchronize()
++        raise AssertionError("unreachable")
+ 
+     def propose(self, reqs: Sequence[DraftRequest]) -> list[list[int]]:
+         """Each stream's ``Drafter.propose``: streams with a depth and a context share one block pass; the others

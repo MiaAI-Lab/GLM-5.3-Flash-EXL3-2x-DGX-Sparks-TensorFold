@@ -162,6 +162,24 @@ rails() {
   echo "$hcas"
 }
 
+# rail_info <rdma device>: "<netdev> <IPv4 address> <MTU>" of the port a RoCE device sits on ("- - -" when it has none).
+# Self-contained: it runs on the workers too (its definition is sent over ssh).
+rail_info() {
+  local n
+  for n in /sys/class/infiniband/"$1"/device/net/*; do
+    [[ -d $n ]] || continue
+    echo "${n##*/} $(ip -o -4 addr show dev "${n##*/}" | awk '{print $4}' | head -1 | cut -d/ -f1) $(cat "$n/mtu" 2>/dev/null || echo 1500)"
+    return 0
+  done
+  echo "- - -"
+}
+
+# rail_ping <local netdev> <peer address> <MTU>: one rail's traffic reaches the peer's twin - a full-size, unfragmentable
+# ping bound to that rail's own port (-I <netdev>: an address alone would be routed out of whichever port of the same
+# subnet the kernel picks, usually the cabled one), so an unaddressed, differently-subnetted or smaller-MTU twin fails
+# here instead of as vendor_err 0x81 (transport retry exceeded) in the first all-gather (issue #66). Self-contained.
+rail_ping() { ping -c2 -W2 -I "$1" -M do -s $(( $3 - 28 )) "$2" >/dev/null 2>&1; }
+
 # The same function on worker i (its definition is sent over ssh).
 worker_link_info() { worker "$1" "$(declare -f link_info); link_info $2"; }
 
@@ -195,6 +213,36 @@ cx7_peer() {
   return 1
 }
 
+# probe_rails: before a second rail (the PCIe twin of the cabled port, or a second cabled port) is used, check that it
+# reaches the peer. roce.py pairs the two nodes' devices by list position at two ranks, so a twin that is up and has a GID
+# but no path to the peer's twin (no address, another subnet, another MTU, a cable on a different port) ends in vendor_err
+# 0x81. Rail k of the head is probed against rail k of the worker, in both directions; a rail that fails is dropped from both
+# lists with a warning (the first device, the link itself, is never probed: the launcher reached the worker over it).
+probe_rails() {
+  local -a h w keep_h=() keep_w=()
+  local k hdev hip hmtu wdev wip wmtu mtu=0 ok
+  IFS=, read -ra h <<<"$HEAD_HCAS"; IFS=, read -ra w <<<"$WORKER_HCAS"
+  (( ${#h[@]} > 1 && ${#h[@]} == ${#w[@]} )) || return 0
+  [[ -z "${WORKER_DOWN[1]:-}" ]] || { warn "DRY_RUN: the second rail ($HEAD_HCAS / $WORKER_HCAS) is not probed: the worker cannot be reached"; return 0; }
+  keep_h=("${h[0]}"); keep_w=("${w[0]}")
+  for (( k = 1; k < ${#h[@]}; k++ )); do
+    read -r hdev hip hmtu <<<"$(rail_info "${h[k]}")"
+    read -r wdev wip wmtu <<<"$(worker 1 "$(declare -f rail_info); rail_info ${w[k]}")"
+    ok=0
+    if [[ "$hip" =~ ^[0-9.]+$ && "$wip" =~ ^[0-9.]+$ && "$hmtu" =~ ^[0-9]+$ && "$wmtu" =~ ^[0-9]+$ ]]; then
+      mtu=$(( hmtu < wmtu ? hmtu : wmtu ))
+      if rail_ping "$hdev" "$wip" "$mtu" && worker 1 "$(declare -f rail_ping); rail_ping $wdev $hip $mtu"; then ok=1; fi
+    fi
+    if (( ok )); then
+      keep_h+=("${h[k]}"); keep_w+=("${w[k]}")
+      log "Rail ${h[k]} <-> ${w[k]}: $hip <-> $wip reaches the peer (MTU $mtu): used"
+    else
+      warn "second rail ${h[k]} (${hip:--}, MTU ${hmtu:--}) <-> ${w[k]} (${wip:--}, MTU ${wmtu:--}) does not reach the peer: NOT used, running on fewer rails. Give both twins an IPv4 address on one subnet per rail with the same MTU on both Sparks (README), or set NCCL_RAILS=1 to silence this"
+    fi
+  done
+  HEAD_HCAS=$(IFS=,; echo "${keep_h[*]}"); WORKER_HCAS=$(IFS=,; echo "${keep_w[*]}")
+}
+
 # TP=2: HEAD_ADDR / HEAD_DEV / HEAD_HCA / HEAD_GID and WORKER_ADDR / WORKER_DEV / WORKER_HCA / WORKER_GID: the link the
 # two ranks talk over (NCCL and the rendezvous). FABRIC_PEER overrides the worker's link address when WORKER is reached
 # over another network.
@@ -219,6 +267,7 @@ detect_link() {
   HEAD_HCAS=$(rails "$HEAD_DEV" "$HEAD_GID")
   WORKER_HCAS=$(worker 1 "$(declare -f rails); rails $WORKER_DEV $WORKER_GID")
   [[ "${NCCL_RAILS:-2}" == 1 ]] && { HEAD_HCAS=$HEAD_HCA; WORKER_HCAS=$WORKER_HCA; }
+  [[ "${NCCL_RAILS:-2}" == 1 ]] || probe_rails
   [[ "$(tr ',' '\n' <<<"$HEAD_HCAS" | wc -l)" == "$(tr ',' '\n' <<<"$WORKER_HCAS" | wc -l)" ]] ||
     { HEAD_HCAS=$HEAD_HCA; WORKER_HCAS=$WORKER_HCA; }
   for v in HEAD_HCA HEAD_GID WORKER_HCA WORKER_GID; do
