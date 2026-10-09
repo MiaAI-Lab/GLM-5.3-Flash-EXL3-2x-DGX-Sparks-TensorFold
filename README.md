@@ -78,6 +78,28 @@ in flight; drafted == serial). The memory reserve grows with `PARALLEL` (see `ME
 is ~1.5M tokens at 8 instead of 2.0-2.6M at 4, with the head's lowest free memory at 12.9 GiB under a 195k-token
 prompt. Two Sparks therefore stay at 4 by default; three Sparks default to 8 ([3 Sparks](#3-sparks-experimental)).
 
+**This build on two Sparks, 1 to 8 requests and prompts up to 256k** (the unreleased build of patches 0098-0109,
+`PARALLEL=8`, the two-Spark defaults otherwise; sparkDash, one boot, 2026-10-09)
+
+| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 59.1 tok/s | 59.1 tok/s | 172 ms | 81.6 tok/s | 81.6 tok/s | 230 ms |
+| 2 | 77.3 tok/s | 38.9 tok/s | 300 ms | 109.9 tok/s | 55.9 tok/s | 425 ms |
+| 4 | 102.2 tok/s | 26.0 tok/s | 299 ms | 127.8 tok/s | 35.2 tok/s | 427 ms |
+| 8 | 132.6 tok/s | 17.1 tok/s | 406 ms | 171.4 tok/s | 23.2 tok/s | 513 ms |
+
+| Prompt | Prefill | Time to first token |
+| ---: | ---: | ---: |
+| 8,217 tokens | 1,955.5 tok/s | 4.42 s |
+| 16,406 tokens | 1,961.7 tok/s | 8.58 s |
+| 32,789 tokens | 1,931.5 tok/s | 17.19 s |
+| 65,559 tokens | 1,907.6 tok/s | 34.58 s |
+| 131,097 tokens | 1,846.4 tok/s | 71.21 s |
+| 262,169 tokens | 1,711.4 tok/s | 153.40 s |
+
+The four-Spark switches (own-row front, micro-batches, side stream) stay off on two Sparks: with them on, one boot gave
+prefill +1-6% at 8k-131k and decode unchanged, too close to run-to-run noise to change the defaults.
+
 **Prefill**
 
 | Prompt | Prefill | Time to first token |
