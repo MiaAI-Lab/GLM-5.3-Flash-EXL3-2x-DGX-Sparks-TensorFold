@@ -96,11 +96,41 @@ DRAFTER="${DRAFTER:-dflash2}"        # dflash2: incoai/GLM-5.3-Flash-DFlash2 dra
 # The checkpoint's MTP head beside DFlash2 (TensorFold's TF_GLM_MTP): auto (default) leaves it out while DFlash2
 # drafts every request; TensorFold v0.6.0's own default, 1, would load it (1.77 GiB a Spark) with PARALLEL=1.
 export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
-# Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). A picture
+# Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 1.41 GiB of workspace). A picture
 # takes at most TENSORFOLD_GLM_IMAGE_TOKENS tokens (2048), a clip TENSORFOLD_GLM_VIDEO_TOKENS (16384) over at most
 # TENSORFOLD_GLM_VIDEO_FRAMES frames (128, 2 a second). VISION_URLS=1 also accepts public https URLs (default: data URLs).
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"
+# A picture keeps its size for a whole chat. TensorFold gives each picture of a request min(IMAGE_TOKENS,
+# TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS / pictures) tokens, with a budget of 16,384 of its own: 8 pictures keep 2,048
+# each, and from the 9th on every new picture shrinks all the earlier ones. Their rows and content keys change, so the
+# conversation's kept prompt state only matches up to its first picture and the rest is read again on every turn that
+# brings a picture: in an agent session at ~420k tokens, 187-191k tokens and 150-167 s before the first token after
+# each screenshot (two Sparks, v1.10, PARALLEL=4). The default here is MAX_IMAGES x IMAGE_TOKENS (50 x 2,048 =
+# 102,400; at most 262,144, TensorFold's ceiling, and never under its 16,384), which no request can exceed, so the cap
+# never moves. tools/picture_turns.py, a 48k-token chat, pictures 9 to 11: 16.4-16.6k tokens read and 13.0-13.3 s a
+# turn with 16,384, 2.1k tokens and 2.5-2.8 s with the default (as pictures 1 to 8 either way). Pictures past the 8th
+# also keep their detail, at up to 2,048 tokens each instead of a share: 50 full-size pictures are a 102k-token prompt.
+# TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS=16384 restores the shared budget.
+# The tower's workspace (TENSORFOLD_VISION_WORKSPACE_MIB, TensorFold's default 768 MiB at up to 4,096 tokens a
+# picture) holds a request's feature rows through its prefill, 8 KiB a row: 128 MiB of it at 16,384 rows. The rows the
+# budget adds are reserved beside it (102,400: 768 + 672 = 1,440 MiB), so a cold request of 50 full-size pictures
+# still fits what startup set aside. Two Sparks, PARALLEL=4: rank 0's startup estimate 88.09 -> 88.74 GiB, the pool
+# 2,582,528 -> 2,537,472 tokens (-1.7%). Set it yourself to size it otherwise (768: TensorFold's own).
+_img_tokens="${TENSORFOLD_GLM_IMAGE_TOKENS:-2048}"
+_img_max="${TENSORFOLD_GLM_MAX_IMAGES:-50}"
+if [[ "$_img_tokens" =~ ^[0-9]{1,6}$ && "$_img_max" =~ ^[0-9]{1,4}$ ]]; then   # (anything else: TensorFold refuses it)
+  _img_budget=$(( 10#$_img_tokens * 10#$_img_max ))
+  (( _img_budget <= 262144 )) || _img_budget=262144
+  (( _img_budget >= 16384 )) || _img_budget=16384
+  export TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS="${TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS:-$_img_budget}"
+  if [[ -z "${TENSORFOLD_VISION_WORKSPACE_MIB:-}" && "$TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS" =~ ^[0-9]{1,7}$ ]]; then
+    _img_rows=$(( 10#$TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS > 16384 ? 10#$TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS - 16384 : 0 ))
+    _img_base=$(( 768 * (10#$_img_tokens > 4096 ? 10#$_img_tokens : 4096) / 4096 ))
+    (( _img_rows == 0 )) || export TENSORFOLD_VISION_WORKSPACE_MIB=$(( _img_base + (_img_rows * 8 + 1023) / 1024 ))
+  fi
+fi
+unset _img_tokens _img_max _img_budget _img_rows _img_base
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
 # a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only (mtp: 1). Default 4 on two Sparks, 8 on three (v1.5).
 # sparkDash aggregate decode at 4 / 8 requests at once: two Sparks prose 103.2 / 130.8 tok/s, code 126.7 / 167.0; three
