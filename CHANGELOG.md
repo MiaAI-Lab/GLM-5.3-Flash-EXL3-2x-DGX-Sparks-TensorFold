@@ -111,6 +111,7 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
+- **Broken concurrent GLM engine is visible** (patch `0109-glm-broken-health-exit`): `/health` reports `ok: false` and its first error in `broken`; `/metrics` exposes `tensorfold_health:ok`. Opt-in `TF_GLM_EXIT_ON_BROKEN=1` logs the cause and exits with code 1 as soon as the broken state latches. The existing stall watchdog is unchanged. CPU check: `tools/test_broken_health_exit.py`.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
