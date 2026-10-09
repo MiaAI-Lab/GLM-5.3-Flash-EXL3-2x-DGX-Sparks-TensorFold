@@ -25,7 +25,7 @@ video input**. The local recipe builds [TensorFold](https://github.com/ashhart/T
 - Tool calling, structured outputs (xgrammar), `/tokenize`, and `reasoning_effort` `low` / `high` / `max`
 - One command on the first Spark: `./start.sh` sets up both Sparks and starts both ranks; `./stop.sh` stops them
 
-The earlier v0.6.6 image passed API, concurrency, vision, cache, and 32k/128k retrieval checks on two independent two-Spark clusters using a compatible EXL3 checkpoint ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The current v1.10-based runtime and the stock Mia and Mia Ablit checkpoints still need GPU smoke checks. The performance figures below were measured on the earlier v0.6.0 recipe.
+The current v1.10-based v0.6.6 image was built from tracked source and tested with stock Mia and Mia Ablit. Both passed 10/11 functional checks; a non-thinking arithmetic failure remains open. Both passed 32k/128k retrieval ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The performance figures below were measured on the earlier v0.6.0 recipe.
 
 ## Performance
 
@@ -262,8 +262,8 @@ caches from **one shared pool**:
 | Requests at once (`PARALLEL`) | 4 |
 | Window per request (`CONTEXT`, the model's native maximum) | 1,048,576 tokens |
 | KV precision (`KV`) | FP8 (e4m3 rows with a power-of-two scale each: half of bf16's bytes) |
-| **Shared pool** (what is free at start minus `MEMORY_RESERVE_GIB` 14.5, at most `KV_POOL_GIB` 12.5 GiB a Spark beyond the window) | Depends on free memory; **2,922,496 tokens** was measured on the earlier v0.6.0 recipe. The two v0.6.6 validation clusters each reported **2,203,648 tokens** |
-| Rank 0's startup estimate (v0.6.0 measurement) | 88.09 GiB |
+| **Shared pool** (what is free at start minus `MEMORY_RESERVE_GIB` 14.5, at most `KV_POOL_GIB` 12.5 GiB a Spark beyond the window) | Depends on free memory; **2,922,496 tokens** was measured on the earlier v0.6.0 recipe. The current v0.6.6 stock Mia/Mia Ablit runs reported **2,535,424 / 2,582,528 tokens** |
+| Rank 0's startup estimate (both v0.6.6 Mia checkpoint runs) | 88.09 GiB |
 | Free memory (`MemAvailable`) at idle (v0.6.0 measurement) | 7.0 GiB on rank 0, 10.5 GiB on rank 1 |
 | Lowest free memory under a 1M-token prompt (v0.6.0 measurement) | 5.6 GiB on rank 0, 9.5 GiB on rank 1 |
 | Display reservation in the pool (`DISPLAY_KV_MIB`) | off; 1792 MiB adds ~277k tokens at `PARALLEL=8` without taking host memory |

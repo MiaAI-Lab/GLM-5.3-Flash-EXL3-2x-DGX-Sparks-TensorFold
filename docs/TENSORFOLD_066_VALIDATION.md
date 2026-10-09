@@ -4,13 +4,33 @@ This draft ports the public v1.10 recipe to TensorFold commit `cb2ebf0540f42604e
 
 ## Current merged runtime
 
-The upstream merge includes the v1.9/v1.10 sparse-kernel loops, display backend, spill tier, kept-state limits, decode launch order, loop guard, draft candidate checks, Responses include values, streamed admission, effort-tail and cache-share options. Anthropic routes and chunked request framing are native to the pinned TensorFold source. The active patch identity is `0a998e123165`. This runtime differs from the earlier tested image and needs a fresh build and GPU validation. The upstream second-rail probe, repeated-character smoke check, defaults, credits and license documentation are retained.
+The upstream merge includes the v1.9/v1.10 sparse-kernel loops, display backend, spill tier, kept-state limits, decode launch order, loop guard, draft candidate checks, Responses include values, streamed admission, effort-tail and cache-share options. Anthropic routes and chunked request framing are native to the pinned TensorFold source. The active patch identity is `0a998e123165`. This runtime differs from the earlier tested image. A fresh image was built from the tracked source archive of merge commit `2486f456bb69482182ee763aa3fa373631e48905`, reusing cached dependency layers (not an uncached rebuild), and exercised with the stock Mia and Mia Ablit checkpoints. The upstream second-rail probe, repeated-character smoke check, defaults, credits and license documentation are retained.
+
+## Current Mia GPU observations
+
+Both checkpoints loaded on the same tensor-parallel pair with four lanes, the configured 1,048,576-token context limit, q4 dense weights, FP8 KV, split prefill and nucleus-union sampling enabled. Both ranks matched the new image and the recipe's pinned checkpoint for each test. No context fallback or container restart occurred.
+
+| Observation | Stock Mia | Mia Ablit |
+| --- | ---: | ---: |
+| Functional checks | 10/11 | 10/11 |
+| Rank 0 startup estimate | 88.09 GiB | 88.09 GiB |
+| Shared KV pool at startup | 2,535,424 tokens | 2,582,528 tokens |
+| Model/kernel load | 429.8 s (cold) | 115.4 s (warm) |
+| API readiness | 441.49 s | 132.3 s |
+| 32k-tier needle | 33,046 tokens, 24.643 s, pass | 33,031 tokens, 23.193 s, pass |
+| 128k-tier needle | 133,416 tokens, 96.106 s, pass | 133,494 tokens, 95.784 s, pass |
+
+The load timings compare cold and warm starts and do not establish a speed difference between checkpoints. Pool capacity depends on startup memory. The configured maximum context was accepted at startup; retrieval at that maximum remains unverified.
+
+Both checkpoints passed chat, SSE, tool roundtrip, Responses, Anthropic messages/count_tokens, vision, prefix-cache, and four-lane queue/cancellation checks. Valid Responses include fields and sampled decoding with `top_k=0`, temperature 0.7, top_p 0.9, min_p 0.05 and seed 2026 also passed bounded checks.
+
+The single failing functional check was `reasoning_on_off`: its arithmetic prompt expected 34, but thinking disabled returned 40; thinking enabled returned 34 with reasoning content. This happened on both checkpoints. A focused stock Mia comparison with `draft: false` (policy 0) returned the same incorrect 40 as the drafted request, with identical output hashes and no cached prompt tokens. The cause remains unassigned, and this diagnostic does not establish general drafted-versus-serial correctness.
 
 ## Earlier GPU observations (prior runtime)
 
 These observations apply to the earlier recipe build identity `eda0320be7fc`, before the v1.9/v1.10 merge. They do not validate the current active patch.
 
-One Docker image built from this Mia recipe was run on two independent tensor-parallel pairs (four DGX Sparks total). This is one build tested on two clusters, not four independent builds. Both used a compatible EXL3 checkpoint, q4 dense weights, FP8 KV, four lanes, and DFlash2 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`. The default Mia checkpoints still need GPU smoke checks.
+One Docker image built from this Mia recipe was run on two independent tensor-parallel pairs (four DGX Sparks total). This is one build tested on two clusters, not four independent builds. Both used a compatible EXL3 checkpoint, q4 dense weights, FP8 KV, four lanes, and DFlash2 revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`. These historical observations do not establish default Mia checkpoint behavior.
 
 - Both clusters passed 11/11 functional checks: health/model discovery, chat, SSE, thinking on/off, typed tool roundtrip, Responses, Anthropic messages/count_tokens, vision, prefix reuse, and four-lane queue/cancellation recovery. Thinking content emission was observed on the second pair. This does not establish compatibility with every API client.
 - Prefix-cache counters changed from 0 to 1,664 tokens. Four requests ran concurrently; a fifth queued, and cancellation recovered the lane.
@@ -36,7 +56,8 @@ The runtime tool prints scalar results, not prompts or replies. Long-context mod
 
 ## Remaining gates
 
-- Fresh merged-runtime build and stock Mia/gated Mia Ablit checkpoint GPU smoke checks, including sampled decoding with the new nucleus-union default.
-- A full Docker build from a clean recipe checkout, followed by a maintainer-published image if prebuilt distribution is desired. The default remains `PULL=0`; no legacy digest is reused.
+- Investigate the non-thinking arithmetic failure on both Mia checkpoints; overall default-checkpoint verification remains incomplete.
+- A maintainer-published image if prebuilt distribution is desired. The image built from the clean tracked source used cached dependency layers. The default remains `PULL=0`; no legacy digest is reused.
+- General drafted-versus-serial/bitwise correctness and memory behavior at maximum concurrent context.
 - Near-limit retrieval and a repeatable isolated performance comparison.
 - Broader Responses/Anthropic streaming-client coverage, TP above two, alternative dense/KV/drafter configurations, and GPU equivalence checks for the sparse-kernel and spill/display options.
