@@ -2,7 +2,7 @@
 """Checks for patch 0097 (the kept-state count follows a share of the pool's memory), run inside the image that
 scripts/prepare.sh built:
 
-    docker run --rm --entrypoint python -v "$PWD/tools/kept_cap_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
+    docker run --rm --entrypoint python -v "$PWD/tools/kept_cap_check.py:/c.py" tensorfold-glm53:v0.6.6 /c.py
 
 engine.kept_entries' arithmetic (off by default: the configured count, no note; a share of the budget; the three quarter
 ceiling that keeps the reservation inside the start-up estimate), and MultiDecoder._keep on the real Pool with a stubbed

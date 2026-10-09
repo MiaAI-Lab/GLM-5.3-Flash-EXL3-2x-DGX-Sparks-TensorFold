@@ -2,7 +2,7 @@
 """Checks for patches 0072 (DISPLAY_KV_MIB) and 0087 (DISPLAY_KV_BACKEND=dispram), run inside the image that
 scripts/prepare.sh built:
 
-    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/display_kv_check.py:/c.py" tensorfold-glm53:v0.6.0 \
+    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/display_kv_check.py:/c.py" tensorfold-glm53:v0.6.6 \
       /c.py [--gpu]
 
 Without --gpu: the setting, the refusal while a display is connected, how many latent planes the span takes, the span's mapping and unwinding (a fake for every

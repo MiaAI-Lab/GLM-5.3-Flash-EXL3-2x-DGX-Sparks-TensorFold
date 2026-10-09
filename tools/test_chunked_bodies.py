@@ -24,6 +24,7 @@ def start(root):
     class App:
         model_ids = ["m"]
         served_name = "m"
+        request_body_limit = 96 * 1024**2
 
         def reply_model(self, body):
             return "m"

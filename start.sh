@@ -308,7 +308,7 @@ fi
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
 env_args() {
   local _skip='^$' name
-  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
+  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" -e MAX_JOBS="${MAX_JOBS:-1}")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }

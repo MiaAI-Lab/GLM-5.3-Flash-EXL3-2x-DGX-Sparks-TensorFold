@@ -2,7 +2,7 @@
 """Checks for patch 0086 (the indexer's prompt scoring, one row and SCORE_LOOP pool blocks a program), run on a GPU
 inside the image that scripts/prepare.sh built:
 
-    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/scores_loop_check.py:/c.py" tensorfold-glm53:v0.6.0 \
+    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/scores_loop_check.py:/c.py" tensorfold-glm53:v0.6.6 \
       /c.py
 
 The patched sparse._select_prompt against a copy of it with the kernel before the patch (copied below, launched as

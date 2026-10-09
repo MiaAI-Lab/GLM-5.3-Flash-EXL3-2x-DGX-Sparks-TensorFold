@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Push the image scripts/prepare.sh built to GitHub Container Registry as $GHCR_IMAGE:<TensorFold version>-<image hash>
 # and :latest, labelled with this repository (so the package takes the repository's visibility and access).
-# The image hash is config.sh's image_hash (patches/*.patch plus IMAGE_EXTRAS), the same value prepare.sh writes into
+# The image hash is config.sh's image_hash (active v066 patch, extras, source commit and base image reference), the same value prepare.sh writes into
 # the image's tf.patches label and looks for when it pulls: prepare.sh pulls $GHCR_IMAGE:<TensorFold version>-<hash>.
 # Run it on the head Spark (the one that runs ./start.sh); the worker gets the image from the head or the registry.
 # Needs a GitHub token with write:packages: `gh auth login -s write:packages`, or GHCR_TOKEN / GITHUB_TOKEN set.

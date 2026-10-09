@@ -1,7 +1,13 @@
 # Changelog
 
-Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
-`ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
+Every change to this recipe, newest first. Published releases below name their tested image. The current v0.6.6 port builds locally and has no image pinned yet.
+
+## Unreleased (2026-10-08): TensorFold v0.6.6 port
+
+- Consolidated the v1.10 public GLM features into `patches/v066/0001-glm-recipe-compat.patch` against TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248`. The earlier numbered v0.6.0 patches remain as history.
+- Kept the public shared-prefix, vision, cancellation, memory, and capacity changes, including v1.9/v1.10 spill, kept-state limits, sparse-kernel loops, draft checks, streamed admission, effort-tail and cache-share options. Adapted the new v0.6.6 scheduler shutdown path and forwarded `Retry-After` on nonstreamed Responses and Anthropic capacity refusals. The public Ablit checkpoint selector is unchanged.
+- The image hash now includes the exact TensorFold source, base image, extras, and active patch. The old v0.6.0 image digest is no longer used, and image builds are local by default until a tested v0.6.6 image is pinned.
+- Built the current image from clean tracked source with cached dependency layers and tested stock Mia and Mia Ablit: both passed 10/11 functional checks, with the same non-thinking arithmetic failure still open. Both passed 32k/128k retrieval ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). General correctness, maximum-context retrieval and performance gates remain open; no overall speed improvement is claimed.
 
 ## Unreleased
 

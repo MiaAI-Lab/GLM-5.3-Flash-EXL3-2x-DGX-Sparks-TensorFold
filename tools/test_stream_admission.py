@@ -51,17 +51,19 @@ def main():
     admit = admit_method(args.source_root)
 
     class App:
-        model_ids, served_name = ["m"], "m"
+        model_ids, served_name = ["m", "background-alias"], "m"
+        background_ids = frozenset({"background-alias"})
         engine = SimpleNamespace(scheduler=Scheduler())
 
         def reply_model(self, body):
-            return "m"
+            return body.get("model", "m")
 
         def prepare(self, body, chat):
             return SimpleNamespace(tools=None)
 
         def run(self, body, chat, emit, prepared=None, cancelled=None):
-            Scheduler()._check_admission(body.get("priority") == "background")       # Scheduler.submit's check
+            by_name = "priority" not in body and self.reply_model(body) in self.background_ids
+            Scheduler()._check_admission(body.get("priority") == "background" or by_name)
             emit({"content": "hi"})
             return {"final": {}, "calls": None, "call_deltas": [], "finish": "stop", "content": "hi", "reasoning": None,
                     "stats": {}, "prompt_tokens": 1, "completion_tokens": 1}
@@ -92,6 +94,10 @@ def main():
             return
         assert status == 429 and b"Retry-After: 5" in reply, (stream, reply[:300])
     assert int(post(stream=True, priority="background").split()[1]) == 200, "background requests queue by design"
+    for stream in (False, True):
+        assert int(post(stream=stream, model="background-alias").split()[1]) == 200
+        reply = post(stream=stream, model="background-alias", priority="foreground")
+        assert int(reply.split()[1]) == 429 and b"Retry-After: 5" in reply
     full[0] = False
     assert int(post(stream=True).split()[1]) == 200
     print("streamed and plain requests to a full server: 429 + Retry-After: 5; with room: 200")

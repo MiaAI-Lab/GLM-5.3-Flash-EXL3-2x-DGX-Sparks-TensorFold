@@ -191,12 +191,12 @@ declare -a NODE_DEV=() NODE_HCAS=() NODE_GID=() LINK_HEAD_ADDR=() LINK_WORKER_AD
 
 # An image's identity by content (its layers' diffIDs and runtime config), the same under Docker's overlay2 and
 # containerd image stores: .Id is the config digest under one and the manifest digest under the other, so it never
-# matches across a mixed pair (issue #8). The template holds no spaces: worker() passes it through ssh, which
-# re-splits arguments. A missing image is "missing". worker_image_ident <i> <image>: on worker i.
-IMAGE_IDENT='{{.RootFS.Layers}}{{.Config.Env}}{{.Config.Entrypoint}}{{.Config.Cmd}}{{.Config.WorkingDir}}'
+# matches across a mixed pair (issue #8). A missing image is "missing". worker_image_ident <i> <image>: on worker i.
+IMAGE_IDENT='{{.RootFS.Layers}}{{.Config.Env}}{{.Config.Entrypoint}}{{index .Config "Cmd"}}{{.Config.WorkingDir}}'
 image_ident() { local s; s=$(docker image inspect -f "$IMAGE_IDENT" "$1" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing; }
 worker_image_ident() {
-  local s; s=$(worker "$1" docker image inspect -f "$IMAGE_IDENT" "$2" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
+  local s command; printf -v command '%q ' docker image inspect -f "$IMAGE_IDENT" "$2"
+  s=$(worker "$1" "$command" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
 }
 
 # cx7_peer <i>: worker i's address on a CX7 port that one of this node's CX7 ports reaches directly (same subnet, no

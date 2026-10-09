@@ -2,7 +2,7 @@
 """Checks for patch 0089 (the kept-state byte budget and per-conversation quota), run inside the image that
 scripts/prepare.sh built:
 
-    docker run --rm --entrypoint python -v "$PWD/tools/kept_state_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
+    docker run --rm --entrypoint python -v "$PWD/tools/kept_state_check.py:/c.py" tensorfold-glm53:v0.6.6 /c.py
 
 MultiDecoder's _keep, _drop and _evict on the real Pool with a stubbed snapshot (no GPU or model): both limits off by
 default (nothing dropped, nothing spilled), the quota keeping a conversation's newest states and not counting shared

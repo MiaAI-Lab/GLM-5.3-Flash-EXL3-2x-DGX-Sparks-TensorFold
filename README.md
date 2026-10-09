@@ -12,11 +12,8 @@
 </p>
 
 Serve **GLM-5.3-Flash** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through an
-OpenAI-compatible API, with **4 concurrent requests**, the model's full **1,048,576-token context** and **image and
-video input**. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 on both Sparks (one rank on each)
-in NVIDIA's PyTorch container, plus 96 patches (65 of v1.4, 3 for 3 Sparks, experimental, 1 for up to 8 requests at once, 1 for stopping serial requests, 5 of v1.6: a shared system prompt keeps each conversation's history, the display reservation in the pool and the pool compacting before it evicts, by [ezoushen](https://github.com/ezoushen); queued requests whose client left dropped at once, by [desy0305](https://github.com/desy0305); `<|assistant|>` ending a reply; 1 of v1.7.1: a new agent run keeps its system prompt's state once the kept-state cap is full, diagnosed and the fix proposed by [meleesciony](https://github.com/meleesciony) in [issue #75](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/75); 1 fix since v1.7.1: a fresh conversation after a long one no longer runs out of memory; 5 of v1.8: pictures read once and quoted media markers, by [ThomasWadeZ](https://github.com/ThomasWadeZ), capacity refusals, by [johnwhited](https://github.com/johnwhited); and 12 of v1.9: the Anthropic Messages API, backported by [Eduardo Florencio](https://github.com/eduffd) from upstream work by [evilpsycho42](https://github.com/evilpsycho42), [ashhart](https://github.com/ashhart) and [Jordi Posthumus](https://github.com/JordiPosthumus); long-context decode and prefill and the display reservation on kindling spark-os, by [BadAd84](https://github.com/BadAd84); a spill tier for kept prompt states, by [Robert Wojciechowski](https://github.com/wojo); kept-state limits, by [Thomas Wade](https://github.com/ThomasWadeZ); the expert decode launch order, by [Lukasz Raczylo](https://github.com/lukaszraczylo); a loop guard, chunked bodies, Responses `include`, streamed admission and checked draft candidates; and 2 of v1.10: the reasoning-effort line at the prompt's tail, opt-in, reported by [jdecker76](https://github.com/jdecker76) in [issue #93](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/93); and the kept-state count as a share of the pool, diagnosed by [jdecker76](https://github.com/jdecker76) in [issue #84](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/84)): DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache,
-faster prompt kernels, a one-shot RoCE all-gather between the Sparks, several requests over one shared cache pool,
-vision, tool calling, `/tokenize` and `/metrics`.
+OpenAI-compatible API, with **4 concurrent requests**, a configured **1,048,576-token context limit**, and **image and
+video input**. The local recipe builds [TensorFold](https://github.com/ashhart/TensorFold) v0.6.6 in NVIDIA's PyTorch container. Its compatibility patch carries forward the public GLM features: DFlash2 and copy drafts, 4-bit dense weights, an FP8 KV cache, faster prompt kernels, RoCE between the Sparks, concurrent requests, vision, and tool calling.
 
 - Checkpoint: [`Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold), Mia's AI Lab's own EXL3 quantization (routed experts at 4 bits a weight,
   BF16 elsewhere, ~176 GB), calibrated for how TensorFold serves it
@@ -24,9 +21,11 @@ vision, tool calling, `/tokenize` and `/metrics`.
 - Drafter: [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2), or the checkpoint's
   own MTP head (`DRAFTER`, see [Configuration](#configuration))
 - API model id: `GLM-5.3-Flash-EXL3`
-- Context: **1,048,576 tokens** a request; the 4 requests share an FP8 KV pool of about **2.9M tokens** (2,922,496 at the measured start)
+- Context: configured limit of **1,048,576 tokens** a request; requests share an FP8 KV pool whose capacity depends on memory available at startup. The v0.6.6 validation covered approximately 32k and 133k tokens, not the configured maximum.
 - Tool calling, structured outputs (xgrammar), `/tokenize`, and `reasoning_effort` `low` / `high` / `max`
 - One command on the first Spark: `./start.sh` sets up both Sparks and starts both ranks; `./stop.sh` stops them
+
+The current v1.10-based v0.6.6 image was built from tracked source and tested with stock Mia and Mia Ablit. Both passed 10/11 functional checks; a non-thinking arithmetic failure remains open. Both passed 32k/128k retrieval ([validation and remaining gates](docs/TENSORFOLD_066_VALIDATION.md)). The performance figures below were measured on the earlier v0.6.0 recipe.
 
 ## Performance
 
@@ -237,12 +236,8 @@ the progress lines, the window retry or the smoke test; when either rank ends, i
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
 1. Preflight on both Sparks: Docker, the GPU, `rsync`, key-based ssh, the RoCE link, disk space.
-2. The image `tensorfold-glm53:v0.6.0` on the head: TensorFold v0.6.0 with every `patches/*.patch` applied, plus PyAV
-   (video decoding) and xgrammar (structured outputs), on NVIDIA's `nvcr.io/nvidia/pytorch:26.07-py3`. It first
-   pulls the published image `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-<image hash>`,
-   by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`) while the patches are this release's
-   (the hash covers the patches and those pip packages); after you change `patches/`, it pulls that hash's tag if
-   one is published, else (or with `PULL=0`) it builds.
+2. The image `tensorfold-glm53:v0.6.6` on the head: TensorFold commit `cb2ebf0540f42604e2759b2ddef497861e928248` with `patches/v066/*.patch` applied, plus PyAV
+   (video decoding) and xgrammar (structured outputs), on NVIDIA's `nvcr.io/nvidia/pytorch:26.07-py3`. It builds locally by default. `PULL=1` first tries a matching image in GitHub Container Registry; no v0.6.6 image is pinned in this recipe. The image hash covers the patch, extras, TensorFold source and base image reference, so a source change rebuilds it.
 3. The same image on the worker: pulled, else streamed from the head (`docker save | docker load`), checked identical.
 4. The checkpoint, and DFlash2 with `DRAFTER=dflash2`, downloaded into `~/.cache/huggingface` on the head at their
    pinned revisions (the checkpoint checked with `tensorfold info`), then copied to the worker with `rsync` over ssh
@@ -254,8 +249,7 @@ scripts/prepare.sh --rebuild   # rebuild the image from scratch
 PREPARE=1 ./start.sh restart   # force prepare.sh, then restart; PREPARE=0 skips the check
 ```
 
-After changing `patches/`, `scripts/publish-image.sh` pushes the new image to GitHub Container Registry (`latest` and
-`v0.6.0-<image hash>`, the tag `prepare.sh` looks for).
+When a tested image is ready to publish, `scripts/publish-image.sh` can push `latest` and `v0.6.6-<image hash>` to GitHub Container Registry.
 
 ## KV pool and memory
 
@@ -268,20 +262,21 @@ caches from **one shared pool**:
 | Requests at once (`PARALLEL`) | 4 |
 | Window per request (`CONTEXT`, the model's native maximum) | 1,048,576 tokens |
 | KV precision (`KV`) | FP8 (e4m3 rows with a power-of-two scale each: half of bf16's bytes) |
-| **Shared pool** (what is free at start minus `MEMORY_RESERVE_GIB` 14.5, at most `KV_POOL_GIB` 12.5 GiB a Spark beyond the window) | **2,922,496 tokens** at the measured start, the 12.5 GiB cap (~2.1-2.9M depending on free memory) |
-| Rank 0's startup estimate | 88.09 GiB |
-| Free memory (`MemAvailable`) at idle | 7.0 GiB on rank 0, 10.5 GiB on rank 1 |
-| Lowest free memory under a 1M-token prompt | 5.6 GiB on rank 0, 9.5 GiB on rank 1 |
+| **Shared pool** (what is free at start minus `MEMORY_RESERVE_GIB` 14.5, at most `KV_POOL_GIB` 12.5 GiB a Spark beyond the window) | Depends on free memory; **2,922,496 tokens** was measured on the earlier v0.6.0 recipe. The current v0.6.6 stock Mia/Mia Ablit runs reported **2,535,424 / 2,582,528 tokens** |
+| Rank 0's startup estimate (both v0.6.6 Mia checkpoint runs) | 88.09 GiB |
+| Free memory (`MemAvailable`) at idle (v0.6.0 measurement) | 7.0 GiB on rank 0, 10.5 GiB on rank 1 |
+| Lowest free memory under a 1M-token prompt (v0.6.0 measurement) | 5.6 GiB on rank 0, 9.5 GiB on rank 1 |
 | Display reservation in the pool (`DISPLAY_KV_MIB`) | off; 1792 MiB adds ~277k tokens at `PARALLEL=8` without taking host memory |
 
-Any one request can grow to the full window, and the four together share the pool: e.g. one 1M-token conversation
-next to one more of 1M, or next to three of ~640k. A request the pool cannot place yet waits until others finish (kept prompt states give way
+The configured window is a per-request limit; all four requests together share the available pool. Fit depends on
+prompt and output lengths, available pool rows, and retained state. Full-window retrieval has not been validated on
+v0.6.6. A request the pool cannot place yet waits until others finish (kept prompt states give way
 first, least recently used first, and only while the free rows fall short: free rows in several ranges are gathered by
 moving caches instead, patch `0074`); `/health` shows `pool_tokens`, `pool_free_tokens` and the streams decoding, filling and paused.
 
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
-TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
-reserve also sets the lowest free memory.
+TensorFold's own default is a tenth of RAM). On the earlier v0.6.0 recipe, the server used about 10 GiB beyond its own estimate at its peak;
+reserve requirements for v0.6.6 still need qualification with the default checkpoint.
 The GB10 firmware also keeps about 2 GiB for a screen, which a headless Spark never uses and `MemAvailable` never
 counts. With `PARALLEL` above 1, `DISPLAY_KV_MIB=1792` (patch 0072) adds that much of it to the pool on every rank, on
 top of `KV_POOL_GIB`: the first DSA layers' latent planes sit in a span of ordinary memory with the reservation mapped
@@ -398,8 +393,7 @@ published checkpoint, which stays in the cache.
 ## 3 Sparks (experimental)
 
 `./start-tp3.sh` runs the same recipe as tensor parallel over three Sparks (`TP=3` with `./start.sh`'s options;
-`./stop.sh` stops every configured worker). **The engine for `--tp N` comes from this repo's patches 0066-0068**
-(TensorFold v0.6.0 itself serves two ranks only), in the same published image as two Sparks (`prepare.sh` pulls it on the head and copies it to every worker). **Three Sparks** were tested on v1.3.2's patches (exact against two Sparks, drafted == serial, images and
+`./stop.sh` stops every configured worker). **The engine for `--tp N` comes from this repo's historical patches 0066-0068, now carried in `patches/v066/`.** It uses the same locally built image as two Sparks. **Three Sparks** were tested on the earlier v0.6.0 recipe (v1.3.2 patches) (exact against two Sparks, drafted == serial, images and
 tool calls, concurrent requests). On top of v1.4 (2026-10-03, `KV_POOL_GIB=27`, NCCL, two boots: sliced fill on and
 off): concurrent requests equal one at a time (22/22 each boot), drafted == serial (6/6), long-prompt replies and every
 streamed reply the same with the sliced fill on and off, the 195k needle right (prefill 115.0 s), a prompt cancelled
@@ -505,7 +499,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |
 | `ABLIT` | `0` | `1`: serve the gated [Ablit weights](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit) instead of the published checkpoint; needs `HF_TOKEN` and the terms accepted on the model's page; thinking defaults to off ([Ablit weights](#ablit-weights)) |
 | `DRAFTER` | `dflash2` | `dflash2`: IncoAI's DFlash2 drafter, licensed [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/), **non-commercial use only**; +5-10% decode. `mtp`: the checkpoint's own MTP head, one request at a time, which avoids that license (set it before the first `./start.sh` and DFlash2 is never downloaded) |
-| `TF_GLM_MTP` | `auto` | the checkpoint's MTP head beside DFlash2: `auto` leaves it out while DFlash2 drafts every request; `1` (TensorFold v0.6.0's own default) loads it, 1.77 GiB a Spark, with `PARALLEL=1`. `DRAFTER=mtp` always loads it |
+| `TF_GLM_MTP` | `auto` | the checkpoint's MTP head beside DFlash2: `auto` leaves it out while DFlash2 drafts every request; `1` (TensorFold v0.6.6's own default) loads it, 1.77 GiB a Spark, with `PARALLEL=1`. `DRAFTER=mtp` always loads it |
 | `TF_GLM_ASSISTANT_ENDS` | `1` | `<\|assistant\|>` ends a reply, like `<\|user\|>` and `<\|observation\|>` (patch 0075, issue #60); `0`: only the checkpoint's own end tokens |
 | `TF_GLM_LOOP_GUARD` | `0` | `1`: a think block that collapsed into repeating itself (an exact cycle of up to 16 tokens held for 256, or one token taking half of the last 256) is closed with the thinking budget's close, per request, and the model answers from there; `usage.tensorfold.loop_guard` counts it (patch 0091, issues #89 and #94). Paraphrase loops need `--thinking-budget` |
 | `DRAFT_POLICY` | `fnc7:0.3` | how many DFlash2 drafts a round verifies: up to 7, until the drafts' chance under the request's own sampling noise drops below 0.3 |
@@ -544,7 +538,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TENSORFOLD_GLM_MAX_IMAGES` / `_MAX_VIDEOS` | `50` / `4` | pictures and clips a request |
 | `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `16384` / `32768` | tokens a request's pictures and clips share (each still within its own cap) |
 | `TENSORFOLD_GLM_PICTURE_CACHE` / `_PICTURE_CACHE_MB` / `_PICTURE_CANVASES` | `1` / `384` / `8` | the vision frontend reads a request's pictures once, not on every turn of the chat (patch `0079`): what reading each source cost is kept by the source's bytes (host memory only, LRU under `_MB`, that many fitted canvases); `0`: the path before the patch, bit for bit (by ThomasWadeZ, #63) |
-| `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
+| `PREPARE` / `PULL` | `auto` / `0` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
 | `LOG_DIR` / `LOG_KEEP` | `~/.cache/tensorfold-glm53/logs` / `10` | where `stop.sh` saves rank 0's log before it removes the container (rank 1's, and ranks 2 and 3's at `TP` above 2, to the same folder on their worker), and how many of each rank's to keep ([Logs of earlier runs](#quick-start)); `0`: none |
 
@@ -556,8 +550,7 @@ Speed settings' measured effects: [What the patches change](#what-the-patches-ch
 changes nothing until the pin does. Set one empty to take the Hub's `main` when first downloaded.
 
 Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`: `MODEL_ID`, `DFLASH2_ID`,
-`TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.6.0; after changing any of these run
-`scripts/prepare.sh --rebuild`), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE` (default `$HF_HOME` or
+`TF_VERSION`, `TF_REVISION`, `TF_REPO`, `BASE_IMAGE` (the active patch is made for TensorFold v0.6.6; changing the source revision requires checking patch compatibility; a changed source or base image triggers a rebuild), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE` (default `$HF_HOME` or
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one RoCE
 port even when the cabled port's two PCIe links, or a second port, are up; at two Sparks `start.sh` pings each second rail across the link before using it and drops one that does not answer, with a warning), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
 server reach Hugging Face; by default it serves from the local cache only).
@@ -595,7 +588,9 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   bodies are accepted; conflicting `Content-Length` headers are refused with the connection closed).
   `redacted_thinking` is refused (this local model cannot decode it), as are `container`, `mcp_servers`,
   `service_tier`, and any `context_management` beyond `clear_thinking` with `keep: all`. Capacity refusals arrive as
-  429 with an Anthropic `overloaded_error` body.
+  429 with an Anthropic `overloaded_error` body and `Retry-After: 5`. Streaming requests are checked before
+  HTTP 200 headers are sent (patch `0095`). Basic nonstreamed routes passed checks on the earlier v0.6.6
+  port revision; the latest merged runtime still needs validation ([results](docs/TENSORFOLD_066_VALIDATION.md)).
 - **Context limits:** a request whose prompt plus `max_tokens` does not fit the window is refused with HTTP 400 in
   OpenAI's wording, `"code": "context_length_exceeded"` and `param` naming the field (`messages` or `prompt`).
 - **Tool calling:** `tools` / `tool_calls`, each call streamed whole once it is written (empty deltas every 2 s
@@ -620,8 +615,7 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
 
 ## What the patches change
 
-`scripts/prepare.sh` bakes every `patches/*.patch` into the image (diffs against TensorFold v0.6.0's site-packages,
-applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the image when the patches change.
+`scripts/prepare.sh` applies `patches/v066/0001-glm-recipe-compat.patch` against TensorFold v0.6.6. It consolidates the public patch series through v1.10 and adapts the new scheduler and API routes. The numbered patches at the top of `patches/` remain as the v0.6.0 history; they are not applied to the v0.6.6 build. A changed source, patch, extras, or base image invalidates the image hash.
 
 | Area | Patches | Change | Effect |
 | --- | --- | --- | --- |
@@ -731,7 +725,7 @@ stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
-patches/      patches baked into the image
+patches/      v066/ is the active patch; numbered patches at the top level document the v0.6.0 history
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a
               full pool) and patches 0072's, 0073's and 0074's checks
 CHANGELOG.md  what changed in each release
@@ -743,7 +737,7 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, b12x
 ## License
 
 Apache License 2.0, see [`LICENSE`](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices that go with it: the
-files in `patches/` modify TensorFold v0.6.0, and the TensorFold code they change or quote as context stays under
+files in `patches/` modify TensorFold v0.6.0 or v0.6.6, and the TensorFold code they change or quote as context stays under
 TensorFold's licenses (Apache 2.0 from v0.6.0, and the MIT notice of code written before it, both in `NOTICE`); parts
 of patches 0006 (b12x), 0036, 0046 and 0047 (glm53-tensorfold-spark) come from Apache-2.0 projects, credited there and
 in [`CREDITS.md`](CREDITS.md). The model

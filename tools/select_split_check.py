@@ -2,7 +2,7 @@
 """Checks for patch 0085 (the split selection's last step over the chunks before its own only), run on a GPU inside
 the image that scripts/prepare.sh built:
 
-    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/select_split_check.py:/c.py" tensorfold-glm53:v0.6.0 \
+    docker run --rm --gpus all --entrypoint python -v "$PWD/tools/select_split_check.py:/c.py" tensorfold-glm53:v0.6.6 \
       /c.py
 
 The patched sparse.select_split against the kernel before the patch (copied below; the whole token and count

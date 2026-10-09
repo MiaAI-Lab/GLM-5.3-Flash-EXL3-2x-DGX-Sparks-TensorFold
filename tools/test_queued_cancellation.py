@@ -1,6 +1,6 @@
 """CPU-only GLM queue lifecycle regression using the real scheduler classes.
 
-Run after applying the recipe patches to TensorFold v0.6.0:
+Run after applying the active recipe patch to TensorFold v0.6.6:
   python3 -B tools/test_queued_cancellation.py --source-root /path/to/src
 Use --expect-stock before patch 0073 to reproduce the original full-lanes
 gap. No Torch/CUDA, sockets, package installation or source writes are needed.
@@ -84,6 +84,7 @@ def main():
     Cancelled = module("tensorfold.server.cancellation", root / "server/cancellation.py").RequestCancelled
     ns = dict(queue=queue, threading=threading, itertools=itertools, Any=Any, Callable=Callable,
               Stream=Stream, time=time, _unwatch=lambda _: None)
+    ns["CapacityError"] = module("queue_errors", root / "server/errors.py").CapacityError
     source = (root / "families/glm5_next/cuda/multi.py").read_text(encoding="utf-8")
     classes(source, {"NoRoom"}, ns)
     classes((root / "cuda/scheduler.py").read_text(encoding="utf-8"), {"Waiting", "Scheduler"}, ns)
@@ -91,8 +92,10 @@ def main():
 
     def scheduler(holders=0, capacity=4):
         obj = object.__new__(ns["GlmScheduler"])
-        obj.decoder, obj.max_streams = Decoder(), capacity
+        obj.decoder, obj.max_streams, obj.max_in_system = Decoder(), capacity, None
         obj.waiting, obj.held, obj.boxes, obj.yields, obj.gather_s = ns["Waiting"](), None, {}, 0, 0
+        obj.flushing, obj.flush_lock = None, threading.Lock()
+        obj.loading, obj.ready, obj.staged = [], [], set()
         # patch 0088's spill tier (off): its scheduler state
         obj.flushing, obj.flush_lock, obj.loading, obj.ready, obj.staged = None, threading.Lock(), [], [], set()
         obj.max_in_system = None              # patch 0082's admission cap: off
@@ -447,6 +450,77 @@ def main():
         thread.join(2)
         ns["queue"] = queue
     checks.append("delivery failure after decoder finish is not swallowed by terminal stats")
+
+    obj = scheduler(4)
+    obj.max_in_system = 4
+    try:
+        obj._check_admission(False)
+    except ns["CapacityError"]:
+        pass
+    else:
+        raise AssertionError("full foreground lanes were admitted")
+    obj._check_admission(True)
+    checks.append("foreground capacity refusal leaves background admission available")
+
+    obj = scheduler(1)
+    obj.waiting.stop()
+    assert obj.waiting.foreground_count() == 0
+    obj._cancel_waiting()
+    obj._admit()
+    assert obj.waiting.qsize() == 1
+    obj.decoder.streams.clear()
+    assert obj._iteration() is False
+    checks.append("shutdown sentinel survives queue cleanup and stops an idle GLM scheduler")
+
+    obj = scheduler()
+    obj.max_in_system = 1
+    pending = Stream([1], 100)
+    obj.loading = [(object(), (pending, queue.Queue()))]
+    try:
+        obj._check_admission(False)
+    except ns["CapacityError"]:
+        pass
+    else:
+        raise AssertionError("spill reads were omitted from admission capacity")
+    obj.loading.clear()
+    obj.ready = [(pending, queue.Queue())]
+    try:
+        obj._check_admission(False)
+    except ns["CapacityError"]:
+        pass
+    else:
+        raise AssertionError("ready spill requests were omitted from admission capacity")
+    checks.append("pending and ready spill requests reserve foreground admission capacity")
+
+    obj = scheduler()
+    box = queue.Queue()
+    pending.emit = lambda _: False
+    pending.emit.cancelled = lambda: True
+    obj.loading = [(object(), (pending, box))]
+    obj.staged.add(id(pending))
+    obj._cancel_waiting()
+    assert obj.loading[0][1] is None and id(pending) not in obj.staged
+    kind, error = box.get_nowait()
+    assert kind == "error" and isinstance(error, Cancelled) and not obj.decoder.admitted
+    checks.append("cancelled spill read answers its caller before admission")
+
+    obj.decoder.load_ready = lambda _: False
+    result = []
+    thread = threading.Thread(target=lambda: result.append(obj._iteration()), daemon=True)
+    thread.start()
+    thread.join(1)
+    assert not thread.is_alive() and result == [None]
+    checks.append("idle spill reads are polled without blocking on the request queue")
+
+    obj = scheduler(4)
+    obj.flushing = threading.Event()
+    flushed = obj.flushing
+    calls = []
+    obj.decoder.flush_spill = lambda: calls.append("flush")
+    obj._admit()
+    assert calls == ["flush"] and flushed.is_set() and obj.flushing is None
+    checks.append("spill shutdown flush is processed while every serving lane is occupied")
+
     print(json.dumps({"status": "PASS", "tests": len(checks), "checks": checks, "device_calls": 0,
                       "source_sha256": hashlib.sha256(source.replace("\r\n", "\n").encode()).hexdigest()}, indent=2))
 
