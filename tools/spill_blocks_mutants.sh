@@ -73,6 +73,11 @@ run read-at-first-base $B "        self.point, self.where = point, where\n" "   
 run move-not-held $MU "        with self.disk.moving(h.lj) if h is not None and h.lj is not None else contextlib.nullcontext():" "        with contextlib.nullcontext():"
 run moving-without-lock $B "        with lj.lock:\n            if lj.last is not None:" "        with contextlib.nullcontext():\n            if lj.last is not None:"
 run copies-without-lock $B "            with lj.lock:                                   # (the extent stays" "            with contextlib.nullcontext():                                   # (the extent stays"
+# review 3, shared flag 1 and 2: a restore keeps rank 0's shared-prefix flag on every rank
+run restore-unshared $MU "        snap.shared = bool(shared)" "        snap.shared = False" \
+    $MU "        self._emit(LOADED, [h.lid, shared])" "        self._emit(LOADED, [h.lid])"
+run each-rank-own-flag $MU "        snap.shared = bool(shared)" "        snap.shared = bool(pt.shared)"
+run loaded-without-flag $MU "        self._emit(LOADED, [h.lid, shared])" "        self._emit(LOADED, [h.lid])"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

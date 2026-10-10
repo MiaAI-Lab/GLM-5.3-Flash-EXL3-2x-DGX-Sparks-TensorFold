@@ -12,7 +12,8 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
   row still filling at the keep);
 - compaction moving an extent a stored prompt is being read into goes on without waiting for the disk, the read's next
   blocks land at the new base and none at the old one, and a move that starts while a block's copy is being issued
-  waits for that copy and moves it too.
+  waits for that copy and moves it too;
+- a restored state keeps its point's shared-prefix flag, rank 0's on every rank (LOADED carries it).
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import os
@@ -250,6 +251,46 @@ t.join(TIMEOUT / 2)
 check("lock: the read ends", until(lambda: h.lj.done.is_set()))
 check("lock: the stored prompt is kept after its read", m.complete_load(h) and len(x.kept) == 1)
 check("lock: its rows are at the extent's new base, as they were kept", x.base == 0 and same(rows(ar, x.base, n), kept))
+
+
+# -- review 3, shared-flag 1 and 2: a restore keeps the shared-prefix flag, rank 0's on every rank -----------------
+def two_ranks(flags: tuple[bool, bool], name: str):
+    """Rank 0 and rank 1 (each its arena, disk and pool), rank 0's ops applied by rank 1's own ``apply``; the same
+    state stored on each with its own shared flag (``flags``), then read back through LOAD and LOADED."""
+
+    ms = []
+    for rank, flag in enumerate(flags):
+        a = arena(40 + rank)
+        s = store(a, f"{name}{rank}", rank)
+        ids, _ = stored(s, a, n, 41, shared=flag)
+        ms.append(decoder(a, s, rank))
+    m0, m1 = ms
+    sent = []
+
+    def flush():
+        msg, m0.outbox = m0.outbox, []
+        sent.extend(m1.parse(msg))
+        m1.apply(msg)
+
+    m0._flush = flush
+    hi, lo, _ = S.key_ints(S.point_key(ids))
+    m0._emit(M.LOAD, [hi, lo, n, 0, align_up(n), 0])         # as ``prestage`` sends it
+    m0._flush()
+    h = m0._start_load(hi, lo, n, 0, align_up(n), 0)
+    until(lambda: h.lj.done.is_set() and m1.loads[0].lj.done.is_set())
+    ok = m0.complete_load(h)
+    return ok, m0, m1, [p for op, p in sent if op == M.LOADED]
+
+
+ok, m0, m1, loaded = two_ranks((True, False), "shared")
+check("shared: a point rank 0 holds as shared is restored on both ranks",
+      ok and len(m0.kept) == 1 and len(m1.kept) == 1)
+check("shared: LOADED carries rank 0's flag", loaded == [[0, 1]])
+check("shared: rank 0 restores it as a shared-prefix state", ok and m0.kept[0].shared is True)
+check("shared: rank 1 too, though its own point says otherwise", ok and m1.kept[0].shared is True)
+ok, m0, m1, loaded = two_ranks((False, True), "own")
+check("shared: a point rank 0 holds as not shared is restored unshared on both ranks",
+      ok and not m0.kept[0].shared and not m1.kept[0].shared and loaded == [[0, 0]])
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)

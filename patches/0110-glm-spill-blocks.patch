@@ -1541,7 +1541,7 @@ index 0000000..949298f
 +                "restore_ms_p50": p(0.5), "restore_ms_p95": p(0.95),
 +                **{f"unwritten_{k}": v for k, v in sorted(self.unwritten_by.items())}}
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 06f33e7..026997d 100644
+index 06f33e7..43e9779 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -34,6 +34,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
@@ -2026,8 +2026,35 @@ index 06f33e7..026997d 100644
          except Exception as exc:                 # noqa: BLE001  (the read fails at LOADED, on every rank)
              h.err = exc
          self.loads[lid] = h
-@@ -1482,11 +1449,11 @@ class MultiDecoder:
-         extent holds a kept prompt; else the extent goes and the entry is forgotten on both."""
+@@ -1464,29 +1431,33 @@ class MultiDecoder:
+         return h.done or h.err is not None or (h.lj is not None and h.lj.done.is_set())
+ 
+     def complete_load(self, h) -> bool:
+-        """Rank 0: LOADED to rank 1, then both agree (``_finish_load``). True when the stored prompt is kept now."""
++        """Rank 0: LOADED to rank 1, then both agree (``_finish_load``). True when the stored prompt is kept now.
++        LOADED carries rank 0's shared-prefix flag of the point: each rank wrote its own point, so theirs may differ,
++        and ``cap_victim`` must drop the same state on every rank."""
+ 
+         if h.done:
+             return getattr(h, "ok", False)
+         self._check()
+-        self._emit(LOADED, [h.lid])
++        shared = int(h.lj is not None and h.lj.point is not None and bool(h.lj.point.shared))
++        self._emit(LOADED, [h.lid, shared])
+         self._flush()
+         try:
+-            return self._finish_load(h.lid)
++            return self._finish_load(h.lid, shared)
+         except Exception as exc:              # a failed all-gather: the ranks may no longer agree
+             self.broken = exc
+             raise
+ 
+-    def _finish_load(self, lid: int) -> bool:
++    def _finish_load(self, lid: int, shared: int = 0) -> bool:
+         """Both ranks: wait for this rank's read, agree through one all-gather that every read worked, then the
+-        extent holds a kept prompt; else the extent goes and the entry is forgotten on both."""
++        extent holds a kept prompt (a shared-prefix one when rank 0's point is: ``shared``); else the extent goes and
++        the entry is forgotten on both."""
  
          h = self.loads.pop(lid)
 -        ok, snap, meta = 0, None, None
@@ -2041,7 +2068,7 @@ index 06f33e7..026997d 100644
              except Exception as exc:             # noqa: BLE001  (a failed read: every rank prefills)
                  print(f"[tensorfold] spill rank {self.rank}: restore failed: {exc!r}", flush=True)
          else:
-@@ -1497,12 +1464,20 @@ class MultiDecoder:
+@@ -1497,19 +1468,27 @@ class MultiDecoder:
          h.done = True
          h.ok = all(r[0] for r in every)
          if not h.ok:
@@ -2066,7 +2093,15 @@ index 06f33e7..026997d 100644
          snap.ids = ids
          snap.pending, snap.mtp_len, snap.rows, snap.nbytes = None, -1, None, 0
          snap.kid = self.next_kid
-@@ -1519,50 +1494,32 @@ class MultiDecoder:
+         self.next_kid += 1
+         snap.key = keyed if keyed is not None else ids if self.rank == 0 else None
+         snap.images = keyed is not None
+-        snap.shared = False
++        snap.shared = bool(shared)               # rank 0's (LOADED): cap_victim keeps a system prompt on every rank
+         snap.own, snap.chat = False, 0           # a restored state counts against no conversation's quota
+         snap.extent = x
+         x.kept.append(snap)
+@@ -1519,50 +1498,32 @@ class MultiDecoder:
          return True
  
      def flush_spill(self, budget: float | None = None) -> None:
@@ -2126,7 +2161,7 @@ index 06f33e7..026997d 100644
          if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
              used = max(used, x.loading.n)
          if x.owner is not None:
-@@ -1572,11 +1529,14 @@ class MultiDecoder:
+@@ -1572,11 +1533,14 @@ class MultiDecoder:
          return used
  
      def _move(self, x, base: int, size: int) -> None:
@@ -2144,7 +2179,7 @@ index 06f33e7..026997d 100644
          if x.owner is not None:
              self.lanes[x.owner].st.bind(x.base, x.size)
  
-@@ -1666,10 +1626,7 @@ class MultiDecoder:
+@@ -1666,10 +1630,7 @@ class MultiDecoder:
          _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
          self.iteration_since = time.monotonic()           # /health's iteration_s
          try:
@@ -2156,7 +2191,7 @@ index 06f33e7..026997d 100644
              return self._iterate()
          except Exception as exc:
              self.broken = exc
-@@ -2244,6 +2201,8 @@ class MultiDecoder:
+@@ -2244,6 +2205,8 @@ class MultiDecoder:
              self._emit(IDLE, [])
              self._flush()
              self.idle = True
@@ -2165,7 +2200,7 @@ index 06f33e7..026997d 100644
          _unwatch(self.watchdog)
          self.iteration_since = None
  
-@@ -2324,6 +2283,7 @@ class MultiDecoder:
+@@ -2324,6 +2287,7 @@ class MultiDecoder:
              _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
              self.apply(unseal(self.g._share(None), self.received, self.rank))
              self.received = (self.received + 1) % SEAL_MOD
@@ -2173,7 +2208,7 @@ index 06f33e7..026997d 100644
              _unwatch(self.watchdog)
              if once:
                  return
-@@ -2357,12 +2317,12 @@ class MultiDecoder:
+@@ -2357,12 +2321,12 @@ class MultiDecoder:
                  self._start_load(*p)
              elif op == LOADED:
                  self._finish_load(*p)
@@ -2190,7 +2225,7 @@ index 06f33e7..026997d 100644
              elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
              elif op == GROW:
-@@ -2405,6 +2365,8 @@ class MultiDecoder:
+@@ -2405,6 +2369,8 @@ class MultiDecoder:
                  if self.lanes:
                      raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
                  self.idle = True
@@ -2199,7 +2234,7 @@ index 06f33e7..026997d 100644
              else:
                  raise RuntimeError(f"rank 1: unknown op {op}")
  
-@@ -2431,6 +2393,7 @@ class GlmScheduler(Scheduler):
+@@ -2431,6 +2397,7 @@ class GlmScheduler(Scheduler):
          self.flush_lock = threading.Lock()
          self.loading: list = []          # (read, item): requests waiting for a stored prompt read (--spill-gib)
          self.ready: list = []            # items whose read ended: admitted before the queue
@@ -2207,7 +2242,7 @@ index 06f33e7..026997d 100644
          self.staged: set = set()         # streams a read was looked for already
          # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
          # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
-@@ -2512,7 +2475,7 @@ class GlmScheduler(Scheduler):
+@@ -2512,7 +2479,7 @@ class GlmScheduler(Scheduler):
  
          if background or self.max_in_system is None:
              return
@@ -2216,7 +2251,7 @@ index 06f33e7..026997d 100644
          if held + self.waiting.foreground_count() >= self.max_in_system:
              raise CapacityError("all serving lanes are busy; retry shortly")
  
-@@ -2526,6 +2489,7 @@ class GlmScheduler(Scheduler):
+@@ -2526,6 +2493,7 @@ class GlmScheduler(Scheduler):
          import heapq
  
          self.ready = [it for it in self.ready if not self._cancel_item(it)]   # their stored prompts read (--spill-gib)
@@ -2224,7 +2259,7 @@ index 06f33e7..026997d 100644
          self.loading = [(read, None if it is None or self._cancel_item(it) else it) for read, it in self.loading]
          if self.held is not None and self._cancel_item(self.held):
              self.held = None
-@@ -2556,6 +2520,9 @@ class GlmScheduler(Scheduler):
+@@ -2556,6 +2524,9 @@ class GlmScheduler(Scheduler):
                  self.decoder.flush_spill()
              finally:
                  flush.set()
@@ -2234,7 +2269,7 @@ index 06f33e7..026997d 100644
          for it in [it for it in self.loading if self.decoder.load_ready(it[0])]:
              self.loading.remove(it)
              try:
-@@ -2601,6 +2568,13 @@ class GlmScheduler(Scheduler):
+@@ -2601,6 +2572,13 @@ class GlmScheduler(Scheduler):
                      self.loading.append((read, item))
                      continue
              self.staged.discard(id(stream))
@@ -2248,7 +2283,7 @@ index 06f33e7..026997d 100644
              self.boxes[id(stream)] = box
              try:
                  self.decoder.admit(stream)
-@@ -2669,7 +2643,7 @@ class GlmScheduler(Scheduler):
+@@ -2669,7 +2647,7 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()
