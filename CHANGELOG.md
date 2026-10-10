@@ -5,6 +5,16 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A worker restarted alone no longer leaves the ranks serving a dead set** (patch `0115-cuda-peer-watch`, issue
+  #129, by [BadAd84](https://github.com/BadAd84)): a rank that stops cannot rejoin the ranks still running, yet rank
+  0 kept its weights and answered `/v1/models` while every request hung, until the head restarted too. Rank 0 now
+  ends (exit code 1) when another rank shows no sign of life for `TENSORFOLD_PEER_TIMEOUT_S` seconds (120; `0`:
+  never) or starts again, and a worker's rank when rank 0 has been gone as long (with three Sparks the worker that
+  did not restart otherwise waits forever), unless rank 0 began a clean stop, so a spill flush still finishes. So
+  `FOREGROUND=1` under systemd, or a container restart policy, starts every rank again. Each rank calls the
+  rendezvous store every 2 s from a thread of its own; rank 0 drops the NCCL id from the store once every rank holds
+  it, so a rank that starts again never takes the old one. Serving is unchanged. CPU check:
+  `tools/peer_watch_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

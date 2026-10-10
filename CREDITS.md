@@ -142,6 +142,7 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
 - `0098-glm-mmap-uploads` (the drafter's and the vision tower's tensors copied out of the safetensors mmap before
   they go to the GPU: kindling spark-os's 64 KiB-page kernel): by [BadAd84](https://github.com/BadAd84).
+- `0115-cuda-peer-watch` (the ranks end when one is lost or starts again, issue #129): by [BadAd84](https://github.com/BadAd84).
 - `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`: the launch order of the expert decode kernel's blocks): by
   Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo)), in
   [PR #95](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/95).
