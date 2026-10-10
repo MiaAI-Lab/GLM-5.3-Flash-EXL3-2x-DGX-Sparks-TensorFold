@@ -1,8 +1,10 @@
 #!/bin/bash
-# spill_blocks_mutants.sh <image | dir> [names]   CPU only: tools/spill_blocks_check.py must pass on patch 0110 as it
-# is and FAIL on each faithful mutant of its fixes (the code before the fix, or one of its parts taken out).
-#   image: one scripts/prepare.sh built with this patch (each run in a fresh container, --network none);
-#   dir:   a folder holding the patched tensorfold/ package, run with $PYTHON (default python3) on a copy of it.
+# spill_blocks_mutants.sh <dir> [names]   CPU only: tools/spill_blocks_check.py must pass on patch 0110 as it is and
+# FAIL on each faithful mutant of its fixes (the code before the fix, or one of its parts taken out). <dir> holds the
+# patched tensorfold/ package; each run works on a copy of it with $PYTHON (default python3). In the image
+# scripts/prepare.sh built:
+#   docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/tools:/t:ro" --entrypoint bash \
+#     tensorfold-glm53:v0.6.0 /t/spill_blocks_mutants.sh /usr/local/lib/python3.12/dist-packages
 # Each run applies one mutant (one or more edits, python escapes; an anchor that does not match exactly once is an
 # ERROR, never a pass); a kill needs the check's non-zero exit AND a FAIL line. names: a bash regex, only the runs it
 # matches. Exit 0 only when the unmutated check passes and every mutant is killed. Not mutated (no CPU check reaches
@@ -35,19 +37,10 @@ run() {   # name, then (file under tensorfold/, old, new) for each edit (name "p
   local env=()
   while [ $# -ge 3 ]; do env+=("FILE$i=$1" "OLD$i=$2" "NEW$i=$3"); i=$((i + 1)); shift 3; done
   env+=("EDITS=$i")
-  if [ -d "$TARGET" ]; then
-    rm -rf "$SCRATCH/t" && mkdir -p "$SCRATCH/t" && cp -r "$TARGET/tensorfold" "$SCRATCH/t/" &&
-    find "$SCRATCH/t" -name __pycache__ -type d -prune -exec rm -rf {} + &&
-    env "${env[@]}" TREE="$SCRATCH/t/tensorfold" "$PYTHON" -c "$MUTATE" > "$OUT" 2>&1 &&
-    (cd "$SCRATCH" && PYTHONPATH="$SCRATCH/t" CUDA_VISIBLE_DEVICES= timeout 300 "$PYTHON" "$C") >> "$OUT" 2>&1
-  else
-    local args=()
-    for e in "${env[@]}"; do args+=(-e "$e"); done
-    docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -e PYTHONUNBUFFERED=1 -v "$C":/c.py:ro "${args[@]}" \
-      -e MUTATE="$MUTATE" --entrypoint sh "$TARGET" -c '
-      TREE=$(python3 -c "import os, tensorfold; print(os.path.dirname(tensorfold.__file__))") &&
-      TREE=$TREE python3 -c "$MUTATE" && cd / && timeout 300 python3 /c.py' > "$OUT" 2>&1
-  fi
+  rm -rf "$SCRATCH/t" && mkdir -p "$SCRATCH/t" && cp -r "$TARGET/tensorfold" "$SCRATCH/t/" &&
+  find "$SCRATCH/t" -name __pycache__ -type d -prune -exec rm -rf {} + &&
+  env "${env[@]}" TREE="$SCRATCH/t/tensorfold" "$PYTHON" -c "$MUTATE" > "$OUT" 2>&1 &&
+  (cd "$SCRATCH" && PYTHONPATH="$SCRATCH/t" CUDA_VISIBLE_DEVICES= timeout 300 "$PYTHON" "$C") >> "$OUT" 2>&1
   rc=$?
   set -- "$name"
   if grep -q "^ANCHOR" "$OUT"; then echo "ERROR $1: $(grep ANCHOR "$OUT")"; bad=1
