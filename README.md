@@ -685,19 +685,6 @@ How the ring runs:
 - `WORKER3` has its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`. On a ring
   `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
 
-### TP4 decode defaults
-
-At `TP=4`, the existing packed sampler, joint draft-depth allocator,
-asynchronous messages and expert launch order 2 are defaults. No extra enable
-switch is needed; individual `TF_GLM_*` overrides still win. This is a
-configuration change, not a new scheduler or kernel. It uses the unchanged
-published image and adds no patches. Two- and three-Spark defaults, side-stream
-behavior, topology discovery, memory settings and the prefill path stay unchanged.
-
-See [TP4 decode tuning](docs/tp4-decode-tuning.md) for switches, checks and matched
-benchmark results and explicit overrides to restore the previous behavior.
-The measured gains on a ring are not a claim for other topologies.
-
 ## Prompt and decode switches for two to four Sparks
 
 Patches 0101-0106 speed up the parts of a prompt chunk that did not shrink with more Sparks, and one part of decode.
@@ -771,7 +758,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_GLM_L2PF` | `1` | L2 prefetch in decode: the weights the next kernels read brought into L2 during each layer's all-gathers; `0`: off |
 | `TF_GLM_EXL3_LOADS` | `nc` | the decode expert kernel's trellis as 16-byte non-coherent loads a step ahead (`nc2` / `nc4`: 2 or 4 steps); `0`: TensorFold's 32-bit loads |
 | `TF_GLM_EXL3_DEC_ORDER` | TP4: `2`; TP2/TP3: `0` | the decode expert kernel's block launch order (patch 0090): `1` runs the eight 128-column blocks of one k slice together, then the items; `2` then the matrices and splits; `0`: as launched. The same bits. Not `TF_GLM_EXL3_ORDER`, which is patch 0020's prompt order |
-| `TF_GLM_MULTI_SAMPLER` / `TF_GLM_MULTI_DEPTH` / `TF_GLM_MULTI_ASYNC` | TP4: `packed` / `joint` / `1`; TP2/TP3: engine defaults unchanged | existing packed sampling, joint draft-depth allocation and asynchronous control messages. Override with `streams` / `policy` / `0` for the previous TP4 behavior; see [TP4 decode defaults](#tp4-decode-defaults) |
+| `TF_GLM_MULTI_SAMPLER` / `TF_GLM_MULTI_DEPTH` / `TF_GLM_MULTI_ASYNC` | TP4: `packed` / `joint` / `1`; TP2/TP3: engine defaults unchanged | packed sampling, joint draft-depth allocation and asynchronous control messages. Override with `streams` / `policy` / `0` for the previous TP4 behavior; [benchmarks and override details](docs/tp4-decode-tuning.md) |
 | `TF_ROCE_MAX_KB` | `512` | the largest all-gather (KiB) sent over RoCE with `COMM=roce` (TensorFold's default: 256); 512 covers the 17-32-row verify windows of concurrent requests |
 | `TF_ROCE_WAIT_S` | `300` | seconds a RoCE all-gather waits for the other Spark before it fails (1 to 3600; the patch's own default is 20, which a late peer on long prompts outlasted, issue #54); until the engine is built, each gather first meets the peer in an NCCL barrier, so a long first start (kernels compiling) does not run into it |
 | `TF_GLM_MULTI_WINDOW` | `32`, `64` past 4 requests | with `PARALLEL` above 1, the rows of every request's verify window together in a round (16 to 64 in steps of 8): with more requests at once each one's drafts get fewer of them (8 requests' code: 141.2 / 160.3 / 167.0 tok/s at 32 / 48 / 64 rows); past 32 rows `TF_ROCE_MAX_KB` rises with it (64: 1024) unless you set it. Exact at any size |
