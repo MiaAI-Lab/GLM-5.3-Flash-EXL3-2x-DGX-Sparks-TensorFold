@@ -103,6 +103,11 @@ prefill seconds does not yield aggregate cluster throughput when work is shared.
 
 ## Measured results (2026-10-10)
 
+For attribution beyond the backported kernels, see the subsequent
+[controlled preset ablations](tp4-decode-ablation.md). They do not demonstrate
+a standalone PRMT speedup; the complete-package gain below must not be
+attributed to the PRMT dispatch alone.
+
 Baseline: upstream `tp4` at `d220030`. Candidate: `47bc74c`, recipe patch hash
 `19ec06e95e57`, with the preset enabled. Both used four GB10 Sparks in a
 switchless ring with upstream NCCL/RoCE transport, the same 4bpw Ablit checkpoint
