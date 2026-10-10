@@ -261,14 +261,23 @@ export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
 STREAM_SMOOTH="${STREAM_SMOOTH:-1}"
 STREAM_SMOOTH_MS="${STREAM_SMOOTH_MS:-400}"
 export TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH" TF_GLM_STREAM_SMOOTH_MS="$STREAM_SMOOTH_MS"
-# Concurrent prompt fills in layer slices (patch 0062): while other requests decode, a new prompt's 1,024-row chunks
+# Concurrent prompt fills in layer slices (patch 0062): while other requests decode, a new prompt's FILL_ROWS chunks
 # run a few layers at a time (about FILL_BUDGET_MS each) with a decode round between slices, instead of freezing the
 # other replies for a whole chunk. FILL_DRAFTS=1 (default): those rounds draft as usual (~3 tokens a stream);
 # 0: one token a stream (the new prompt's first token sooner, the others slower while it fills). FILL_BUDGET_MS=0:
 # whole chunks, as before. A request alone fills at full speed either way. Same replies.
 FILL_BUDGET_MS="${FILL_BUDGET_MS:-200}"
 FILL_DRAFTS="${FILL_DRAFTS:-1}"
-export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS"
+# FILL_ROWS (TensorFold's TF_GLM_FILL_ROWS, whose own default is 1,024): the rows of such a fill's chunk. 2,048
+# (default) is the whole prompt chunk (TF_GLM_PREFILL_ROWS, 2,048), whose buffers already exist: the same memory and
+# the same replies (a token's result does not depend on the chunk it is filled in), half the passes over the weights.
+# Three Sparks, PARALLEL=4, a prompt filling while another reply streams: a warm +20k turn on a 596k conversation
+# 15.6-15.7 -> 14.0-14.1 s, a cold 256k prompt 132.2-132.6 -> 113.4-114.0 s; the streaming reply's gaps the same
+# (max 25-67 ms either way). At most the prompt chunk (the engine refuses more): a smaller TF_GLM_PREFILL_ROWS lowers
+# the default with it. 1024: as before.
+_fill_max="${TF_GLM_PREFILL_ROWS:-2048}"
+FILL_ROWS="${FILL_ROWS:-${TF_GLM_FILL_ROWS:-$(( _fill_max < 2048 ? _fill_max : 2048 ))}}"
+export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS" TF_GLM_FILL_ROWS="$FILL_ROWS"
 # L2 prefetch in decode windows (patch 0046, adapted from jayleaton/glm53-tensorfold-spark's patch 0460): a side stream
 # brings the weights the next kernels read into L2 during each layer's all-gathers. 1 (default): one request's prose
 # 48.36 -> 49.46 tok/s, code 59.54 -> 61.08 (two boots each). Same bits. 0: off.

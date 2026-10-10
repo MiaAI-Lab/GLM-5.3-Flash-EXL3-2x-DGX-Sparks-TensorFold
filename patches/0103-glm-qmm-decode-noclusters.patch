@@ -1,0 +1,103 @@
+# Decode windows' 4-bit matmuls (tensorfold/cuda/kernels/qmm: every dense projection, the shared expert and DFlash2's
+# drafter) reduce their K slices through the partials buffer and reduce_kernel instead of a thread-block cluster when
+# the window has at most 64 rows and the weight holds fewer than 28 Mi values. The same slice-ordered fp32 sums and one
+# rounding, so the same bits; on a GB10 the cluster's launch and its two cluster.sync cost 20-60% on those latency-bound
+# matrices, while the bandwidth-bound ones keep their clusters. Prompt chunks (more rows) are unchanged.
+# TF_GLM_QMM_CLUSTERS=1: clusters for every reduced K split, as before. The extension is renamed tensorfold_qmm_v5, so
+# a kernel folder holding v4's build does not serve it. tools/qmm_noclusters_check.py.
+
+diff --git tensorfold/cuda/kernels/qmm.cpp tensorfold/cuda/kernels/qmm.cpp
+--- tensorfold/cuda/kernels/qmm.cpp
++++ tensorfold/cuda/kernels/qmm.cpp
+@@ -1,7 +1,7 @@
+ #include <torch/extension.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
+-bool qmm_clusters(int, bool);
++bool qmm_clusters(int, bool, long long, long long, long long);
+ void qmm_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+               at::Tensor&, const at::Tensor&, int, int, int, int, bool, bool);
+ void qmm_cfg_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -37,7 +37,7 @@ void qmm(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const a
+                 out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
+     c10::cuda::CUDAGuard guard(x.device());
+     at::Tensor p;
+-    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), reduce)) {
++    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), reduce, m, n, k)) {
+         p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
+         TORCH_CHECK(p.is_cuda() && p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n,
+                     "part: at least (SK, M, n) fp32");
+@@ -68,7 +68,7 @@ void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, con
+                 out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
+     c10::cuda::CUDAGuard guard(x.device());
+     at::Tensor p;
+-    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), true)) {
++    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), true, m, n, k)) {
+         p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
+         TORCH_CHECK(p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n, "part");
+     }
+diff --git tensorfold/cuda/kernels/qmm.cu tensorfold/cuda/kernels/qmm.cu
+--- tensorfold/cuda/kernels/qmm.cu
++++ tensorfold/cuda/kernels/qmm.cu
+@@ -327,8 +327,29 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
+ } // namespace
+ 
+ // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
+-bool qmm_clusters(int SK, bool reduce) {
+-    return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9;
++// Patch 0103: windows of up to CLUSTER_ROWS rows also use the buffer (and reduce_kernel) unless the weight holds
++// at least CLUSTER_VALUES values. The same sums in the same order (slice 0 + slice 1 + ... in fp32, then one
++// rounding), so the same bits. Measured on GB10 (cold L2, 1-64 rows) at GLM-5.3-Flash's rank-0 decode shapes for two,
++// three and four ranks: the cluster launch and its two cluster.sync cost 20-60% on the latency-bound matrices (shared
++// expert gate/up 18.8 -> 12.4 us at TP=4, DSA q_a|kv_a 31.5 -> 22.9, DFlash2's qkv 38.1 -> 25.0 at TP=3, at one row);
++// the buffer is as fast or faster for every matrix up to 25 Mi values (TP=4's KDA proj 69.9 -> 65.4 us; its dense
++// gate/up at 24 Mi within 1% up to 16 rows, 4-8% slower at 32-64), while from 32 Mi the clusters mostly win (TP=3's
++// dense gate/up at 32 Mi 82.0 vs 84.9 us, KDA proj at 34 Mi 88.5 vs 89.5, DFlash2's taps fc at 80 Mi 206 vs 216;
++// TP=2's DSA o at 32 Mi is 4-13% faster on the buffer at 1 and 32-64 rows and keeps its clusters, as before). 28 Mi
++// sits between, over 10% from the nearest shape on either side. TF_GLM_QMM_CLUSTERS=1: clusters for every reduced K
++// split, the rule before this patch. Prompt chunks (more rows) are unchanged.
++constexpr long long CLUSTER_ROWS = 64;
++constexpr long long CLUSTER_VALUES = 28LL << 20;
++static bool clusters_always() {
++    static const bool always = [] {
++        const char* v = std::getenv("TF_GLM_QMM_CLUSTERS");
++        return v != nullptr && v[0] == '1' && v[1] == '\0';
++    }();
++    return always;
++}
++bool qmm_clusters(int SK, bool reduce, long long M, long long N, long long K) {
++    return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9 &&
++           (clusters_always() || M > CLUSTER_ROWS || N * K >= CLUSTER_VALUES);
+ }
+ 
+ // ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
+@@ -336,7 +357,7 @@ void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w
+                   const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
+     const int M = x.size(0);
+     TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
+-    const bool cluster = qmm_clusters(SK, true);
++    const bool cluster = qmm_clusters(SK, true, M, N, x.size(1));
+     if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+                else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
+     else { if (cluster) dispatch_cfg<false, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+@@ -356,7 +377,7 @@ void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, co
+               const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, int gs, int bm,
+               bool f32, bool reduce) {
+     const int M = x.size(0);
+-    const bool cluster = qmm_clusters(SK, reduce);
++    const bool cluster = qmm_clusters(SK, reduce, M, N, x.size(1));
+ #define GO(G, F, C) dispatch<G, F, C>(bm, x, xs, w, scales, biases, out, part, N, SK)
+     if (gs == 64) {
+         if (f32) { if (cluster) GO(64, true, true); else GO(64, true, false); }
+diff --git tensorfold/cuda/kernels/qmm.py tensorfold/cuda/kernels/qmm.py
+--- tensorfold/cuda/kernels/qmm.py
++++ tensorfold/cuda/kernels/qmm.py
+@@ -16,7 +16,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_qmm_v4", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
++    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                    str(here / "qmm_prefill.cu"), str(here / "qmm_prefill8.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
