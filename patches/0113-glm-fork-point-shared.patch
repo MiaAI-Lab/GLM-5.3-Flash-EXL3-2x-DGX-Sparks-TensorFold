@@ -1,0 +1,99 @@
+# Kept prompt states: a state a second conversation forks from is a shared prefix (issue #121, diagnosed with a
+# proposed fix by @RyanLeeUPC).
+#
+# A conversation keeps its own state at the last grid point before its prompt ends. With a short first message that
+# point is the system block's, so that state is the system prompt's state, but it is kept as the conversation's turn
+# state: `shared` is set only for admission's shared points, which lie between the resume point and the prompt's own
+# point. The next conversation resumes from it, takes its extent over and keeps its own longer state there. Past
+# TF_GLM_CACHE_ENTRIES, cap_victim then drops the system prompt's state as superseded at once, and the third
+# conversation on that system prompt reads it whole again (hit, miss, until a cold prompt's shared point heals it).
+#
+# 1. _keep records how the writing prompt goes on past each kept state (`after`: its next 64 ids; keyed ids with
+#    pictures). In _admitted, a stream that resumes from a state and goes on otherwise forked there from another
+#    conversation: the state is flagged shared (kept by recency, 0077) and is no conversation's own turn state any
+#    more (`own` false: TF_GLM_KEEP_PER_CHAT, 0089). It is flagged before the stream's chain is chosen, so the forking
+#    conversation starts a chain of its own instead of joining the writer's. A conversation resuming its own turn goes
+#    on as its writer did and is not flagged, so 0063's order (a long chat drops its own earlier turns first) holds.
+#    A state whose writing prompt ended there takes the line of the first stream that goes on from it.
+# 2. Same ids kept again (_keep): the new state stays a shared prefix when the dropped one was one, and becomes one
+#    when the two prompts went on differently (two conversations prefilled one system block at the same time).
+# 3. The spill tier stores `after` with a state (spill.encode takes every field not skipped), so a restored state
+#    still tells a fork from its writer's next turn.
+#
+# Both ranks see the same ids, so they decide alike. Only which kept states stay changes: the same replies, the same
+# bits. Check: tools/fork_point_check.py. Applies after 0063, 0071, 0077, 0088 and 0089.
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -235,9 +235,10 @@ def cap_victim(kept: list):
+     prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
+     conversation, superseded by the longer one: the oldest of those goes first, then the least recently used of any.
+     A conversation taking many turns thus drops its own earlier turns instead of the only state of a conversation
+-    that is waiting on a long reply. A shared-prefix state (a system block, where prompts stop sharing) is never
+-    dropped as superseded: it is what the next conversation or run with that prefix resumes from, and its writer's
+-    longer state cannot serve them, so it goes by recency only, with the other conversations' latest states.
++    that is waiting on a long reply. A shared-prefix state (a system block: where prompts stop sharing, or where a
++    second conversation went on from a kept state, ``forks``) is never dropped as superseded: it is what the next
++    conversation or run with that prefix resumes from, and its writer's longer state cannot serve them, so it goes by
++    recency only, with the other conversations' latest states.
+     Deterministic in ``kept``'s order and extents, so both ranks drop the same one."""
+ 
+     longest: dict[int, int] = {}
+@@ -249,6 +250,18 @@ def cap_victim(kept: list):
+     return kept[0]
+ 
+ 
++FORK_SPAN = 64                         # the ids past a kept state that tell one line from another there (``forks``)
++
++
++def forks(after, ids) -> bool:
++    """Two lines past a kept state part: ``after`` (the ids that followed it on the first prompt that wrote or resumed
++    it, up to FORK_SPAN) and ``ids`` (another prompt's) differ where both have ids. Nothing on either side: unknown,
++    False. A conversation's next turn goes on as its last prompt did; another conversation forked there."""
++
++    m = min(len(after), len(ids))
++    return m > 0 and tuple(after[:m]) != tuple(ids[:m])
++
++
+ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
+     """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
+     policy its DFlash2 twin; without a draft model, serial."""
+@@ -976,6 +989,21 @@ class MultiDecoder:
+         code = a["code"]
+         dflash = code[0] >= 10 and self.drafts is not None
+         policy = decode_policy(code, g.costs) if code[0] else None
++        # A prompt that goes on past its kept state otherwise than the prompt that wrote it forked there from another
++        # conversation: that state is a shared prefix (a system block) for every later conversation too. Unflagged, a
++        # longer state in its extent (its writer's, or this stream's after a takeover) made it "superseded", and past
++        # TF_GLM_CACHE_ENTRIES cap_victim dropped it at the next keep, so the third conversation on a system prompt
++        # read it whole again (#121). Flagged before the chain below: it is no conversation's own turn state any more
++        # (TF_GLM_KEEP_PER_CHAT), and this stream starts a chain of its own. A conversation resuming its own turn goes
++        # on as its writer did: unchanged. A state its writer's prompt ended at takes the line of the first stream that
++        # goes on from it. Both ranks see the same ids (with pictures: their keyed ids), so they decide alike.
++        if hit is not None:
++            line = tuple((a["keyed"] if a.get("keyed") is not None else prompt)[cut:cut + FORK_SPAN])
++            after = getattr(hit, "after", None) or ()
++            if not after:
++                hit.after = line
++            elif forks(after, line):
++                hit.shared, hit.own = True, False
+         # the conversation this stream belongs to: the chain it resumed from when that state is a turn's own, else a
+         # new one (a shared-prefix state belongs to everyone, so resuming from it starts no chain)
+         if hit is not None and getattr(hit, "own", False) and getattr(hit, "chat", 0):
+@@ -1074,8 +1102,15 @@ class MultiDecoder:
+         snap.extent = lane.extent
+         snap.shared = n in lane.shared
+         snap.own, snap.chat = bool(own), int(lane.chat)
+-        # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
++        # how the prompt that wrote it goes on from here (both ranks): a prompt resuming here that goes on otherwise
++        # forked from it (``_admitted``)
++        snap.after = tuple((lane.key if lane.images and lane.key is not None else lane.s.prompt)[n:n + FORK_SPAN])
++        # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key). The new
++        # state takes the dropped one's place: a shared prefix stays one, and one two prompts wrote going on differently
++        # (two conversations that prefilled one system block at the same time) becomes one
+         for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
++            if getattr(c, "shared", False) or forks(getattr(c, "after", None) or (), snap.after):
++                snap.shared, snap.own = True, False
+             self._drop(c, spill=False)
+         lane.extent.kept.append(snap)
+         self.kept.append(snap)
