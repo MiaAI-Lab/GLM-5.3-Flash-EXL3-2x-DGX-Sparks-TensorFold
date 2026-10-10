@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **CI: a pull request that adds or changes a patch is no longer red for the image pin alone** (by
+  [BadAd84](https://github.com/BadAd84)). Such a PR cannot carry a published image for its new patch set, so on a
+  pull request that changes `patches/` the pin check now passes with a warning naming the tag the set hashes to.
+  A push to `main`, and a pull request that does not change `patches/` (a pin bump, for example), still fail on a
+  mismatch.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
