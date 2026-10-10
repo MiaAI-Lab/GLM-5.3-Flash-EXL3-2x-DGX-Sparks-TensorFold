@@ -95,6 +95,9 @@ run finish-load-drops-lost $MU "            self.disk.forget(h.key, lj.bad if lj
 run ops-unsent $MU "LOAD, FLUSH, LOADED, \\\\\n    HAS = range(1, 17)" "LOAD, FLUSH, SPILL, LOADED, \\\\\n    TOUCH, HAS = range(1, 19)" \
     $MU "       FLUSH: \"FLUSH\", LOADED: \"LOADED\", HAS: \"HAS\"}" "       FLUSH: \"FLUSH\", SPILL: \"SPILL\", LOADED: \"LOADED\", TOUCH: \"TOUCH\", HAS: \"HAS\"}"
 run prefix-not-exported server/metrics.py "        if field in body:\n            body.setdefault(name, body[field])\n" "        pass\n"
+# the page cache: every point file's pages dropped after its fsync (already so in the patch; pinned here)
+run small-files-keep-pages $B "            os.fsync(fd)\n            _drop_cache(fd)                                 # (clean now" "            os.fsync(fd)\n            pass                                 # (clean now"
+run pages-dropped-before-fsync $B "            os.fsync(fd)\n            _drop_cache(fd)                                 # (clean now" "            _drop_cache(fd)\n            os.fsync(fd)                                 # (clean now"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

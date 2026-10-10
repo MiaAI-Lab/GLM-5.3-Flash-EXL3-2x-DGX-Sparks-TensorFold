@@ -19,7 +19,8 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
   dropped during the rewrite does not get its json back;
 - a read that fails on a missing block file drops that name and the points naming it, not the points whose blocks
   are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them;
-- every op in multi's table has a sender, and /metrics carries the prefix wait's counters.
+- every op in multi's table has a sender, and /metrics carries the prefix wait's counters;
+- each of a point's files (.ids, .st, .json) has its pages dropped from the page cache after its fsync.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import inspect
@@ -443,6 +444,30 @@ H.of = of
 check("metrics: the prefix wait's counters", f"{MT.HEALTH}prefix_waits_total 6" in lines
       and f"{MT.HEALTH}prefix_wait_tokens_total 98688" in lines
       and f"# TYPE {MT.HEALTH}prefix_waits_total counter" in lines)
+
+
+# -- a point's small files leave no pages behind: each one's pages are dropped after its fsync ---------------------
+events: list = []                                   # (what, file name) in order, on the writer thread
+
+
+def fname(fd: int) -> str:
+    try:
+        return os.path.basename(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        return "?"
+
+
+fsync, drop_cache = os.fsync, S._drop_cache
+os.fsync = lambda fd: (events.append(("fsync", fname(fd))), fsync(fd))[1]
+S._drop_cache = lambda fd: (events.append(("drop", fname(fd))), drop_cache(fd))[1]
+ar = arena(7)
+st = store(ar, "pages")
+ids, _ = stored(st, ar, ALIGN + 100, 71)
+os.fsync, S._drop_cache = fsync, drop_cache
+key = S.point_key(ids)
+for suffix in (".ids", ".st", ".json"):
+    mine = [what for what, f in events if f == f".{key}{suffix}"]
+    check(f"pages: {suffix} dropped from the page cache after its fsync", mine == ["fsync", "drop"])
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
