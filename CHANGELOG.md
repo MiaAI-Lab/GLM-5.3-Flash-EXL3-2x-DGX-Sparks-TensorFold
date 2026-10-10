@@ -3,6 +3,19 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased: opt-in TP4 decode tuning
+
+- `TP4_DECODE_TUNING=1`: an opt-in preset of the existing decode launch/scheduler
+  settings and three appended patches. Existing defaults and the ring transport
+  are retained; no host networking or checkpoint changes.
+- `0110`: backport the main branch's small-Q4 no-cluster reduction, keeping it
+  opt-in here. `0111`: adapt its CUDA attention chunk pass to TP4's 16 heads, with
+  a guarded Triton fallback. `0112`: opt-in PRMT unpacking for decode experts only.
+- Synthetic CPU/GPU regressions and a stdlib-only prose/TTFT benchmark helper.
+  Details and provenance: [TP4 decode tuning](docs/tp4-decode-tuning.md).
+- No published image pin for these patches. The existing patch-hash mechanism
+  selects a distinct image and falls back to a local build.
+
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
 Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest

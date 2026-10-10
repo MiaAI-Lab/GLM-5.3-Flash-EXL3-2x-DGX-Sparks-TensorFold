@@ -31,6 +31,22 @@ unset _n _line _key _value
 # ring, experimental: README "3 Sparks", "4 Sparks"), with WORKER2 (rank 2) and WORKER3 (rank 3); a start uses WORKER ..
 # WORKER<TP-1> and leaves later ones out (stop.sh stops every configured one).
 TP="${TP:-2}"
+# Opt-in portable TP4 decode tuning; explicit per-setting overrides still win.
+# No transport, checkpoint, context, memory-pool or parallelism changes.
+TP4_DECODE_TUNING="${TP4_DECODE_TUNING:-0}"
+case "$TP4_DECODE_TUNING" in 0|1) ;; *) echo "TP4_DECODE_TUNING: expected 0 or 1" >&2; return 2 ;; esac
+if [[ "$TP4_DECODE_TUNING" == 1 ]]; then
+  [[ "$TP" == 4 ]] || { echo "TP4_DECODE_TUNING=1 requires TP=4" >&2; return 2; }
+  export TF_GLM_EXL3_DEC_PRMT="${TF_GLM_EXL3_DEC_PRMT:-1}"
+  export TF_GLM_QMM_CLUSTERS="${TF_GLM_QMM_CLUSTERS:-0}"
+  export TF_GLM_SEG_CHUNKS_CUDA="${TF_GLM_SEG_CHUNKS_CUDA:-1}"
+  export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-2}"
+  export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
+  export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
+  export TF_GLM_MULTI_ASYNC="${TF_GLM_MULTI_ASYNC:-1}"
+  export TF_GLM_MULTI_PROFILE="${TF_GLM_MULTI_PROFILE:-0}"
+  export TF_GLM_SIDE="${TF_GLM_SIDE:-0}"
+fi
 WORKER="${WORKER:-}"                 # e.g. user@<worker address>; set it in scripts/local.sh
 FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is reached over another network
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-}"  # the worker's Hugging Face cache when it is not its HF_HOME (absolute path)

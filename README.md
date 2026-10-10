@@ -685,6 +685,20 @@ How the ring runs:
 - `WORKER3` has its own `FABRIC_PEER3`, `WORKER_WEIGHTS3`, `NFS_SERVER3` and `WORKER_HF_CACHE3`. On a ring
   `./start-tp3.sh` stops: no three Sparks are all cabled to each other.
 
+### Opt-in TP4 decode tuning
+
+`TP4_DECODE_TUNING=1 ./start-tp4-switchless.sh` enables the experimental decode
+preset in patches 0110–0112: small Q4 projections without thread-block clusters,
+the CUDA attention chunk pass for 16 heads, and PRMT expert unpacking, together
+with the existing packed/joint/asynchronous scheduler options. Off by default;
+two- and three-Spark defaults, topology discovery, and the prefill path stay
+unchanged. Individual `TF_GLM_*` overrides still win. The changed patch hash
+builds a new image; it does not reuse the published image unchanged.
+
+See [TP4 decode tuning](docs/tp4-decode-tuning.md) for switches, attribution,
+correctness checks, and the benchmark procedure. This is an opt-in experiment,
+not a replacement for the supported defaults or a claim for other topologies.
+
 ## Prompt and decode switches for two to four Sparks
 
 Patches 0101-0106 speed up the parts of a prompt chunk that did not shrink with more Sparks, and one part of decode.
