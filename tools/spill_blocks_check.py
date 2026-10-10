@@ -13,9 +13,13 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - compaction moving an extent a stored prompt is being read into goes on without waiting for the disk, the read's next
   blocks land at the new base and none at the old one, and a move that starts while a block's copy is being issued
   waits for that copy and moves it too;
-- a restored state keeps its point's shared-prefix flag, rank 0's on every rank (LOADED carries it).
+- a restored state keeps its point's shared-prefix flag, rank 0's on every rank (LOADED carries it);
+- the same ids kept again as a shared prefix make the stored point shared, its json rewritten through a temporary
+  name and the folder fsynced (a restart reads it so), also when they were still waiting or being written; a point
+  dropped during the rewrite does not get its json back.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
+import json
 import os
 import tempfile
 import threading
@@ -291,6 +295,86 @@ check("shared: rank 1 too, though its own point says otherwise", ok and m1.kept[
 ok, m0, m1, loaded = two_ranks((False, True), "own")
 check("shared: a point rank 0 holds as not shared is restored unshared on both ranks",
       ok and not m0.kept[0].shared and not m1.kept[0].shared and loaded == [[0, 0]])
+
+
+# -- shared-flag 3: the same ids kept again as a shared prefix make the stored point shared, on disk too ------------
+def json_of(st: S.BlockStore, key: str) -> dict:
+    try:
+        with open(st._point_path(key, ".json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def keep(st: S.BlockStore, ids: list, shared: bool, lineage: str) -> str:
+    x = Pool(ROWS).add(0, align_up(len(ids)))
+    return st.persist(ids, snap(ids, shared), extent=x, lineage=lineage, shared=shared,
+                      skip=M.MultiDecoder._SPILL_SKIP)
+
+
+log: list = []                                     # (what, path) of the writer's puts and folder fsyncs
+_put, _fsync_dir, hooks = S._put, S._fsync_dir, {}
+
+
+def put_logged(path, data, owner, direct=False):
+    log.append(("put", os.path.basename(path)))
+    for suffix, fn in list(hooks.items()):          # (before the file is written)
+        if path.endswith(suffix):
+            hooks.pop(suffix)
+            fn()
+    return _put(path, data, owner, direct)
+
+
+def fsync_dir_logged(path):
+    log.append(("fsync_dir", os.path.basename(path)))
+    return _fsync_dir(path)
+
+
+S._put, S._fsync_dir = put_logged, fsync_dir_logged
+n2 = ALIGN + 100
+ar = arena(5)
+st = store(ar, "upgrade")
+ids, _ = stored(st, ar, n2, 51)                     # written as a conversation's own turn
+key = S.point_key(ids)
+log.clear()
+check("upgrade: the same ids kept again as shared are not written again", keep(st, ids, True, "s51") == "stored")
+check("upgrade: the point is shared now", st.index[key].shared is True)
+check("upgrade: its json says so", until(lambda: json_of(st, key).get("shared") is True, 5))
+check("upgrade: the json goes through a temporary name, fsynced, renamed, then the folder is fsynced",
+      until(lambda: log[-2:] == [("put", f"{key}.json"), ("fsync_dir", "points")], 5))
+check("upgrade: a restart reads it shared", store(ar, "upgrade").index.get(key, NS(shared=None)).shared is True)
+
+ids = ids_of(n2, 52)
+key = S.point_key(ids)
+check("upgrade: a state waiting to be written", keep(st, ids, False, "s52") == "queued")
+check("upgrade: kept again as shared meanwhile", keep(st, ids, True, "s52") == "stored")
+st.drain(TIMEOUT / 4)
+check("upgrade: it is written as shared", st.index[key].shared is True
+      and until(lambda: json_of(st, key).get("shared") is True, 5))
+
+ids = ids_of(n2, 53)
+key = S.point_key(ids)
+hooks[f"{key}.ids"] = lambda: keep(st, ids, True, "s53")   # kept again as shared while its files are written
+check("upgrade: a state written as its own", keep(st, ids, False, "s53") == "queued")
+st.drain(TIMEOUT / 4)
+check("upgrade: kept again as shared during its write, its json is rewritten shared",
+      st.index[key].shared is True and until(lambda: json_of(st, key).get("shared") is True, 5))
+
+ids, _ = stored(st, ar, n2, 54)
+key = S.point_key(ids)
+
+
+def drop():
+    with st.lock:
+        st._remove(key, "dropped")
+
+
+hooks[f"{key}.json"] = drop                         # dropped while its json is rewritten
+keep(st, ids, True, "s54")
+check("upgrade: a point dropped during the rewrite", until(lambda: not hooks, 5) and key not in st.index)
+time.sleep(0.2)
+check("upgrade: ... loses the json the rewrite put back", not os.path.exists(st._point_path(key, ".json")))
+S._put, S._fsync_dir = _put, _fsync_dir
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)

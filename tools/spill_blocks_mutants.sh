@@ -55,8 +55,8 @@ run() {   # name, then (file under tensorfold/, old, new) for each edit (name "p
     if [ $rc = 0 ] && grep -q "^all passed" "$OUT" && ! grep -q "^FAIL" "$OUT"; then
       echo "patched: all passed ($(grep -c '^ok' "$OUT") checks)"
     else echo "patched: FAILS, exit $rc ($(grep -m3 -E '^FAIL|Error' "$OUT" | tr '\n' ' '))"; bad=1; fi
-  elif [ $rc != 0 ] && grep -q "^FAIL" "$OUT"; then
-    echo "KILLED $1 ($(grep -c '^FAIL' "$OUT") FAIL lines, e.g. $(grep -m1 '^FAIL' "$OUT" | cut -c1-110))"
+  elif [ $rc != 0 ] && grep -q "^FAIL " "$OUT"; then
+    echo "KILLED $1 ($(grep -c '^FAIL ' "$OUT") FAIL lines, e.g. $(grep -m1 '^FAIL ' "$OUT" | cut -c1-110))"
   elif [ $rc = 0 ]; then echo "SURVIVED $1"; bad=1
   else echo "CRASHED $1, exit $rc: $(grep -E 'Error|error' "$OUT" | tail -1)"; bad=1; fi
 }
@@ -78,6 +78,14 @@ run restore-unshared $MU "        snap.shared = bool(shared)" "        snap.shar
     $MU "        self._emit(LOADED, [h.lid, shared])" "        self._emit(LOADED, [h.lid])"
 run each-rank-own-flag $MU "        snap.shared = bool(shared)" "        snap.shared = bool(pt.shared)"
 run loaded-without-flag $MU "        self._emit(LOADED, [h.lid, shared])" "        self._emit(LOADED, [h.lid])"
+# shared flag 3: ids kept again as shared make their point shared, durably
+run no-upgrade $B "                pt = self.index.get(key)\n                if pt is not None:\n                    pt.used = time.time()\n                elif key in self.waiting:" "                pt = None\n                if key in self.index:\n                    self.index[key].used = time.time()\n                elif False:"
+run upgrade-not-durable $B "                    if key in self.index:                   # its json again, on the writer (\`\`_mark_shared\`\`)\n                        self.jobs.put((\"shared\", None, key, None))\n" ""
+run waiting-not-flagged $B "                elif key in self.waiting:                   # still being written: its json takes the flag then\n                    pt = self.waiting[key].point\n" ""
+run written-no-rewrite $B "                if pt.shared and not shared:\n                    self.jobs.put((\"shared\", None, pt.key, None))\n" ""
+run rewrite-resurrects $B "        if gone:\n            try:\n                os.remove(path)" "        if False:\n            try:\n                os.remove(path)"
+run rewrite-not-put $B "        _put(path, json.dumps(meta).encode(), self.owner)\n" "        open(path, \"wb\").write(json.dumps(meta).encode())\n"
+run rewrite-no-dir-fsync $B "        _put(path, json.dumps(meta).encode(), self.owner)\n        _fsync_dir(self.points_dir)\n" "        _put(path, json.dumps(meta).encode(), self.owner)\n"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

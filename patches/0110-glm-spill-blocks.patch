@@ -9,10 +9,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..949298f
+index 0000000..b168f5d
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1527 @@
+@@ -0,0 +1,1572 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -661,7 +661,9 @@ index 0000000..949298f
 +        """Every rank, when a state of ``ids`` (keyed ids with pictures; ``tokens`` then its ids) is kept with its rows
 +        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) and the block its end
 +        cuts copied to the host now, its other blocks this disk lacks left in the pool and queued (``pump`` stages
-+        them, the writer writes them). Returns what happened ("queued", "stored", "no_space", "backlog")."""
++        them, the writer writes them). Ids stored or on their way already are not written again; kept again as a shared
++        prefix, their point becomes one (its json rewritten on the writer). Returns what happened ("queued", "stored",
++        "no_space", "backlog")."""
 +
 +        t0 = time.perf_counter()
 +        ids = np.asarray(ids, dtype=np.int64)
@@ -669,8 +671,16 @@ index 0000000..949298f
 +        key = point_key(ids)
 +        with self.lock:
 +            if key in self.index or key in self.inflight:
-+                if key in self.index:
-+                    self.index[key].used = time.time()
++                pt = self.index.get(key)
++                if pt is not None:
++                    pt.used = time.time()
++                elif key in self.waiting:                   # still being written: its json takes the flag then
++                    pt = self.waiting[key].point
++                if shared and pt is not None and not pt.shared:   # the same ids kept again as a shared prefix
++                    pt.shared = True
++                    self.version += 1
++                    if key in self.index:                   # its json again, on the writer (``_mark_shared``)
++                        self.jobs.put(("shared", None, key, None))
 +                self.stats["skipped"] += 1
 +                return "stored"
 +        hashes = block_hashes(ids, self.block, lineage)
@@ -917,6 +927,12 @@ index 0000000..949298f
 +                    self.free_slots.put(slot)
 +                self.stats["write_s"] += time.perf_counter() - t0
 +                continue
++            if kind == "shared":
++                try:
++                    self._mark_shared(h)
++                except Exception as exc:                    # noqa: BLE001  (the flag holds in memory until a restart)
++                    print(f"[tensorfold] spill rank {self.rank}: marking {h} shared failed: {exc!r}", flush=True)
++                continue
 +            if kind == "rows":
 +                try:
 +                    if job.failed is None:
@@ -929,6 +945,32 @@ index 0000000..949298f
 +            self._write_point(job)
 +            self.stats["write_s"] += time.perf_counter() - t0
 +
++    def _mark_shared(self, key: str) -> None:
++        """The writer: point ``key``'s json again with ``"shared": true`` (its ids kept again as a shared prefix), the
++        way it was first written (a temporary name, fsynced, renamed, then the points' folder fsynced). A point dropped
++        before is left alone; one dropped while this ran loses the json this wrote back."""
++
++        with self.lock:
++            pt = self.index.get(key)
++        if pt is None:
++            return
++        path = self._point_path(key, ".json")
++        try:
++            with open(path, "rb") as fh:
++                meta = json.loads(fh.read())
++        except FileNotFoundError:                           # (dropped meanwhile)
++            return
++        meta["shared"] = True
++        _put(path, json.dumps(meta).encode(), self.owner)
++        _fsync_dir(self.points_dir)
++        with self.lock:
++            gone = self.index.get(key) is not pt
++        if gone:
++            try:
++                os.remove(path)
++            except OSError:
++                pass
++
 +    def _write_point(self, job: Job) -> None:
 +        pt = job.point
 +        try:
@@ -940,6 +982,7 @@ index 0000000..949298f
 +                    raise RuntimeError(f"{got.count(None)} of its blocks are no longer on disk")
 +                pt.crcs = [c for c, _, _ in got]
 +                pt.digests = [d for _, _, d in got]
++                shared = pt.shared                          # (kept again as shared after this: rewritten below)
 +            _fsync_dir(self.blocks_dir)                     # the blocks' renames before the point naming them
 +            ids_crc = _put(self._point_path(pt.key, ".ids"), job.ids_bytes, self.owner)
 +            parts = _small_parts(*job.small)
@@ -948,7 +991,7 @@ index 0000000..949298f
 +            meta = {"format": FORMAT, "key": pt.key, "n": pt.n, "lineage": pt.lineage, "blocks": pt.blocks,
 +                    "crcs": pt.crcs, "digests": [d.hex() for d in pt.digests], "ids_crc": ids_crc,
 +                    "small_crc": pt.small_crc, "small_bytes": sum(len(m) for m in parts) + len(job.ids_bytes),
-+                    "shared": pt.shared, "head": pt.head, "fields": pt.fields}
++                    "shared": shared, "head": pt.head, "fields": pt.fields}
 +            pt.chain = _chain(pt.ids, self.block)
 +            _put(self._point_path(pt.key, ".json"), json.dumps(meta).encode(), self.owner)
 +            _fsync_dir(self.points_dir)
@@ -969,6 +1012,8 @@ index 0000000..949298f
 +                self.stats["written_small_bytes"] += pt.small_bytes
 +                self.version += 1
 +                self._trim_path(pt)
++                if pt.shared and not shared:
++                    self.jobs.put(("shared", None, pt.key, None))
 +        except Exception as exc:                            # noqa: BLE001  (only this state is not kept on disk)
 +            self.stats["write_failed"] += 1
 +            print(f"[tensorfold] spill rank {self.rank}: writing {pt.key} failed: {exc!r}", flush=True)
