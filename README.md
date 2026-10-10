@@ -574,8 +574,8 @@ other defaults are three Sparks' (`PARALLEL=8`, `KV_POOL_GIB=32`: a shared pool 
 measured at every start on 2026-10-08; the lowest free memory under a 1M-token prompt is not measured at four yet);
 four Sparks also turn on `TF_GLM_PROMPT_OWN_FRONT`,
 `TF_GLM_PROMPT_MICROBATCH` with `TF_GLM_PREFILL_ROWS=4096`, and `TF_GLM_SIDE`, and the ring `COMM=roce` (patches 0099
-and 0100; `COMM=nccl ./start-tp4-switchless.sh` for NCCL only). `./start-tp4.sh` (a switch, not tested) keeps
-`COMM=nccl`. The switches are in [Prompt and decode switches for two to four Sparks](#prompt-and-decode-switches-for-two-to-four-sparks).
+and 0100; `COMM=nccl ./start-tp4-switchless.sh` for NCCL only). `./start-tp4.sh` (a switch, not tested) defaults to
+`COMM=roce` too, without the ring's relay. The switches are in [Prompt and decode switches for two to four Sparks](#prompt-and-decode-switches-for-two-to-four-sparks).
 
 Both need what two Sparks need ([Requirements](#requirements)) on all four: ~110 GiB free GPU memory each, Docker with
 the NVIDIA runtime, `rsync`, and key-based ssh from the head (the Spark that runs the script and the API) to the three
@@ -599,8 +599,8 @@ triangle of three Sparks ([3 Sparks](#3-sparks-experimental)).
    No line about a ring; every rank's `NCCL_IB_HCA` lists its CX7 devices. When it says the Sparks are cabled as a
    ring, or that two ranks share no RoCE subnet, some Sparks are not on the switch's subnet.
 5. **Start:** `./start-tp4.sh` (the first start prepares all four Sparks and pulls the image; `TP=4
-   scripts/prepare.sh` does that on its own). NCCL carries the all-gathers (`COMM=nccl`); `COMM=roce ./start-tp4.sh`
-   sends the small ones over RoCE, as at three Sparks.
+   scripts/prepare.sh` does that on its own). The small all-gathers go over RoCE (`COMM=roce`, the default here, as
+   at two Sparks); `COMM=nccl ./start-tp4.sh` gives every all-gather to NCCL instead.
 
 When a port and its twin share a subnet, NCCL may send everything on one of them and leave the twin idle (on the ring
 `NCCL_IB_SUBNET_PREFIX_LEN` keeps them apart; it is not set on a switch). That costs speed, not correctness.
@@ -746,7 +746,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
-| `COMM` | `roce` at `TP=2` and on a four-Spark ring (`nccl` at `TP=3` and on a switch at `TP=4`) | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link (on a four-Spark ring, `COMM=roce` relays them by the neighbours: patch 0099, `TF_ROCE_RING=1`, set on a ring; decode +11-12% at one stream there); `nccl`: NCCL for all |
+| `COMM` | `roce` at `TP=2` and at `TP=4` (a ring or a switch); `nccl` at `TP=3` | the ranks' small all-gathers as one-shot RDMA writes over the RoCE link (on a four-Spark ring, `COMM=roce` relays them by the neighbours: patch 0099, `TF_ROCE_RING=1`, set on a ring; decode +11-12% at one stream there); `nccl`: NCCL for all |
 | `TF_ROCE_IB_TIMEOUT` | `20` | the RoCE all-gather's ACK timeout (4.096 us x 2^value a try; NCCL's; b12x's was 14), 1 to 31 (patch 0100) |
 | `TF_GLM_PROMPT_OWN_FRONT` / `TF_GLM_PROMPT_MICROBATCH` / `TF_GLM_PROMPT_MICROBATCH_MIN_ROWS` | `0` / `0` / `2048` (`1` / `1` with `TF_GLM_PREFILL_ROWS=4096` at `TP=4`) | with `SPLIT=1`: each rank's DSA front on its own rows (patch 0102); a chunk in two halves (patch 0104, meant with `TF_GLM_PREFILL_ROWS=4096`; halves of fewer rows run the chunk whole). [Prompt and decode switches](#prompt-and-decode-switches-for-two-to-four-sparks) |
 | `TF_GLM_PROMPT_PARTIALS` | `fp32` | `bf16`: the split's partials as bf16, half the bytes; needs `SPLIT=1`, other prompt bits (patch 0106) |
