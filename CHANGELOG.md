@@ -3,12 +3,17 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## Unreleased: TP4 decode defaults
+## Unreleased: patch 0116, TP4 decode defaults
 
 - At TP4, default to the existing packed sampler, joint draft-depth allocation,
   asynchronous messages and expert launch order 2. No extra enable switch.
-  Individual overrides win; TP2/TP3, kernels, transport and image stay unchanged.
-- Configuration regression tests and a stdlib-only matched prose benchmark.
+  Patch `0116-glm-tp4-decode-defaults` resolves these in the engine before loading
+  and the ranks' settings comparison. Individual overrides win; TP2/TP3, kernels
+  and transport stay unchanged. `scripts/config.sh` forwards local overrides.
+- CPU checks cover the engine startup path, unchanged TP2/TP3 defaults and
+  configuration precedence; a stdlib-only helper reproduces the prose benchmark.
+- The patch changes the image hash; rebuild with `scripts/prepare.sh`. The
+  published image pin is left for the merged patch set's release.
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
