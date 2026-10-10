@@ -3,9 +3,11 @@
 # is and FAIL on each faithful mutant of its fixes (the code before the fix, or one of its parts taken out).
 #   image: one scripts/prepare.sh built with this patch (each run in a fresh container, --network none);
 #   dir:   a folder holding the patched tensorfold/ package, run with $PYTHON (default python3) on a copy of it.
-# Each run applies one mutation (python escapes; an anchor that does not match exactly once is an ERROR, never a
-# pass); a kill needs the check's non-zero exit AND a FAIL line. names: a bash regex, only the runs it matches.
-# Exit 0 only when the unmutated check passes and every mutant is killed.
+# Each run applies one mutant (one or more edits, python escapes; an anchor that does not match exactly once is an
+# ERROR, never a pass); a kill needs the check's non-zero exit AND a FAIL line. names: a bash regex, only the runs it
+# matches. Exit 0 only when the unmutated check passes and every mutant is killed. Not mutated (no CPU check reaches
+# them): the CUDA events that order a read's copies around a move (``moving``'s wait on ``last``, the reader's wait on
+# ``moved``).
 set -u
 TARGET=$1; ONLY=${2:-.}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -16,30 +18,38 @@ SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH" "$OUT"' EXIT
 MUTATE='
 import os, sys
-old = os.environ["OLD"].encode().decode("unicode_escape")
-if old:
-    p = os.path.join(os.environ["TREE"], os.environ["FILE"])
+for i in range(int(os.environ["EDITS"])):
+    old = os.environ[f"OLD{i}"].encode().decode("unicode_escape")
+    p = os.path.join(os.environ["TREE"], os.environ[f"FILE{i}"])
     s = open(p).read()
     n = s.count(old)
     if n != 1:
-        sys.exit(f"ANCHOR {n}")
-    open(p, "w").write(s.replace(old, os.environ["NEW"].encode().decode("unicode_escape")))
+        sys.exit(f"ANCHOR {n} (edit {i})")
+    open(p, "w").write(s.replace(old, os.environ[f"NEW{i}"].encode().decode("unicode_escape")))
 '
 bad=0
-run() {   # name, file (under tensorfold/), old, new (name "patched": no mutation)
-  [[ "$1" =~ $ONLY ]] || return 0
+run() {   # name, then (file under tensorfold/, old, new) for each edit (name "patched": none)
+  local name=$1 i=0
+  shift
+  [[ "$name" =~ $ONLY ]] || return 0
+  local env=()
+  while [ $# -ge 3 ]; do env+=("FILE$i=$1" "OLD$i=$2" "NEW$i=$3"); i=$((i + 1)); shift 3; done
+  env+=("EDITS=$i")
   if [ -d "$TARGET" ]; then
     rm -rf "$SCRATCH/t" && mkdir -p "$SCRATCH/t" && cp -r "$TARGET/tensorfold" "$SCRATCH/t/" &&
     find "$SCRATCH/t" -name __pycache__ -type d -prune -exec rm -rf {} + &&
-    TREE="$SCRATCH/t/tensorfold" FILE="$2" OLD="$3" NEW="$4" "$PYTHON" -c "$MUTATE" > "$OUT" 2>&1 &&
+    env "${env[@]}" TREE="$SCRATCH/t/tensorfold" "$PYTHON" -c "$MUTATE" > "$OUT" 2>&1 &&
     (cd "$SCRATCH" && PYTHONPATH="$SCRATCH/t" CUDA_VISIBLE_DEVICES= timeout 300 "$PYTHON" "$C") >> "$OUT" 2>&1
   else
-    docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -e PYTHONUNBUFFERED=1 -v "$C":/c.py:ro \
-      -e FILE="$2" -e OLD="$3" -e NEW="$4" -e MUTATE="$MUTATE" --entrypoint sh "$TARGET" -c '
+    local args=()
+    for e in "${env[@]}"; do args+=(-e "$e"); done
+    docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -e PYTHONUNBUFFERED=1 -v "$C":/c.py:ro "${args[@]}" \
+      -e MUTATE="$MUTATE" --entrypoint sh "$TARGET" -c '
       TREE=$(python3 -c "import os, tensorfold; print(os.path.dirname(tensorfold.__file__))") &&
       TREE=$TREE python3 -c "$MUTATE" && cd / && timeout 300 python3 /c.py' > "$OUT" 2>&1
   fi
   rc=$?
+  set -- "$name"
   if grep -q "^ANCHOR" "$OUT"; then echo "ERROR $1: $(grep ANCHOR "$OUT")"; bad=1
   elif [ "$1" = patched ]; then
     if [ $rc = 0 ] && grep -q "^all passed" "$OUT" && ! grep -q "^FAIL" "$OUT"; then
@@ -51,11 +61,18 @@ run() {   # name, file (under tensorfold/), old, new (name "patched": no mutatio
   else echo "CRASHED $1, exit $rc: $(grep -E 'Error|error' "$OUT" | tail -1)"; bad=1; fi
 }
 B=cuda/spill_blocks.py; MU=families/glm5_next/cuda/multi.py
-run patched "" "" ""
+run patched
 # review 1: the tail block copied at keep
 run tail-staged-later $B "        cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in new[-1:] if e - s < self.block]" "        cut = []"
 run tail-copied-and-staged $B "            job = Job(pt, new[:len(new) - len(cut)], (items, layer)" "            job = Job(pt, new, (items, layer)"
 run tail-not-queued $B "        for h, data in cut:                                 # (written before the blocks the pumps stage)\n            self.jobs.put((\"rows\", job, h, data))\n" ""
+# review 2: a move of an extent being read waits for neither the read nor the disk
+run move-waits-for-read $MU "        if keep is None:\n            return\n        h = getattr(x, \"loading\", None)\n        if h is not None and h.lj is not None:\n            h.lj.done.wait()\n        if self.disk is not None:\n" "        h = getattr(x, \"loading\", None)\n        if h is not None and h.lj is not None:\n            h.lj.done.wait()\n        if self.disk is not None and keep is not None:\n"
+run read-at-first-base $B "        self.point, self.where = point, where\n" "        self.point, self.where = point, where\n        self.base0 = where.base\n" \
+    $B "                base = lj.where.base\n" "                base = lj.base0\n"
+run move-not-held $MU "        with self.disk.moving(h.lj) if h is not None and h.lj is not None else contextlib.nullcontext():" "        with contextlib.nullcontext():"
+run moving-without-lock $B "        with lj.lock:\n            if lj.last is not None:" "        with contextlib.nullcontext():\n            if lj.last is not None:"
+run copies-without-lock $B "            with lj.lock:                                   # (the extent stays" "            with contextlib.nullcontext():                                   # (the extent stays"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

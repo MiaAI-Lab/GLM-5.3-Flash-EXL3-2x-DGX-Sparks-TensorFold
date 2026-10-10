@@ -7,16 +7,19 @@ folder under $TMPDIR:
       tensorfold-glm53:v0.6.0 /c.py
 
 A real BlockStore over a real Arena on the host (a latents plane, div 1, and a pooled-key plane, div 4 with 2 pad
-rows), with a stand-in small state:
+rows), with a stand-in small state, and MultiDecoder's own load and move paths on a real Pool:
 - the block a kept state's end cuts holds the rows of the keep, not what the stream writes after it (its pooled-key
-  row still filling at the keep).
+  row still filling at the keep);
+- compaction moving an extent a stored prompt is being read into goes on without waiting for the disk, the read's next
+  blocks land at the new base and none at the old one, and a move that starts while a block's copy is being issued
+  waits for that copy and moves it too.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import os
-import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace as NS
 
 import numpy as np
 import torch
@@ -81,6 +84,12 @@ def rows(ar: Arena, base: int, n: int) -> list[torch.Tensor]:
     return [p.tensor[base // p.div:base // p.div + -(-n // p.div)].clone() for p in ar.planes]
 
 
+def span(ar: Arena, a: int, b: int) -> list[torch.Tensor]:
+    """Every plane's rows of tokens [a, b) (both multiples of 4)."""
+
+    return [p.tensor[a // p.div:b // p.div].clone() for p in ar.planes]
+
+
 def same(a: list, b: list) -> bool:
     return all(torch.equal(x, y) for x, y in zip(a, b))
 
@@ -89,16 +98,65 @@ def ids_of(n: int, seed: int = 0) -> list[int]:
     return [int(v) for v in np.random.default_rng(seed).integers(1, 150000, n)]
 
 
-def load_rows(st: S.BlockStore, ar: Arena, key: str, base: int, n: int):
-    """A read of point ``key`` into the rows at ``base`` (the store's own reader), then those rows; Nones when the
-    read fails."""
+def until(cond, timeout: float = 10.0) -> bool:
+    end = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def load_rows(st: S.BlockStore, ar: Arena, key: str, x, n: int):
+    """A read of point ``key`` into extent ``x`` (the store's own reader), then its rows; Nones when the read fails."""
 
     try:
-        small, pt = st.finish_load(st.load_async(key, base))
+        small, pt = st.finish_load(st.load_async(key, x))
     except Exception as exc:                        # noqa: BLE001  (a failed read: the checks below say so)
         print(f"     (read of {key} failed: {exc!r})")
         return None, None, None
-    return small, pt, rows(ar, base, n)
+    return small, pt, rows(ar, x.base, n)
+
+
+def stored(st: S.BlockStore, ar: Arena, n: int, seed: int, base: int = 0, shared: bool = False):
+    """A state of ``n`` tokens kept at ``base`` and written: (its ids, its rows as kept)."""
+
+    ids = ids_of(n, seed)
+    x = Pool(ROWS).add(base, align_up(n))
+    st.persist(ids, snap(ids), extent=x, lineage=f"s{seed}", shared=shared, skip=M.MultiDecoder._SPILL_SKIP)
+    if not st.drain(TIMEOUT / 2):
+        print("     (a write did not end)")
+    return ids, rows(ar, base, n)
+
+
+def decoder(ar: Arena, st: S.BlockStore, rank: int = 0) -> M.MultiDecoder:
+    """A MultiDecoder with only what its spill-tier paths use: a real Pool over ``ar`` guarded by ``_guard_pool``,
+    ``st`` as its disk, one rank's view (no collectives), its ops left in ``outbox``."""
+
+    m = object.__new__(M.MultiDecoder)
+    m.pool, m.arena, m.disk, m.rank = Pool(ROWS), ar, st, rank
+    m.w = NS(world=1, device="cpu")
+    m.g = NS(cache_entries=8)
+    m.kept, m.lanes, m.partial, m.loads, m.outbox = [], {}, None, {}, []
+    m.next_lid = m.next_kid = 0
+    m.broken, m.idle = None, False
+    m._flush = lambda: None
+    m._guard_pool()
+    return m
+
+
+def gate_reads(st: S.BlockStore, hold) -> threading.Event:
+    """Reads of the blocks ``hold(name)`` names wait for the returned event (the disk slow)."""
+
+    gate, orig = threading.Event(), st._read_block
+
+    def gated(h, crc, buf, nb):
+        if hold(h):
+            gate.wait(TIMEOUT)
+        return orig(h, crc, buf, nb)
+
+    st._read_block = gated
+    return gate
 
 
 # -- review 1: the block a state's end cuts is frozen at the keep ---------------------------------------------------
@@ -118,9 +176,80 @@ for p in ar.planes:                                 # the stream goes on decodin
 check("tail: the stream's next pooled-key row is the one the keep ended in", not same(rows(ar, x.base, n), kept))
 check("tail: drained", st.drain(TIMEOUT / 2))
 y = pool.add(4 * ALIGN, align_up(n))
-_, pt, got = load_rows(st, ar, S.point_key(ids), y.base, n)
+_, pt, got = load_rows(st, ar, S.point_key(ids), y, n)
 check("tail: the stored rows are those of the keep (the filling row as it was)", got is not None and same(got, kept))
 check("tail: the tail block is not staged from the pool later", st.stats["staged_blocks"] == 2)
+
+# -- review 2: compaction moves an extent being read without waiting for the read ----------------------------------
+n = 3 * ALIGN
+ar = arena(2)
+st = store(ar, "move")
+m = decoder(ar, st)
+ids, kept = stored(st, ar, n, 21)
+pt = st.index[S.point_key(ids)]
+gate = gate_reads(st, lambda h: h != pt.blocks[0])  # the first block comes, the disk holds the rest
+below = m.pool.add(0, 2 * ALIGN)                    # an extent below the read's, gone before the compaction
+hi, lo, _ = S.key_ints(pt.key)
+h = m._start_load(hi, lo, n, 2 * ALIGN, align_up(n), 0)
+x = h.x
+check("move: the read's first block is in the pool", until(lambda: st.stats["loaded_bytes"] > 0))
+m.pool.remove(below)
+t = threading.Thread(target=m._compact, daemon=True)
+t.start()
+t.join(3.0)
+check("move: compaction moves the extent being read without waiting for the disk", not t.is_alive() and x.base == 0)
+left = (align_up(n), 2 * ALIGN + align_up(n))       # the rows it left (past its new end)
+for p in ar.planes:
+    p.tensor[left[0] // p.div:left[1] // p.div] = 7
+before = span(ar, *left)
+gate.set()
+t.join(TIMEOUT / 2)
+check("move: the read ends", until(lambda: h.lj.done.is_set()))
+check("move: the stored prompt is kept after its read", m.complete_load(h) and len(x.kept) == 1)
+check("move: its rows are at the extent's new base, as they were kept", same(rows(ar, x.base, n), kept))
+check("move: no block of the read landed at the old base", same(span(ar, *left), before))
+
+
+class Holding:
+    """Extent ``x``'s base as the reader reads it to issue a block's copies; the first read hands out the base, then
+    waits for ``go`` (a move starting now finds that block's copies being issued)."""
+
+    def __init__(self, x) -> None:
+        self.x, self.entered, self.go = x, threading.Event(), threading.Event()
+
+    @property
+    def base(self) -> int:
+        b = self.x.base
+        if not self.entered.is_set():
+            self.entered.set()
+            self.go.wait(TIMEOUT / 4)
+        return b
+
+
+ar = arena(3)
+st = store(ar, "lock")
+m = decoder(ar, st)
+ids, kept = stored(st, ar, n, 31)
+pt = st.index[S.point_key(ids)]
+gate = gate_reads(st, lambda h: True)
+below = m.pool.add(0, 2 * ALIGN)
+hi, lo, _ = S.key_ints(pt.key)
+h = m._start_load(hi, lo, n, 2 * ALIGN, align_up(n), 0)
+x = h.x
+hold = Holding(x)
+h.lj.where = hold                                   # (the reader reads the extent's base through it)
+gate.set()
+check("lock: a block's copies are being issued", until(hold.entered.is_set))
+m.pool.remove(below)
+t = threading.Thread(target=m._compact, daemon=True)
+t.start()
+t.join(0.5)
+check("lock: the move waits for the copies being issued", t.is_alive())
+hold.go.set()
+t.join(TIMEOUT / 2)
+check("lock: the read ends", until(lambda: h.lj.done.is_set()))
+check("lock: the stored prompt is kept after its read", m.complete_load(h) and len(x.kept) == 1)
+check("lock: its rows are at the extent's new base, as they were kept", x.base == 0 and same(rows(ar, x.base, n), kept))
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
