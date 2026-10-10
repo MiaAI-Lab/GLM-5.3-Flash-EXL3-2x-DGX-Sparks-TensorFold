@@ -530,7 +530,7 @@ every configured worker), one for each way of connecting them:
 
 Each one finds the links from the subnets the nodes share and stops, naming the other script, when the Sparks are
 connected the other way. Both run the same engine (patches 0066-0068 run 2, 3 or 4 ranks), plus patches 0098-0100 on a ring;
-the image is not published yet, so `prepare.sh` builds it on the first start.
+the image is published (`v0.6.0-7a37454d3238`), so `prepare.sh` pulls it by digest on the first start.
 
 **Four Sparks, measured with sparkDash** (a ring, `./start-tp4-switchless.sh` with its defaults: 8 streams,
 1,048,576-token window, FP8 KV cache, 4-bit dense weights, DFlash2 plus copy drafts, vision on; 2026-10-09)
@@ -596,7 +596,7 @@ triangle of three Sparks ([3 Sparks](#3-sparks-experimental)).
 4. **Dry run:** `DRY_RUN=1 ./start-tp4.sh` prints the links found and every rank's `docker run`, and changes nothing.
    No line about a ring; every rank's `NCCL_IB_HCA` lists its CX7 devices. When it says the Sparks are cabled as a
    ring, or that two ranks share no RoCE subnet, some Sparks are not on the switch's subnet.
-5. **Start:** `./start-tp4.sh` (the first start prepares all four Sparks and builds the image; `TP=4
+5. **Start:** `./start-tp4.sh` (the first start prepares all four Sparks and pulls the image; `TP=4
    scripts/prepare.sh` does that on its own). NCCL carries the all-gathers (`COMM=nccl`); `COMM=roce ./start-tp4.sh`
    sends the small ones over RoCE, as at three Sparks.
 
@@ -656,7 +656,7 @@ no cable. Traffic between those goes through a neighbour.
 6. **Dry run:** `DRY_RUN=1 ./start-tp4-switchless.sh` prints the ring found, which worker is across it, and every
    rank's `docker run`, and changes nothing. When the workers are in another order it stops and names the order that
    fits; when every pair shares a subnet it points to `./start-tp4.sh`.
-7. **Start:** `./start-tp4-switchless.sh` (the first start prepares all four Sparks and builds the image).
+7. **Start:** `./start-tp4-switchless.sh` (the first start prepares all four Sparks and pulls the image).
 
 How the ring runs:
 

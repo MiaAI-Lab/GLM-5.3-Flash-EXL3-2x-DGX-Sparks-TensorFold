@@ -5,8 +5,9 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
-Image: not published yet; `prepare.sh` builds it locally (106 patches: v1.10's 96 plus ten of `0098`-`0109`, with two numbers unused until they are renumbered at the final rebase), for two and three
-Sparks too (the patches' hash no longer matches the pinned image until a new one is published and pinned). The
+Image: `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold:v0.6.0-7a37454d3238`, pinned by digest
+(`sha256:eb17e092...47e8`; 106 patches: v1.10's 96 plus ten of `0098`-`0109`, with two numbers unused until they are
+renumbered at the final rebase), for two and three Sparks too. The
 TP-N engine of patches 0066-0068 already runs 4 ranks; patch 0098 adds the ring exchange, 0099 the RoCE all-gather
 round the ring. Patches 0099-0109 come from the GLM-5.3 recipe (Mia's AI Lab). **Measured on a four-Spark ring**
 (2026-10-08, one boot each; README "4 Sparks"): against the TP=4 build before (v1.7.1 with 0076), prefill 8k / 32k /
