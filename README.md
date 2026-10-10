@@ -494,7 +494,7 @@ not from `main`.
   four-Spark ring and the RoCE all-gather relayed round it.
 - **Not in it yet:** the patches `main` merged after v1.10 (BadAd84's 0098-0108 and `FILL_ROWS`). The branch moves to
   `main` once it is rebased on them and tested.
-- **The image:** none is published for the branch yet, so its first start builds the image locally (a few minutes more).
+- **The image:** its own, published as `v0.6.0-7a37454d3238` and pinned by digest on the branch; `prepare.sh` pulls it.
 - **Credits:** the branch's README and `CREDITS.md`. Mia's AI Lab wrote its code; the own-row front and the
   micro-batches are designs [drowzeys](https://github.com/drowzeys) authored in
   [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05). Its prompt kernels take
