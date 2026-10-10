@@ -5,6 +5,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A rewound conversation keeps its id** (patch `0100-glm-chat-continued`, by [wojo](https://github.com/wojo)): patch
+  `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
+  client rewinding before the kept turns (issue #104, @danielbanu), a state read back from the spill tier, or dropped
+  states split one session into several ids, and `TF_GLM_KEEP_PER_CHAT` counted each piece on its own: one session
+  held more states than the quota. Now the stream joins the conversation whose own kept state its prompt repeats past
+  that conversation's first prompt and the first 32 tokens of the reply to it. On two Sparks (PARALLEL=8,
+  `TF_GLM_KEEP_PER_CHAT=2`, `TF_GLM_CACHE_ENTRIES=16`), a ~110k-token session rewinding three rounds every fifth of 16
+  while six chats fill the cache: before, its states went under 3 ids; after, 1, holding 2 states as asked; replies
+  the same drafted and with `draft:false`. New counters `chats_continued`, `chats_continued_prefill_tokens` (`/health`,
+  `/metrics`) and a rank-0 log line for one prefilling 4096 tokens or more, with where the prompt left the kept state
+  and what it resumed from. CPU check: `tools/chat_continued_check.py` (fails on the unpatched engine).
+
 - **kindling spark-os: the server starts** (patch `0098-glm-mmap-uploads`, by [BadAd84](https://github.com/BadAd84)):
   on kindling's 64 KiB-page kernel a pageable copy to the GPU straight from a safetensors mmap hangs in the driver
   (`cuMemcpyHtoDAsync`) once the process holds GPU memory, and the DFlash2 drafter and the GLM vision tower load
