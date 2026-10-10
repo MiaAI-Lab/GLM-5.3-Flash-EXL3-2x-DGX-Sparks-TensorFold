@@ -140,7 +140,7 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
   dispram ships here: the ranks import the host's client (`python/dispram.py`, GPL-3.0 with a bundling exception)
   mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
-- `0100-glm-chat-continued` (a conversation keeps its id across a rewind or a resume from disk, for patch `0089`'s
+- `0111-glm-chat-continued` (a conversation keeps its id across a rewind or a resume from disk, for patch `0089`'s
   quota by Thomas Wade; issue #104 by [danielbanu](https://github.com/danielbanu)): by Robert Wojciechowski
   ([wojo](https://github.com/wojo)).
 - `0098-glm-mmap-uploads` (the drafter's and the vision tower's tensors copied out of the safetensors mmap before

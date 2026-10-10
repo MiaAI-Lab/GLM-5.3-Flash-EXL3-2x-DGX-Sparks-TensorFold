@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks for patch 0100 (a conversation keeps its id when a stream continues it without its own turn state), run
+"""Checks for patch 0111 (a conversation keeps its id when a stream continues it without its own turn state), run
 inside the image that scripts/prepare.sh built:
 
     docker run --rm --entrypoint python -v "$PWD/tools/chat_continued_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py

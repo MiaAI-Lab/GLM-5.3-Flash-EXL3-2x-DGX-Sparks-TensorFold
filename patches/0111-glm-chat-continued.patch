@@ -7,10 +7,10 @@
 # chats_continued_prefill_tokens); rank 0 logs one prefilling 4096 tokens or more, with where the prompt left the kept
 # state and what it resumed from. Builds on 0089-glm-kept-state (Thomas Wade, PR #65). By @wojo. Apache-2.0.
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 775b2a5..c63839d 100644
+index 06f33e7..9eccfff 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -245,6 +245,44 @@ def cap_victim(kept: list):
+@@ -249,6 +249,44 @@ def cap_victim(kept: list):
      return kept[0]
  
  
@@ -55,7 +55,7 @@ index 775b2a5..c63839d 100644
  def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
      """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
      policy its DFlash2 twin; without a draft model, serial."""
-@@ -557,6 +595,8 @@ class MultiDecoder:
+@@ -562,6 +600,8 @@ class MultiDecoder:
          self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
          self.next_sid = self.next_kid = self.next_order = 0
          self.next_chat = 0
@@ -64,7 +64,7 @@ index 775b2a5..c63839d 100644
          self.outbox: list[int] = []
          self.idle = True
          self.broken: Exception | None = None
-@@ -586,6 +626,10 @@ class MultiDecoder:
+@@ -591,6 +631,10 @@ class MultiDecoder:
                              "paused": sum(l.decoding and l.paused for l in lanes)},
                  "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
                  "kept_prompts": len(self.kept),
@@ -75,7 +75,7 @@ index 775b2a5..c63839d 100644
                  "kept_bytes": self._held_bytes(), "kept_bytes_cap": self.kept_bytes_cap,
                  # what the slots are holding. own = a conversation's turn-boundary state (capped by
                  # TF_GLM_KEEP_PER_CHAT); shared = a shared-prefix point or a mid-prefill pause state (not capped);
-@@ -971,13 +1015,24 @@ class MultiDecoder:
+@@ -976,13 +1020,24 @@ class MultiDecoder:
          code = a["code"]
          dflash = code[0] >= 10 and self.drafts is not None
          policy = decode_policy(code, g.costs) if code[0] else None
@@ -104,7 +104,7 @@ index 775b2a5..c63839d 100644
          lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                      constraint=constraint, images=a["images"], chat=chat)
          if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
-@@ -1016,6 +1071,25 @@ class MultiDecoder:
+@@ -1021,6 +1076,25 @@ class MultiDecoder:
          lane.t0 = s.started
          self.lanes[lane.sid] = lane
  
