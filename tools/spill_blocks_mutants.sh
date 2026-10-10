@@ -86,6 +86,7 @@ run written-no-rewrite $B "                if pt.shared and not shared:\n       
 run rewrite-resurrects $B "        if gone:\n            try:\n                os.remove(path)" "        if False:\n            try:\n                os.remove(path)"
 run rewrite-not-put $B "        _put(path, json.dumps(meta).encode(), self.owner)\n" "        open(path, \"wb\").write(json.dumps(meta).encode())\n"
 run rewrite-no-dir-fsync $B "        _put(path, json.dumps(meta).encode(), self.owner)\n        _fsync_dir(self.points_dir)\n" "        _put(path, json.dumps(meta).encode(), self.owner)\n"
+run drain-skips-rewrites $B "        synced = threading.Event()                          # (behind every rewrite those jobs or a keep queued)\n        self.jobs.put((\"sync\", None, None, synced))\n        return synced.wait(None if end is None else max(0.0, end - time.monotonic()))\n" "        return True\n"
 # review 4: a missing name is not damage to the names linked to its bytes
 run lost-is-damage $B "                if isinstance(exc, FileNotFoundError):     # this name is gone: its links' bytes are not in question\n                    lj.lost.add(h)\n                elif isinstance(exc, (Corrupt, EOFError)):  # damaged bytes, not a passing I/O error\n" "                if isinstance(exc, (Corrupt, FileNotFoundError, EOFError)):   # damage, not a passing I/O error\n"
 run lost-names-kept $B "            gone = bad | set(lost)\n" "            gone = bad\n"

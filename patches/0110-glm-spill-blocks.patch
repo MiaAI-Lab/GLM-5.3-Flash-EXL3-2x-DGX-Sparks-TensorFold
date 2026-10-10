@@ -9,10 +9,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..7c9b7ff
+index 0000000..5b5347a
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1579 @@
+@@ -0,0 +1,1585 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -662,11 +662,11 @@ index 0000000..7c9b7ff
 +    def persist(self, ids: Sequence[int], obj, *, extent, lineage: str, tokens: Sequence[int] | None = None,
 +                shared: bool = False, head: bool = False, skip: Sequence[str] = (), fields: dict | None = None) -> str:
 +        """Every rank, when a state of ``ids`` (keyed ids with pictures; ``tokens`` then its ids) is kept with its rows
-+        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) and the block its end
-+        cuts copied to the host now, its other blocks this disk lacks left in the pool and queued (``pump`` stages
-+        them, the writer writes them). Ids stored or on their way already are not written again; kept again as a shared
-+        prefix, their point becomes one (its json rewritten on the writer). Returns what happened ("queued", "stored",
-+        "no_space", "backlog")."""
++        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) and the block its
++        end cuts copied to the host now, its other blocks this disk lacks left in the pool and queued (``pump`` stages
++        them, the writer writes them). Ids stored or on their way already are not written again; kept again as a
++        shared prefix, their point becomes one (its json rewritten on the writer). Returns what happened ("queued",
++        "stored", "no_space", "backlog")."""
 +
 +        t0 = time.perf_counter()
 +        ids = np.asarray(ids, dtype=np.int64)
@@ -810,7 +810,8 @@ index 0000000..7c9b7ff
 +                time.sleep(0.001)
 +
 +    def drain(self, timeout: float | None = None) -> bool:
-+        """Every waiting state to the writer and on disk (an idle engine, a shutdown). True when done in time."""
++        """Every waiting state to the writer and on disk, and the json rewrites queued before (``_mark_shared``) too
++        (an idle engine, a shutdown). True when done in time."""
 +
 +        end = None if timeout is None else time.monotonic() + timeout
 +        while self.pending:
@@ -825,7 +826,9 @@ index 0000000..7c9b7ff
 +            left = None if end is None else max(0.0, end - time.monotonic())
 +            if not job.done.wait(left):
 +                return False
-+        return True
++        synced = threading.Event()                          # (behind every rewrite those jobs or a keep queued)
++        self.jobs.put(("sync", None, None, synced))
++        return synced.wait(None if end is None else max(0.0, end - time.monotonic()))
 +
 +    def release(self, extent, keep: int) -> None:
 +        """``extent``'s rows from ``keep`` on are about to be freed or overwritten: waiting states there reaching past
@@ -929,6 +932,9 @@ index 0000000..7c9b7ff
 +                finally:
 +                    self.free_slots.put(slot)
 +                self.stats["write_s"] += time.perf_counter() - t0
++                continue
++            if kind == "sync":                              # (``drain``: everything queued before it is done)
++                item.set()
 +                continue
 +            if kind == "shared":
 +                try:

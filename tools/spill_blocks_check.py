@@ -16,7 +16,7 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - a restored state keeps its point's shared-prefix flag, rank 0's on every rank (LOADED carries it);
 - the same ids kept again as a shared prefix make the stored point shared, its json rewritten through a temporary
   name and the folder fsynced (a restart reads it so), also when they were still waiting or being written; a point
-  dropped during the rewrite does not get its json back;
+  dropped during the rewrite does not get its json back, and a drain (a clean stop) waits for the rewrite;
 - a read that fails on a missing block file drops that name and the points naming it, not the points whose blocks
   are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them;
 - every op in multi's table has a sender, and /metrics carries the prefix wait's counters;
@@ -381,6 +381,13 @@ keep(st, ids, True, "s54")
 check("upgrade: a point dropped during the rewrite", until(lambda: not hooks, 5) and key not in st.index)
 time.sleep(0.2)
 check("upgrade: ... loses the json the rewrite put back", not os.path.exists(st._point_path(key, ".json")))
+
+ids, _ = stored(st, ar, n2, 55)
+key = S.point_key(ids)
+hooks[f"{key}.json"] = lambda: time.sleep(0.3)     # a slow rewrite
+keep(st, ids, True, "s55")
+check("upgrade: a drain (a clean stop) waits for the rewrite", st.drain(TIMEOUT / 4)
+      and json_of(st, key).get("shared") is True)
 S._put, S._fsync_dir = _put, _fsync_dir
 
 
