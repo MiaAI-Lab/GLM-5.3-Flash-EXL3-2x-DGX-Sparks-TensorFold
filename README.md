@@ -570,7 +570,9 @@ one stream's, then all streams' together at 4 and 8):
 Up to the defaults row, four greedy replies (prompts of 14 to ~20,000 tokens) equal the build before's token for token;
 bf16 partials changed all four (and one long prompt's answer got worse), `msa.cu` one, so both stay off. The full
 exactness checks of three Sparks (concurrent == serial, drafted == serial, needles) have not been run at four. The
-other defaults are three Sparks' (`PARALLEL=8`, `KV_POOL_GIB=32`); four Sparks also turn on `TF_GLM_PROMPT_OWN_FRONT`,
+other defaults are three Sparks' (`PARALLEL=8`, `KV_POOL_GIB=32`: a shared pool of 5,834,752 tokens at four Sparks,
+measured at every start on 2026-10-08; the lowest free memory under a 1M-token prompt is not measured at four yet);
+four Sparks also turn on `TF_GLM_PROMPT_OWN_FRONT`,
 `TF_GLM_PROMPT_MICROBATCH` with `TF_GLM_PREFILL_ROWS=4096`, and `TF_GLM_SIDE`, and the ring `COMM=roce` (patches 0099
 and 0100; `COMM=nccl ./start-tp4-switchless.sh` for NCCL only). `./start-tp4.sh` (a switch, not tested) keeps
 `COMM=nccl`. The switches are in [Prompt and decode switches for two to four Sparks](#prompt-and-decode-switches-for-two-to-four-sparks).
@@ -727,7 +729,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
-| `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
+| `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3` and `TP=4`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
 | `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0`; headless Sparks only (refused while a display is connected) |
 | `DISPLAY_KV_BACKEND` | `drm` | where `DISPLAY_KV_MIB`'s reservation comes from: `drm` (a DRM dumb buffer on `card0`, `nvidia_drm` with `modeset=1`) or `dispram` (kindling spark-os's `dispramd`; `start.sh` mounts its socket and client into every rank) (patch 0087) |
 | `DENSE` | `q4` | the checkpoint's BF16 weights (attention, shared experts, dense layers, head): `q4` (4-bit groups of 64, the head in FP8, kv_b in BF16), `fp8` or `bf16`. **Non-English prompts:** `q4` can lose the end of turn on short French coding prompts (replies run to `max_tokens`, issue #18); `fp8` keeps it, at ~10% decode speed |

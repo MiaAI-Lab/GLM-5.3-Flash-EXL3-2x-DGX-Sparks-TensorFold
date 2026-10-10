@@ -346,8 +346,9 @@ MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
-# (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680). TP=4: 32 as at three, not measured
-# there yet; each rank holds a quarter of the weights instead of a third, so it leaves more memory free.
+# (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680). TP=4: 32 as at three: pool 5,834,752
+# tokens (2026-10-08); its lowest free memory under a 1M-token prompt is not measured yet. Each rank holds a quarter of
+# the weights instead of a third, so it leaves more memory free.
 case "$TP" in 3|4) _pool=32 ;; *) _pool=12.5 ;; esac
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
