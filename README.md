@@ -28,6 +28,11 @@ vision, tool calling, `/tokenize` and `/metrics`.
 - Tool calling, structured outputs (xgrammar), `/tokenize`, and `reasoning_effort` `low` / `high` / `max`
 - One command on the first Spark: `./start.sh` sets up both Sparks and starts both ranks; `./stop.sh` stops them
 
+**Four Sparks (experimental): use the [`tp4` branch](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/tp4)**
+(`git clone -b tp4 ...`, then `./start-tp4-switchless.sh` on a ring of direct cables or `./start-tp4.sh` on a switch):
+prose 95.2 tok/s for one request, 222.4 at 8 at once, prefill ~2,530 tok/s at 128k on a ring. Guide:
+[4 Sparks](#4-sparks-experimental-the-tp4-branch).
+
 ## Performance
 
 Two DGX Sparks at the default configuration (4 streams, 1,048,576-token window, FP8 KV cache, 4-bit dense weights,
@@ -480,6 +485,82 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
   it is the same on all of a node's devices, and no P2P or SHM transport. These come from a vLLM recipe that ran on
   the same three Sparks.
 - `prepare.sh` on its own takes `TP` too: `TP=3 scripts/prepare.sh`.
+
+## 4 Sparks (experimental): the `tp4` branch
+
+Four Sparks run from the [`tp4` branch](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/tp4),
+not from `main`.
+- **What it is:** v1.10 plus ten patches for two to four Sparks, among them the split prefill's exchanges round a
+  four-Spark ring and the RoCE all-gather relayed round it.
+- **Not in it yet:** the patches `main` merged after v1.10 (BadAd84's 0098-0108 and `FILL_ROWS`). The branch moves to
+  `main` once it is rebased on them and tested.
+- **The image:** none is published for the branch yet, so its first start builds the image locally (a few minutes more).
+- **Credits:** the branch's README and `CREDITS.md`. Mia's AI Lab wrote its code; the own-row front and the
+  micro-batches are designs [drowzeys](https://github.com/drowzeys) authored in
+  [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold/tree/glm53-tp4-2026-10-05). Its prompt kernels take
+  design points from work by drowzeys and by [BertholomusAI (Albert Lee)](https://github.com/bertholomus); the decode
+  side stream is BertholomusAI's idea.
+
+**Measured** on a ring of four Sparks (`./start-tp4-switchless.sh` with its defaults: 8 streams, 1,048,576-token
+window, FP8 KV, DFlash2 plus copy drafts; sparkDash, 2026-10-09):
+
+| Concurrent requests | Prose | Prose, per request | TTFT | Code | Code, per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 95.2 tok/s | 95.2 tok/s | 122 ms | 138.6 tok/s | 138.6 tok/s | 143 ms |
+| 2 | 133.2 tok/s | 68.4 tok/s | 201 ms | 185.1 tok/s | 93.7 tok/s | 263 ms |
+| 4 | 163.3 tok/s | 44.0 tok/s | 281 ms | 224.5 tok/s | 57.6 tok/s | 299 ms |
+| 8 | 222.4 tok/s | 29.2 tok/s | 330 ms | 286.0 tok/s | 37.9 tok/s | 495 ms |
+
+| Prompt | Prefill | Time to first token |
+| ---: | ---: | ---: |
+| 8,218 tokens | 2,568.8 tok/s | 3.33 s |
+| 32,789 tokens | 2,583.3 tok/s | 12.83 s |
+| 131,097 tokens | 2,530.7 tok/s | 51.94 s |
+| 262,170 tokens | 2,462.7 tok/s | 106.59 s |
+
+### Steps
+
+**Requirements.** What two Sparks need ([Requirements](#requirements)), on all four:
+- ~110 GiB of free GPU memory each;
+- Docker with the NVIDIA runtime, and `rsync`;
+- key-based ssh from the head (the Spark that runs the script and the API) to the three workers
+  (`ssh-copy-id user@<worker>`).
+
+1. **Get the branch** on the head:
+
+   ```bash
+   git clone -b tp4 https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold.git
+   cd GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+   ```
+
+   (or `git fetch origin tp4 && git switch tp4` in a clone you have).
+2. **Cable and address the Sparks**, one of two ways:
+   - **A ring of direct cables (tested).** Each Spark has two CX7 ports: cable each to its two neighbours, port to
+     like port (spark1 p1 - spark2 p1, spark2 p0 - spark3 p0, spark3 p1 - spark4 p1, spark4 p0 - spark1 p0).
+     - Give each cable its own subnet with MTU 9000, on both PCIe twins of each port.
+     - Give each Spark a `/32` on `lo`, routed round the ring through a neighbour, with IP forwarding on. The two
+       Sparks across from each other have no cable.
+     - The branch's README, "Without a switch", has the exact addresses, routes and Docker `FORWARD` rule. It also has
+       the `ib_write_bw` check, which should show ~112 Gb/s each way on every cable before the first start.
+   - **A switch (not tested yet).** Put every CX7 netdev, both PCIe twins, in one subnet. Every pair then talks
+     directly, as three Sparks do.
+3. **Settings** in `scripts/local.sh`:
+   - `WORKER`, `WORKER2` and `WORKER3`. On a ring, list them in the ring's order from the head: `WORKER2` is the
+     Spark across, given by its `lo` address, e.g. `WORKER=user@10.0.22.2`, `WORKER2=user@10.0.0.3`,
+     `WORKER3=user@10.0.0.4`.
+   - With `WORKER_WEIGHTS=nfs`, export the head's cache to every worker's address on its route back.
+4. **Dry run:** `DRY_RUN=1 ./start-tp4-switchless.sh` on a ring, or `DRY_RUN=1 ./start-tp4.sh` on a switch. It prints
+   the links found and every rank's `docker run`, and changes nothing. If the Sparks are cabled the other way it stops
+   and names the other script. On a ring with the workers in the wrong order, it names the order that fits.
+5. **Start:** `./start-tp4-switchless.sh` (ring) or `./start-tp4.sh` (switch). The first start prepares all four
+   Sparks and builds the image. `./stop.sh` stops every rank.
+
+**Defaults on the branch:**
+- At four Sparks, three switches are on: each rank's DSA front on its own rows, two micro-batches a prompt chunk
+  (4,096-row chunks), and the MoE's shared expert on a decode side stream.
+- On a ring, the small all-gathers go over RoCE through the neighbours (`COMM=roce`). On a switch, `COMM=nccl`, and
+  `COMM=roce ./start-tp4.sh` is worth trying for decode.
+- The same branch serves two Sparks with `./start.sh` and three with `./start-tp3.sh`.
 
 ## Configuration
 
