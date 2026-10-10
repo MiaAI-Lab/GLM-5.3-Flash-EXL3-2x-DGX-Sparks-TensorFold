@@ -131,16 +131,19 @@ index 06f33e7..9eccfff 100644
          """The lane's slot's DFlash2 context."""
          return self.drafts.contexts[lane.slot]
 diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
-index c96a9a8..9c78b9b 100644
+index c96a9a8..ed8b409 100644
 --- tensorfold/server/metrics.py
 +++ tensorfold/server/metrics.py
-@@ -183,6 +183,9 @@ _HEALTH_TOTALS = (
-     ("rounds_total", "counter", "Decode rounds of finished requests."),
-     ("prefill_seconds_total", "counter", "Engine prefill seconds of finished requests."),
-     ("decode_seconds_total", "counter", "Engine decode seconds of finished requests."),
+@@ -192,6 +192,12 @@ _HEALTH_GAUGES = (
+     ("pool_free_tokens", "Pool rows no stream or kept prompt holds."),
+     ("kept_prompts", "Prompt states kept in the pool for reuse."),
+ )
++# the GLM engine's conversation counters: streams that continued a conversation without its own kept turn state
++_HEALTH_TOTALS += (
 +    ("chats_continued", "counter",
 +     "Streams that continued a conversation without resuming from its own turn state (a rewind, or it was dropped)."),
 +    ("chats_continued_prefill_tokens", "counter", "Prompt tokens those streams prefilled."),
- )
- _SPILL_GAUGES = {"entries", "pending", "stored_bytes", "disk_free_bytes", "highwater", "writers"}
- _HEALTH_GAUGES = (
++)
+ 
+ 
+ def _health(lines: list[str], app: Any) -> None:
