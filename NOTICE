@@ -160,13 +160,4 @@ Third-party software in the image
   (BSD) with its FFmpeg libraries (LGPL) and xgrammar (Apache 2.0). This project's Apache License covers its own
   work only (as described above), not the software in the image.
 
-TP4 decode tuning (patches 0110-0112)
-  Patches 0110 and 0111 backport/adapt main-branch patches 0103 and 0108 by BadAd84
-  from MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold at
-  11619a191999398c6392e8079fe4dcc545cc3f1a (Apache License, Version 2.0).
-  Changes: opt-in Q4 reduction; CUDA attention admitted at 16 heads with standalone
-  TP4 integration and runtime fallback. The CUDA kernel's padded layout and
-  arithmetic are retained. Patch 0112 reuses the existing PRMT unpack helper for
-  decode. Integration, tests and benchmark helper contributed by virtualkevin.
-
 See CREDITS.md for everyone this project builds on.

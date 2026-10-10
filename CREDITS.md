@@ -193,13 +193,10 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
-- `0110-glm-qmm-decode-noclusters` and `0111-glm-tp4-seg-chunks-cuda`: backport/adaptation of
-  **[BadAd84](https://github.com/BadAd84)**'s main-branch patches `0103` and `0108`
-  at `11619a191999398c6392e8079fe4dcc545cc3f1a` (Apache-2.0). The opt-in defaults,
-  16-head TP4 admission, integration and tests are by [virtualkevin](https://github.com/virtualkevin).
-- `0112-glm-exl3-decode-prmt`, the TP4 preset and prose benchmark: by virtualkevin,
-  reusing this recipe's existing PRMT unpack helper and scheduler implementations.
-  The expert kernels and the code quoted as patch context retain their original authorship.
+- The opt-in `TP4_DECODE_TUNING` preset, its configuration tests and matched prose
+  benchmark: by [virtualkevin](https://github.com/virtualkevin). They select existing
+  scheduler and expert launch-order options; their implementations retain the
+  authorship credited above, including lukaszraczylo's patch 0090.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
