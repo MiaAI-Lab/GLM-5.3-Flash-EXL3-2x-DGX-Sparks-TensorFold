@@ -86,6 +86,11 @@ run written-no-rewrite $B "                if pt.shared and not shared:\n       
 run rewrite-resurrects $B "        if gone:\n            try:\n                os.remove(path)" "        if False:\n            try:\n                os.remove(path)"
 run rewrite-not-put $B "        _put(path, json.dumps(meta).encode(), self.owner)\n" "        open(path, \"wb\").write(json.dumps(meta).encode())\n"
 run rewrite-no-dir-fsync $B "        _put(path, json.dumps(meta).encode(), self.owner)\n        _fsync_dir(self.points_dir)\n" "        _put(path, json.dumps(meta).encode(), self.owner)\n"
+# review 4: a missing name is not damage to the names linked to its bytes
+run lost-is-damage $B "                if isinstance(exc, FileNotFoundError):     # this name is gone: its links' bytes are not in question\n                    lj.lost.add(h)\n                elif isinstance(exc, (Corrupt, EOFError)):  # damaged bytes, not a passing I/O error\n" "                if isinstance(exc, (Corrupt, FileNotFoundError, EOFError)):   # damage, not a passing I/O error\n"
+run lost-names-kept $B "            gone = bad | set(lost)\n" "            gone = bad\n"
+run damage-not-widened $B "                if b in self.have and self.have[b][1] in self.inodes:\n                    bad |= self.inodes[self.have[b][1]][1]\n" "                pass\n"
+run finish-load-drops-lost $MU "            self.disk.forget(h.key, lj.bad if lj is not None else (), lj.lost if lj is not None else ())" "            self.disk.forget(h.key, lj.bad if lj is not None else ())"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

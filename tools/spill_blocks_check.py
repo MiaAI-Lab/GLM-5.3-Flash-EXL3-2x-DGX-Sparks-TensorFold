@@ -16,7 +16,9 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
 - a restored state keeps its point's shared-prefix flag, rank 0's on every rank (LOADED carries it);
 - the same ids kept again as a shared prefix make the stored point shared, its json rewritten through a temporary
   name and the folder fsynced (a restart reads it so), also when they were still waiting or being written; a point
-  dropped during the rewrite does not get its json back.
+  dropped during the rewrite does not get its json back;
+- a read that fails on a missing block file drops that name and the points naming it, not the points whose blocks
+  are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import json
@@ -375,6 +377,54 @@ check("upgrade: a point dropped during the rewrite", until(lambda: not hooks, 5)
 time.sleep(0.2)
 check("upgrade: ... loses the json the rewrite put back", not os.path.exists(st._point_path(key, ".json")))
 S._put, S._fsync_dir = _put, _fsync_dir
+
+
+# -- review 4: a missing block file drops that name, a damaged one every name linked to its bytes -----------------
+def linked(name: str):
+    """A (2 blocks), B (other ids, the same rows: its blocks linked to A's) and C (A's ids and one block more, A's
+    lineage: it names A's blocks), written; a decoder over the store."""
+
+    a = arena(60)
+    s = store(a, name)
+    ia, ib = ids_of(2 * ALIGN, 61), ids_of(2 * ALIGN, 62)
+    ic = ia + ids_of(ALIGN, 63)
+    kept = rows(a, 0, 2 * ALIGN)
+    for ids, lineage in ((ia, "a"), (ib, "b"), (ic, "a")):
+        keep(s, ids, False, lineage)
+        s.drain(TIMEOUT / 4)
+    return a, s, decoder(a, s), [S.point_key(i) for i in (ia, ib, ic)], kept
+
+
+def read_fails(m: M.MultiDecoder, key: str, n: int) -> bool:
+    """A read of ``key`` through LOAD / LOADED (``_finish_load`` forgets it): True when it failed."""
+
+    hi, lo, _ = S.key_ints(key)
+    h = m._start_load(hi, lo, n, 4 * ALIGN, align_up(n), m.next_lid)
+    until(lambda: m.load_ready(h))
+    return not m.complete_load(h)
+
+
+ar, st, m, (ka, kb, kc), kept = linked("lost")
+pa, pb = st.index[ka], st.index[kb]
+check("forget: B's blocks are links to A's (the same bytes)", st.stats["dedup_blocks"] == 2
+      and [st.have[b][1] for b in pa.blocks] == [st.have[b][1] for b in pb.blocks])
+os.remove(st._block_path(pa.blocks[0]))              # one name of the bytes gone
+check("forget: the read of A fails", read_fails(m, ka, 2 * ALIGN))
+check("forget: A goes, and C, which names the missing block", ka not in st.index and kc not in st.index)
+check("forget: B, linked to the missing name's bytes, stays with its files",
+      kb in st.index and all(os.path.exists(st._block_path(b)) for b in pb.blocks))
+y = Pool(ROWS).add(4 * ALIGN, 2 * ALIGN)
+_, _, got = load_rows(st, ar, kb, y, 2 * ALIGN)
+check("forget: B still reads back whole", got is not None and same(got, kept))
+
+ar, st, m, (ka, kb, kc), kept = linked("damaged")
+pa, pb = st.index[ka], st.index[kb]
+with open(st._block_path(pa.blocks[0]), "r+b") as fh:   # the bytes of every name linked to them
+    fh.write(b"\xff" * 64)
+check("forget: the read of a damaged A fails", read_fails(m, ka, 2 * ALIGN))
+check("forget: damaged bytes drop every point naming any of their names (A, B, C)",
+      ka not in st.index and kb not in st.index and kc not in st.index)
+check("forget: ... and those names' files", not any(os.path.exists(st._block_path(b)) for b in pb.blocks[:1]))
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
