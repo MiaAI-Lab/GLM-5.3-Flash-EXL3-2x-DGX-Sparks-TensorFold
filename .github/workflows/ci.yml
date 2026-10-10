@@ -31,6 +31,7 @@ jobs:
           python tools/test_chunked_bodies.py --source-root /tmp/tf/src
           python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
           python tools/test_think_tag_mention.py --source-root /tmp/tf/src
+          python tools/test_unoffered_tool_call.py --source-root /tmp/tf/src
       - name: Image pin matches the patch set
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]

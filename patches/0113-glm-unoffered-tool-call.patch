@@ -1,0 +1,59 @@
+# A call to a tool the request did not offer goes out under its own name (#103), as TensorFold's Zig server does
+# since be8bccbec (#256/#415). parse_tool_calls kept such a call as content text: finish_reason "stop", no
+# tool_calls, so the client never learned the tool is unknown and the agent stopped on raw markup. This happens when
+# a tool the conversation used is no longer offered (a client that moved MCP tools behind codemode, a changed tool
+# list). Now the name goes out when it is 1 to 64 of [A-Za-z0-9_-] and the arguments are a finite JSON object
+# (_call_name); the client answers "unknown tool" and the model corrects itself. Anything else stays text as before,
+# bare JSON outside an envelope still needs an offered name, an offered tool keeps its offered spelling, and
+# tool_choice "none" / a named function are unchanged (no tools to parse / the call gate). Calls the streamer skipped
+# reach the client from the end parser, as before. CPU check: tools/test_unoffered_tool_call.py.
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+index c0acaed..4bbd785 100644
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -133,6 +133,26 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+         pos = end + len(_CALL_CLOSE)
+ 
+ 
++_CALL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
++
++
++def _call_name(name: Any, args: Any, known: dict[str, str]) -> str | None:
++    """The name a parsed call goes out under (TensorFold be8bccbec, #256/#415): the offered tool's spelling; else the
++    call's own name when it is 1 to 64 of ``[A-Za-z0-9_-]`` and its arguments a finite JSON object, so the client can
++    answer "unknown tool" and the model correct itself; else None, and the block stays text."""
++
++    name = str(name or "").strip()
++    if name.lower() in known:
++        return known[name.lower()]
++    if _CALL_NAME.fullmatch(name) is None or not isinstance(args, dict):
++        return None
++    try:
++        json.dumps(args, allow_nan=False)
++    except (ValueError, TypeError):
++        return None
++    return name
++
++
+ def _tool_name(tool: dict[str, Any]) -> str:
+     fn = tool.get("function") if isinstance(tool, dict) else None
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+@@ -178,7 +198,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+                 glm = parse_glm_tool_call_block(repair_glm_keys(block), tools, complete=max_calls is not None)
+                 if glm is not None:
+                     name, args = glm
+-        if not name or str(name).lower() not in known:
++        call_name = _call_name(name, args, known)
++        if call_name is None:
+             if max_calls is None:
+                 residue.append(match.group(0))
+             continue
+@@ -190,7 +211,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+             except (ValueError, TypeError):
+                 continue
+         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+-                      "function": {"name": known[str(name).lower()],
++                      "function": {"name": call_name,
+                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
+     residue.append(text[cursor:])
+     return "".join(residue).strip(), calls or None

@@ -5,6 +5,14 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A call to a tool the request did not offer goes out under its own name** (patch `0113-glm-unoffered-tool-call`, by
+  [kky42](https://github.com/kky42), #103; TensorFold's rule since be8bccbec, #256/#415): such a call stayed content
+  text with `finish_reason` "stop", so the client never learned the tool was unknown and the agent stopped on raw
+  markup. Now its name goes out when it is 1 to 64 of `[A-Za-z0-9_-]` and its arguments are a finite JSON object; the
+  client answers "unknown tool" and the model corrects itself. Anything else stays text, and bare JSON still needs an
+  offered name. Two Sparks, 30 seeded replies in a conversation whose earlier turn called a tool no longer offered:
+  10 such calls came back as text, all 10 are now `tool_calls` (whole and streamed); the other 20 replies are
+  unchanged. CPU check: `tools/test_unoffered_tool_call.py`.
 - **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0112-glm-tool-tag-mention`, by
   [kky42](https://github.com/kky42)): every place the server finds GLM calls ran a block from any `<tool_call>` to the
   next `</tool_call>`, so a reply that mentioned the tag ("the literal `<tool_call>` markup") before its real call made
