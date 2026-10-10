@@ -1,0 +1,39 @@
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -35,6 +35,22 @@
+ import torch
+
+
++def decode_defaults(world: int, env=None) -> None:
++    """Set TP4's existing decode options before loading/capture and the ranks' settings comparison.
++
++    One engine runs in each rank process. Use its resolved world, not a launcher-specific TP variable.
++    Explicit nonempty values win; empty values mean the default, as in the recipe's config.sh.
++    Other TP sizes are untouched. No arithmetic, transport, side-stream or profile setting changes.
++    """
++    if world != 4:
++        return
++    env = os.environ if env is None else env
++    for key, value in (("TF_GLM_MULTI_SAMPLER", "packed"), ("TF_GLM_MULTI_DEPTH", "joint"),
++                       ("TF_GLM_MULTI_ASYNC", "1"), ("TF_GLM_EXL3_DEC_ORDER", "2")):
++        if not env.get(key):
++            env[key] = value
++
++
+ @dataclass
+ class MultiSettings:
+     sampler: str = "streams"
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -526,6 +526,9 @@
+
+         if world not in SIZES:
+             raise ValueError(f"GLM-5.3-Flash's CUDA engine runs on {', '.join(map(str, SIZES))} ranks, not {world}")
++        from .multi_tune import decode_defaults
++
++        decode_defaults(world)
+         if int(parallel) > 1 and drafter is None and not serial_only:
+             # before any connection or memory: the MTP head is not loaded under --parallel (``mtp_on`` below), so
+             # this used to fail later as "TF_GLM_MTP=0 leaves no MTP head" whatever TF_GLM_MTP said (issue #38)

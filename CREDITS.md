@@ -193,6 +193,10 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `0116-glm-tp4-decode-defaults`, its configuration tests and matched prose
+  benchmark: by [virtualkevin](https://github.com/virtualkevin). They select existing
+  scheduler and expert launch-order options; their implementations retain the
+  authorship credited above, including lukaszraczylo's patch 0090.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

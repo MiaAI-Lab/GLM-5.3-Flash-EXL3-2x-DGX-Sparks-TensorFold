@@ -8,7 +8,8 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: run scripts/prepare.sh first"
-args=(--rm --memory "${MEM:-3g}" --cpus "${CPUS:-6}" -v "$PWD/tests:/tests:ro" -w /tests)
+args=(--rm --memory "${MEM:-3g}" --cpus "${CPUS:-6}" -v "$PWD/tests:/tests:ro" -w /tests
+      -v "$PWD/scripts/config.sh:/recipe/scripts/config.sh:ro")
 [[ -z "${TF_SRC:-}" ]] || args+=(-v "$(readlink -f "$TF_SRC"):/tf-src:ro" -e TF_SRC=/tf-src)
 # pytest is not in the image: a throwaway layer adds it
 exec docker run "${args[@]}" --entrypoint bash "$IMAGE" -c \

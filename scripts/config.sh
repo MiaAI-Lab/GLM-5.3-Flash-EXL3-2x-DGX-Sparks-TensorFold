@@ -296,6 +296,9 @@ export TENSORFOLD_NUCLEUS_UNION="${NUCLEUS_UNION:-${TENSORFOLD_NUCLEUS_UNION:-1}
 # 196.3 -> 227.9 tok/s; one request unchanged. Exact. MULTI_PREFILL=0 turns it off.
 MULTI_PREFILL="${MULTI_PREFILL:-1}"
 export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
+# Patch 0116 selects packed/joint/async messages at TP4 in the engine; TP2/TP3 stay unchanged.
+# Export local.sh overrides without filling unset values: every rank resolves its own defaults.
+export TF_GLM_MULTI_SAMPLER TF_GLM_MULTI_DEPTH TF_GLM_MULTI_ASYNC
 # Smooth streaming (patch 0061): with drafts a round accepts ~3 tokens at once, so a streamed reply arrives in bursts
 # (every ~50 ms alone, ~100 ms with 4 streams), and pauses while another request's prompt fills. 1 (default): tokens
 # go out one event each at a steady pace from a playout buffer of STREAM_SMOOTH_MS (text appears that much later; the
@@ -320,11 +323,12 @@ export TF_GLM_L2PF="${TF_GLM_L2PF:-1}"
 # Together with TF_GLM_L2PF=1 and TF_ROCE_MAX_KB=512: one request's prose 49.68, code 61.49 (+2.7% / +3.3%); 4 at once
 # prose 74.8 -> 76.6, code 100.0 -> 102.7 tok/s in all (two boots each). Same bits. 0: TensorFold's 32-bit loads.
 export TF_GLM_EXL3_LOADS="${TF_GLM_EXL3_LOADS:-nc}"
-# The decode expert kernel's block launch order (patch 0090, by lukaszraczylo): 0 (default) the grid as launched, items
+# The decode expert kernel's block launch order (patch 0090, by lukaszraczylo): 0 the grid as launched, items
 # fastest; 1: the eight 128-column blocks of one k slice run together (contiguous trellis reads), then the items; 2: then
-# the matrices and splits. The same bits for every value; the author's single-stream gain for 1 is +2.2%, one tester, not yet
-# measured here. Not TF_GLM_EXL3_ORDER, which is patch 0020's prompt order (default on).
-export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-0}"
+# the matrices and splits. Same bits; patch 0116 defaults to 2 at TP4, 0 at TP2/TP3 in the engine.
+# Not TF_GLM_EXL3_ORDER, which is patch 0020's prompt order (default on).
+[[ "$TP" == 4 ]] || TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-0}"
+export TF_GLM_EXL3_DEC_ORDER
 # Conversations that share a system prompt reuse its prompt state (patch 0015): a 7.9k-token system prompt's second and
 # later chats prefill in 0.13 s instead of 4.24 s. Same replies. SHARED_PREFIX=0 turns it off.
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
