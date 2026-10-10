@@ -5,6 +5,13 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A call to a tool the request did not offer stays text, and is now reported** (patch `0113-glm-unoffered-tool-call`,
+  by [kky42](https://github.com/kky42), adapted from [BadAd84](https://github.com/BadAd84)'s #137, #103): such a call
+  stayed content text with `finish_reason` "stop" and nothing said why, so a gateway could not tell it from an answer.
+  It still stays text and never runs, as in TensorFold since 7be90a36b / 806af974c (v1.0.0 on, only an offered name is
+  a call; a one-call reply drops it). Now the server logs `tool call rejected: unknown_tool_name ['<name>']` (names
+  only), and with `TF_GLM_TOOL_DIAGNOSTICS=1` the reply's `tensorfold` block lists them as `tool_call_rejections`.
+  Tokens, content, calls and `finish_reason` are unchanged. CPU check: `tools/test_unoffered_tool_call.py`.
 - **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0112-glm-tool-tag-mention`, by
   [kky42](https://github.com/kky42)): every place the server finds GLM calls ran a block from any `<tool_call>` to the
   next `</tool_call>`, so a reply that mentioned the tag ("the literal `<tool_call>` markup") before its real call made
