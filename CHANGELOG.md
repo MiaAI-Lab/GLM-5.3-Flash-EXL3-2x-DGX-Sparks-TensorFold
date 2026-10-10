@@ -129,7 +129,8 @@ Every change to this recipe, newest first. Each release names the image it serve
 - **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
   with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
   agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
-  first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies.
+  first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies. Counted in `/health` (`prefix_waits`,
+  `prefix_wait_tokens`) and `/metrics` (`prefix_waits_total`, `prefix_wait_tokens_total`).
 - `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
   `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
   block store and its hooks in `multi.py`; `tools/spill_blocks_mutants.sh` runs it on faithful mutants of each fix.

@@ -91,6 +91,10 @@ run lost-is-damage $B "                if isinstance(exc, FileNotFoundError):   
 run lost-names-kept $B "            gone = bad | set(lost)\n" "            gone = bad\n"
 run damage-not-widened $B "                if b in self.have and self.have[b][1] in self.inodes:\n                    bad |= self.inodes[self.have[b][1]][1]\n" "                pass\n"
 run finish-load-drops-lost $MU "            self.disk.forget(h.key, lj.bad if lj is not None else (), lj.lost if lj is not None else ())" "            self.disk.forget(h.key, lj.bad if lj is not None else ())"
+# review 5: no op without a sender; the prefix wait's counters in /metrics
+run ops-unsent $MU "LOAD, FLUSH, LOADED, \\\\\n    HAS = range(1, 17)" "LOAD, FLUSH, SPILL, LOADED, \\\\\n    TOUCH, HAS = range(1, 19)" \
+    $MU "       FLUSH: \"FLUSH\", LOADED: \"LOADED\", HAS: \"HAS\"}" "       FLUSH: \"FLUSH\", SPILL: \"SPILL\", LOADED: \"LOADED\", TOUCH: \"TOUCH\", HAS: \"HAS\"}"
+run prefix-not-exported server/metrics.py "        if field in body:\n            body.setdefault(name, body[field])\n" "        pass\n"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

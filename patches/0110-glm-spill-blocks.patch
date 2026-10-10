@@ -9,10 +9,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..c7f2cbf
+index 0000000..7c9b7ff
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1578 @@
+@@ -0,0 +1,1579 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -21,12 +21,13 @@ index 0000000..c7f2cbf
 +snapshot fields: recurrences, windows, a head row; ``spill.encode``). On disk:
 +
 +- the rows, in blocks of ``block`` tokens (the pool's extent alignment). A block is named by a hash chained over the
-+  ids up to its end and salted with the state's lineage (the computation its rows belong to: a stream inherits the
-+  lineage of the state it resumed from, a fresh prefill starts its own), so a later turn of a conversation, or a fork
-+  that resumed from it, names the blocks its earlier turns wrote and writes only its new ones. States of the same ids
-+  computed apart (another prompt chunking: other bits) never share a block by name; a block whose bytes equal one
-+  already on disk is linked to it instead of written again (content dedup: two streams that prefilled the same
-+  system prompt at once store it once);
++  ids up to its end and salted with the state's lineage (the computation its rows belong to: a stream that resumed
++  from a state forks that state's lineage at the resume point, ``fork``: the same names before the block holding it,
++  its own from there; a fresh prefill starts its own), so a later turn of a conversation, or a fork that resumed from
++  it, names the blocks its earlier turns wrote and writes only its new ones. States of the same ids computed apart
++  (another prompt chunking: other bits) never share a block by name; a block whose bytes equal one already on disk is
++  linked to it instead of written again (content dedup: two streams that prefilled the same system prompt at once
++  store it once);
 +- a point a state: ``points/<key>.ids`` (its ids; with pictures its keyed ids and its tokens), ``points/<key>.st``
 +  (its small state, safetensors), then ``points/<key>.json`` naming its blocks with a CRC-32 of each, written LAST, so
 +  a point with its json is complete. Every file goes to a temporary name, is fsynced and renamed; the folders are
@@ -1592,7 +1593,7 @@ index 0000000..c7f2cbf
 +                "restore_ms_p50": p(0.5), "restore_ms_p95": p(0.95),
 +                **{f"unwritten_{k}": v for k, v in sorted(self.unwritten_by.items())}}
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 06f33e7..3f9017a 100644
+index 06f33e7..9193539 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -34,6 +34,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
@@ -1603,16 +1604,18 @@ index 06f33e7..3f9017a 100644
  import hashlib
  import json
  import os
-@@ -56,10 +57,10 @@ from .pool import ALIGN, Pool, align_up
+@@ -55,11 +56,11 @@ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_
+ from .pool import ALIGN, Pool, align_up
  from .verify import BatchedVerify, Segment, SerialVerify, Verified
  
- ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, SPILL, LOADED, \
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, SPILL, LOADED, \
 -    TOUCH = range(1, 18)
-+    TOUCH, HAS = range(1, 19)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, LOAD, FLUSH, LOADED, \
++    HAS = range(1, 17)
  OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
         IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART", LOAD: "LOAD",
 -       FLUSH: "FLUSH", SPILL: "SPILL", LOADED: "LOADED", TOUCH: "TOUCH"}
-+       FLUSH: "FLUSH", SPILL: "SPILL", LOADED: "LOADED", TOUCH: "TOUCH", HAS: "HAS"}
++       FLUSH: "FLUSH", LOADED: "LOADED", HAS: "HAS"}
  
  
  def watchdog_seconds(value: str | None = None) -> float:
@@ -2345,14 +2348,30 @@ index 06f33e7..3f9017a 100644
          if reading and not self.decoder.live():
              time.sleep(0.002)                    # only reads in flight: poll them
 diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
-index c96a9a8..3609500 100644
+index c96a9a8..b3fb39c 100644
 --- tensorfold/server/metrics.py
 +++ tensorfold/server/metrics.py
-@@ -184,7 +184,10 @@ _HEALTH_TOTALS = (
+@@ -175,7 +175,8 @@ def send(handler: Any, app: Any) -> None:
+         handler.close_connection = True
+ 
+ 
+-# /health's fields under HEALTH: (field, type, help); the totals are the finished requests' engine stats
++# /health's fields under HEALTH: (field, type, help); the totals are the finished requests' engine stats, then the GLM
++# engine's prefix-wait counters (/health names them without the suffix: _HEALTH_RENAMED)
+ _HEALTH_TOTALS = (
+     ("requests_total", "counter", "Finished requests (as /health's requests_total)."),
+     ("completion_tokens_total", "counter", "Reply tokens, the running replies' tokens so far included."),
+@@ -183,8 +184,16 @@ _HEALTH_TOTALS = (
+     ("rounds_total", "counter", "Decode rounds of finished requests."),
      ("prefill_seconds_total", "counter", "Engine prefill seconds of finished requests."),
      ("decode_seconds_total", "counter", "Engine decode seconds of finished requests."),
++    ("prefix_waits_total", "counter", "Requests that waited for a prefix another request was prefilling."),
++    ("prefix_wait_tokens_total", "counter", "Prompt tokens those requests did not prefill again."),
  )
 -_SPILL_GAUGES = {"entries", "pending", "stored_bytes", "disk_free_bytes", "highwater", "writers"}
++_HEALTH_RENAMED = {"prefix_waits": "prefix_waits_total", "prefix_wait_tokens": "prefix_wait_tokens_total"}
++# the spill tier's gauges in /health's spill (highwater, writers: the one-stream engine's SpillStore; the rest from
++# entries on: either store, or the block store alone); its other numbers are counters
 +_SPILL_GAUGES = {"entries", "pending", "stored_bytes", "disk_free_bytes", "highwater", "writers", "blocks",
 +                 "backlog_mb", "block_tokens", "stored_gib", "cap_bytes", "turns", "quota", "conversations",
 +                 "conversation_bytes_max", "conversation_share_max", "conversation_tokens_max", "shared_states",
@@ -2360,3 +2379,13 @@ index c96a9a8..3609500 100644
  _HEALTH_GAUGES = (
      ("context_length", "Tokens a request's prompt and reply may hold (the server's effective window)."),
      ("streams_max", "Streams the concurrent engine decodes at most (--parallel)."),
+@@ -203,6 +212,9 @@ def _health(lines: list[str], app: Any) -> None:
+     body = _read(lambda: snapshot(app), None) if callable(snapshot) else None
+     if not isinstance(body, dict):
+         return
++    for field, name in _HEALTH_RENAMED.items():         # (counters /health names without the suffix)
++        if field in body:
++            body.setdefault(name, body[field])
+     for name, kind, help_text in _HEALTH_TOTALS:
+         if isinstance(body.get(name), (int, float)):
+             _family(lines, name, kind, help_text, [f"{HEALTH}{name} {_num(body[name])}"], HEALTH)

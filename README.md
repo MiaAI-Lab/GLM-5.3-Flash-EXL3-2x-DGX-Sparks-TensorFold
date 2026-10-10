@@ -324,9 +324,10 @@ its block store, patch `0110-glm-spill-blocks`, carries over the NVMe KV tier of
 How it stores (`PARALLEL` above 1):
 
 - **Blocks a later turn shares.** Rows go to disk in blocks of 2,048 tokens, named by a hash chained over the token ids
-  and the state's lineage (the computation it belongs to: a request inherits the lineage of the state it resumed from).
-  A later turn of a conversation, or a fork that resumed from it, names the blocks its earlier turns wrote and writes
-  only its new ones; a block whose bytes equal one already on disk is linked to it instead of written again.
+  and the state's lineage (the computation it belongs to: a request that resumed from a state keeps that state's
+  block names up to its resume point and forks its own from the block holding it). A later turn of a conversation, or
+  a fork that resumed from it, names the blocks its earlier turns wrote and writes only its new ones; a block whose
+  bytes equal one already on disk is linked to it instead of written again.
 - **Written when kept, so it survives a crash.** Only a kept state's small part (its recurrences and DFlash2 window)
   and the block its end cuts (whose last pooled-key row is still filling) are copied off the GPU when it is kept; its
   other rows go to disk a few blocks between rounds through a pinned ring, written with O_DIRECT (the page cache
@@ -397,6 +398,9 @@ prompt, two Sparks, `PARALLEL=8`, every reply equal to its own fresh `draft: fal
 | All six answered (wall) | 47.0 s / 45.7 s | 14.7 s / 15.0 s |
 | Slowest first token | 46.2 s / 45.0 s | 13.5 s / 13.8 s |
 | System-prompt tokens prefilled again | 60,160 | 0 |
+
+Its counters: `/health` `prefix_waits` and `prefix_wait_tokens` (requests that waited, prompt tokens they did not
+prefill again), `/metrics` `prefix_waits_total` and `prefix_wait_tokens_total`.
 
 ## Worker weights over NFS
 

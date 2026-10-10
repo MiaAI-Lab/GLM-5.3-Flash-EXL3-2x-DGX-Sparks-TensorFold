@@ -18,9 +18,11 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
   name and the folder fsynced (a restart reads it so), also when they were still waiting or being written; a point
   dropped during the rewrite does not get its json back;
 - a read that fails on a missing block file drops that name and the points naming it, not the points whose blocks
-  are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them.
+  are links to the same bytes (they still read back); one that fails on damaged bytes drops every name of them;
+- every op in multi's table has a sender, and /metrics carries the prefix wait's counters.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
+import inspect
 import json
 import os
 import tempfile
@@ -31,10 +33,12 @@ from types import SimpleNamespace as NS
 import numpy as np
 import torch
 
+from tensorfold.cuda import health as H
 from tensorfold.cuda import spill as SP
 from tensorfold.cuda import spill_blocks as S
 from tensorfold.families.glm5_next.cuda import multi as M
 from tensorfold.families.glm5_next.cuda.pool import ALIGN, Arena, Plane, Pool, align_up
+from tensorfold.server import metrics as MT
 
 ROWS = 8 * ALIGN
 TIMEOUT = float(os.environ.get("TEST_TIMEOUT_S", "60"))
@@ -425,6 +429,20 @@ check("forget: the read of a damaged A fails", read_fails(m, ka, 2 * ALIGN))
 check("forget: damaged bytes drop every point naming any of their names (A, B, C)",
       ka not in st.index and kb not in st.index and kc not in st.index)
 check("forget: ... and those names' files", not any(os.path.exists(st._block_path(b)) for b in pb.blocks[:1]))
+
+
+# -- review 5: every op has a sender; the prefix wait's counters reach /metrics ------------------------------------
+src = inspect.getsource(M)
+unsent = [name for name in M.OPS.values() if f"self._emit({name}," not in src]
+check("ops: every op in the table has a sender", not unsent)
+of = H.of
+H.of = lambda app: NS(snapshot=lambda app: {"prefix_waits": 6, "prefix_wait_tokens": 98688})
+lines: list = []
+MT._health(lines, object())
+H.of = of
+check("metrics: the prefix wait's counters", f"{MT.HEALTH}prefix_waits_total 6" in lines
+      and f"{MT.HEALTH}prefix_wait_tokens_total 98688" in lines
+      and f"# TYPE {MT.HEALTH}prefix_waits_total counter" in lines)
 
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)
