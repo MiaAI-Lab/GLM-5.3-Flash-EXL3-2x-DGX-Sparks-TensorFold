@@ -9,10 +9,10 @@
 # for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..7dc4e1d
+index 0000000..cc94c16
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1493 @@
+@@ -0,0 +1,1501 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -33,12 +33,13 @@ index 0000000..7dc4e1d
 +  fsynced before a point's json is. Blocks are written with O_DIRECT where the file system takes it (the page cache
 +  shares a unified-memory GPU's memory).
 +
-+Writes go through a bounded ring of pinned host slots: when a state is kept only its small state is copied to the
-+host; its rows stay in the pool until written. Between rounds the engine calls ``pump`` (a few blocks a call, one
-+gather and one copy each), the writer thread writes each slot, then frees it; at idle ``drain`` writes the rest. Rows
-+about to be freed or overwritten while still waiting are copied to the host at once (``release``). Reads run on a
-+reader thread (blocks read ahead on several threads, each checked against its CRC-32) and copy into the pool on their
-+own CUDA stream, so other streams keep decoding; rows a memcpy may not reach (patch 0072's display span) go by kernel.
++Writes go through a bounded ring of pinned host slots: when a state is kept only its small state, and the block its
++end cuts (a pooled-key row there is still filling), are copied to the host; its other rows stay in the pool until
++written. Between rounds the engine calls ``pump`` (a few blocks a call, one gather and one copy each), the writer
++thread writes each slot, then frees it; at idle ``drain`` writes the rest. Rows about to be freed or overwritten while
++still waiting are copied to the host at once (``release``). Reads run on a reader thread (blocks read ahead on several
++threads, each checked against its CRC-32) and copy into the pool on their own CUDA stream, so other streams keep
++decoding; rows a memcpy may not reach (patch 0072's display span) go by kernel.
 +
 +Every rank keeps its own disk and decides alone what to keep there; the engine asks every rank before a read
 +(``has``) and drops a state everywhere when any rank's read fails its checks.
@@ -346,6 +347,7 @@ index 0000000..7dc4e1d
 +        self.point, self.new, self.size, self.where = point, new, size, where
 +        self.small = small                                  # (items, layer): its tensors on the host
 +        self.ids_bytes = ids_bytes
++        self.cut: list[str] = []                           # its tail block, copied to the host at keep (``persist``)
 +        self.next = 0
 +        self.failed: BaseException | None = None
 +        self.done = threading.Event()
@@ -652,9 +654,9 @@ index 0000000..7dc4e1d
 +    def persist(self, ids: Sequence[int], obj, *, extent, lineage: str, tokens: Sequence[int] | None = None,
 +                shared: bool = False, head: bool = False, skip: Sequence[str] = (), fields: dict | None = None) -> str:
 +        """Every rank, when a state of ``ids`` (keyed ids with pictures; ``tokens`` then its ids) is kept with its rows
-+        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) copied to the host
-+        now, its blocks this disk lacks left in the pool and queued (``pump`` stages them, the writer writes them).
-+        Returns what happened ("queued", "stored", "no_space", "backlog")."""
++        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) and the block its end
++        cuts copied to the host now, its other blocks this disk lacks left in the pool and queued (``pump`` stages
++        them, the writer writes them). Returns what happened ("queued", "stored", "no_space", "backlog")."""
 +
 +        t0 = time.perf_counter()
 +        ids = np.asarray(ids, dtype=np.int64)
@@ -701,6 +703,9 @@ index 0000000..7dc4e1d
 +            if short > 0 or self.stored() + self.backlog + need > self.cap:
 +                self.stats["no_space"] += 1
 +                return "no_space"
++        # the block the state's end cuts (a tail): its last pooled-key row is still filling, and the stream goes on
++        # writing it in place, so its rows are copied to the host now, as they are at the keep (at most one block)
++        cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in new[-1:] if e - s < self.block]
 +        with self.lock:
 +            if self.backlog + size > BACKLOG:
 +                self.stats["backlog_skipped"] += 1
@@ -709,9 +714,12 @@ index 0000000..7dc4e1d
 +            self.inflight.add(key)
 +            self.inflight.update(h for _, _, h in new)
 +            ids_bytes = ids.tobytes() + (b"" if tokens is None else np.asarray(tokens, dtype=np.int64).tobytes())
-+            job = Job(pt, new, (items, layer), size, extent, ids_bytes)
++            job = Job(pt, new[:len(new) - len(cut)], (items, layer), size, extent, ids_bytes)
++            job.cut = [h for h, _ in cut]
 +            self.waiting[key] = job
 +            self._ref(pt.blocks, 1)
++        for h, data in cut:                                 # (written before the blocks the pumps stage)
++            self.jobs.put(("rows", job, h, data))
 +        self.pending.append(job)
 +        self.stats["keep_s"] += time.perf_counter() - t0
 +        return "queued"
@@ -964,7 +972,7 @@ index 0000000..7dc4e1d
 +            with self.lock:
 +                self.backlog -= job.size
 +                self.inflight.discard(pt.key)
-+                self.inflight.difference_update(h for _, _, h in job.new)
++                self.inflight.difference_update([h for _, _, h in job.new] + job.cut)
 +                self.waiting.pop(pt.key, None)
 +                self._ref(pt.blocks, -1)
 +                self._gc(pt.blocks)

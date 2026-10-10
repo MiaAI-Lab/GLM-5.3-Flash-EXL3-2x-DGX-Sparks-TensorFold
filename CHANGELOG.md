@@ -131,7 +131,8 @@ Every change to this recipe, newest first. Each release names the image it serve
   agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
   first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies.
 - `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
-  `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list.
+  `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
+  block store and its hooks in `multi.py`; `tools/spill_blocks_mutants.sh` runs it on faithful mutants of each fix.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 

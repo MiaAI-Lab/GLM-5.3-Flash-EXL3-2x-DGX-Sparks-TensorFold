@@ -328,9 +328,10 @@ How it stores (`PARALLEL` above 1):
   A later turn of a conversation, or a fork that resumed from it, names the blocks its earlier turns wrote and writes
   only its new ones; a block whose bytes equal one already on disk is linked to it instead of written again.
 - **Written when kept, so it survives a crash.** Only a kept state's small part (its recurrences and DFlash2 window)
-  is copied off the GPU when it is kept; its rows go to disk a few blocks between rounds through a pinned ring, written
-  with O_DIRECT (the page cache shares a GB10's memory). A conversation resumes from disk after an eviction, a clean
-  restart, a `kill -9` or a watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s).
+  and the block its end cuts (whose last pooled-key row is still filling) are copied off the GPU when it is kept; its
+  other rows go to disk a few blocks between rounds through a pinned ring, written with O_DIRECT (the page cache
+  shares a GB10's memory). A conversation resumes from disk after an eviction, a clean restart, a `kill -9` or a
+  watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s).
 - **Reads beside decoding.** A restore reads its blocks on 8 threads, checks each against its CRC-32, and copies them
   into the pool on its own CUDA stream while the other requests keep decoding; a file that fails is dropped on every
   Spark and the prompt is prefilled. Rank 0 asks every Spark before a read; a read happens only when all hold the state.
