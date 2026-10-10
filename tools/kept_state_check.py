@@ -5,9 +5,9 @@ scripts/prepare.sh built:
     docker run --rm --entrypoint python -v "$PWD/tools/kept_state_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
 
 MultiDecoder's _keep, _drop and _evict on the real Pool with a stubbed snapshot (no GPU or model): both limits off by
-default (nothing dropped, nothing spilled), the quota keeping a conversation's newest states and not counting shared
-ones, the byte budget evicting to its size with one EVICT op a victim, neither limit writing to the spill tier while the
-entry cap's drops do. Exit code 1 when a check fails.
+default (nothing dropped), the quota keeping a conversation's newest states and not counting shared ones, the byte
+budget evicting to its size with one EVICT op a victim; with the spill tier on, every kept state written when it is kept
+and none at a drop (the quota's, the byte budget's, the entry cap's or rank 1's EVICT). Exit code 1 when a check fails.
 """
 from types import SimpleNamespace as NS
 
@@ -43,8 +43,8 @@ def dec(entries=32, size=100, cap=0):
     m.e = NS(size=size, use=lambda st: None)
     m.g = NS(cache_entries=entries)
     m.rank, m.next_kid, m.kept_bytes_cap = 0, 0, cap
-    m.disk = object()                                    # the spill tier "on": _spill records what it is asked
-    m._spill = lambda c, leaving=False, keep=frozenset(): m.spilled.append(c.kid) or True
+    m.disk = object()                                    # the spill tier "on": _persist records what it is asked
+    m._persist = lambda c: m.spilled.append(c.kid)
     m._emit = lambda op, p: m.ops.append((op, list(p)))
     m._ctx = lambda lane: None
     return m
@@ -64,7 +64,8 @@ m = dec()
 l = lane(m, 1, 64)
 for i in range(6):
     m._keep(l, 64 + i, own=True)
-check("off: all six of one chat kept, nothing evicted or spilled", len(m.kept) == 6 and not m.ops and not m.spilled)
+check("off: all six of one chat kept and written when kept, nothing evicted", len(m.kept) == 6 and not m.ops
+      and len(m.spilled) == 6)
 
 M.KEEP_PER_CHAT = 2
 m = dec()
@@ -73,7 +74,7 @@ for i in range(5):
     m._keep(l, 64 + i, own=True)
 check("quota keeps 2 own states of one chat", sum(1 for c in m.kept if c.own) == 2)
 check("quota keeps the newest", sorted(len(c.ids) for c in m.kept) == [67, 68])
-check("quota drops are not spilled", not m.spilled)
+check("quota drops write nothing (each state was written when kept)", len(m.spilled) == 5)
 sh = lane(m, 2, 64)
 m._keep(sh, 64)
 m._keep(sh, 66)
@@ -93,13 +94,13 @@ for i, l in enumerate(ls):
 check("byte cap: evicts down to 250 MB (2 states of 100 MB)", m._held_bytes() <= 250 * MB and len(m.kept) == 2)
 check("byte cap: one EVICT op a victim, marked no-spill",
       [p[1] for op, p in m.ops if op == M.EVICT] == [0, 0, 0, 0])
-check("byte cap: nothing spilled", not m.spilled)
+check("byte cap: its drops write nothing (each state was written when kept)", len(m.spilled) == 6)
 
 m = dec(entries=2)
 ls = [lane(m, i, 64) for i in range(4)]
 for i, l in enumerate(ls):
     m._keep(l, 64 + i)
-check("entry cap: still spills what it drops", len(m.kept) == 2 and len(m.spilled) == 2)
+check("entry cap: every state written when kept, none at its drop", len(m.kept) == 2 and len(m.spilled) == 4)
 
 # rank 1 applies the EVICT: the same drop, no spill
 r = dec(cap=250 * MB)
@@ -108,7 +109,7 @@ x = lane(r, 9, 64)
 r._keep(x, 64)
 c = r.kept[0]
 r._drop(c, spill=False)
-check("rank 1: EVICT without spill drops and does not write", not r.kept and not r.spilled)
+check("rank 1: EVICT drops and writes nothing more", not r.kept and len(r.spilled) == 1)
 
 print("all passed" if not fails else f"FAILED: {fails}")
 raise SystemExit(1 if fails else 0)

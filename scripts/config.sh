@@ -395,17 +395,31 @@ prepared_state() {
   echo "$line"
 }
 
-# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
-# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
-# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
-# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
-# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
+# Spill tier (patches 0088-glm-spill-tier and 0099-glm-spill-blocks, off by default): kept prompt states go to local
+# disk on each Spark when they are kept (PARALLEL above 1) and come back instead of a new prefill, also after a
+# restart or a crash. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same absolute path on every Spark (mounted
+# at /spill; files owned by your user). SPILL_QUOTA: the share of SPILL_GIB one conversation may hold before its own
+# old turns and forks go first (0: none). SPILL_TURNS: the newest states kept on a conversation's path; older turns
+# go as each one is written (each keeps a ~91 MB small part; 2 for heavy agent loops or a small disk, 8+ for chats with
+# deep edits, 0: every turn kept until room is needed).
+# SPILL_HIGHWATER: no longer used (states are written when kept). A clean stop writes what still waits within
+# SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
 SPILL_GIB="${SPILL_GIB:-0}"
 SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
 SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
 SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
 SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
 SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
+SPILL_QUOTA="${SPILL_QUOTA:-0}"
+export TF_GLM_SPILL_QUOTA="$SPILL_QUOTA"
+SPILL_TURNS="${SPILL_TURNS:-4}"
+export TF_GLM_SPILL_TURNS="$SPILL_TURNS"
+# A request whose prompt starts with what another request is still prefilling (a system prompt several agents share)
+# waits for that state instead of prefilling it beside it (patch 0099): six agents at once on a fresh 12k-token system
+# prompt answered in 15 s instead of 47 s. Same replies. PREFIX_WAIT=0 turns it off. README: A system prompt
+# prefilled once.
+PREFIX_WAIT="${PREFIX_WAIT:-1}"
+export TF_GLM_PREFIX_WAIT="$PREFIX_WAIT"
 if [[ "$SPILL_GIB" != 0 ]]; then
   STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
 fi

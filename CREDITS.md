@@ -163,6 +163,18 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   read, private file modes, a per-Spark weights fingerprint and naming a rank whose settings differ are those of the
   session tier of [JSpark3](https://github.com/jakejharris/jspark3) v2.0.1 by
   [jakejharris](https://github.com/jakejharris). The code is new.
+- `0099-glm-spill-blocks` (the spill tier's block store and the in-flight prefix wait, `SPILL_GIB` with `PARALLEL`
+  above 1, `PREFIX_WAIT`): the block layout (blocks of the pool's alignment named by a hash chained over the ids and
+  salted with the state's lineage), the lineage, writing a state when it is kept through a pinned staging ring between
+  rounds, copying rows still waiting before they are freed or overwritten (`release`), and the fsync order are those
+  of the NVMe KV tier by [BadAd84](https://github.com/BadAd84) in
+  [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) (Apache 2.0), carried
+  over into `tensorfold/cuda/spill_blocks.py`; the rest (lineage forks at each resume point, eviction by conversation
+  and the quota from [issue #122](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/122),
+  reported by [xiepengqi](https://github.com/xiepengqi), the free-disk floor making room in that order, content dedup
+  by hard link, reads on a CUDA stream beside decoding after every rank's HAS, pictures by content keys, and the
+  prefix wait) by Robert Wojciechowski ([wojo](https://github.com/wojo)). It builds on `0088-glm-spill-tier`, whose
+  credits above apply to the tier around it.
 - `0089-glm-kept-state` (a byte budget for the kept states and a per-conversation quota, `TF_GLM_KEPT_BYTES_GIB` and
   `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
   [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased

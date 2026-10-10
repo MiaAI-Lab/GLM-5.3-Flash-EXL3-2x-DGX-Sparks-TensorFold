@@ -313,36 +313,89 @@ with that window and says so (free memory on both Sparks for the full one). Othe
 
 The KV pool keeps a few conversations' prompt states (`TF_GLM_CACHE_ENTRIES`, and what the pool holds); one that
 leaves it, and every one after a restart, costs a full prefill on its next turn (~2 minutes at 200k tokens). With
-`SPILL_GIB=64` (and `SPILL_DIR`, the same absolute path on every Spark) a kept state that leaves the pool is written to
-that directory on each Spark, and a later request that extends it reads it back instead (patch `0088-glm-spill-tier`,
-authored by Robert Wojciechowski, [wojo](https://github.com/wojo), in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78)).
-With `PARALLEL` above 1, past `SPILL_HIGHWATER` (0.70) of the pool the states eviction would take next are written
-early, in the background, so an eviction frees its rows at once; a clean stop writes what is kept (`SPILL_FLUSH_S`,
-60 s). A restore reads on a background thread while the other requests keep decoding.
+`SPILL_GIB=64` (and `SPILL_DIR`, the same absolute path on every Spark) every kept state of `SPILL_MIN_TOKENS` (8,192)
+or more is written to that directory on each Spark when it is kept, and a later request that extends it reads it back
+instead of prefilling (patch `0088-glm-spill-tier`, authored by Robert Wojciechowski, [wojo](https://github.com/wojo),
+in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78); with `PARALLEL` above 1
+its block store, patch `0099-glm-spill-blocks`, carries over the NVMe KV tier of
+[PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
+[BadAd84](https://github.com/BadAd84)).
 
-Two Sparks, `PARALLEL=4`, `SPILL_GIB=64`, `SPILL_HIGHWATER=0.70` against v1.5 (two runs each; first-token means;
-"resumed" = at least half the prompt came from a kept state, in the pool or on disk):
+How it stores (`PARALLEL` above 1):
 
-| Workload | v1.5 | Spill tier |
+- **Blocks a later turn shares.** Rows go to disk in blocks of 2,048 tokens, named by a hash chained over the token ids
+  and the state's lineage (the computation it belongs to: a request inherits the lineage of the state it resumed from).
+  A later turn of a conversation, or a fork that resumed from it, names the blocks its earlier turns wrote and writes
+  only its new ones; a block whose bytes equal one already on disk is linked to it instead of written again.
+- **Written when kept, so it survives a crash.** Only a kept state's small part (its recurrences and DFlash2 window)
+  is copied off the GPU when it is kept; its rows go to disk a few blocks between rounds through a pinned ring, written
+  with O_DIRECT (the page cache shares a GB10's memory). A conversation resumes from disk after an eviction, a clean
+  restart, a `kill -9` or a watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s).
+- **Reads beside decoding.** A restore reads its blocks on 8 threads, checks each against its CRC-32, and copies them
+  into the pool on its own CUDA stream while the other requests keep decoding; a file that fails is dropped on every
+  Spark and the prompt is prefilled. Rank 0 asks every Spark before a read; a read happens only when all hold the state.
+- **Pictures** (`PARALLEL` above 1): stored under their content keys, so a request resumes one only with the same
+  pictures in the same places.
+
+Old turns. Every turn keeps its own small part (~91 MB a Spark: the recurrent state and DFlash2 window at that
+point, the same size at any length), while the rows are shared, so a long agent loop would store one small part a
+turn. As soon as a state is written, its conversation's path keeps the newest `SPILL_TURNS` (4) states and the older
+ones go (`trimmed_turns`): they free only their small part, since the newest turn still names every block. A request
+can then resume from any of the last 4 turns (a regenerate, an edited last message, a rewound tool call); an edit
+further back resumes from the shared system prompt and prefills the rest. `SPILL_TURNS=2` suits heavy agent loops or a
+small disk, 8 or more chats with frequent deep edits, `0` keeps every turn until room is needed. Forks off the path (an
+edited message's old branch) stay until room is needed.
+
+Room. At most `SPILL_GIB` a Spark, and no write leaves less than `SPILL_MIN_FREE_GIB` (50) GiB free on its file system.
+When either needs room, states go in this order (blocks go once no state names them):
+
+1. a conversation's old turns beyond the newest `SPILL_TURNS` on the path of its most recently used state (only with
+   `SPILL_TURNS=0`, or the newest one then: they are gone already otherwise);
+2. abandoned forks (an edited or retried message): a conversation's states off that path, least recently used first;
+3. whole conversations, least recently used first;
+4. shared-prefix states (a system prompt other conversations resume from), last.
+
+A conversation is the branch below the shared system-prompt state it extends ([issue #122](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/122),
+reported by [xiepengqi](https://github.com/xiepengqi): one conversation's per-turn states filled the disk and pushed
+the others out). `SPILL_QUOTA` (a fraction of
+`SPILL_GIB`, off by default) caps one conversation: past it, it trims its own old turns and forks first, so one busy
+conversation cannot push every other one off the disk. If nothing can make the room, the state is not written.
+
+Two Sparks, `PARALLEL=8`, `SPILL_GIB=64`, every reply compared to a fresh `draft: false` one (temperature 0):
+
+| Case | Result |
+| --- | --- |
+| A 40k-token conversation kept 3 s before `kill -9` of every rank | resumed from disk after the restart, same reply, 1.4 s (fresh 21.8 s) |
+| The same after a clean restart; a turn that adds 10.4k tokens to it | resumed, same reply, 1.2 s (fresh 27.0 s); the turn wrote 68 MiB (6 new blocks), not the whole state |
+| 4 conversations growing 30k to 45k tokens over 7 turns each, at once | decode 27.99 tok/s together with the tier on and off; 1.2 GiB written for 28 kept states; dirty pages as with it off |
+| A picture prompt across a clean restart | resumed, same reply |
+| Restore of a 40k-token state | 147 ms (median) |
+| An agent rewinding its last two rounds every 4th of 16 (~110k tokens, issue #104), 6 chats filling the cache | the 3 rewinds prefilled 22, 66 and 67 tokens (before: 22, 109,186 and 4,227); same replies |
+
+Files: `spill-<build>/rank<N>/blocks/` (about 6.2 MB a 1,000 tokens a Spark) and `points/` (each state's ids and
+small part), owned by you and readable only by you (they hold your prompts' tokens). Its counters are in `/health`
+(`spill`: states, blocks, bytes written in all and linked, what each eviction step dropped, restores and their
+p50/p95; what fills it: conversations, the largest one's bytes, share of the cap and tokens, the five largest, shared
+prefixes, abandoned forks, turns kept on one path; whether it pays: `disk_lookups`, `disk_hits`, `has_refused` (a
+rank lacking the state); the cap, turns and quota) and `/metrics` (`spill_*`). Each build gets its own folder, so a
+new image starts the tier empty (the previous build's folder is kept until the next). With `PARALLEL=1` the one-stream engine writes a kept state to one file when memory drops it, as before.
+`SPILL_HIGHWATER` no longer changes anything (states are written when kept). Design and credits: `NOTICE`,
+`CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`, `tensorfold/cuda/spill_blocks.py`) is model-agnostic.
+
+### A system prompt prefilled once for every agent
+
+Agents that start at the same moment on a system prompt the server has not kept yet (a cold start, a new harness or
+harness version, a changed tool list or instructions) would each prefill it, side by side. A request whose prompt
+starts with a point another request is still prefilling (its system block's end, a shared-prefix point) now waits for
+that state, apart from the queue, and resumes from it: the system prompt is prefilled once, and every agent's first
+token comes sooner (`PREFIX_WAIT`, on; `PREFIX_WAIT=0` turns it off). Six agents at once on a fresh 12k-token system
+prompt, two Sparks, `PARALLEL=8`, every reply equal to its own fresh `draft: false` one:
+
+| | Without | With |
 | --- | --- | --- |
-| 15 conversations of 200k tokens resent after others pushed them out | 7-10 of 15 resumed, 40-64 s | 15 of 15, 0.6 s |
-| The same 15 after a clean restart | 1 of 15, 110 s | 15 of 15, 0.8 s |
-| 4 of them returning at once | 117-135 s | 4.3-5.8 s |
-| 2 agents, 24 requests of 60k shared + 40k own, resent | 23 s | 0.5 s |
-| A 200k prompt back while 3 streams decode: its first token; their tok/s meanwhile | 199-202 s; 78-80 -> 25 | 2.2-2.4 s; 78-80 -> 60-65 |
-| Cold prefill, 8k to 256k tokens (nothing to resume) | 1,623-1,966 tok/s | within 2% (1,595-1,933) |
-| Decode, tok/s (prose x1 / x4, structured x1 / x4), full pool | 44.0 / 90.9 / 86.6 / 176.8 | 44.0 / 90.7 / 86.6 / 177.1 |
-
-A restored state gives the same tokens as a fresh prefill (256 greedy tokens, `draft: false`, compared after a clean
-restart and after `kill -9`). Every 8 MiB of a file carries a CRC-32 that is checked on each read; a file that fails it
-is dropped on every Spark and the prompt is prefilled. With `PARALLEL` above 1, prompts with images or video are
-stored too, under their pictures' content: a request resumes one only with the same pictures in the same places.
-
-Files: one per stored prompt, about 6.7 KB a token a Spark (1.34 GB at 200k tokens), owned by you and readable only by
-you (they hold your prompts' tokens); the oldest go first past `SPILL_GIB`, and also when a write would leave less
-than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that room, the write is skipped). Prompts
-under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and credits: `NOTICE`,
-`CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to TensorFold itself.
+| All six answered (wall) | 47.0 s / 45.7 s | 14.7 s / 15.0 s |
+| Slowest first token | 46.2 s / 45.0 s | 13.5 s / 13.8 s |
+| System-prompt tokens prefilled again | 60,160 | 0 |
 
 ## Worker weights over NFS
 
@@ -512,7 +565,9 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `COPY` / `COPY_MAX` | `1` / `15` | copy drafts: when the reply's last 8 tokens occurred before, the tokens that followed are verified ahead of DFlash2's, up to 15 a round |
 | `COPY_CODE` | `1` | 16-row verify windows as CUDA graphs, and copies from the reply itself only after a 16-token match |
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
-| `SPILL_GIB` / `SPILL_DIR` / `SPILL_HIGHWATER` | `0` / `~/.cache/tensorfold-spill` / `0.70` | the spill tier: kept prompt states on local disk, up to `SPILL_GIB` GiB a Spark (0: off), written early past `SPILL_HIGHWATER` of the pool ([Spill tier](#spill-tier-optional)) |
+| `SPILL_GIB` / `SPILL_DIR` | `0` / `~/.cache/tensorfold-spill` | the spill tier: kept prompt states on local disk, written when kept, up to `SPILL_GIB` GiB a Spark (0: off) ([Spill tier](#spill-tier-optional)) |
+| `SPILL_QUOTA` / `SPILL_TURNS` | `0` / `4` | the spill tier's share of `SPILL_GIB` one conversation may hold before it trims its own old turns and forks (0: no quota), and the newest states kept on a conversation's path, older turns trimmed as each one is written (2: heavy agent loops or a small disk; 8+: chats with deep edits; 0: every turn until room is needed) |
+| `PREFIX_WAIT` | `1` | a request whose prompt starts with what another request is still prefilling (a shared system prompt) waits for that state instead of prefilling it too ([A system prompt prefilled once](#a-system-prompt-prefilled-once-for-every-agent)) |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -660,7 +715,8 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Delivery abort | `0083-tfcap-delivery-abort` | a stream whose delivery callback raises (broken pipe, reset, timeout) ends at once and frees its lane, instead of the exception escaping and the lane leaking until generation ends (by johnwhited, #48) | a client that dies mid-reply no longer holds a lane |
 | Anthropic Messages | `0084-anthropic-messages` | Anthropic's `/v1/messages` (also `/messages`, with `/count_tokens` suffixes), translated to the same chat completion the OpenAI route serves — text and image blocks, `tool_use` / `tool_result`, thinking, `stop_sequences`, `output_config` effort/JSON schema — with Anthropic SSE streaming and bodies capped at 32 MiB (upstream v0.6.3, by [evilpsycho42](https://github.com/evilpsycho42) and [ashhart](https://github.com/ashhart), request bodies by [Jordi Posthumus](https://github.com/JordiPosthumus); backported by [Eduardo Florencio](https://github.com/eduffd)) | Claude Code and the Anthropic SDKs work against the server directly, without a translating proxy |
 | Checked draft candidates | `0092-glm-draft-candidates-checked` | the drafter checks each block pass's candidate ids against the vocabulary; on an id outside it (issue #80: a float's bits read as an id) it logs the value, copies the rows again once the device is idle, and fails only if they are still bad | a rare drafter `IndexError` is retried (and its cause logged) instead of killing a rank |
-| Spill tier | `0088-glm-spill-tier` | kept prompt states written to local disk on every Spark when they leave the pool (early, in the background, past `SPILL_HIGHWATER`) and read back beside decoding streams, also after a clean restart (`SPILL_GIB`, off by default; authored by Robert Wojciechowski, [wojo](https://github.com/wojo), #78) | [Spill tier](#spill-tier-optional) |
+| Spill tier | `0088-glm-spill-tier` | kept prompt states on local disk on every Spark, read back beside decoding streams, also after a restart; the one-stream engine (`PARALLEL=1`) writes one file a state when memory drops it (`SPILL_GIB`, off by default; authored by Robert Wojciechowski, [wojo](https://github.com/wojo), #78) | [Spill tier](#spill-tier-optional) |
+| Spill tier, blocks | `0099-glm-spill-blocks` | with `PARALLEL` above 1: every kept state written when kept, in 2,048-token blocks later turns share (equal bytes linked), so it survives a crash; room by conversation (old turns, forks, whole conversations, shared prefixes last), `SPILL_QUOTA`; a request waits for a prefix another one is prefilling (`PREFIX_WAIT`) (block layout, lineage, write-at-keep ring, release and fsync order from #118 by [BadAd84](https://github.com/BadAd84); eviction by conversation for #122, reported by [xiepengqi](https://github.com/xiepengqi); the rest by [wojo](https://github.com/wojo)) | [Spill tier](#spill-tier-optional) |
 | Kept-state count | `0097-glm-kept-entries-share` | `TF_GLM_CACHE_SHARE_PCT` (the kept-state count as a share of the pool's memory; a ceiling at three quarters of it, so the reservation stays inside the estimate) and the kept states' key arrays built once, not at every admission (issue #84, @jdecker76) |
 | Kept-state limits | `0089-glm-kept-state` | `TF_GLM_KEPT_BYTES_GIB` (a byte budget for the kept states, with the freed blocks handed back to the driver) and `TF_GLM_KEEP_PER_CHAT` (a per-conversation quota of turn-boundary states), both off by default; `/health` `kept_bytes`, `kept_mix` (authored by Thomas Wade, [ThomasWadeZ](https://github.com/ThomasWadeZ), #65) | with both at 0, nothing changes |
 | Responses `include` | `0093-responses-include` | `/v1/responses` accepts OpenAI's `include` values and ignores them (reasoning already comes as text, nothing is encrypted); an unknown value or a non-list is still a 400 (issue #73) | the AI SDK's `include: ["reasoning.encrypted_content"]` no longer fails every request |
