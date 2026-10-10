@@ -130,6 +130,12 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   MLX-style server, issues #67, #74): uses the reader `tensorfold/server/request_body.py` (`read_body`, TensorFold
   commit 977f2cc), authored by Jordi Posthumus ([JordiPosthumus](https://github.com/JordiPosthumus)) and brought in by
   `0084`; the call sites are ours. TensorFold's own chunked-body issue is ashhart/TensorFold#244.
+- `0112-server-sse-keepalive` (SSE keep-alive comments while a streamed reply is silent, issue #106): the diagnosis,
+  the measurements behind a Cloudflare Tunnel, the design (a `: keepalive` comment line after
+  `TENSORFOLD_SSE_KEEPALIVE_S` seconds of silence) and the first patch and CPU test, for the chat stream, by
+  [stevehansen](https://github.com/stevehansen) in [issue #106](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/106);
+  this version, which also carries the comments through the Messages and Responses streams, and its extended test,
+  by [BadAd84](https://github.com/BadAd84).
 - `0085-glm-select-split-loop` (the split selection's last pass over the earlier chunks only): by
   [BadAd84](https://github.com/BadAd84).
 - `0086-glm-prompt-scores-loop` (the prompt scoring, one row and many pool blocks a program): by
