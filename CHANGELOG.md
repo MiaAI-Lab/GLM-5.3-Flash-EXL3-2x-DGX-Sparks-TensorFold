@@ -5,6 +5,26 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A call to a tool the request did not offer goes out under its own name** (patch `0113-glm-unoffered-tool-call`, by
+  [kky42](https://github.com/kky42), #103; TensorFold's rule since be8bccbec, #256/#415): such a call stayed content
+  text with `finish_reason` "stop", so the client never learned the tool was unknown and the agent stopped on raw
+  markup. Now its name goes out when it is 1 to 64 of `[A-Za-z0-9_-]` and its arguments are a finite JSON object; the
+  client answers "unknown tool" and the model corrects itself. Anything else stays text, and bare JSON still needs an
+  offered name. Two Sparks, 30 seeded replies in a conversation whose earlier turn called a tool no longer offered:
+  10 such calls came back as text, all 10 are now `tool_calls` (whole and streamed); the other 20 replies are
+  unchanged. CPU check: `tools/test_unoffered_tool_call.py`.
+- **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0112-glm-tool-tag-mention`, by
+  [kky42](https://github.com/kky42)): every place the server finds GLM calls ran a block from any `<tool_call>` to the
+  next `</tool_call>`, so a reply that mentioned the tag ("the literal `<tool_call>` markup") before its real call made
+  one unparseable block of both: across `</think>` in the reasoning (cut at the mention), across the prose in the
+  answer. The call came back as content text with `finish_reason` "stop" and no `tool_calls`, and the agent stopped.
+  An opener now starts a block only when a call's head follows (GLM's name then `<arg_key>` or `</tool_call>`, Qwen's
+  `<function=`, or JSON), and a call in the think block does not cross `</think>`. Two Sparks, 30 live replies to five
+  prompts about the tag, each ending in a real `bash` call (seeded; v1.10's image and the same image with only this
+  file changed, token-identical replies): `tool_calls` 15/30 -> 30/30, whole and streamed alike, and call markup in
+  `content` 18 -> 0. A whole example call the model quotes is still read as a call, as before (3 of the 30 gave two
+  calls). CPU check:
+  `tools/test_think_tag_mention.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
