@@ -31,17 +31,6 @@ unset _n _line _key _value
 # ring, experimental: README "3 Sparks", "4 Sparks"), with WORKER2 (rank 2) and WORKER3 (rank 3); a start uses WORKER ..
 # WORKER<TP-1> and leaves later ones out (stop.sh stops every configured one).
 TP="${TP:-2}"
-# Opt-in existing scheduler and expert launch-order settings; individual overrides win.
-# No kernel, transport, checkpoint, memory-pool, context or parallelism changes.
-TP4_DECODE_TUNING="${TP4_DECODE_TUNING:-0}"
-case "$TP4_DECODE_TUNING" in 0|1) ;; *) echo "TP4_DECODE_TUNING: expected 0 or 1" >&2; return 2 ;; esac
-if [[ "$TP4_DECODE_TUNING" == 1 ]]; then
-  [[ "$TP" == 4 ]] || { echo "TP4_DECODE_TUNING=1 requires TP=4" >&2; return 2; }
-  export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-2}"
-  export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
-  export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
-  export TF_GLM_MULTI_ASYNC="${TF_GLM_MULTI_ASYNC:-1}"
-fi
 WORKER="${WORKER:-}"                 # e.g. user@<worker address>; set it in scripts/local.sh
 FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is reached over another network
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-}"  # the worker's Hugging Face cache when it is not its HF_HOME (absolute path)
@@ -307,6 +296,14 @@ export TENSORFOLD_NUCLEUS_UNION="${NUCLEUS_UNION:-${TENSORFOLD_NUCLEUS_UNION:-1}
 # 196.3 -> 227.9 tok/s; one request unchanged. Exact. MULTI_PREFILL=0 turns it off.
 MULTI_PREFILL="${MULTI_PREFILL:-1}"
 export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
+# TP4 defaults for the existing sampler/allocator/control path; individual overrides win.
+# With expert launch order 2 below: matched prose C4 +1.9%, C8 +4.1% on a four-Spark
+# ring (one boot, not a general speedup claim; docs/tp4-decode-tuning.md). TP2/TP3 unchanged.
+if [[ "$TP" == 4 ]]; then
+  export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
+  export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
+  export TF_GLM_MULTI_ASYNC="${TF_GLM_MULTI_ASYNC:-1}"
+fi
 # Smooth streaming (patch 0061): with drafts a round accepts ~3 tokens at once, so a streamed reply arrives in bursts
 # (every ~50 ms alone, ~100 ms with 4 streams), and pauses while another request's prompt fills. 1 (default): tokens
 # go out one event each at a steady pace from a playout buffer of STREAM_SMOOTH_MS (text appears that much later; the
@@ -331,11 +328,11 @@ export TF_GLM_L2PF="${TF_GLM_L2PF:-1}"
 # Together with TF_GLM_L2PF=1 and TF_ROCE_MAX_KB=512: one request's prose 49.68, code 61.49 (+2.7% / +3.3%); 4 at once
 # prose 74.8 -> 76.6, code 100.0 -> 102.7 tok/s in all (two boots each). Same bits. 0: TensorFold's 32-bit loads.
 export TF_GLM_EXL3_LOADS="${TF_GLM_EXL3_LOADS:-nc}"
-# The decode expert kernel's block launch order (patch 0090, by lukaszraczylo): 0 (default) the grid as launched, items
+# The decode expert kernel's block launch order (patch 0090, by lukaszraczylo): 0 the grid as launched, items
 # fastest; 1: the eight 128-column blocks of one k slice run together (contiguous trellis reads), then the items; 2: then
-# the matrices and splits. The same bits for every value; the author's single-stream gain for 1 is +2.2%, one tester, not yet
-# measured here. Not TF_GLM_EXL3_ORDER, which is patch 0020's prompt order (default on).
-export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-0}"
+# the matrices and splits. Same bits; default 2 at TP4 (with the scheduler defaults above), 0 at TP2/TP3.
+# Not TF_GLM_EXL3_ORDER, which is patch 0020's prompt order (default on).
+export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-$([[ "$TP" == 4 ]] && echo 2 || echo 0)}"
 # Conversations that share a system prompt reuse its prompt state (patch 0015): a 7.9k-token system prompt's second and
 # later chats prefill in 0.13 s instead of 4.24 s. Same replies. SHARED_PREFIX=0 turns it off.
 SHARED_PREFIX="${SHARED_PREFIX:-1}"

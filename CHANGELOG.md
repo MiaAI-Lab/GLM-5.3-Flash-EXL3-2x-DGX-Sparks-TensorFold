@@ -3,11 +3,11 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## Unreleased: opt-in TP4 decode tuning
+## Unreleased: TP4 decode defaults
 
-- `TP4_DECODE_TUNING=1`: an opt-in preset for the existing packed sampler,
-  joint draft-depth allocation, asynchronous messages and expert launch order 2.
-  Individual overrides win; defaults, kernels, transport and image stay unchanged.
+- At TP4, default to the existing packed sampler, joint draft-depth allocation,
+  asynchronous messages and expert launch order 2. No extra enable switch.
+  Individual overrides win; TP2/TP3, kernels, transport and image stay unchanged.
 - Configuration regression tests and a stdlib-only matched prose benchmark.
   Scope and results: [TP4 decode tuning](docs/tp4-decode-tuning.md).
 

@@ -1,4 +1,4 @@
-# Opt-in TP4 scheduler and expert launch-order preset
+# TP4 scheduler and expert launch-order defaults
 
 This change selects four existing runtime options. It adds no kernel patches,
 PRMT dispatch, QMM/attention backports, private NCCL build or transport changes.
@@ -8,17 +8,19 @@ memory limits, parallelism and prefill code remain unchanged.
 Configure the workers normally, then:
 
 ```bash
-TP4_DECODE_TUNING=1 ./start-tp4-switchless.sh
-# Restart with the preset disabled:
-TP4_DECODE_TUNING=0 ./start-tp4-switchless.sh restart
+./start-tp4-switchless.sh
+# Restore the previous TP4 settings explicitly:
+TF_GLM_MULTI_SAMPLER=streams TF_GLM_MULTI_DEPTH=policy \
+TF_GLM_MULTI_ASYNC=0 TF_GLM_EXL3_DEC_ORDER=0 ./start-tp4-switchless.sh restart
 ```
 
-The preset requires TP=4 and is off by default. Per-setting overrides win, under
+These are defaults at TP=4; no extra enable/disable switch is needed.
+Per-setting overrides win, under
 the recipe's existing environment/local-config precedence. Workers receive the
 same exported settings through the normal launcher. The published image and
 patch hash are unchanged; no image rebuild is required.
 
-| Setting | Preset | Existing implementation |
+| Setting | TP4 default | Existing implementation |
 | --- | --- | --- |
 | `TF_GLM_MULTI_SAMPLER` | `packed` | Packed sampling collectives |
 | `TF_GLM_MULTI_DEPTH` | `joint` | Joint draft-depth allocation |
@@ -36,10 +38,11 @@ do not establish a gain on a switched fabric or other hardware/workloads.
 IMAGE=<published-image> scripts/test-cpu.sh -k tp4_decode_tuning
 ```
 
-Tests check that the preset changes exactly four settings, preserves defaults
-and individual overrides, and rejects invalid preset/TP combinations.
+Tests check that TP4 selects exactly these four settings, preserves TP2/TP3
+defaults and individual overrides, and honors environment/local-config precedence.
 
-Run the baseline (preset off) and candidate (preset on) serially, on an idle
+Run the baseline (the four explicit previous settings above) and candidate
+(new defaults) serially, on an idle
 server, with the same weights/settings and identical warmup/cache preparation.
 Use the bundled benchmark helper; the output caps below match the original
 upstream-versus-fork screen:
@@ -58,12 +61,17 @@ seconds of their common span. SSE TTFT is recorded separately. It rejects
 contaminated request/output counters and saves hashes rather than prompt/output
 text. Compare token hashes, token counts and cache state across configurations.
 
-## Exact-preset results
+## Matched-settings results
 
 Measured 2026-10-10, source `336811f8c2c19e13bca2157dd4c7330d5a520b31`, against
 upstream `tp4` at `d22003070575c2774de0f010062aa57bae06f3c7`. Both used the same
 published image, patch hash `7a37454d3238`, with no additional kernel patches.
 Exactly the four settings above differ; the shared-expert side stream stays on.
+
+This measurement used these four values as an explicit opt-in preset. They are
+now automatic TP4 defaults, with the same runtime values and unchanged image.
+Configuration regression checks verify equivalence; these are not new
+performance measurements of the later configuration refactor.
 
 Four GB10 Sparks on a switchless ring, upstream NCCL/RoCE, the same 4bpw Ablit
 checkpoint and DFlash2 drafter, 500,000 context, eight slots, FP8 KV / Q4 dense
@@ -71,7 +79,7 @@ KV, 32 GiB KV pool and 20 GiB memory reserve. Exact revisions, image digest,
 counts and output token hashes are in the
 [machine-readable results](benchmarks/tp4-scheduler-order-20261010.json).
 
-| Concurrency | Upstream aggregate decode tok/s | Preset aggregate decode tok/s | Change | Mean TTFT, upstream / preset |
+| Concurrency | Upstream aggregate decode tok/s | Tuned aggregate decode tok/s | Change | Mean TTFT, upstream / tuned |
 | --- | ---: | ---: | ---: | ---: |
 | C1 | 65.03 | 65.60 | +0.88% | 0.363 / 0.365 s |
 | C4 | 123.17 | 125.48 | +1.88% | 0.643 / 0.629 s |
