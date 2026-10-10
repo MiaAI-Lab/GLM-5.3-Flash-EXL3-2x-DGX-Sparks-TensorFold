@@ -1,0 +1,45 @@
+# The DSA layers' decode attention (latent.seg_attention) gives a rank of 17-24 heads (TP=3: 22 / 21) one 32-head
+# tile a row from 5 rows instead of 8 (seg_head_block(R, H)). Its 16-head tiles are two programs a row and chunk, which
+# from 5 rows pass the GB10's 48 SMs and run in two waves. 16 heads (TP=4) and 32 (TP=2) a rank keep the 8-row rule. Heads a tile
+# never change a row's bits (head_block). tools/seg_head_block_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -815,13 +815,22 @@ def seg_chunks() -> int:
+ 
+ 
+ SEG_WIDE_ROWS = 8        # segmented windows from this many rows take 32-head tiles (keys read once; fewer programs)
++# Patch 0104: a rank of more than HB and at most SEG_FEW_HEADS heads (TP=3: 22 on rank 0, 21 on ranks 1 and 2) takes them from
++# SEG_FEW_WIDE_ROWS rows. Its 16-head tiles are two programs a row and chunk (16 + 6 heads), so from 5 rows x 5 chunks
++# they pass the GB10's 48 SMs and run in two waves, while one 22-head tile a row stays in one wave up to 9 rows.
++# Measured cold on a GB10 (11 calls a graph, L2 flushed, 180k-596k, the same bits in every arm): 5 / 6 / 7
++# rows 93.6 / 104.6 / 108.7 us a call with 16 heads, 66.8 / 67.2 / 67.7 with 22; 1-4 rows stay with 16 (58-59 vs
++# 61-66). TP=2's 32 heads a rank keep SEG_WIDE_ROWS (its own measurement), and so do TP=4's 16 (one 16-head tile a row already).
++SEG_FEW_HEADS = 24
++SEG_FEW_WIDE_ROWS = 5
+ 
+ 
+-def seg_head_block(R: int) -> int:
+-    """Heads per program of a segmented window: 16 for a few rows (more programs in flight), a rank's 32 from
+-    SEG_WIDE_ROWS (each key tile read once for them). 16- and 32-row tiles give a row the same bits (head_block),
+-    so either matches the single-stream kernels' 16 (tests/cuda/test_glm_attn_segments.py checks both)."""
+-    return HB_WIDE if R >= SEG_WIDE_ROWS else HB
++def seg_head_block(R: int, H: int) -> int:
++    """Heads per program of a segmented window of R rows of H heads a rank: 16 for a few rows (more programs in
++    flight), 32 (a rank's heads in one tile) from SEG_WIDE_ROWS, or from SEG_FEW_WIDE_ROWS with HB < H <= SEG_FEW_HEADS
++    heads. 16- and 32-row tiles give a row the same bits (head_block), so either matches the single-stream kernels'
++    16 (tests/cuda/test_glm_attn_segments.py checks both)."""
++    return HB_WIDE if R >= (SEG_FEW_WIDE_ROWS if HB < H <= SEG_FEW_HEADS else SEG_WIDE_ROWS) else HB
+ 
+ 
+ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Tensor | None,
+@@ -841,7 +850,7 @@ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Ten
+     else:
+         W = tokens.shape[1]
+     n = nch * R * H
+-    hb = seg_head_block(R) if hb is None else hb
++    hb = seg_head_block(R, H) if hb is None else hb
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"segmented attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)

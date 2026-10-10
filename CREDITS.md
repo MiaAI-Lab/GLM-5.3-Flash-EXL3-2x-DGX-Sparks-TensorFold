@@ -134,6 +134,7 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [BadAd84](https://github.com/BadAd84).
 - `0086-glm-prompt-scores-loop` (the prompt scoring, one row and many pool blocks a program): by
   [BadAd84](https://github.com/BadAd84).
+- `0099-glm-tokenize-nogil` (prompts tokenized with Python's GIL released): by [BadAd84](https://github.com/BadAd84).
 - `0087-glm-display-kv-dispram` (`DISPLAY_KV_BACKEND=dispram`: `0072`'s display reservation on kindling spark-os): by
   [BadAd84](https://github.com/BadAd84). It maps the span through `dispram`, the display-carveout lender of
   [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
@@ -211,3 +212,14 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   128 GB unified memory), two of them linked by their ConnectX-7 ports: every number in the README was measured there.
 
 If you believe something here is missing or credited wrongly, please open an issue.
+- `0101-glm-prompt-select-floor` (a prompt chunk's pool selection from one pass over the scores): by
+- `0105-glm-prompt-scores-cuda` (a prompt chunk's indexer scoring in CUDA, Triton's instruction order): by
+- `0106-glm-sparse-onepass-cuda` (a prompt chunk's sparse attention in CUDA, Triton's instruction order):
+  by [BadAd84](https://github.com/BadAd84).
+- `0107-glm-decode-indexer` (a decode window's indexer: the scoring in CUDA, the selection in one pass): by
+- `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
+- `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
+- `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
+  `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
+- `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
+- `0103-glm-qmm-decode-noclusters` (decode matmuls reduce through the partials buffer at few rows): by

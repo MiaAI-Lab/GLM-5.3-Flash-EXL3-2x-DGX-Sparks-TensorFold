@@ -1,0 +1,258 @@
+# The next DFlash2 block pass starts at a decode round's end: MultiDecoder._prelaunch -> MultiDrafter.prelaunch
+# launches the block pass of the streams that will ask for drafts next round, so it runs while rank 0 finishes the
+# round (emit, the next plan, the message all-gather) instead of after it. The next round's candidates() only waits
+# for it when its streams and pending tokens match and none of their contexts changed since (DraftContext.context_end
+# bumps that context's generation; another slot's prompt chunk or admission leaves it valid); else it runs its own
+# pass. The same inputs give the same candidates: the same drafts and replies. The decision reads only state every
+# rank holds (the round's streams, tokens and depths from the gathered samples, context ends), never Stream.done,
+# which rank 0's emit sets alone, so every rank launches the same collectives. Patch 0092's check-and-retry loop is
+# kept: the first copy of the candidates goes out with the pass, the retry copies again. TF_GLM_DRAFT_PRELAUNCH=0
+# turns it off (checked equal on every rank at startup). tools/draft_prelaunch_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -100,8 +100,21 @@ class DraftContext:
+         self.kc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.kc]
+         self.vc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.vc]
+         self.pos_dev = owner.pos[slot:slot + 1]          # the device mirror of context_end (restore fills it)
++        self.gen = 0                    # bumped by every change of this context (``context_end``)
+         self.context_end = 0
+ 
++    @property
++    def context_end(self) -> int:
++        return self._end
++
++    @context_end.setter
++    def context_end(self, value: int) -> None:
++        # every change of this stream's context (taps, a restore, a reslot into this slot, a reset, a capture)
++        # goes through here and outdates a block pass of this slot launched ahead (``MultiDrafter.prelaunch``):
++        # a pass reads only its own slots' rings, so another slot's change (a prompt chunk, an admission) does not
++        self._end = value
++        self.gen += 1
++
+     def reset(self) -> None:
+         self.context_end = 0
+         self.pos_dev.zero_()
+@@ -137,6 +150,7 @@ class MultiDrafter:
+ 
+     def __init__(self, drafter: Drafter, streams: int = 4, *, tap_rows: int | None = None) -> None:
+         d = self.d = drafter
++        self._pre = None                # the ``_key`` of the block pass launched ahead (``prelaunch``)
+         if streams < 1:
+             raise ValueError("a multi-stream drafter needs at least one stream")
+         self.streams = streams
+@@ -372,17 +386,26 @@ class MultiDrafter:
+             self._launch_taps(pieces)
+ 
+     # -- drafts -------------------------------------------------------------------------------------------------
+-    @torch.no_grad()
+-    def candidates(self, reqs: Sequence[tuple[DraftContext, int, int]]) -> list[tuple[np.ndarray, ...]]:
+-        """(stream, pending, depth) -> each stream's ``Drafter.candidates(pending, depth)``: one batched pass."""
+-
+-        S, St = len(reqs), self.streams
++    def _check_block(self, ctxs: Sequence[DraftContext]) -> None:
++        S, St = len(ctxs), self.streams
+         if not 1 <= S <= St:
+             raise ValueError(f"a block pass takes 1..{St} streams, got {S}")
+-        if len({c.slot for c, _, _ in reqs}) != S or any(c.owner is not self for c, _, _ in reqs):
++        if len({c.slot for c in ctxs}) != S or any(c.owner is not self for c in ctxs):
+             raise ValueError("a block pass takes each of this drafter's streams at most once")
++
++    @staticmethod
++    def _key(reqs: Sequence[tuple]) -> tuple:
++        """A block pass's inputs: its streams in order, their pending tokens and their contexts' generations
++        (a context's end, and the ring rows below it, change only with its generation)."""
++        return tuple((r[0].slot, int(r[1]), r[0].gen) for r in reqs)
++
++    def _launch_block(self, reqs: Sequence[tuple[DraftContext, int]]) -> tuple:
++        """One batched block pass for (stream, pending) and its candidates' copy to ``cand_host`` (``cand_ready``
++        records its end); returns the pass's ``_key``."""
++
++        S, St = len(reqs), self.streams
+         h = self.b_host
+-        for s, (c, pending, _) in enumerate(reqs):
++        for s, (c, pending) in enumerate(reqs):
+             h[s], h[St + s], h[2 * St + s] = int(pending), c.slot, c.context_end
+         self.b_meta.copy_(h, non_blocking=True)
+         g = self.block_graphs.get(S)
+@@ -390,16 +413,54 @@ class MultiDrafter:
+             g.replay()
+         else:
+             self._block_compute(S)
++        if self.cand_ready is not None:
++            self.cand_host.copy_(self.cand, non_blocking=True)
++            self.cand_ready.record()
++        else:
++            self.cand_host.copy_(self.cand)
++        return self._key(reqs)
++
++    @torch.no_grad()
++    def prelaunch(self, reqs: Sequence[tuple[DraftContext, int]]) -> None:
++        """Launch now the block pass a later ``candidates`` call will ask for (the next round's, from the
++        end of this one, so it runs while the host finishes the round and rank 0's message goes out). Every rank
++        calls it at the same point with the same streams (its all-gather pairs up). ``candidates`` with the same
++        streams and pending tokens, none of their contexts changed in between (``DraftContext.gen``), only waits for
++        it; any other call runs its own pass. The pass's inputs are the ones ``candidates`` would give it, so its
++        candidates and the drafts chosen from them are the same."""
++
++        if not reqs:
++            return
++        self._check_block([c for c, _ in reqs])
++        if self._pre is not None and self.cand_ready is not None:
++            self.cand_ready.synchronize()              # an unused pass ahead still reads b_host
++        self._pre = self._launch_block(reqs)
++
++    @torch.no_grad()
++    def candidates(self, reqs: Sequence[tuple[DraftContext, int, int]]) -> list[tuple[np.ndarray, ...]]:
++        """(stream, pending, depth) -> each stream's ``Drafter.candidates(pending, depth)``: one batched pass (or
++        the one ``prelaunch`` started for exactly these inputs)."""
++
++        S, St = len(reqs), self.streams
++        self._check_block([c for c, _, _ in reqs])
++        key = self._key(reqs)
++        pre, self._pre = self._pre, None
++        if pre != key:
++            if pre is not None and self.cand_ready is not None:
++                self.cand_ready.synchronize()          # the unused pass ahead still reads b_host
++            self._launch_block([(c, p) for c, p, _ in reqs])
+         d = self.d
+         m, k = self.block - 1, d.top_k
+         vocab = d.succ.shape[0]
+         for attempt in (0, 1):
+-            if self.cand_ready is not None:
+-                self.cand_host.copy_(self.cand, non_blocking=True)
+-                self.cand_ready.record()
++            if attempt:                        # (patch 0092) the rows again, copied once the device is idle
++                if self.cand_ready is not None:
++                    self.cand_host.copy_(self.cand, non_blocking=True)
++                    self.cand_ready.record()
++                else:
++                    self.cand_host.copy_(self.cand)
++            if self.cand_ready is not None:    # the first copy went out with the pass (``_launch_block``)
+                 self.cand_ready.synchronize()
+-            else:
+-                self.cand_host.copy_(self.cand)
+             g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
+             p_all = self.cand_host[self.cand_n:].view(St * m, -1)
+             try:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -701,6 +701,9 @@ class GlmEngine:
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
++        from .multi import PRELAUNCH                          # TF_GLM_DRAFT_PRELAUNCH: every rank alike
++
++        mine = mine + [int(PRELAUNCH)]                      # checked alike, not in the spill tier's key (``agreed``)
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+         if odd:
+@@ -709,7 +712,8 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
++                               "TF_GLM_DRAFT_PRELAUNCH): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -141,6 +141,10 @@ LONE_LEFT = 16                            # a lone stream moves home only with a
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+ MAX_WINDOW = 32                          # rows of every stream's windows together in one round (TF_GLM_MULTI_WINDOW)
+ SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
++# TF_GLM_DRAFT_PRELAUNCH (default 1; 0 off, the same drafts and replies either way): a round's end launches
++# the next round's DFlash2 block pass (``MultiDecoder._prelaunch``). Every rank reads it (start.sh forwards TF_GLM_*);
++# ranks that disagree would launch different collectives, so it is read once here and must be set alike everywhere
++PRELAUNCH = __import__("os").environ.get("TF_GLM_DRAFT_PRELAUNCH", "1").strip() != "0"
+ 
+ 
+ # -- settings ------------------------------------------------------------------------------------------------------
+@@ -458,6 +462,7 @@ class Lane:
+     copy_rounds: int = 0
+     copy_drafted: int = 0
+     copy_accepted: int = 0
++    next_copy: Any = None        # ((copies length, room), proposal, proposed) the round's end worked out
+ 
+ 
+ class NoRoom(RuntimeError):
+@@ -2052,7 +2057,6 @@ class MultiDecoder:
+         stream at home, verified through the one-stream graphs when its window fits them. ``short``: between fill
+         slices, commit one token per stream without proposing drafts (the same keyed sample, lower round cost)."""
+ 
+-        from .decode import copy_room
+         from .dflash2_multi import DraftRequest
+ 
+         if depths is not None and [l.depth for l in lanes] != depths:
+@@ -2063,7 +2067,7 @@ class MultiDecoder:
+         copied: list[bool] = []
+         asks = []
+         for l in lanes:
+-            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and not short else []
++            c = self._copy_proposal(l) if l.copies is not None and not short else []
+             copied.append(bool(c))
+             drafts.append(list(c))
+             if not short and not c and l.dflash and l.depth > 0:
+@@ -2150,11 +2154,57 @@ class MultiDecoder:
+             elif l.policy is not None:
+                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
+                               max(0, s.count - len(s.out)))
++        if not short and PRELAUNCH and self.drafts is not None:
++            self._prelaunch(lanes)
+         if prof is not None:
+             prof.mark("emit")
+             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
+                      sum(len(g.tokens) - 1 for g in segments))
+ 
++    def _copy_proposal(self, l: Lane) -> list[int]:
++        """``l.copies.propose`` with this round's room. The previous round's end may have worked it out
++        already (``_prelaunch``); with the copies unchanged since (the same length and room) its proposal and
++        ``proposed`` are this call's."""
++
++        from .decode import copy_room
++
++        room = copy_room(l.copies, l.s.count, l.s.out)
++        hit = l.next_copy
++        if hit is not None and hit[0] == (l.copies.length, room):
++            l.copies.proposed = hit[2]
++            return list(hit[1])
++        return l.copies.propose(room)
++
++    def _prelaunch(self, lanes: list[Lane]) -> None:
++        """Both ranks, at the end of a round that was not short: the DFlash2 block pass of the streams that
++        will ask for drafts next round if nothing changes (``MultiDrafter.prelaunch``), so it runs while rank 0
++        finishes the round and sends the next message instead of after. Only state every rank holds decides it -
++        not ``Stream.done``, which rank 0's emit sets alone (a stop string, a cancelled client) - so every rank
++        launches the same pass and its all-gather pairs up. A next round that differs (a stream left, joined or
++        paused, a short round, copied drafts) runs its own pass; the drafts are the same either way."""
++
++        from .decode import copy_room
++
++        reqs = []
++        for l in lanes:
++            s = l.s
++            if not l.dflash or l.depth <= 0 or not s.out or len(s.out) >= s.count or s.out[-1] in self._ends(l):
++                continue
++            ctx = self._ctx(l)
++            if min(l.depth, self.drafts.block - 1) < 1 or ctx.context_end <= 0:
++                continue
++            if l.copies is not None:
++                room = copy_room(l.copies, s.count, s.out)
++                before = l.copies.proposed
++                c = l.copies.propose(room)
++                l.next_copy = ((l.copies.length, room), list(c), l.copies.proposed)
++                l.copies.proposed = before        # settled by extend as before (a short round proposes nothing)
++                if c:
++                    continue
++            reqs.append((ctx, s.out[-1]))
++        if reqs:
++            self.drafts.prelaunch(reqs)
++
+     def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
+         """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
+         round's rows allocated across them by expected tokens per ms (``multi_tune.allocate``). The picks are each

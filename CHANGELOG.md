@@ -5,6 +5,105 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
+  while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
+  half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
+  most `TF_GLM_PREFILL_ROWS`): the same memory, the same replies, half the passes over the expert weights. Three
+  Sparks, `PARALLEL=4`, a 35k-token reply streaming meanwhile: a warm +20k turn on a 596k conversation 15.6-15.7 ->
+  14.0-14.1 s, a cold ~256k prompt 132.2-132.6 -> 113.4-114.0 s; the reply's gaps during the fill median 13-15 /
+  p99 20-25 / max 25-67 ms either way. `FILL_ROWS=1024` restores the old size. CPU check: `tools/fill_rows_check.py`.
+- **Decode matmuls without clusters where they cost more than they save** (patch
+  `0103-glm-qmm-decode-noclusters`, by [BadAd84](https://github.com/BadAd84)): the decode 4-bit matmuls reduce their K slices through
+  the partials buffer and `reduce_kernel` instead of a thread-block cluster when the window has at most 64
+  rows and the weight holds fewer than 28 Mi values: the same slice-ordered fp32 sums, so the same bits. On
+  a GB10 the cluster's launch and syncs cost 20-60% on those latency-bound matrices (a shared expert's
+  gate/up at one row 29.3 -> 18.4 us), at the shapes of two, three and four Sparks; from 32 Mi the clusters
+  mostly win, and no shape sits between. Live on three Sparks: real code 89.5 / 88.6 -> 90.6 / 90.0 tok/s,
+  prose 64.7 / 64.5 -> 66.4 / 66.6. `TF_GLM_QMM_CLUSTERS=1`: the clusters as before. The extension is renamed
+  `tensorfold_qmm_v5`, so a kernel folder with v4's build does not serve it. GPU check:
+  `tools/qmm_noclusters_check.py`.
+- **A prompt chunk's dense projections on a faster tile** (patch `0102-glm-prompt-matmul-tile`, by [BadAd84](https://github.com/BadAd84)):
+  `forward.mm` launched every 4-bit prompt projection on the extension's default tile 0. It now launches
+  tile 9 (128 x 128 on four 64 x 64 warps, two blocks an SM) where K >= 1024 and the grid has 96 or more
+  blocks, else tile 3. A tile only picks which warp computes an output, so the bits are the same. A
+  2,048-row chunk's dense projections on one GB10: 178.1 -> 152.2 ms at TP=3 shapes, 238.1 -> 200.7 ms at
+  TP=2 shapes. `TF_GLM_PROMPT_TILE=0`: tile 0. GPU check: `tools/prompt_tile_check.py`.
+- **The next draft pass starts at a round's end** (patch `0100-glm-draft-prelaunch`, by
+  [BadAd84](https://github.com/BadAd84)): a decode round asked for its DFlash2 drafts only after rank 0 had emitted
+  the last round's tokens, planned the next round and sent its message, so the GPU sat idle meanwhile (an nsys
+  trace on three Sparks: 0.47 ms a round between the taps update and the message gather, 0.74 ms at 4 streams). Now
+  every rank launches the next round's block pass at the end of the round, from state every rank holds (never
+  rank 0's own stop decisions), and the next round waits for it when its streams, pending tokens and contexts
+  match (a context's every change bumps its generation), else runs its own pass. The same inputs give the same
+  candidates: every digest equal, drafted and serial alike. Three Sparks, `PARALLEL=4`: one stream's prose
+  66.8-67.0 -> 67.9-68.2 tok/s (38.0 -> 37.3 ms a round), code 88.8-91.1 -> 89.2-92.3 (overlapping), four at 596k
+  133.7-133.9 -> 134.7-134.9; `0092`'s check and retry is kept. `TF_GLM_DRAFT_PRELAUNCH=0` turns it off. GPU check:
+  `tools/draft_prelaunch_check.py`.
+- **No stall at a long request's start** (patch `0099-glm-tokenize-nogil`, by [BadAd84](https://github.com/BadAd84)):
+  the server tokenized each prompt with the tokenizer's `encode`, which holds Python's GIL for the whole text (~1.2
+  us a token), so while a long prompt was being tokenized the engine loop, and every other stream with it, stopped:
+  ~270 ms at 226k tokens and 725-768 ms at a ~619k-token agent turn (a second stream's longest gap, three Sparks).
+  Every tokenizer call in the server now goes through one helper that uses `encode_batch_fast` on the one text:
+  the same ids (`tools/tokenize_check.py`: real code and prose files, filler, every added token, random Unicode,
+  edge cases, both `add_special_tokens` values, and no `encode` call left in `server.py`), the GIL released (a
+  counting thread keeps 93-99% of its rate, against ~1% under `encode`) and ~30% faster (689k tokens: 799-825 ms
+  -> 559-593 ms). Requests with pictures or clips (`GlmVision.prepare`) tokenize the same way: the same ids, picture
+  positions and content hash (`tools/vision_tokenize_check.py`), and a counting thread's longest gap at ~784k tokens
+  749 -> 8 ms.
+- **A decode window's latent attention in CUDA at three Sparks** (patch `0108-glm-seg-chunks-cuda`, by
+  [BadAd84](https://github.com/BadAd84)): `seg_chunks.cu` computes every chunk partial of `_seg_chunks` with the Triton kernel's own
+  instruction sequence (patch 0106's chains, in `_seg_chunks`' kWidth-4 dot layout and p-sum tree; key
+  tiles past a chunk's last key, which Triton runs fully masked, are skipped): the same bits under Triton 3.7, and
+  Triton's `_merge` reads them as before. FP8 arenas with 17-24 heads a rank (22 / 21 at TP=3); 32 heads
+  keep Triton. One GB10, the whole call at 4 streams x 8 rows at 596k: 242.5 -> 94.8 us a call (x11 layers a round). Live on three Sparks:
+  real code / prose rounds 46.90 / 37.40 -> 46.35 / 37.00 ms. Built when the engine starts; under another
+  Triton release (`sparse.TRITON_PTX`), or when the build fails, the Triton kernel serves (logged once).
+  `TF_GLM_SEG_CHUNKS_CUDA=0`: Triton. Applies after `0104`, `0105` and `0106`. GPU check:
+  `tools/seg_chunks_check.py`.
+- **Three-Spark decode attention in one wave** (patch `0104-glm-seg-attention-tp3-tiles`, by [BadAd84](https://github.com/BadAd84)):
+  `seg_head_block` gave 32-head tiles from 8 rows, sized for two Sparks' 32 heads a rank. At three Sparks
+  (22 / 21 heads) the 16-head tiles are two programs a row and chunk, so from 5 rows they pass the GB10's
+  48 SMs and run in two waves. A rank of 17 to 24 heads now takes 32-head tiles from 5 rows; 16 and 32 heads
+  keep 8. The chunk pass at 5 / 6 / 7 rows on one GB10: 92.4 / 103.3 / 108.1 -> 65.3 / 65.9 / 66.4 us a
+  call; the same bits. GPU check: `tools/seg_head_block_check.py`.
+- **A decode window's indexer, twice as fast with four agents** (patch `0107-glm-decode-indexer`, by [BadAd84](https://github.com/BadAd84)):
+  the same tokens and counts in less time. (1) The Triton scoring's grid is 512 programs a segment (was
+  256). (2) Segments of 4 or more rows are scored by `seg_scores.cu`, which stores `_seg_scores`' scores
+  with patch 0105's instruction sequence (the same bits under Triton 3.7) while a CTA converts each FP8 key tile once for up to 8 of the
+  segment's rows; fewer rows stay on Triton (memory-bound there). (3) Windows of 8 or more rows select
+  each row's pools by `_seg_select_floor`, one pass over its scores (patch 0101's method), instead of
+  `select_split`'s five. The indexer call on one GB10, 4 streams x 8 rows at 596k: 1,296 -> 647 us
+  (x11 layers a round); 1 x 16 rows 635 -> 344 us. Live on three Sparks with four agents at ~596k, every
+  stream's round -2 to -4%. Under another Triton release (`sparse.TRITON_PTX`), or when the build fails, the
+  Triton scoring serves (logged once). `TF_GLM_SEG_SCORES_CUDA=0` / `TF_GLM_SEG_SELECT_FLOOR=0`: the old scoring /
+  selection. Applies after `0101`, `0105` and `0106`. GPU check: `tools/decode_indexer_check.py`.
+- **A prompt chunk's sparse attention in CUDA at three Sparks** (patch `0106-glm-sparse-onepass-cuda`, by
+  [BadAd84](https://github.com/BadAd84)): `sparse_onepass.cu` computes every output of `_sparse_onepass` with the Triton kernel's own
+  instruction sequence, read from its PTX (the mma chains and their K order, the online softmax's roundings
+  and `ex2.approx`, the p-sum's reduction tree, `div.full`): the same bits under Triton 3.7. Producer warps gather and convert
+  the FP8 rows two tiles ahead, q stays in registers, the softmax stays inside a warp, and 384 mma a tile
+  instead of 768. FP8 caches with 17-24 heads a rank (22 / 21 at TP=3); 32 heads (TP=2) keep Triton. A
+  2,048-row chunk at 113k on one GB10: 7.98 -> 3.51 ms with recent selections, 8.72 -> 7.30 ms with
+  spread ones. Live on three Sparks, cold prefill at 226k 103.58 -> 98.65 s (the first version), then
+  99.61 -> 98.53 s (the balanced warps). Built when the engine starts; under another Triton release
+  (`sparse.TRITON_PTX`), or when the build fails, the Triton kernel serves (logged once).
+  `TF_GLM_ONEPASS_CUDA=0`: Triton. Applies after `0105`. GPU check: `tools/sparse_onepass_check.py`.
+- **A prompt chunk's indexer scoring in CUDA** (patch `0105-glm-prompt-scores-cuda`, by [BadAd84](https://github.com/BadAd84)): `_scores`
+  (patch 0086's loop) converts and loads each 64-pool FP8 key tile again for every row. `prompt_scores.cu`
+  computes every score with the Triton kernel's own instruction sequence, read from its PTX (the mma K
+  order of Triton's kWidth-4 dot layout, the epilogue's roundings, the head sum's order), while a CTA of 8
+  rows converts each tile once: the same bits under Triton 3.7, whose PTX it reproduces. A 512-row block's
+  scores on one GB10: 0.61 / 1.85 / 4.85 / 10.07 -> 0.40 / 1.30 / 3.39 / 6.77 ms at 35k / 113k / 300k / 590k.
+  The extension is built when the engine starts, not at the first long prompt. Under another Triton release
+  (`sparse.TRITON_PTX`), or when the build fails, the Triton kernel serves and the start goes on (logged once).
+  `TF_GLM_SCORES_CUDA=0`: Triton. Applies after `0101`. GPU check: `tools/prompt_scores_check.py`.
+- **A prompt chunk's pool selection in one pass** (patch `0101-glm-prompt-select-floor`, by [BadAd84](https://github.com/BadAd84)):
+  `_select_rows` read a row's scores five times (four radix passes and the write), and at long context a
+  row has hundreds of thousands of pools. `prompt_pools` reads them once: a strided sample sets a floor,
+  one pass compacts the pools at or above it in pool order, and the radix select runs over those in
+  registers; a row with fewer than 512 or more than CAP candidates takes `_select_rows` itself, so the
+  pools and ties are the same. A 512-row block at 590k 6.24 -> 1.51 ms on one GB10. GPU check:
+  `tools/select_floor_check.py`.
 - **kindling spark-os: the server starts** (patch `0098-glm-mmap-uploads`, by [BadAd84](https://github.com/BadAd84)):
   on kindling's 64 KiB-page kernel a pageable copy to the GPU straight from a safetensors mmap hangs in the driver
   (`cuMemcpyHtoDAsync`) once the process holds GPU memory, and the DFlash2 drafter and the GLM vision tower load

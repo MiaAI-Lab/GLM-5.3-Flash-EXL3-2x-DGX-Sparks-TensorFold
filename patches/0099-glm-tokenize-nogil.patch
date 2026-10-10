@@ -1,0 +1,86 @@
+# The server tokenizes with Python's GIL released: every tokenizer call in the server (the chat and prompt routes,
+# /tokenize, the forced think close and the tool-call gate's encode) goes through App._encode_ids, which calls HF
+# tokenizers' encode_batch_fast on the one text: the same ids as encode, without the character offsets nothing here
+# reads; and GlmVision.prepare (every request with pictures or clips) does the same. encode held the GIL for the whole
+# text, ~1.2 us a token, so a long request's start stopped the engine loop and every other stream (~0.75 s at ~600k
+# tokens). tools/tokenize_check.py, tools/vision_tokenize_check.py.
+
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -236,14 +236,14 @@ class App:
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             else:
+                 text = render(body["messages"])
+-            prompt = self.tok.encode(text, add_special_tokens=False).ids
++            prompt = self._encode_ids(text, False)
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+         else:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string or a list of token ids")
+-            prompt = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", False)).ids
++            prompt = self._encode_ids(text, _flag(body, "add_special_tokens", False))
+         if not prompt:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+@@ -264,6 +264,14 @@ class App:
+             raise RequestError(f"{field} token ids must be in the vocabulary's range 0{top}")
+         return list(value)
+ 
++    def _encode_ids(self, text: str, special: bool) -> list[int]:
++        """``self.tok.encode(text, add_special_tokens=special).ids``, the same ids, through the batch call: it tokenizes
++        with Python's GIL released (``encode`` holds it, ~1.2 us a token: a 600k-token prompt stopped the engine loop,
++        and every other stream, for ~0.8 s at each request's start) and skips the character offsets nothing here reads
++        (~30% faster)."""
++
++        return self.tok.encode_batch_fast([text], add_special_tokens=special)[0].ids
++
+     def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+         """vLLM's ``/tokenize``: a prompt's ids (``add_special_tokens`` as vLLM, default true), or ``messages``' as the
+         chat route renders them (``add_generation_prompt``, default true)."""
+@@ -284,7 +292,7 @@ class App:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+                 raise RequestError("prompt must be a string (or send messages)")
+-            ids = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", True)).ids
++            ids = self._encode_ids(text, _flag(body, "add_special_tokens", True))
+         limit = self._context_limit()
+         return {"count": len(ids), "max_model_len": limit if limit is not None else self.native_context_window,
+                 "tokens": [int(t) for t in ids]}
+@@ -662,9 +670,9 @@ class App:
+ 
+         if think_end is None:
+             return []
+-        close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
++        close = [*self._encode_ids("\n", False), think_end]
+         if prepared.grammar is None:
+-            close += self.tok.encode("\n\n", add_special_tokens=False).ids
++            close += self._encode_ids("\n\n", False)
+         return close
+ 
+     def _glm_calls(self) -> bool:
+@@ -703,7 +711,7 @@ class App:
+         names = [str((t.get("function") or t).get("name") or "") for t in tools] if lead is not None else []
+         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
+                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
+-                                     encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
++                                     encode=lambda t: list(self._encode_ids(t, False)))
+ 
+ 
+ def _flag(body: dict[str, Any], name: str, default: bool) -> bool:
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -727,7 +727,9 @@
+                 pieces.append(_as_text(rest[:v]) + "<|begin_of_video|>" + frames + "<|end_of_video|>")
+                 items.append(("video", clip.frames))
+                 rest = rest[v + len(VIDEO_SPAN):]
+-        ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
++        # patch 0099: the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a long
++        # prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
++        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
