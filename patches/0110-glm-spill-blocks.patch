@@ -1507,7 +1507,7 @@ index 0000000..7dc4e1d
 +                "restore_ms_p50": p(0.5), "restore_ms_p95": p(0.95),
 +                **{f"unwritten_{k}": v for k, v in sorted(self.unwritten_by.items())}}
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 775b2a5..4afe866 100644
+index 06f33e7..d1b29ee 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -56,10 +56,10 @@ from .pool import ALIGN, Pool, align_up
@@ -1523,7 +1523,7 @@ index 775b2a5..4afe866 100644
  
  
  def watchdog_seconds(value: str | None = None) -> float:
-@@ -452,6 +452,7 @@ class Lane:
+@@ -456,6 +456,7 @@ class Lane:
      key: list[int] | None = None       # rank 0: the prompt's ids with its pictures' keys in their rows (kept states)
      images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
      chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
@@ -1531,8 +1531,8 @@ index 775b2a5..4afe866 100644
      decoding: bool = False
      paused: bool = False
      t0: float = 0.0
-@@ -460,6 +461,9 @@ class Lane:
-     copy_accepted: int = 0
+@@ -465,6 +466,9 @@ class Lane:
+     next_copy: Any = None        # ((copies length, room), proposal, proposed) the round's end worked out
  
  
 +PREFIX_WAIT = os.environ.get("TF_GLM_PREFIX_WAIT", "1") != "0"
@@ -1541,7 +1541,7 @@ index 775b2a5..4afe866 100644
  class NoRoom(RuntimeError):
      """The pool cannot place a stream now (it waits for others to finish)."""
  
-@@ -554,6 +558,9 @@ class MultiDecoder:
+@@ -559,6 +563,9 @@ class MultiDecoder:
          self.sent = self.received = 0                     # messages sealed on rank 0, unsealed on rank 1
          self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
          self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
@@ -1551,7 +1551,7 @@ index 775b2a5..4afe866 100644
          self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
          self.next_sid = self.next_kid = self.next_order = 0
          self.next_chat = 0
-@@ -603,6 +610,7 @@ class MultiDecoder:
+@@ -608,6 +615,7 @@ class MultiDecoder:
                  },
                  **({"multi_prefill": dict(self.grouped)} if self.group else {}),
                  **({"spill": self.disk.info()} if self.disk is not None else {}),
@@ -1559,7 +1559,7 @@ index 775b2a5..4afe866 100644
                  # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
                  "iteration_s": round(time.monotonic() - since, 1)
                  if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
-@@ -980,6 +988,12 @@ class MultiDecoder:
+@@ -985,6 +993,12 @@ class MultiDecoder:
              chat = self.next_chat
          lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                      constraint=constraint, images=a["images"], chat=chat)
@@ -1572,7 +1572,7 @@ index 775b2a5..4afe866 100644
          if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
              lane.key = a["keyed"]
          self.next_sid = max(self.next_sid, a["sid"] + 1)
-@@ -1072,14 +1086,17 @@ class MultiDecoder:
+@@ -1077,14 +1091,17 @@ class MultiDecoder:
          # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
          for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
              self._drop(c, spill=False)
@@ -1592,7 +1592,7 @@ index 775b2a5..4afe866 100644
              mine = [c for c in self.kept if getattr(c, "own", False) and getattr(c, "chat", 0) == snap.chat]
              for c in mine[:-KEEP_PER_CHAT]:
                  self._drop(c, spill=False)
-@@ -1089,7 +1106,7 @@ class MultiDecoder:
+@@ -1094,7 +1111,7 @@ class MultiDecoder:
          # the pool (copies of the DFlash2 window), so 64 entries reached tens of GiB on the hosts (free memory to
          # 0.1 GB) and never came back. With TF_GLM_KEPT_BYTES_GIB set, rank 0 drops states past it, by the cap's
          # victim order, and tells rank 1 with EVICT (the same rank-0-decides path the takeover uses); the freed blocks
@@ -1601,7 +1601,7 @@ index 775b2a5..4afe866 100644
          if self.rank == 0 and self.kept_bytes_cap:
              while len(self.kept) > 1 and self._held_bytes() > self.kept_bytes_cap:
                  victim = cap_victim(self.kept)
-@@ -1122,11 +1139,9 @@ class MultiDecoder:
+@@ -1127,11 +1144,9 @@ class MultiDecoder:
          return sum(snapshot_bytes(c) for c in self.kept)
  
      def _drop(self, c, spill: bool = True) -> None:
@@ -1615,7 +1615,7 @@ index 775b2a5..4afe866 100644
          held = 0
          if self.kept_bytes_cap:
              from .decode import snapshot_bytes
-@@ -1158,23 +1173,66 @@ class MultiDecoder:
+@@ -1163,23 +1178,66 @@ class MultiDecoder:
          self._emit(EVICT, [c.kid, int(spill)])
          self._drop(c, spill=spill)
  
@@ -1692,7 +1692,7 @@ index 775b2a5..4afe866 100644
          planes = [(tuple(p.tensor.shape[1:]), str(p.tensor.dtype), p.div, p.pad) for p in self.arena.planes]
          drafter = getattr(self.g, "drafter", None)
          model = os.path.basename(str(getattr(self.g, "model_dir", "")).rstrip("/"))
-@@ -1185,14 +1243,16 @@ class MultiDecoder:
+@@ -1190,14 +1248,16 @@ class MultiDecoder:
                                os.environ.get("TF_GLM_KV", ""), os.environ.get("TF_GLM_DENSE", ""),
                                f"tp{self.w.world}", repr(planes), str(self.grid), str(self.drafts is not None),
                                repr(self.g.agreed)])
@@ -1715,7 +1715,7 @@ index 775b2a5..4afe866 100644
          self._guard_pool()
          return store
  
-@@ -1211,7 +1271,7 @@ class MultiDecoder:
+@@ -1216,7 +1276,7 @@ class MultiDecoder:
              return remove(x)
  
          def g_move(x, base, size=None):
@@ -1724,7 +1724,7 @@ index 775b2a5..4afe866 100644
              return move(x, base, size)
  
          def g_resize(x, size):
-@@ -1220,75 +1280,37 @@ class MultiDecoder:
+@@ -1225,75 +1285,37 @@ class MultiDecoder:
  
          pool.remove, pool.move, pool.resize = g_remove, g_move, g_resize
  
@@ -1810,7 +1810,7 @@ index 775b2a5..4afe866 100644
              return "short"
          if self.grid and n % self.grid:
              return "off_grid"
-@@ -1298,93 +1320,31 @@ class MultiDecoder:
+@@ -1303,93 +1325,31 @@ class MultiDecoder:
              return "no_draft_window"
          return None
  
@@ -1923,7 +1923,7 @@ index 775b2a5..4afe866 100644
  
      # reads: rank 0 sends LOAD when a request's prompt extends a stored prompt longer than any kept one; both ranks
      # add an extent for it and start their reads (other streams keep decoding meanwhile); when rank 0's read is done
-@@ -1411,22 +1371,29 @@ class MultiDecoder:
+@@ -1416,22 +1376,29 @@ class MultiDecoder:
              if len(prompt) >= h.n and prompt[:h.n] == h.ids:
                  return h
          hit = self._resume(prompt)
@@ -1962,7 +1962,7 @@ index 775b2a5..4afe866 100644
          return h
  
      def _start_load(self, hi: int, lo: int, n: int, base: int, size: int, lid: int):
-@@ -1439,15 +1406,11 @@ class MultiDecoder:
+@@ -1444,15 +1411,11 @@ class MultiDecoder:
          h = types.SimpleNamespace(lid=lid, key=(hi, lo), n=n, x=x, lj=None, err=None, done=False, ids=None)
          x.loading = h
  
@@ -1981,7 +1981,7 @@ index 775b2a5..4afe866 100644
          except Exception as exc:                 # noqa: BLE001  (the read fails at LOADED, on every rank)
              h.err = exc
          self.loads[lid] = h
-@@ -1477,11 +1440,11 @@ class MultiDecoder:
+@@ -1482,11 +1445,11 @@ class MultiDecoder:
          extent holds a kept prompt; else the extent goes and the entry is forgotten on both."""
  
          h = self.loads.pop(lid)
@@ -1996,7 +1996,7 @@ index 775b2a5..4afe866 100644
              except Exception as exc:             # noqa: BLE001  (a failed read: every rank prefills)
                  print(f"[tensorfold] spill rank {self.rank}: restore failed: {exc!r}", flush=True)
          else:
-@@ -1492,12 +1455,20 @@ class MultiDecoder:
+@@ -1497,12 +1460,20 @@ class MultiDecoder:
          h.done = True
          h.ok = all(r[0] for r in every)
          if not h.ok:
@@ -2021,7 +2021,7 @@ index 775b2a5..4afe866 100644
          snap.ids = ids
          snap.pending, snap.mtp_len, snap.rows, snap.nbytes = None, -1, None, 0
          snap.kid = self.next_kid
-@@ -1514,50 +1485,32 @@ class MultiDecoder:
+@@ -1519,50 +1490,32 @@ class MultiDecoder:
          return True
  
      def flush_spill(self, budget: float | None = None) -> None:
@@ -2081,7 +2081,7 @@ index 775b2a5..4afe866 100644
          if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
              used = max(used, x.loading.n)
          if x.owner is not None:
-@@ -1661,10 +1614,7 @@ class MultiDecoder:
+@@ -1666,10 +1619,7 @@ class MultiDecoder:
          _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
          self.iteration_since = time.monotonic()           # /health's iteration_s
          try:
@@ -2093,7 +2093,7 @@ index 775b2a5..4afe866 100644
              return self._iterate()
          except Exception as exc:
              self.broken = exc
-@@ -2194,6 +2144,8 @@ class MultiDecoder:
+@@ -2244,6 +2194,8 @@ class MultiDecoder:
              self._emit(IDLE, [])
              self._flush()
              self.idle = True
@@ -2102,7 +2102,7 @@ index 775b2a5..4afe866 100644
          _unwatch(self.watchdog)
          self.iteration_since = None
  
-@@ -2274,6 +2226,7 @@ class MultiDecoder:
+@@ -2324,6 +2276,7 @@ class MultiDecoder:
              _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
              self.apply(unseal(self.g._share(None), self.received, self.rank))
              self.received = (self.received + 1) % SEAL_MOD
@@ -2110,7 +2110,7 @@ index 775b2a5..4afe866 100644
              _unwatch(self.watchdog)
              if once:
                  return
-@@ -2307,12 +2260,12 @@ class MultiDecoder:
+@@ -2357,12 +2310,12 @@ class MultiDecoder:
                  self._start_load(*p)
              elif op == LOADED:
                  self._finish_load(*p)
@@ -2127,7 +2127,7 @@ index 775b2a5..4afe866 100644
              elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
              elif op == GROW:
-@@ -2355,6 +2308,8 @@ class MultiDecoder:
+@@ -2405,6 +2358,8 @@ class MultiDecoder:
                  if self.lanes:
                      raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
                  self.idle = True
@@ -2136,7 +2136,7 @@ index 775b2a5..4afe866 100644
              else:
                  raise RuntimeError(f"rank 1: unknown op {op}")
  
-@@ -2381,6 +2336,7 @@ class GlmScheduler(Scheduler):
+@@ -2431,6 +2386,7 @@ class GlmScheduler(Scheduler):
          self.flush_lock = threading.Lock()
          self.loading: list = []          # (read, item): requests waiting for a stored prompt read (--spill-gib)
          self.ready: list = []            # items whose read ended: admitted before the queue
@@ -2144,7 +2144,7 @@ index 775b2a5..4afe866 100644
          self.staged: set = set()         # streams a read was looked for already
          # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
          # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
-@@ -2462,7 +2418,7 @@ class GlmScheduler(Scheduler):
+@@ -2512,7 +2468,7 @@ class GlmScheduler(Scheduler):
  
          if background or self.max_in_system is None:
              return
@@ -2153,7 +2153,7 @@ index 775b2a5..4afe866 100644
          if held + self.waiting.foreground_count() >= self.max_in_system:
              raise CapacityError("all serving lanes are busy; retry shortly")
  
-@@ -2476,6 +2432,7 @@ class GlmScheduler(Scheduler):
+@@ -2526,6 +2482,7 @@ class GlmScheduler(Scheduler):
          import heapq
  
          self.ready = [it for it in self.ready if not self._cancel_item(it)]   # their stored prompts read (--spill-gib)
@@ -2161,7 +2161,7 @@ index 775b2a5..4afe866 100644
          self.loading = [(read, None if it is None or self._cancel_item(it) else it) for read, it in self.loading]
          if self.held is not None and self._cancel_item(self.held):
              self.held = None
-@@ -2506,6 +2463,9 @@ class GlmScheduler(Scheduler):
+@@ -2556,6 +2513,9 @@ class GlmScheduler(Scheduler):
                  self.decoder.flush_spill()
              finally:
                  flush.set()
@@ -2171,7 +2171,7 @@ index 775b2a5..4afe866 100644
          for it in [it for it in self.loading if self.decoder.load_ready(it[0])]:
              self.loading.remove(it)
              try:
-@@ -2551,6 +2511,13 @@ class GlmScheduler(Scheduler):
+@@ -2601,6 +2561,13 @@ class GlmScheduler(Scheduler):
                      self.loading.append((read, item))
                      continue
              self.staged.discard(id(stream))
@@ -2185,7 +2185,7 @@ index 775b2a5..4afe866 100644
              self.boxes[id(stream)] = box
              try:
                  self.decoder.admit(stream)
-@@ -2619,7 +2586,7 @@ class GlmScheduler(Scheduler):
+@@ -2669,7 +2636,7 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()

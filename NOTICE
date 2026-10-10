@@ -100,7 +100,7 @@ glm53-tensorfold-spark
   by Robert Wojciechowski (wojo, https://github.com/wojo). Its multi-rank design (an NVMe tier for kept prompt states,
   one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
   that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
-  patches/0099-glm-spill-blocks.patch (tensorfold/cuda/spill_blocks.py and its hooks in multi.py) carries over the
+  patches/0110-glm-spill-blocks.patch (tensorfold/cuda/spill_blocks.py and its hooks in multi.py) carries over the
   block layout, lineage, write-at-keep ring, release and fsync order of the NVMe KV tier in pull request #118 of this
   project, authored by BadAd84 (https://github.com/BadAd84); the rest is authored by Robert Wojciechowski (wojo), and
   it builds on patches/0088-glm-spill-tier.patch above.

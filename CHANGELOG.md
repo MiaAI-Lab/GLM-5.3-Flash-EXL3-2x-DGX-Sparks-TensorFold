@@ -111,7 +111,7 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
-- **Spill tier, blocks** (patch `0099-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
+- **Spill tier, blocks** (patch `0110-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
   every kept prompt state is written to local disk when it is kept, in blocks of 2,048 tokens that later turns and forks
   of the same conversation share, so a conversation resumes from disk after an eviction, a clean restart, a `kill -9` or
   a watchdog restart, and a turn writes only its new rows (a 10.4k-token turn of a 50k conversation: 68 MiB, not the
@@ -126,7 +126,7 @@ Every change to this recipe, newest first. Each release names the image it serve
   [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
   [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
   one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
-- **A system prompt prefilled once for every agent** (patch `0099`, `PREFIX_WAIT`, on): a request whose prompt starts
+- **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
   with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
   agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
   first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies.

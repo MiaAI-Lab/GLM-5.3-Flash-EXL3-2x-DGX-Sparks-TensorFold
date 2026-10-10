@@ -164,7 +164,7 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   read, private file modes, a per-Spark weights fingerprint and naming a rank whose settings differ are those of the
   session tier of [JSpark3](https://github.com/jakejharris/jspark3) v2.0.1 by
   [jakejharris](https://github.com/jakejharris). The code is new.
-- `0099-glm-spill-blocks` (the spill tier's block store and the in-flight prefix wait, `SPILL_GIB` with `PARALLEL`
+- `0110-glm-spill-blocks` (the spill tier's block store and the in-flight prefix wait, `SPILL_GIB` with `PARALLEL`
   above 1, `PREFIX_WAIT`): the block layout (blocks of the pool's alignment named by a hash chained over the ids and
   salted with the state's lineage), the lineage, writing a state when it is kept through a pinned staging ring between
   rounds, copying rows still waiting before they are freed or overwritten (`release`), and the fsync order are those
