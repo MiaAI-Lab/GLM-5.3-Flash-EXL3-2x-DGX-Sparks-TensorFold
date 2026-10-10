@@ -60,6 +60,34 @@ text. Compare token hashes, token counts and cache state across configurations.
 
 ## Exact-preset results
 
-Validation of this reduced preset against the unmodified upstream TP4 image
-is pending. Earlier experimental-branch measurements included kernel backports
-and other settings and must not be attributed to this reduced change.
+Measured 2026-10-10, source `336811f8c2c19e13bca2157dd4c7330d5a520b31`, against
+upstream `tp4` at `d22003070575c2774de0f010062aa57bae06f3c7`. Both used the same
+published image, patch hash `7a37454d3238`, with no additional kernel patches.
+Exactly the four settings above differ; the shared-expert side stream stays on.
+
+Four GB10 Sparks on a switchless ring, upstream NCCL/RoCE, the same 4bpw Ablit
+checkpoint and DFlash2 drafter, 500,000 context, eight slots, FP8 KV / Q4 dense
+KV, 32 GiB KV pool and 20 GiB memory reserve. Exact revisions, image digest,
+counts and output token hashes are in the
+[machine-readable results](benchmarks/tp4-scheduler-order-20261010.json).
+
+| Concurrency | Upstream aggregate decode tok/s | Preset aggregate decode tok/s | Change | Mean TTFT, upstream / preset |
+| --- | ---: | ---: | ---: | ---: |
+| C1 | 65.03 | 65.60 | +0.88% | 0.363 / 0.365 s |
+| C4 | 123.17 | 125.48 | +1.88% | 0.643 / 0.629 s |
+| C8 | 156.14 | 162.54 | +4.10% | 0.570 / 0.574 s |
+
+This is **one additional candidate boot**, compared with the retained upstream
+run from earlier the same day, not a fresh bracketed A/B or a repeated
+statistical study. Both used the same API/vision/tools/eight-stream warmup and
+the same C1, C4, C8 sequence. All 13 measured requests matched prompt hashes,
+output token hashes, usage and cached-input counts. Actual output totals were
+2,048 / 11,746 / 16,384 tokens; partial cached input was 0 / 64 / 256 tokens.
+Counter deltas matched the exact workload. No OOMs/restarts occurred during
+measurement, and the 14 configuration tests passed.
+
+These results support a modest, workload-specific observed benefit for selecting
+the existing options together. They do not prove a universal speedup, improved
+prefill, long-context quality, or a gain from a new kernel. Earlier broader
+experimental-branch results included backports and other settings and are not
+the baseline here; they remain in Git history, not in this proposed change.
