@@ -75,9 +75,7 @@ performance measurements of the later configuration refactor.
 
 Four GB10 Sparks on a switchless ring, upstream NCCL/RoCE, the same 4bpw Ablit
 checkpoint and DFlash2 drafter, 500,000 context, eight slots, FP8 KV / Q4 dense
-KV, 32 GiB KV pool and 20 GiB memory reserve. Exact revisions, image digest,
-counts and output token hashes are in the
-[machine-readable results](benchmarks/tp4-scheduler-order-20261010.json).
+KV, 32 GiB KV pool and 20 GiB memory reserve.
 
 | Concurrency | Upstream aggregate decode tok/s | Tuned aggregate decode tok/s | Change | Mean TTFT, upstream / tuned |
 | --- | ---: | ---: | ---: | ---: |
