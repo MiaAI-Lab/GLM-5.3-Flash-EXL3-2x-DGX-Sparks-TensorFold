@@ -111,6 +111,29 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
+- **Spill tier, blocks** (patch `0110-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
+  every kept prompt state is written to local disk when it is kept, in blocks of 2,048 tokens that later turns and forks
+  of the same conversation share, so a conversation resumes from disk after an eviction, a clean restart, a `kill -9` or
+  a watchdog restart, and a turn writes only its new rows (a 10.4k-token turn of a 50k conversation: 68 MiB, not the
+  whole state). Each conversation keeps its newest `SPILL_TURNS` (4) states, older turns trimmed as each one is written
+  (each held a ~91 MB small part; the rows stay, the newest turn names them), and small parts go to disk with O_DIRECT,
+  so the page cache keeps no copy. Room goes by conversation: old turns beyond `SPILL_TURNS`, abandoned forks, whole
+  conversations least recently used, shared system prompts last; `SPILL_QUOTA` caps one conversation's share (#122,
+  reported by [xiepengqi](https://github.com/xiepengqi): one conversation's per-turn states filled 128 GiB in 30 minutes
+  and pushed the others out). The free-disk floor makes room in the same order. Blocks with equal bytes are linked, not
+  written twice. Rank 0 asks every Spark before a read (HAS). The block layout, the lineage, writing at keep through a
+  pinned ring and the fsync order are those of
+  [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
+  [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
+  one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
+- **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
+  with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
+  agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
+  first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies. Counted in `/health` (`prefix_waits`,
+  `prefix_wait_tokens`) and `/metrics` (`prefix_waits_total`, `prefix_wait_tokens_total`).
+- `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
+  `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
+  block store and its hooks in `multi.py`; `tools/spill_blocks_mutants.sh` runs it on faithful mutants of each fix.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
