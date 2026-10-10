@@ -9,7 +9,6 @@ Every change to this recipe, newest first. Each release names the image it serve
   asynchronous messages and expert launch order 2. No extra enable switch.
   Individual overrides win; TP2/TP3, kernels, transport and image stay unchanged.
 - Configuration regression tests and a stdlib-only matched prose benchmark.
-  Scope and results: [TP4 decode tuning](docs/tp4-decode-tuning.md).
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 

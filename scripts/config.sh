@@ -298,7 +298,7 @@ MULTI_PREFILL="${MULTI_PREFILL:-1}"
 export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
 # TP4 defaults for the existing sampler/allocator/control path; individual overrides win.
 # With expert launch order 2 below: matched prose C4 +1.9%, C8 +4.1% on a four-Spark
-# ring (one boot, not a general speedup claim; docs/tp4-decode-tuning.md). TP2/TP3 unchanged.
+# ring (one boot, not a general speedup claim). TP2/TP3 unchanged.
 if [[ "$TP" == 4 ]]; then
   export TF_GLM_MULTI_SAMPLER="${TF_GLM_MULTI_SAMPLER:-packed}"
   export TF_GLM_MULTI_DEPTH="${TF_GLM_MULTI_DEPTH:-joint}"
