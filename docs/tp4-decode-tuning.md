@@ -101,4 +101,52 @@ For prefill, use `--prompts` with a JSON list of fresh long prompts, confirm zer
 cached tokens, and report active prefill separately from TTFT. Summing request
 prefill seconds does not yield aggregate cluster throughput when work is shared.
 
-Benchmark results for the exact contribution build will be appended after validation.
+## Measured results (2026-10-10)
+
+Baseline: upstream `tp4` at `d220030`. Candidate: `47bc74c`, recipe patch hash
+`19ec06e95e57`, with the preset enabled. Both used four GB10 Sparks in a
+switchless ring with upstream NCCL/RoCE transport, the same 4bpw Ablit checkpoint
+and DFlash2 drafter, 500,000 context, eight slots, FP8 KV / Q4 dense KV, a 32 GiB
+KV pool and 20 GiB memory reserve. No custom NCCL or site-specific runtime hooks
+were included. Exact model revisions, settings, token counts and hashes are in
+the [machine-readable results](benchmarks/tp4-decode-20261010.json).
+
+These are **aggregate steady-state decode** rates, not end-to-end throughput:
+
+| Prose workload | Upstream tok/s | Preset tok/s | Change | Mean TTFT, upstream / preset |
+| --- | ---: | ---: | ---: | ---: |
+| C1, short prompt | 65.03 | 69.18 | +6.4% | 0.363 / 0.378 s |
+| C4, short prompts | 123.17 | 129.52 | +5.2% | 0.643 / 0.616 s |
+| C8, short prompts | 156.14 | 167.31 | +7.2% | 0.570 / 0.576 s |
+| C4, cold ~8K prompts | 127.14 | 132.03 | +3.9% | 13.062 / 12.587 s |
+
+Short-prompt C1/C4/C8 generated 2,048 / 11,746 / 16,384 tokens respectively;
+the cold C4 test generated 4,096. The short-prompt runs had identical partial
+cache reuse on both builds (0 / 64 / 256 input tokens). They are decode tests,
+not cold-prefill measurements.
+
+Cold-prefill checks all reported zero cached tokens:
+
+| Workload | Active prefill seconds, upstream / preset | Effective prefill tok/s, upstream / preset | Mean TTFT, upstream / preset |
+| --- | ---: | ---: | ---: |
+| C1, 8,331 input tokens | 4.378 / 3.841 | 1,903 / 2,169 | 4.474 / 3.857 s |
+| C1, 33,107 input tokens | 14.321 / 14.431 | 2,312 / 2,294 | 14.400 / 14.488 s |
+| C4, ~8K input each | 5.806 / 5.816 per request | 1,434 / 1,432 per request | 13.062 / 12.587 s |
+
+The two isolated C1 prefill checks generated only 16 tokens; no decode score is
+reported for them. C4 active prefill is averaged over requests; its effective
+rate is **not** aggregate cluster prefill throughput. These checks do not
+establish a general prefill improvement: the 33K and C4 cases were effectively
+unchanged. The long prompts were synthetic prose, separate from the bundled
+short-prompt fixture.
+
+All 19 matched requests returned the same token hashes as the baseline, and
+request/output counters matched the benchmark workload. Validation also passed
+69 targeted CPU tests, 12 GPU tests, all 109 recipe patches applied without fuzz,
+and comparison of all 430 source files against a clean full-series build.
+Native four-node transport checks and API/vision/tools/eight-stream smoke checks
+passed; no container OOMs or restarts occurred during this bounded run.
+
+This is one matched screening run per point, not a repeated statistical study,
+long stability soak, or validation of full-context quality. Small differences,
+especially TTFT and prefill, should not be treated as established improvements.
