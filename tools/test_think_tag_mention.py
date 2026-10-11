@@ -46,6 +46,13 @@ CASES = [
      "file for that literal string.", ["grep -c '<tool_call>' /tmp/workspace/documents/session.jsonl"]),
     ("mention, close, no call", "The `<tool_call>` tag.</think>\n\nIt leaked as `<tool_call>` text.",
      "The `<tool_call>` tag.", "It leaked as `<tool_call>` text.", []),
+    # a word the tags enclose with space is prose naming them, not a call without arguments
+    ("tags around a word", "Plan.</think>The tags are <tool_call> and </tool_call>.", "Plan.",
+     "The tags are <tool_call> and </tool_call>.", []),
+    ("tags around a placeholder", "Plan.</think>Wrap each call as <tool_call> name </tool_call> in the reply.",
+     "Plan.", "Wrap each call as <tool_call> name </tool_call> in the reply.", []),
+    ("tags around a tool's name, then a call", "Plan.</think>Write <tool_call> bash </tool_call> like this." + CALL,
+     "Plan.", "Write <tool_call> bash </tool_call> like this.", ["grep -c x s.jsonl"]),
     # what already worked and still does: plain calls, and calls inside the think block that end the reply (D5 rule)
     ("plain close, call", "Plan.</think>" + CALL, "Plan.", "", ["grep -c x s.jsonl"]),
     ("value holds the tag", "Plan.</think>" + GREP, "Plan.", "", ["grep -c '<tool_call>' s.jsonl"]),
@@ -54,6 +61,7 @@ CASES = [
     ("call, then close", "Plan: grep.\n" + CALL + "</think>", "Plan: grep.", "", ["grep -c x s.jsonl"]),
     ("two calls end the think block", "Plan.\n" + CALL + "\n" + GREP, "Plan.", "",
      ["grep -c x s.jsonl", "grep -c '<tool_call>' s.jsonl"]),
+    ("call without arguments", "Plan.</think><tool_call>bash</tool_call>", "Plan.", "", [None]),
     ("call, then more reasoning", "Plan.\n" + CALL + "\nNo, wait.</think>Done.", "Plan.\n" + CALL + "\nNo, wait.",
      "Done.", []),
 ]
@@ -88,7 +96,7 @@ def run(mod, reply: str, hold: int | None, streamed: bool) -> tuple[str, str, li
         if streamed_calls:                       # the server sends the streamer's calls when it followed any
             assert [c["function"]["arguments"] for c in streamed_calls] == \
                    [c["function"]["arguments"] for c in calls or ()], "streamed calls differ from the end parser's"
-    return reasoning, content, [json.loads(c["function"]["arguments"])["command"] for c in calls or ()]
+    return reasoning, content, [json.loads(c["function"]["arguments"]).get("command") for c in calls or ()]
 
 
 def main() -> int:

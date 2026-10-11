@@ -9,14 +9,16 @@
 # with no </think> yet could also be held and, past THINK_CALL_HOLD, committed as a call.
 # Now an opener starts a block only when what follows can be a call's head (_call_head: GLM's name then <arg_key> or
 # </tool_call>, Qwen's <function=, or JSON; or the start of one while streaming), so a mention is text and a call's
-# value may hold the tag; and a call block in the think block does not cross </think>. Calls the reply ends on inside
-# the think block (the D5 rule), whole calls, and calls to unoffered tools (still text, #103) are as before.
+# value may hold the tag; and a call block in the think block does not cross </think>. A call without arguments is
+# <tool_call>name</tool_call> as the chat template writes it, so a word the tags enclose with space ("The tags are
+# <tool_call> and </tool_call>.") is text too, whole and streamed (the content hider used to drop it from the stream
+# for good). Calls the reply ends on inside the think block (the D5 rule), whole calls, and calls to unoffered tools
+# (still text, #103) are as before.
 # CPU check: tools/test_think_tag_mention.py.
 diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
-index 55ccf2f..c0acaed 100644
 --- tensorfold/cuda/reply_text.py
 +++ tensorfold/cuda/reply_text.py
-@@ -17,6 +17,39 @@ from tensorfold.tool_parameters import decode_parameter, nullable_text, paramete
+@@ -17,6 +17,42 @@
  
  _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
  _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
@@ -28,16 +30,19 @@ index 55ccf2f..c0acaed 100644
 +def _call_head(text: str, at: int) -> bool:
 +    """Whether the text after a ``<tool_call>`` (from ``at``) begins as a call or may still: GLM's name then
 +    ``<arg_key>`` or ``</tool_call>``, Qwen's ``<function=``, or JSON. A tag the text only mentions (``the literal
-+    `<tool_call>` markup``) does not, and is text: the block a call's markup makes starts at the call's own opener."""
++    `<tool_call>` markup``) does not, and is text: the block a call's markup makes starts at the call's own opener.
++    A call without arguments is ``<tool_call>name</tool_call>``, as the chat template writes it: a word the tags
++    enclose with space (``<tool_call> name </tool_call>``) is prose naming them."""
 +
-+    rest = text[at:at + _HEAD_WINDOW].lstrip()
++    rest = text[at:at + _HEAD_WINDOW]
++    spaced, rest = rest[:1].isspace(), rest.lstrip()
 +    if not rest or rest[0] in "{[" or rest.startswith(_QWEN_HEAD) or _QWEN_HEAD.startswith(rest):
 +        return True
 +    name = _GLM_NAME.match(rest)
 +    if name is None:
 +        return False
 +    after = rest[name.end():].lstrip()
-+    return any(after.startswith(tag) or tag.startswith(after) for tag in (_KEY, _CALL_CLOSE))
++    return any(after.startswith(tag) or tag.startswith(after) for tag in ((_KEY,) if spaced else (_KEY, _CALL_CLOSE)))
 +
 +
 +def _call_blocks(text: str):
@@ -56,7 +61,7 @@ index 55ccf2f..c0acaed 100644
  _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
  _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
  
-@@ -89,6 +122,10 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+@@ -89,6 +125,10 @@
              tail = text[pos:]
              out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
              return "".join(out)
@@ -67,7 +72,7 @@ index 55ccf2f..c0acaed 100644
          out.append(text[pos:start])
          end = text.find(_CALL_CLOSE, start)
          if end < 0:
-@@ -111,7 +148,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+@@ -111,7 +151,7 @@
      calls: list[dict[str, Any]] = []
      residue: list[str] = []
      cursor = 0
@@ -76,7 +81,7 @@ index 55ccf2f..c0acaed 100644
          residue.append(text[cursor:match.start()])
          cursor = match.end()
          if max_calls is not None and len(calls) >= max_calls:
-@@ -160,7 +197,9 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+@@ -160,7 +200,9 @@
  
  
  _THINK_CLOSE = "</think>"
@@ -87,7 +92,7 @@ index 55ccf2f..c0acaed 100644
  THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
  _GLM_TAG = re.compile(r"</?arg_(?:key|value)>")
  _LAST_WORD = re.compile(r"(\S+)\s*$")
-@@ -209,7 +248,7 @@ def _call_run(text: str, start: int, finished: bool) -> tuple[int, str]:
+@@ -209,7 +251,7 @@
      come true, ``"reasoning"`` once text follows it (more reasoning, or an answer after the think block)."""
  
      end = pos = start
@@ -96,7 +101,7 @@ index 55ccf2f..c0acaed 100644
          end = block.end()
          pos = len(text) - len(text[end:].lstrip())
      after = text[end:].lstrip()
-@@ -217,6 +256,8 @@ def _call_run(text: str, start: int, finished: bool) -> tuple[int, str]:
+@@ -217,6 +259,8 @@
          after = ""
      if not after:
          return end, "calls" if finished and end > start else "pending"
@@ -105,7 +110,7 @@ index 55ccf2f..c0acaed 100644
      if not finished and (after.startswith(_CALL_OPEN) or _CALL_OPEN.startswith(after)
                           or _THINK_CLOSE.startswith(after)):
          return end, "pending"                   # a block, or the think block's close, being written
-@@ -327,6 +368,9 @@ class GlmCallStreamer:
+@@ -327,6 +371,9 @@
                  self.start = self.pos + at
                  self.pos, self.state = self.start + len(_CALL_OPEN), "name"
              elif self.state == "name":                  # the end parser's name: the text before <arg_key> or the end
