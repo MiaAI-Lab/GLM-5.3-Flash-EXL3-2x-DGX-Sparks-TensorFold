@@ -240,6 +240,11 @@ export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
 MAX_QUEUED="${MAX_QUEUED:-}"
 # A streamed request is checked before its 200 goes out (patch 0095), so it gets the same 429 + Retry-After.
 export TF_GLM_MAX_QUEUED="$MAX_QUEUED"
+# A streamed reply that has sent nothing for SSE_KEEPALIVE_S seconds writes an SSE comment line, ": keepalive" (patch
+# 0112). A request waiting for a lane or filling a long prompt is silent otherwise, and a proxy in front cuts an idle
+# stream (Cloudflare: after about two minutes, issue #106). Clients skip comment lines; the events are the same bytes.
+# Every streaming route (chat, completions, Messages, Responses). 0: off.
+export TENSORFOLD_SSE_KEEPALIVE_S="${SSE_KEEPALIVE_S:-${TENSORFOLD_SSE_KEEPALIVE_S:-15}}"
 # Sampled decode with the checkpoint's defaults (temperature 1, top_p 0.95, top_k 0) draws from the top_p nucleus
 # (patch 0034). Stock TensorFold tests each rank's candidates alone, which fails on any two ranks whenever both hold
 # part of the nucleus, so every such step gathered and sorted the whole vocabulary on the CPU: ~15 tok/s against

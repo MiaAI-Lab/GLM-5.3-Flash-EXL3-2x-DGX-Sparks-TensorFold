@@ -1,0 +1,168 @@
+# Streamed replies send an SSE comment line, ": keepalive", after TENSORFOLD_SSE_KEEPALIVE_S seconds (default 15; 0:
+# off) with nothing else written, on every streaming route (issue #106). A request that waits for a lane or fills a
+# long prompt sends nothing after its first event, and a proxy in front cuts an idle stream (Cloudflare: after about
+# two minutes). Comment lines are part of the SSE format and clients skip them; the events are the same bytes.
+# cuda/http.py: _Keepalive holds the stream's writes under one lock and runs the comments from a thread only while
+# App.run runs, so leaving it ends the thread before the reply's last event, its error event or a cancellation.
+# server/responses.py: Wire passes the chat stream's comment lines through to the client's socket, so the Messages
+# (server/anthropic.py) and Responses streams, which translate the chat stream, carry them too.
+# Non-streamed replies are unchanged. A bad value stops the server at import. CPU test: tools/test_sse_keepalive.py.
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 5b48deb..7360924 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -2,6 +2,9 @@
+ from __future__ import annotations
+ 
+ import json
++import math
++import os
++import threading
+ import time
+ import traceback
+ import uuid
+@@ -22,6 +25,68 @@ if TYPE_CHECKING:
+ _TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
+ 
+ 
++def _keepalive_seconds() -> float:
++    """``TENSORFOLD_SSE_KEEPALIVE_S`` (default 15): the longest a streamed reply stays silent before a keep-alive
++    comment; 0 turns keep-alives off."""
++
++    raw = os.environ.get("TENSORFOLD_SSE_KEEPALIVE_S", "15")
++    try:
++        seconds = float(raw)
++    except ValueError:
++        seconds = math.nan
++    if not math.isfinite(seconds) or seconds < 0:
++        raise ValueError(f"TENSORFOLD_SSE_KEEPALIVE_S={raw!r}: seconds of silence before a keep-alive, 0 for none")
++    return seconds
++
++
++_SSE_KEEPALIVE_S = _keepalive_seconds()
++
++
++class _Keepalive:
++    """A streamed reply's writes, plus an SSE comment line (``: keepalive``) whenever nothing has been written for
++    ``seconds`` while ``with`` holds it (patch 0112). A request that waits for a lane or fills a long prompt sends
++    nothing else, and a proxy in front drops a stream that stays silent (Cloudflare: after about two minutes); SSE
++    clients skip comment lines. Every write holds one lock, since the comments come from their own thread, and
++    leaving ``with`` ends that thread before it returns, so no comment follows the reply's last event."""
++
++    COMMENT = b": keepalive\n\n"
++
++    def __init__(self, wfile: Any, seconds: float) -> None:
++        self.wfile, self.seconds = wfile, seconds
++        self.lock = threading.Lock()
++        self.last = time.monotonic()
++        self.stop = threading.Event()
++        self.thread: threading.Thread | None = None
++
++    def write(self, data: bytes) -> None:
++        with self.lock:
++            self.wfile.write(data)
++            self.wfile.flush()
++            self.last = time.monotonic()
++
++    def __enter__(self) -> None:
++        if self.seconds > 0:
++            self.thread = threading.Thread(target=self._beat, name="sse-keepalive", daemon=True)
++            self.thread.start()
++
++    def __exit__(self, *exc: Any) -> None:
++        self.stop.set()
++        if self.thread is not None:          # a comment being written goes out first, before the reply's last event
++            self.thread.join()
++
++    def _beat(self) -> None:
++        while not self.stop.wait(max(0.0, self.last + self.seconds - time.monotonic())):
++            with self.lock:
++                if time.monotonic() - self.last < self.seconds:      # an event went out meanwhile
++                    continue
++                try:
++                    self.wfile.write(self.COMMENT)
++                    self.wfile.flush()
++                except OSError:                   # the client has gone
++                    return
++                self.last = time.monotonic()
++
++
+ def usage_of(result: dict[str, Any]) -> dict[str, Any]:
+     """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
+ 
+@@ -159,11 +224,11 @@ def make_handler(app: App):
+                 self.send_header("Cache-Control", "no-cache")
+                 self.send_header("Connection", "close")
+                 self.end_headers()
++                keepalive = _Keepalive(self.wfile, _SSE_KEEPALIVE_S)
+ 
+                 def emit(delta: dict[str, Any]) -> bool:
+                     try:
+-                        self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
+-                        self.wfile.flush()
++                        keepalive.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
+                         return True
+                     except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
+                         return False
+@@ -171,7 +236,8 @@ def make_handler(app: App):
+                 if chat:
+                     emit({"role": "assistant"})
+                 try:
+-                    result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++                    with keepalive:                     # comments while the reply is silent, none after it
++                        result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+                 except RequestCancelled:
+                     self.close_connection = True
+                     return
+diff --git tensorfold/server/anthropic.py tensorfold/server/anthropic.py
+index d443807..fc2557b 100644
+--- tensorfold/server/anthropic.py
++++ tensorfold/server/anthropic.py
+@@ -81,7 +81,7 @@ def post(handler: Any, app: Any) -> None:
+         handler.close_connection = True
+         reply.start()
+ 
+-    wire = Wire(opened, reply.chunk)
++    wire = Wire(opened, reply.chunk, handler.wfile)
+     try:
+         _run_chat(handler, chat, wire)
+         if wire.stream or wire.status is None:
+diff --git tensorfold/server/responses.py tensorfold/server/responses.py
+index 89f45bb..3bca9e8 100644
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -126,10 +126,12 @@ def _refuse(handler: Any, message: str, status: int = 400, param: str | None = N
+ 
+ 
+ class Wire:
+-    """The chat handler's side of its socket: the status and headers, then the JSON body or each stream event."""
++    """The chat handler's side of its socket: the status and headers, then the JSON body or each stream event; a
++    stream's comment lines (the keep-alives of patch 0112) are written to ``comments`` as they came."""
+ 
+-    def __init__(self, opened: Callable[[], None], event: Callable[[dict[str, Any] | None], None]) -> None:
+-        self.opened, self.event = opened, event
++    def __init__(self, opened: Callable[[], None], event: Callable[[dict[str, Any] | None], None],
++                 comments: Any) -> None:
++        self.opened, self.event, self.comments = opened, event, comments
+         self.status: int | None = None
+         self.stream = False
+         self.data = bytearray()
+@@ -156,6 +158,9 @@ class Wire:
+                         self.event(None if line[6:] == b"[DONE]" else json.loads(line[6:]))
+                     except OSError as exc:           # our client has gone: the chat handler's write fails
+                         raise BrokenPipeError(str(exc)) from exc
++                elif line.startswith(b":"):
++                    self.comments.write(line + b"\n\n")
++                    self.comments.flush()
+         return len(data)
+ 
+     def flush(self) -> None:
+@@ -211,7 +216,7 @@ def post(handler: Any, app: Any) -> None:
+         handler.close_connection = True
+         reply.start()
+ 
+-    wire = Wire(opened, reply.chunk)
++    wire = Wire(opened, reply.chunk, handler.wfile)
+     try:
+         _run_chat(handler, request.chat, wire)
+     except OSError:                                   # the client left while the reply was written
