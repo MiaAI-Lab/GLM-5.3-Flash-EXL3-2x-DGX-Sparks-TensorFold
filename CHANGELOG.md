@@ -111,6 +111,15 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
+- **A GET with a body no longer breaks the next request on its connection** (patch `0121-http-get-delete-body-discard`,
+  by [cawilliamson](https://github.com/cawilliamson)): the CUDA handler's `do_GET` and `do_DELETE` never read a request
+  body, so a GET or DELETE carrying one left its bytes on the keep-alive connection and the stdlib parsed them as the
+  next request's start: a "Bad request syntax" 400, an HTML page with no JSON, for whatever came next. Scanners probe
+  with GET bodies, and behind a pooling proxy (nginx upstream keepalive) the next request on that connection is often
+  another client's: the cross-session 400s that prompted this, with the probe's bytes quoted in a real agent's error.
+  Both now read the body through `0059`'s `_discard_body` (`read_body`: Content-Length or chunked; a refusal closes the
+  connection) before answering; a request without one reads nothing. CPU test: `tools/test_get_bodies.py` (fails on
+  the unpatched source).
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 

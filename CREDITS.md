@@ -88,6 +88,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   past 1023.
 - `0059-server-refused-bodies`: TensorFold v0.6.1's fix for #181 (commit 50dfe38a, by
   [SxMShaDoW](https://github.com/SxMShaDoW)), backported to v0.6.0.
+- `0121-http-get-delete-body-discard` (GET and DELETE bodies read before the response, as `0059` does for refused
+  requests): by [cawilliamson](https://github.com/cawilliamson).
 - `0060-glm-keep-thinking` (earlier turns keep their reasoning, `TF_GLM_CLEAR_THINKING`): by
   [kky42](https://github.com/kky42), pull request #23.
 - `0071-glm-shared-prefix-copy` (a shared system prompt's resume keeps the writer's kept prompt, issue #43): by

@@ -1,0 +1,27 @@
+# GET and DELETE requests have their bodies read. The CUDA handler's do_GET and do_DELETE never read a body, so a GET
+# or DELETE carrying one (scanners send GETs with a body) left those bytes on the keep-alive connection, and the
+# stdlib parsed them as the start of the next request on it: a "Bad request syntax" 400, in HTML with no JSON, for
+# whatever came next. Behind a pooling proxy (nginx upstream keepalive) that next request is often another client's.
+# Both now call _discard_body (patch 0059's helper, read_body underneath: Content-Length or chunked, a refusal closes
+# the connection) before answering, as do_POST's refusals already do. A request without a body reads nothing.
+# tools/test_get_bodies.py.
+
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -81,6 +81,7 @@
+             self.close_connection = True
+ 
+         def do_GET(self):
++            self._discard_body()
+             route = self.path.split("?", 1)[0].rstrip("/")
+             if route in ("/metrics", "/v1/metrics"):
+                 return metrics.send(self, app)
+@@ -95,6 +96,7 @@
+                 self._json(404, {"error": "not found"})
+ 
+         def do_DELETE(self):
++            self._discard_body()
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):
