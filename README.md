@@ -184,7 +184,7 @@ If `start.sh` stops at a check:
 
 ## Images and video
 
-GLM's own vision tower runs on the head (rank 0: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). Send images and
+GLM's own vision tower runs on the head (rank 0: 1.05 GiB of bf16 weights and 1.41 GiB of workspace). Send images and
 videos as OpenAI-style content parts in a user message:
 
 ```bash
@@ -208,7 +208,7 @@ pictures are the same.
 | --- | --- | --- |
 | Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
 | Per request | up to 50 (`TENSORFOLD_GLM_MAX_IMAGES`), 10 MB each, 64 MB in all | up to 4 (`TENSORFOLD_GLM_MAX_VIDEOS`), 64 MB each, 96 MB in all, up to an hour of footage each |
-| Tokens | at most 2,048 a picture (`TENSORFOLD_GLM_IMAGE_TOKENS`; a 1080p picture takes 2,040); a request's pictures share 16,384 (`TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`), so past 8 each gets an equal share (327 with 50) | 2 frames a second, at most 128 frames spread over the whole clip (`TENSORFOLD_GLM_VIDEO_FRAMES`), at most 16,384 tokens a clip (`TENSORFOLD_GLM_VIDEO_TOKENS`); a request's clips share 32,768 (`TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS`), so 3 or 4 clips get 10,922 or 8,192 each |
+| Tokens | at most 2,048 a picture (`TENSORFOLD_GLM_IMAGE_TOKENS`; a 1080p picture takes 2,040); every picture of a chat keeps that cap however many it has (a request's pictures share `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`, here 50 x 2,048 = 102,400), so a new picture never resizes the earlier ones and the chat still resumes from its kept prompt state | 2 frames a second, at most 128 frames spread over the whole clip (`TENSORFOLD_GLM_VIDEO_FRAMES`), at most 16,384 tokens a clip (`TENSORFOLD_GLM_VIDEO_TOKENS`); a request's clips share 32,768 (`TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS`), so 3 or 4 clips get 10,922 or 8,192 each |
 
 A request body can be up to 96 MiB, so data URLs carry about 70 MB of pictures and clips in all.
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs.
@@ -544,7 +544,8 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SERVED_NAME` / `PORT` / `HOST` | `GLM-5.3-Flash-EXL3` / `8888` / `0.0.0.0` | the model id in `/v1/models` and replies; where the API listens |
 | `TENSORFOLD_GLM_IMAGE_TOKENS` / `_VIDEO_TOKENS` / `_VIDEO_FRAMES` | `2048` / `16384` / `128` | a picture's and a clip's token caps, and a clip's frames |
 | `TENSORFOLD_GLM_MAX_IMAGES` / `_MAX_VIDEOS` | `50` / `4` | pictures and clips a request |
-| `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `16384` / `32768` | tokens a request's pictures and clips share (each still within its own cap) |
+| `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `102400` / `32768` | tokens a request's pictures and clips share (each still within its own cap). Pictures: `scripts/config.sh` sets `MAX_IMAGES` x `IMAGE_TOKENS` (at most 262,144; TensorFold's own default is 16,384), so a picture's cap does not depend on how many pictures the chat has. With 16,384, the 9th picture and every one after it shrank all the earlier ones, and the chat's kept prompt state then matched only up to its first picture: an agent session at ~420k tokens waited 150-167 s after each screenshot; `tools/picture_turns.py` on two Sparks, a 48k-token chat, pictures 9 to 11: 16.4-16.6k tokens read and 13.0-13.3 s a turn, now 2.1k and 2.5-2.8 s. 50 full-size pictures are then a 102k-token prompt, not 16k. `16384`: the shared budget, as before |
+| `TENSORFOLD_VISION_WORKSPACE_MIB` | `1440` | what rank 0 sets aside for the tower's encode and a request's feature rows (8 KiB a row, kept through its prefill). TensorFold's 768 MiB plus the rows the picture budget adds past 16,384, so a cold request of 50 full-size pictures fits (rank 0's startup estimate 88.09 -> 88.74 GiB, the pool 2,582,528 -> 2,537,472 tokens on two Sparks at `PARALLEL=4`). Set it to size it yourself (`768` if your requests never carry many pictures) |
 | `TENSORFOLD_GLM_PICTURE_CACHE` / `_PICTURE_CACHE_MB` / `_PICTURE_CANVASES` | `1` / `384` / `8` | the vision frontend reads a request's pictures once, not on every turn of the chat (patch `0079`): what reading each source cost is kept by the source's bytes (host memory only, LRU under `_MB`, that many fitted canvases); `0`: the path before the patch, bit for bit (by ThomasWadeZ, #63) |
 | `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
@@ -725,6 +726,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/picture_turns.py [pictures] [size]` | a chat of ~`size` tokens (default 40000) gets one new 1920x1080 picture a turn (default 12), with a text turn after each; exit 1 when a turn re-reads more than the new picture, which is what a picture cap that moves with the picture count does from the 9th picture on |
+| `tools/picture_budget_check.py <checkout>` | the picture budget's checks, run in the image (`docker run ... --entrypoint python3`, see the file; CPU): `scripts/config.sh` and `start.sh` send every rank a budget under which a picture's cap is the same for 1 to `MAX_IMAGES` pictures, the environment's values win, and the workspace covers the budget's rows |
 
 ## Repository layout
 
