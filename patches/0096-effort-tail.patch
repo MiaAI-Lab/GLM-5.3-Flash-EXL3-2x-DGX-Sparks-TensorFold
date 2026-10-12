@@ -1,0 +1,92 @@
+diff --git tensorfold/families/glm5_next/prompts.py tensorfold/families/glm5_next/prompts.py
+--- tensorfold/families/glm5_next/prompts.py
++++ tensorfold/families/glm5_next/prompts.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import json
++import os
++import re
+ import sys
+ from typing import Any
+ 
+@@ -74,6 +76,34 @@
+     return out
+ 
+ 
++_HEAD_EFFORT = re.compile(r"(\[gMASK\]<sop>)?(<\|system\|>Reasoning Effort: (?:Max|High|Low))")
++
++
++def effort_tail_enabled() -> bool:
++    """``TF_GLM_EFFORT_TAIL=1``: the reasoning-effort line is rendered at the tail of the prompt (issue #93)."""
++
++    value = os.environ.get("TF_GLM_EFFORT_TAIL", "0").strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_EFFORT_TAIL={value!r}: expected 0 or 1")
++    return value == "1"
++
++
++def effort_to_tail(text: str, thinking: bool) -> str:
++    """The checkpoint text with its leading effort line moved to just before the generation prompt (thinking on), or
++    gone (thinking off), so the conversation before it renders the same for every effort level and with thinking on or
++    off. Text without the line at its head, or thinking on and not ending in the opened think block, is returned as is."""
++
++    head = _HEAD_EFFORT.match(text)
++    if head is None:
++        return text
++    rest = text[head.end():]
++    if not thinking:
++        return (head.group(1) or "") + rest
++    if not rest.endswith(OPENED):
++        return text
++    return (head.group(1) or "") + rest[:-len(OPENED)] + head.group(2) + OPENED
++
++
+ def thinking_off(text: str) -> str:
+     """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
+ 
+@@ -92,7 +122,13 @@
+ 
+     def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
+         messages = agent_history(messages)
+-        if kwargs.get("enable_thinking", True) is not False:
++        thinking = kwargs.get("enable_thinking", True) is not False
++        tail = effort_tail_enabled()
++        if thinking and not tail:
+             return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
+-        text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
++        text = self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs)
++        if tail:
++            text = effort_to_tail(text, thinking)
++        if not thinking:
++            text = thinking_off(text)
+         return list(self._inner.encode(text, add_special_tokens=False)) if tokenize else text
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -9,7 +9,7 @@
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+-from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
++from tensorfold.families.glm5_next.prompts import agent_history, effort_tail_enabled, effort_to_tail, thinking_off
+ 
+ 
+ class ThinkingOffTemplate:
+@@ -31,6 +31,8 @@
+         extra = {"clear_thinking": self.clear_thinking, **(extra or {})}
+         text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                  allow_images=allow_images)
++        if effort_tail_enabled():       # TF_GLM_EFFORT_TAIL=1 (issue #93): the effort line goes last, not first
++            text = effort_to_tail(text, bool(enable_thinking))
+         return text if enable_thinking else thinking_off(text)
+ 
+ 
+@@ -67,6 +69,7 @@
+         clear = os.environ.get("TF_GLM_CLEAR_THINKING", "0").strip() or "0"
+         if clear not in ("0", "1"):
+             raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
++        effort_tail_enabled()       # a typo fails at load, not at the first request
+         self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:

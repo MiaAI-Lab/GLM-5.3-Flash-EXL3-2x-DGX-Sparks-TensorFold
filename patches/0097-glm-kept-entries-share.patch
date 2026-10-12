@@ -1,0 +1,109 @@
+# Kept prompt states: the count can follow a share of the pool's memory (issue #84, reported by @jdecker76).
+#
+# TF_GLM_CACHE_ENTRIES is a memory reservation as well as a limit: --parallel reserves ENTRIES x (a KDA recurrent state
+# + conv window + the DFlash2 window copy, ~45 MiB at GLM-5.3-Flash's geometry; flat in the context length, the window
+# is bounded) out of the budget TF_GLM_CACHE_GIB leaves the pool beyond the window, and the pool takes the rest. 32
+# entries are ~1.4 GiB of 12.5, so a pool of millions of free tokens still evicted a live conversation at the 33rd
+# state, and an explicit 128 reserved 5.7 GiB.
+#
+# 1. TF_GLM_CACHE_SHARE_PCT (default 0: off, the count stays TF_GLM_CACHE_ENTRIES): the count is at least that share of
+#    the pool's budget in states (25: 71 states). The same count sizes the reservation (the pool shrinks by it, the
+#    start-up estimate does not change) and bounds `kept`, on every rank (the largest rank's state cost decides).
+# 2. Any count (explicit or derived) is cut to three quarters of the budget, logged: past that the reservation would
+#    take memory the estimate never counted (pool beyond the window = 0, states in the reserve).
+# 3. Every admission rebuilt an int64 array of every kept state's ids to look for shared prefixes (112 ms for 32 states
+#    of 200k tokens, before the prefill starts): a state's array is built once, with the state.
+#
+# Merge order: after 0089 (whose byte budget, TF_GLM_KEPT_BYTES_GIB, bounds the DFlash2 window copies when long).
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -195,6 +195,31 @@
+     return out[-SHARED_MOST:]
+ 
+ 
++def kept_entries(configured: int, share_pct: float, budget: int, state: int) -> tuple[int, str]:
++    """How many kept prompt states ``--parallel`` reserves memory for and keeps: (count, a note for the log, "" when
++    nothing changed).
++
++    Each kept state owns ``state`` bytes outside the pool (its KDA recurrent state and conv window, the indexer rings'
++    tail and the DFlash2 window copy: ~45 MiB), reserved at start out of ``budget`` (what TF_GLM_CACHE_GIB leaves the
++    pool beyond the window), so the count is a memory reservation, not only a limit. ``share_pct`` (TF_GLM_CACHE_SHARE_PCT,
++    0: off) makes the count at least that share of the budget -- a pool-sized count, so a pool of millions of free
++    tokens is not pushed empty by 32 one-shot conversations. Past three quarters of the budget the count is cut: the
++    states would own memory the start-up estimate never counted. Pure arithmetic, the same on every rank."""
++
++    state = max(1, state)
++    n = max(1, configured)
++    note = ""
++    if share_pct > 0:
++        n = max(n, int(budget * min(share_pct, 75.0) / 100 // state))
++        note = f"{n} (at least {share_pct:g}% of the {budget / 2 ** 30:.1f} GiB the pool shares, ~{state >> 20} MiB each)"
++    ceiling = max(1, int(budget * 0.75) // state)
++    if n > ceiling:
++        n = ceiling
++        note = (f"{n}, not the {configured} asked: they would take more than three quarters of the {budget / 2 ** 30:.1f} "
++                f"GiB the pool shares ({state >> 20} MiB each reserved at start)")
++    return n, note
++
++
+ def user_opener(model_dir: Path) -> int | None:
+     """The id of GLM's ``<|user|>`` role token (the first one ends the system block), or None without a tokenizer."""
+ 
+@@ -712,10 +737,16 @@
+             text = read_config(model_dir)
+             g = geometry(text)
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+-            states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, world, rows=0, rank=rank) // 2 +
+-                                                                          (22 << 20))
+             # TF_GLM_DISPLAY_KV_MIB: the display reservation's bytes too, which free memory never counted
+             display = display_kv.credit()
++            # one kept state's fixed cost outside the pool, the largest of any rank's: every rank derives the same count
++            state = max(slot_bytes(text, world, rows=0, rank=r) // 2 + (22 << 20) for r in range(world))
++            self.entries, why = kept_entries(int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")),
++                                             float(os.environ.get("TF_GLM_CACHE_SHARE_PCT", "0") or 0),
++                                             self.cache_bytes + display, state)
++            if rank == 0 and why:
++                print(f"[tensorfold] kept prompt states: {why}", flush=True)
++            states = self.entries * (slot_bytes(text, world, rows=0, rank=rank) // 2 + (22 << 20))
+             pool_rows = (capacity + max(0, self.cache_bytes + display - states) // per_token) // ALIGN * ALIGN
+             display_rows = pool_rows - (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+@@ -832,7 +863,7 @@
+         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+         self.cache: list = []
+         self.live: list[int] = []
+-        self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++        self.cache_entries = getattr(self, "entries", None) or int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+         self.spill = self._spill_store() if spill is not None and parallel == 1 else None   # (multi: its own)
+         if parallel > 1:
+             from .multi import GlmScheduler, MultiDecoder
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -216,6 +216,16 @@
+ KEPT_BYTES_CAP = kept_bytes_cap()
+ 
+ 
++def known_key(c):
++    """A kept state's key as an int64 array, converted once: every admission scans all of ``kept`` for the prefix a
++    new prompt shares, and rebuilding the array each time cost O(kept states x their tokens) a request."""
++
++    arr = getattr(c, "key_array", None)
++    if arr is None:
++        arr = c.key_array = np.asarray(c.key, dtype=np.int64)
++    return arr
++
++
+ def cap_victim(kept: list):
+     """The kept prompt to drop past TF_GLM_CACHE_ENTRIES (``kept``: least recently used first). An extent's kept
+     prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
+@@ -861,7 +871,7 @@
+         cut = len(hit.ids) if hit is not None else 0
+         shared: list[int] = []
+         if draft and key is not None and g.shared:
+-            known = [np.asarray(c.key, dtype=np.int64) for c in self.kept if c.key is not None]
++            known = [known_key(c) for c in self.kept if c.key is not None]
+             shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
+                                    g.opener)
+         sid = self.next_sid

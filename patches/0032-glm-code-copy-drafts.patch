@@ -1,0 +1,301 @@
+diff --git tensorfold/families/glm5_next/cuda/copy_drafts.py tensorfold/families/glm5_next/cuda/copy_drafts.py
+index 3aa3b25..10860da 100644
+--- tensorfold/families/glm5_next/cuda/copy_drafts.py
++++ tensorfold/families/glm5_next/cuda/copy_drafts.py
+@@ -4,6 +4,17 @@ A reply that quotes or edits its prompt (or repeats itself) is cheap to draft: i
+ pending token included) are searched in the prompt and the reply so far, and the tokens after the latest earlier
+ occurrence become the drafts. They only propose; verification keeps the serial sample, so replies stay exact.
+ 
++Three refinements, off by default (they only change what is proposed, never what is kept):
++- ``reply_match`` (TF_GLM_COPY_REPLY_MATCH): an occurrence that starts inside the reply must match the context's last
++  ``reply_match`` tokens, not ``match``. Code replies repeat short boilerplate (``    def __init__(self``, ``}); ``)
++  whose continuations differ: over 39 live code replies (2026-09-30) reply-sourced copies kept 23% of their drafts,
++  prompt-sourced ones 74%, and a missed copy round costs a wide window and the DFlash2 round it displaced.
++- ``miss_most`` (TF_GLM_COPY_MISS_MAX): after a copied round whose drafts were not all kept, the next copied round
++  proposes at most this many (a narrow window), until a copied round keeps all of its drafts again.
++- ``pad`` (the engine's TF_GLM_WIDE_GRAPHS widths): a proposal whose window (pending token + drafts) falls between 8
++  rows and a captured width is padded to that width by repeating its last draft, so the window replays a CUDA graph
++  instead of running eagerly. Padded drafts are drafts like any other: kept only where they equal the sample.
++
+ Both ranks hold the same prompt and sample the same tokens, so each computes the same proposals with no exchange.
+ Pure numpy (no torch), so it is testable anywhere."""
+ 
+@@ -19,14 +30,22 @@ MATCH = 8        # the context's last this many tokens must have occurred before
+ MOST = 5         # drafts a round (TF_GLM_COPY_MAX, up to 15): graphs cover windows of 8 rows, wider ones run eagerly
+ 
+ 
++GRAPHED = 8      # verify windows up to this many rows always replay CUDA graphs (engine.GRAPH_ROWS)
++
++
+ @dataclass(frozen=True)
+ class CopySettings:
+     match: int = MATCH
+     most: int = MOST
++    reply_match: int = 0             # 0: occurrences in the reply need ``match`` tokens like the prompt's
++    pad: tuple[int, ...] = ()        # window widths past GRAPHED rows that replay CUDA graphs (TF_GLM_WIDE_GRAPHS)
++    miss_most: int = 0               # 0: off; else drafts a copied round after one that missed
+ 
+     @classmethod
+-    def from_env(cls, max_drafts: int, env=None) -> CopySettings | None:
+-        """TF_GLM_COPY_DRAFTS=1 turns copy drafts on (off by default); TF_GLM_COPY_MATCH and TF_GLM_COPY_MAX tune."""
++    def from_env(cls, max_drafts: int, env=None, pad: Sequence[int] = ()) -> CopySettings | None:
++        """TF_GLM_COPY_DRAFTS=1 turns copy drafts on (off by default); TF_GLM_COPY_MATCH, TF_GLM_COPY_MAX and
++        TF_GLM_COPY_REPLY_MATCH (0 or more than the match, up to 64) and TF_GLM_COPY_MISS_MAX (0: off, or 1 up to
++        TF_GLM_COPY_MAX) tune; ``pad``: the engine's wide graph widths."""
+ 
+         env = os.environ if env is None else env
+         on = env.get("TF_GLM_COPY_DRAFTS", "0").strip()
+@@ -43,22 +62,46 @@ class CopySettings:
+                 raise ValueError(f"{name}: {low} to {high}, not {text!r}")
+             return int(text)
+ 
+-        return cls(number("TF_GLM_COPY_MATCH", MATCH, 2, 64),
+-                   number("TF_GLM_COPY_MAX", min(MOST, max_drafts), 1, max_drafts))
++        match = number("TF_GLM_COPY_MATCH", MATCH, 2, 64)
++        reply = number("TF_GLM_COPY_REPLY_MATCH", 0, 0, 64)
++        if reply and reply <= match:
++            raise ValueError(f"TF_GLM_COPY_REPLY_MATCH: 0 (off) or more than TF_GLM_COPY_MATCH ({match}), not {reply}")
++        widths = tuple(sorted(int(r) for r in pad if GRAPHED < int(r) <= max_drafts + 1))
++        most = number("TF_GLM_COPY_MAX", min(MOST, max_drafts), 1, max_drafts)
++        return cls(match, most, reply, widths, number("TF_GLM_COPY_MISS_MAX", 0, 0, most))
+ 
+     def code(self) -> list[int]:
+-        """The settings as ints both ranks compare at startup (zeros: off)."""
++        """The settings as ints both ranks compare at startup (zeros: off; the pad widths are the engine's
++        TF_GLM_WIDE_GRAPHS, compared on their own)."""
+ 
+-        return [self.match, self.most]
++        return [self.match, self.most, self.reply_match, self.miss_most]
++
++    def drafts(self, context: Sequence[int]) -> CopyDrafts:
++        """A request's index: ``context`` is its prompt and pending token (the reply's first token)."""
++
++        return CopyDrafts(context, self.match, self.most, prompt=max(len(context) - 1, 0),
++                          reply_match=self.reply_match, pad=self.pad, miss_most=self.miss_most)
+ 
+ 
+ class CopyDrafts:
+     """One sequence's context (prompt, then committed reply tokens and the pending one) and its copy proposals."""
+ 
+-    def __init__(self, context: Sequence[int], match: int = MATCH, most: int = MOST) -> None:
++    def __init__(self, context: Sequence[int], match: int = MATCH, most: int = MOST, *, prompt: int = 0,
++                 reply_match: int = 0, pad: Sequence[int] = (), miss_most: int = 0) -> None:
++        """``prompt``: how many leading context tokens are the prompt (occurrences starting at or past it are the
++        reply's, which need ``reply_match`` tokens when that is more than ``match``); ``pad``: window widths past
++        GRAPHED rows to pad a proposal's window up to (``propose``); ``miss_most``: drafts a copied round after one
++        that missed (0: ``most`` always)."""
++
+         if match < 1 or most < 1:
+             raise ValueError("match and most must be positive")
+         self.match, self.most = int(match), int(most)
++        self.prompt = int(prompt)
++        self.reply_match = int(reply_match) if int(reply_match) > self.match else 0
++        self.pad = tuple(sorted(int(r) for r in pad if int(r) > GRAPHED))
++        self.miss_most = int(miss_most)
++        self.proposed = 0              # drafts of the last proposal not yet settled by ``extend``
++        self.missed = False            # the last settled copied round kept fewer than all of its drafts
+         n = len(context)
+         self.buf = np.empty((max(1024, 2 * n),), dtype=np.int32)
+         self.buf[:n] = np.asarray(context, dtype=np.int32) if n else 0
+@@ -71,11 +114,15 @@ class CopyDrafts:
+         return self.buf[:self.length].tolist()
+ 
+     def extend(self, tokens: Sequence[int]) -> None:
+-        """Committed tokens (the last one is the next round's pending token) join the context."""
++        """Committed tokens (the last one is the next round's pending token) join the context; after a proposal,
++        they settle whether its round kept all of its copied drafts (they then number at least those plus one)."""
+ 
+         k = len(tokens)
+         if not k:
+             return
++        if self.proposed:
++            self.missed = k <= self.proposed
++            self.proposed = 0
+         if self.length + k > self.buf.shape[0]:
+             grown = np.empty((2 * (self.length + k),), dtype=np.int32)
+             grown[:self.length] = self.buf[:self.length]
+@@ -97,13 +144,28 @@ class CopyDrafts:
+             if not hits.size:
+                 break
+             hits = hits[ctx[hits + k] == q[k]]
++        extra = self.reply_match - n if self.reply_match else 0
++        if extra and hits.size:
++            # an occurrence starting inside the reply: the extra tokens before it must match too
++            inside = hits >= self.prompt
++            ok = ~inside | ((hits >= extra) & (L - n - extra >= 0))
++            for k in range(1, extra + 1):
++                sel = inside & ok
++                if not sel.any():
++                    break
++                ok[sel] = ctx[hits[sel] - k] == ctx[L - n - k]
++            hits = hits[ok]
+         return hits
+ 
+     def propose(self, room: int | None = None) -> list[int]:
+         """Up to ``min(most, room)`` drafts: what followed the latest earlier occurrence that has that many tokens
+-        after it, else the most after any occurrence (the earliest); [] when the suffix never occurred before."""
++        after it, else the most after any occurrence (the earliest); [] when the suffix never occurred before. With
++        ``pad``, a window of more than GRAPHED rows short of a padded width is filled up to it (``room`` allowing)
++        by repeating the last draft."""
+ 
+-        k = self.most if room is None else min(self.most, int(room))
++        most = min(self.most, self.miss_most) if self.missed and self.miss_most else self.most
++        k = most if room is None else min(most, int(room))
++        self.proposed = 0
+         if k < 1:
+             return []
+         hits = self.starts()
+@@ -112,4 +174,18 @@ class CopyDrafts:
+         L, n = self.length, self.match
+         full = hits[hits <= L - n - k]
+         s = int(full[-1]) if full.size else int(hits[0])
+-        return self.buf[s + n:min(s + n + k, L)].tolist()
++        out = self.buf[s + n:min(s + n + k, L)].tolist()
++        self.proposed = len(out)                  # the copied drafts (a pad's repeats may miss without counting)
++        return self.padded(out, room)
++
++    def padded(self, drafts: list[int], room: int | None = None) -> list[int]:
++        """``drafts`` filled up to the next ``pad`` width's window by repeating the last one, when their window is
++        wider than GRAPHED rows, narrower than that width, and ``room`` (default ``most``) leaves space for it."""
++
++        rows = 1 + len(drafts)
++        if not self.pad or not drafts or rows <= GRAPHED:
++            return drafts
++        width = next((w for w in self.pad if w >= rows), 0)
++        if width <= rows or width - 1 > (self.most if room is None else int(room)):
++            return drafts
++        return drafts + [drafts[-1]] * (width - rows)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6b796d7..66fa9ca 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -17,7 +17,48 @@ DEFAULT_POLICY = "auto"
+ DFLASH_POLICY = os.environ.get("TF_GLM_DFLASH_POLICY", "").strip() or "fc5:0.3"
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+ GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
+-MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts: copy drafts)
++
++
++def max_rows(value: str | None = None) -> int:
++    """TF_GLM_MAX_ROWS: the widest verify window, 16 (default) to 64 in steps of 8 (``geometry.MLA_DECODE_ROWS``,
++    which the startup estimate sizes decode buffers for). Wider windows serve copy drafts only (TF_GLM_COPY_MAX up to
++    this minus one); past 16 rows a window's all-gathers exceed TF_ROCE_MAX_KB's default 256 KiB (16 KiB a row) and
++    go through NCCL unless it is raised (TF_ROCE_MAX_KB=512 for 32 rows)."""
++
++    from tensorfold.cuda.geometry import MLA_DECODE_ROWS
++
++    value = (os.environ.get("TF_GLM_MAX_ROWS", "") if value is None else value).strip()
++    if value == "":
++        return 16
++    if not value.isdecimal() or not 16 <= int(value) <= MLA_DECODE_ROWS or int(value) % 8:
++        raise ValueError(f"TF_GLM_MAX_ROWS: 16 to {MLA_DECODE_ROWS} in steps of 8, not {value!r}")
++    return int(value)
++
++
++MAX_ROWS = max_rows()                 # the widest verify window (a pending token and up to 15 drafts: copy drafts)
++
++
++def wide_graphs(value: str | None = None, most: int | None = None) -> tuple[int, ...]:
++    """TF_GLM_WIDE_GRAPHS: verify-window widths past GRAPH_ROWS (9 to TF_GLM_MAX_ROWS) that also replay CUDA graphs,
++    comma separated (e.g. ``16`` or ``16,32``; off by default: wider windows run eagerly). Copy drafts pad a window
++    that falls short of a captured width up to it (``copy_drafts.CopySettings.pad``). Each width costs a graph a KDA
++    parity, and one more a pool bucket past the dense limit, at startup."""
++
++    most = MAX_ROWS if most is None else most
++    value = (os.environ.get("TF_GLM_WIDE_GRAPHS", "") if value is None else value).strip()
++    if value in ("", "0"):
++        return ()
++    out = set()
++    for part in value.split(","):
++        part = part.strip()
++        if not part.isdecimal() or not max(GRAPH_ROWS) < int(part) <= most:
++            raise ValueError(f"TF_GLM_WIDE_GRAPHS: widths from {max(GRAPH_ROWS) + 1} to {most} (TF_GLM_MAX_ROWS), "
++                             f"comma separated, not {value!r}")
++        out.add(int(part))
++    return tuple(sorted(out))
++
++
++WIDE_GRAPHS = wide_graphs()
+ MTP_ROWS = 8                          # rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+@@ -352,7 +393,7 @@ class GlmEngine:
+ 
+         # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
+         # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
+-        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
++        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1, pad=WIDE_GRAPHS)
+         from .hcsplit import SplitSettings
+ 
+         # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
+@@ -468,9 +509,10 @@ class GlmEngine:
+             verify_code = 1 + ("batched", "serial").index(verify_kind())
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
++                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+-                                 parallel, verify_code]
++                                 parallel, verify_code, MAX_ROWS, len(WIDE_GRAPHS), sum(WIDE_GRAPHS),
++                                 max(WIDE_GRAPHS, default=0)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -481,7 +523,7 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+-                               "TF_GLM_MULTI_VERIFY): "
++                               "TF_GLM_MULTI_VERIFY, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -530,13 +572,21 @@ class GlmEngine:
+ 
+             self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+-                        graph_rows=GRAPH_ROWS, long_context=long_context,
++                        graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+                         split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+                 print(f"[tensorfold] {self.split.describe()}", flush=True)
++        c = self.copy
++        if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
++            print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
++                  f"{', '.join(map(str, GRAPH_ROWS + WIDE_GRAPHS))} rows (TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS)"
++                  + (f"; copies from the reply match {c.reply_match} tokens (TF_GLM_COPY_REPLY_MATCH)"
++                     if c is not None and c.reply_match else "")
++                  + (f"; {c.miss_most} copied drafts after a copied round that missed (TF_GLM_COPY_MISS_MAX)"
++                     if c is not None and c.miss_most else ""), flush=True)
+         if rank == 0 and self.dump is not None:
+             print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
+                   f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
+@@ -894,9 +944,7 @@ class GlmEngine:
+         policy = decode_policy(code, self.costs)
+         copies = None
+         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+-            from .copy_drafts import CopyDrafts
+-
+-            copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
++            copies = self.copy.drafts(list(prompt) + [first])
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index f62a69d..bf316fd 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -794,7 +794,9 @@ class MultiDecoder:
+         lane.decoding = True
+         s.started = time.perf_counter()
+         if lane.policy is not None and self.g.copy is not None:
+-            lane.copies = CopyDrafts(list(prompt) + [first], self.g.copy.match, self.g.copy.most)
++            c = self.g.copy                 # no pads: batched windows are not the single-stream widths
++            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=n, reply_match=c.reply_match,
++                                     miss_most=c.miss_most)
+         if lane.policy is not None:
+             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
+         return first

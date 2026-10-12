@@ -1,0 +1,2280 @@
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+index d926642..b08e325 100644
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -83,6 +83,14 @@ class Health:
+         if decoder is not None:                         # read, never locked: sizes of the decoder's own tables
+             body["streams"] = {"decoding": len(getattr(decoder, "streams", ())),
+                                "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
++            more = getattr(decoder, "health", None)       # a decoder's own counts (GLM: paused streams, its pool)
++            if callable(more):
++                try:
++                    extra = dict(more())
++                except Exception:                         # noqa: BLE001  (a table changing under the read)
++                    extra = {}
++                body["streams"].update(extra.pop("streams", {}))
++                body.update(extra)
+         window = getattr(app, "effective_context_window", None)
+         if window:
+             body["context_length"] = int(window)
+diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
+index a2f4a6f..90cb8f3 100644
+--- tensorfold/families/glm5_next/__init__.py
++++ tensorfold/families/glm5_next/__init__.py
+@@ -223,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+                      drafter=Path(drafter) if drafter and not no_drafts else None,
+                      context=options.get("context"), context_explicit=options.get("context_explicit"),
+                      serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),
+-                     vision_urls=bool(options.get("vision_urls", False)))
++                     vision_urls=bool(options.get("vision_urls", False)), parallel=int(options.get("parallel", 1)))
+ 
+ 
+ def __getattr__(name: str) -> Any:
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 93ab4dc..eb427d0 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -84,11 +84,15 @@ class Engine:
+ 
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+-                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None) -> None:
++                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
++                 streams: int = 1, pool_rows: int | None = None) -> None:
+         """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
+         ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit;
+         ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``): draft chains take one row a step,
+-        so the MTP buffers need not be as wide as the verify windows."""
++        so the MTP buffers need not be as wide as the verify windows; ``streams``: stream slots (``forward.Slots``)
++        and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``, default ``capacity``) for concurrent
++        streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
++        ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
+ 
+         if grid and prefill_rows % grid:
+             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
+@@ -110,7 +114,11 @@ class Engine:
+ 
+             self.pbuf.split = HcSplit(w, self.pbuf, split)
+         self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
+-        self.st = State(w, capacity, max_rows)
++        from .forward import Caches, Slots
++
++        self.caches = Caches(w, pool_rows or capacity)
++        self.slots = Slots(w, streams, max_rows)
++        self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
+         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
+         self.draft_n = w.head.n
+@@ -126,13 +134,29 @@ class Engine:
+     def reset(self) -> None:
+         self.st.reset()
+ 
++    def use(self, st: State) -> State:
++        """Run the single-stream paths (prefill, forward, commit, snapshots) on ``st``; returns the previous state."""
++
++        prev, self.st = self.st, st
++        return prev
++
++    def graphed(self, st: State | None = None) -> bool:
++        """Whether the captured graphs run ``st`` (default the current state): the same slot and extent base as the
++        state they were captured on (and the pool's views, not a clone's)."""
++
++        st = self.st if st is None else st
++        return (self.graphs is not None and st.caches is self.caches and st.slots is self.slots
++                and st.graph_key == self.home.graph_key)
++
+     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
+-        """A step's forward (a CUDA graph when one was captured for its shape): logits [R, V/world]."""
++        """A step's forward (a CUDA graph when one was captured for its shape and state): logits [R, V/world]."""
+ 
+         R = stage(self.w, self.st, self.buf, tokens)
+         dense = self.st.pos + R <= self.w.cfg.dense_limit
+         g, kind = None, "main"
+-        if self.graphs is not None and dense:
++        if not self.graphed():
++            pass
++        elif self.graphs is not None and dense:
+             g = self.graphs.main.get((R, self.st.parity))
+         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
+             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+@@ -151,7 +175,9 @@ class Engine:
+         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
+         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
+         g, kind = None, "mtp"
+-        if self.graphs is not None and not self.mbuf.zero_first and dense:
++        if not self.graphed():
++            pass
++        elif self.graphs is not None and not self.mbuf.zero_first and dense:
+             g = self.graphs.mtp.get(n)
+         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
+               and self.st.mtp_len >= self.w.cfg.dense_limit):
+@@ -407,22 +433,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+     last = None
+     prof.active = True
+     for start in range(begin, len(prompt), e.prefill_rows):
+-        chunk = list(prompt[start:start + e.prefill_rows])
+-        R = len(chunk)
+-        inject = feed.chunk(start, R) if feed is not None else None
+-        out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
+-                      head=sample)
+-        last = out.clone() if sample else None
+-        e.last_hidden = b.fnormed[R - 1:R].clone()
+-        if drafter is not None:
+-            drafter.add_taps(e.tap_rows(R, b))
+-        if use_mtp:
+-            nxt = list(prompt[start + 1:start + R + 1])
+-            if nxt:
+-                with prof.timed("mtp absorb"):
+-                    _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+-        with prof.timed("commit"):
+-            commit(w, st, b, R, R)
++        last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter, feed=feed,
++                             mtp=use_mtp, head=sample)
+     prof.active = False
+     prof.report(len(prompt) - begin)
+     if not sample:
+@@ -434,6 +446,32 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+     return first
+ 
+ 
++def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
++                  mtp: bool = False, head: bool = True) -> torch.Tensor | None:
++    """Commit prompt rows start .. start + R (at e.st.pos == start): the chunk's forward, DFlash2's taps, the MTP
++    head's rows (``mtp``: the next tokens are the prompt's), the commit; a copy of the head's logits of its last
++    row, taken before anything else reuses the buffers, with ``head``, else None. ``prefill`` runs a prompt as these;
++    so do concurrent streams' prompt steps (``multi``), one chunk at a time."""
++
++    w, st, b = e.w, e.st, e.pbuf
++    chunk = list(prompt[start:start + R])
++    inject = feed.chunk(start, R) if feed is not None else None
++    out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
++                  head=head)
++    out = out.clone() if head else None
++    e.last_hidden = b.fnormed[R - 1:R].clone()
++    if drafter is not None:
++        drafter.add_taps(e.tap_rows(R, b))
++    if mtp:
++        nxt = list(prompt[start + 1:start + R + 1])
++        if nxt:
++            with prof.timed("mtp absorb"):
++                _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
++    with prof.timed("commit"):
++        commit(w, st, b, R, R)
++    return out
++
++
+ def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
+     """A prompt's rows into the MTP cache through the prefill buffers (the prefill arithmetic, like the prompt)."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 1a65d1c..6b796d7 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -248,6 +248,44 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
+ 
+ 
++PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
++MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
++
++
++def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS) -> int:
++    """What one more stream slot (``forward.Slots``) takes on each rank, from the text config: every KDA layer's
++    recurrent states (two parities), conv window, a decode window's projections and replay scratch."""
++
++    from tensorfold.cuda.geometry import layer_counts
++
++    linear, _ = layer_counts(t)
++    lin = t.get("linear_attn_config") or {}
++    lh = int(lin.get("num_heads", t.get("linear_num_heads", 64))) // world
++    ld = int(lin.get("head_dim", t.get("linear_head_dim", 128)))
++    conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
++    width = 3 * lh * ld + 2 * ld + lh                  # the KDA input projection's rows (q, k, v, f_a, g_a, beta)
++    scratch = rows * lh * (ld * 2 + ld * 4 + ld * 2 + ld * 4 + 4)
++    return linear * (2 * lh * ld * ld * 4 + (conv - 1) * 3 * lh * ld * 2 + rows * width * 2 + scratch)
++
++
++def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capacity: int,
++                      tap_rows: int = MAX_ROWS) -> int:
++    """``dflash2_multi.MultiDrafter``'s context pool on each rank: ``streams`` rings (or flat contexts of capacity +
++    block rows) and the padded context updates' trash rows, keys and values per draft layer."""
++
++    from tensorfold.cuda.geometry import draft_ring_rows
++
++    layers = int(t["num_hidden_layers"])
++    heads = int(t["num_key_value_heads"]) // world
++    hd = int(t["head_dim"])
++    block = int((t.get("dflash_config") or {}).get("block_size", 16))
++    window = int(t.get("sliding_window", 0))
++    ring_rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
++    cap = ring_rows if 0 < ring_rows < capacity + block else capacity + block
++    trash = -(-max(64, streams * tap_rows) // block) * block
++    return 2 * layers * heads * hd * (streams * cap + trash) * 2
++
++
+ def _f64_ints(x: float) -> list[int]:
+     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
+ 
+@@ -283,14 +321,19 @@ class GlmEngine:
+ 
+     shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
+     opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
++    parallel = 1                # --parallel N: requests decoded together (``multi``); 1 serves one at a time
++    concurrent = False          # the server hands every request straight to ``generate`` (the scheduler orders them)
++    multi = None                # --parallel > 1: the ``multi.MultiDecoder`` (both ranks)
++    scheduler = None            # ... and rank 0's ``multi.GlmScheduler``
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+                  prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
+-                 split=None) -> None:
++                 split=None, parallel: int = 1) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+         ``vision``: rank 0 runs the image tower (rank 1 only takes its rows); ``split``: a ``hcsplit.SplitSettings``
+-        instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests)."""
++        instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests); ``parallel``: requests decoded together
++        (``multi``: their caches share one pool, each stream up to the context window; DFlash2 drafts only)."""
+ 
+         import torch
+ 
+@@ -318,6 +361,10 @@ class GlmEngine:
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank = rank
++        parallel = int(parallel)
++        if not 1 <= parallel <= PARALLEL_MOST:
++            raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
++        self.parallel = parallel
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+@@ -348,7 +395,7 @@ class GlmEngine:
+         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
+         weights_estimate = kvb_weights(weights_estimate, kvb)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+-        self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
++        self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+         # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike), more amortizes each chunk's expert
+@@ -381,12 +428,29 @@ class GlmEngine:
+             g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+                              prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4")
+-            return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
++            # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
++            # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
++            # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
++            extra = workspace + (parallel - 1) * slot_bytes(text)
++            per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
++            if not extra and not per:
++                return g
++            return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
++
++        def draft_geometry(text):
++            from tensorfold.cuda.capacity import Geometry
++
++            g = dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING)
++            if parallel == 1:
++                return g
++            # --parallel: the multi-stream drafter's own pool of contexts beside the solo drafter's
++            return Geometry(lambda slots: g.bytes_at(slots) + multi_draft_bytes(text, parallel, ring=DRAFT_RING,
++                                                                                 capacity=slots), g.reserve)
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+                                    geometry,
+                                    weights_estimate, rank=rank, world=2, gather=self._gather_ints,
+                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
+-                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
++                                   draft_geometry=draft_geometry)
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
+@@ -395,12 +459,18 @@ class GlmEngine:
+         from .draft_dump import dump_dir
+         from .qmm import DRAFT_QUANTS, draft_quant
+ 
+-        self.dump = dump_dir() if drafter is not None and not serial_only else None
++        self.dump = dump_dir() if drafter is not None and not serial_only and parallel == 1 else None
+         quant_code = DRAFT_QUANTS.index(draft_quant())
++        verify_code = 0
++        if parallel > 1:                      # serial and batched verify windows make different collectives
++            from .multi import verify_kind
++
++            verify_code = 1 + ("batched", "serial").index(verify_kind())
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
+-            self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(self.mtp_on), int(DRAFT_RING)]
++            self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
++                                 parallel, verify_code]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -410,14 +480,35 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+-                               "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
++                               "TF_GLM_MULTI_VERIFY): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+         plan["kept_bytes"] = self.cache_bytes
+         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
+             plan[key] = plan[key] + self.cache_bytes
+-        if rank == 0 and self.cache_bytes < wanted:
++        # --parallel: one pool of per-token caches for every stream and kept prompt: the window's slots, plus what
++        # TF_GLM_CACHE_GIB gives kept prompts (their rows in the pool, their KDA states and DFlash2 windows beside it),
++        # whole 2,048-token extents; each stream holds up to the window (pool.py, multi.py)
++        pool_rows = None
++        if parallel > 1:
++            from tensorfold.cuda.capacity import config as read_config
++
++            from .pool import ALIGN
++
++            text = read_config(model_dir)
++            g = geometry(text)
++            per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
++            states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, rows=0) // 2 + (22 << 20))
++            pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
++            if pool_rows < ALIGN:
++                raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
++                                 f"extent; free memory or lower --context")
++            self.limit = min(self.limit, pool_rows - MAX_ROWS)
++            self.cache_bytes = 0                 # kept prompts live in the pool
++            plan["pool_tokens"] = pool_rows
++        if rank == 0 and self.cache_bytes < wanted and parallel == 1:
+             print(f"[tensorfold] other conversations' prompts are kept in {self.cache_bytes / 2 ** 30:.1f} GiB, what "
+                   f"the {self.limit}-token window leaves (TF_GLM_CACHE_GIB asks {wanted / 2 ** 30:.1f})", flush=True)
+         if not self.mtp_on and drafter is None and not serial_only:
+@@ -437,11 +528,11 @@ class GlmEngine:
+         if drafter is not None:
+             from .dflash2 import Drafter
+ 
+-            self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
+-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++            self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
++        self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+                         graph_rows=GRAPH_ROWS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+-                        split=self.split, mtp_rows=MTP_ROWS)
++                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+@@ -489,6 +580,18 @@ class GlmEngine:
+         self.cache: list = []
+         self.live: list[int] = []
+         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++        if parallel > 1:
++            from .multi import GlmScheduler, MultiDecoder
++
++            self.multi = MultiDecoder(self, parallel)
++            self.multi.model_dir = self.model_dir
++            if rank == 0:
++                self.scheduler = GlmScheduler(self.multi, max_streams=parallel)
++                self.concurrent = True
++                print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
++                      f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
++                      f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
++                      f"{self.multi.share:g})", flush=True)
+ 
+     def _calibrate(self) -> dict:
+         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
+@@ -840,8 +943,8 @@ class GlmEngine:
+         return stats
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
+-                 constraint=None, *, vision=None) -> dict[str, Any]:
+-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``)."""
++                 constraint=None, *, vision=None, background: bool = False) -> dict[str, Any]:
++        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them."""
+ 
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+@@ -852,6 +955,14 @@ class GlmEngine:
+             spec = getattr(self.request, "policy", None) or self.policy
+         code = self._effective(encode_policy(spec))
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
++        if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
++            if vision is not None and self.vision is None:
++                raise ValueError("image inputs require starting this server with --vision")
++            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
++                                          on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
++                                          background=background, glm={"code": code, "spec": spec})
++            stats.update(policy=spec, drafts=draft)
++            return stats
+         positions: list[int] = []
+         feed = None
+         if vision is not None:               # encoded here, before rank 1 is told anything, so a failure stops both
+@@ -900,6 +1011,9 @@ class GlmEngine:
+     def follow(self) -> None:
+         """Rank 1: mirror every request rank 0 serves, forever."""
+ 
++        if self.multi is not None:
++            self.multi.follow()
++            return
+         while True:
+             self.follow_one()
+ 
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index cb39952..e156332 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -161,52 +161,137 @@ class Buffers:
+         return p
+ 
+ 
+-class State:
+-    """Committed caches of one sequence (and of the MTP head's attention layer)."""
++class Caches:
++    """Every per-token cache of the model over ``rows`` tokens of a shared pool (``pool.Arena``): per DSA layer its
++    latents (or keys and values without the latent cache); the MTP layer's; and with long contexts per indexed layer
++    (the DSA layers, then the MTP layer) its index keys, gates and pooled keys (a row a pool of 4 tokens, 2 rows of
++    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``)."""
++
++    def __init__(self, w: Weights, rows: int) -> None:
++        from .pool import Arena, Plane
+ 
+-    def __init__(self, w: Weights, capacity: int, rows: int) -> None:
+         c = w.cfg
+         dev = w.device
+         HL = c.heads // w.world
++        dsa = len([l for l in w.layers if l.kind == "dsa"])
++        self.latent = latent.ENABLED
++        planes: list[Plane] = []
++
++        def add(shape, div: int = 1, pad: int = 0) -> int:
++            planes.append(Plane(torch.zeros((rows // div + pad, *shape), dtype=torch.bfloat16, device=dev), div, pad))
++            return len(planes) - 1
++
++        def attention_planes() -> tuple[int, int | None]:
++            if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
++                return add((c.kv_lora,)), None
++            return add((HL, c.qk_dim)), add((HL, c.v_dim))
++
++        self.kc, self.vc = [], []
++        for _ in range(dsa):
++            k, v = attention_planes()
++            self.kc.append(k)
++            self.vc.append(v)
++        self.mtp = attention_planes() if w.mtp is not None else None
++        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
++        self.index = None
++        if w.meta.get("long_context"):
++            n_idx = dsa + (1 if w.mtp is not None else 0)
++            self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2)) for _ in range(n_idx)]
++        self.arena = Arena(rows, planes)
++        self.rows = rows
++
++    def bind(self, st: "State", base: int, size: int) -> None:
++        """Point ``st``'s caches at tokens [base, base + size) of the pool."""
++
++        view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
++        st.kc = [view(i) for i in self.kc]
++        st.vc = [view(i) for i in self.vc]
++        if self.mtp is not None:
++            st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
++        st.index = None if self.index is None else [tuple(view(i) for i in trio) for trio in self.index]
++
++
++class Slots:
++    """What each of ``count`` concurrent streams holds whatever its length: KDA recurrent states [count, 2, layers,
++    H, 128, 128] (two parities) and conv windows [count, layers, 3, C], the decode window's KDA projections and replay
++    scratch (so a window's commit can come after another stream's forward), and the device positions a captured graph
++    reads. A ``State`` in slot s views slot s."""
++
++    def __init__(self, w: Weights, count: int, rows: int) -> None:
++        c = w.cfg
++        dev = w.device
+         LL = c.lin_heads // w.world
+-        self.capacity = capacity
+-        self.pos = 0
+-        self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
+-        self.mtp_pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
++        kda_layers = [l for l in w.layers if l.kind == "kda"]
++        n = len(kda_layers)
++        width = kda_layers[0].kda.proj.n if kda_layers else 0
++        self.count, self.rows, self.layers = count, rows, n
++        self.conv = torch.zeros((count, n, c.conv - 1, 3 * LL * 128), dtype=torch.bfloat16, device=dev)
++        self.rec = torch.zeros((count, 2, n, LL, 128, 128), dtype=torch.float32, device=dev)
++        self.proj = torch.zeros((count, n, rows, width), dtype=torch.bfloat16, device=dev)
++        self.scratch = [kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None for _ in range(count)]
++        self.pos_dev = torch.zeros((count, 1), dtype=torch.int32, device=dev)
++        self.mtp_pos_dev = torch.zeros((count, 1), dtype=torch.int32, device=dev)
++
++    def nbytes(self) -> int:
++        t = [self.conv, self.rec, self.proj, self.pos_dev, self.mtp_pos_dev]
++        s = [x for set_ in self.scratch if set_ is not None for x in (set_.out, set_.k, set_.v, set_.g, set_.b)]
++        return sum(x.numel() * x.element_size() for x in t + s)
++
++
++def slot_bytes(w: Weights, rows: int) -> int:
++    """Device bytes one more stream slot takes (``Slots``), without allocating it."""
++
++    c = w.cfg
++    LL = c.lin_heads // w.world
++    kda_layers = [l for l in w.layers if l.kind == "kda"]
++    n = len(kda_layers)
++    width = kda_layers[0].kda.proj.n if kda_layers else 0
++    DK = DV = 128
++    scratch = rows * LL * DV * 2 + rows * LL * DK * 4 + rows * LL * DV * 2 + rows * LL * DK * 4 + rows * LL * 4
++    return (n * (c.conv - 1) * 3 * LL * 128 * 2 + 2 * n * LL * 128 * 128 * 4 + n * rows * width * 2 + n * scratch
++            + 16)
++
++
++class State:
++    """Committed caches of one sequence (and of the MTP head's attention layer): views of its extent [base, base +
++    capacity) of the pool's ``Caches`` and of its stream slot (``Slots``). Without ``caches`` / ``slots`` it makes its
++    own (one sequence of ``capacity`` tokens, one slot), as it always held tensors of its own."""
++
++    def __init__(self, w: Weights, capacity: int, rows: int, *, caches: Caches | None = None, base: int = 0,
++                 slots: Slots | None = None, slot: int = 0) -> None:
++        self.caches = caches if caches is not None else Caches(w, capacity)
++        self.slots = slots if slots is not None else Slots(w, 1, rows)
++        self.slot = slot
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         dsa_layers = [l for l in w.layers if l.kind == "dsa"]
+         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
+         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
+         n = len(kda_layers)
+-        width = kda_layers[0].kda.proj.n if kda_layers else 0
+-        self.conv = torch.zeros((n, c.conv - 1, 3 * LL * 128), dtype=torch.bfloat16, device=dev)
+-        self.rec = torch.zeros((2, n, LL, 128, 128), dtype=torch.float32, device=dev)
++        sl = self.slots
++        self.pos = 0
++        self.pos_dev = sl.pos_dev[slot]
++        self.mtp_pos_dev = sl.mtp_pos_dev[slot]
++        self.conv = sl.conv[slot]
++        self.rec = sl.rec[slot]
+         self.cur = [0] * n
+-        self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
+-        self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
++        self.proj = sl.proj[slot]
++        self.scratch_set = sl.scratch[slot]
+         self.scratch = self.scratch_set.views if n else []
+         self.latent = latent.ENABLED
+-        if self.latent:              # one 512-wide latent a token and layer (kc), no separate values (vc)
+-            self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+-            self.vc = [None for _ in dsa_layers]
+-        else:
+-            self.kc = [torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+-            self.vc = [torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+         self.mtp_len = 0
+         self.mtp_drafted = 0
+-        if w.mtp is not None:
+-            if self.latent:
+-                self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
+-                self.mtp_vc = None
+-            else:
+-                self.mtp_kc = torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev)
+-                self.mtp_vc = torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev)
+-        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
+-        self.index = None
+-        if w.meta.get("long_context"):
+-            n_idx = len(dsa_layers) + (1 if w.mtp is not None else 0)
+-            mk = lambda n: torch.zeros((n, c.index_dim), dtype=torch.bfloat16, device=dev)   # noqa: E731
+-            self.index = [(mk(capacity), mk(capacity), mk(capacity // 4 + 2)) for _ in range(n_idx)]
++        self.bind(base, capacity)
++
++    def bind(self, base: int, capacity: int) -> None:
++        """View the pool's tokens [base, base + capacity) (a new extent, grown or moved: the rows are the caller's)."""
++
++        self.base, self.capacity = int(base), int(capacity)
++        self.caches.bind(self, self.base, self.capacity)
++
++    @property
++    def graph_key(self) -> tuple[int, int]:
++        """What a captured graph baked in besides the shared buffers: the slot and the extent's base."""
++        return self.slot, self.base
+ 
+     def reset(self) -> None:
+         self.conv.zero_()
+@@ -229,9 +314,11 @@ class State:
+         return self.cur[0] if self.cur else 0
+ 
+     def clone(self) -> "State":
++        """A copy with tensors of its own (no longer the pool's or the slot's views; not for captured graphs)."""
+         import copy
+ 
+         other = copy.copy(self)
++        other.proj = self.proj.clone()
+         other.conv = self.conv.clone()
+         other.rec = self.rec.clone()
+         other.cur = list(self.cur)
+@@ -314,6 +401,30 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+         return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
+ 
+ 
++def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: "Slots",
++                 proj: torch.Tensor, scratch, li: int) -> torch.Tensor:
++    """kda_block's decode path for a multi-stream window (``seg``: kda.segment_table, set): the projections on every
++    row at once (``proj`` [layers, rows, width]: the window's, which the commit's conv shift reads), the chain per
++    segment from its slot's state (``kda.chain_segments``: each segment's bits alone; always the wide path, as
++    decode windows run by default), ``scratch``: the window's replay scratch (a KDAScratchSet)."""
++
++    c = w.cfg
++    k = layer.kda
++    p = proj[li, :R]
++    with prof.timed("kda: projections"):
++        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
++        fa = p[:, k.fa_off:k.fa_off + 128]
++        ga = p[:, k.ga_off:k.ga_off + 128]
++        mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
++        mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++    with prof.timed("kda: recurrence"):
++        out = kda_mod.chain_segments(seg, p, k.b_off, b.ka[:R], b.kg[:R], slots.conv[:, li], k.conv,
++                                     slots.rec[:, :, li], k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R,
++                                     scratch.views[li])
++    with prof.timed("kda: out + all-gather"):
++        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
++
++
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+               R: int, nch: int | None, index=None, host_pos: int | None = None,
+               sparse_np: int | None = None) -> torch.Tensor:
+@@ -539,13 +650,16 @@ def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+-                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
++                  host_pos: int | None = None, sparse_np: int | None = None, mixer=None) -> None:
++    """``mixer``: the layer's KDA / DSA block as ``mixer(layer)`` instead of on ``st`` (a multi-stream window's
++    segmented blocks, ``verify.BatchedVerify``); everything else is the same calls."""
++
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+-    g = _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
++    g = mixer(layer) if mixer is not None else _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
+     with prof.timed("hc"):
+         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+         h = layer.ffn_hc
+@@ -606,7 +720,7 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True):
++            host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
+     c = w.cfg
+@@ -614,11 +728,11 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+-    if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
++    if b.prefill and b.split is not None and sparse_np is None and mixer is None and b.split.applies(R):
+         split_layers(w, st, b, R, nch, host_pos)             # also leaves the taps and b.hidden[:R]
+     else:
+         for layer in w.layers:
+-            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
++            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
+             for slot in b.tap_at.get(layer.index, ()):
+                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
+         glue.stream_mean(b.x[:R], b.hidden[:R])
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+new file mode 100644
+index 0000000..f62a69d
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -0,0 +1,1117 @@
++"""GLM-5.3-Flash's concurrent requests (--parallel N) on two ranks: every stream commits exactly its own rows, so each
++reply is the one its request gets served alone with ``"draft": false``.
++
++Layout: the per-token caches are one pool (``pool.py``, ``forward.Caches``); a stream, or a kept prompt, owns an
++extent of it aligned to 2,048 tokens, and the single-stream code (prompt chunks, verify windows, commits, snapshots)
++runs on a ``forward.State`` viewing that extent and the stream's slot (``forward.Slots``: KDA states, conv windows,
++window scratch; a DFlash2 context, ``dflash2_multi.DraftContext``; host side its copy-draft index, sampler and grammar).
++
++Iterations (``GlmScheduler``, one worker thread on rank 0): admissions, then either one prompt chunk of the oldest
++filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the engine's prompt chunk alone) or one
++decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. A round: each
++decoding stream (admission order) proposes drafts under its own DFlash2 policy (copy drafts first), the combined
++window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
++(``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
++DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own forward; TF_GLM_MULTI_VERIFY),
++one packed all-gather for the samplers, each stream accepts and commits its own.
++
++Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
++ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, which both ranks apply
++in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
++sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
++ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
++
++Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2 ones (drafts never change a reply)."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import queue
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable, Sequence
++
++import numpy as np
++import torch
++
++from tensorfold.cuda.scheduler import Scheduler
++from tensorfold.cuda.streams import Stream, next_fill
++
++from .pool import ALIGN, Pool, align_up
++from .verify import BatchedVerify, Segment, SerialVerify, Verified
++
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE = range(1, 9)
++OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
++       IDLE: "IDLE"}
++DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
++MAX_WINDOW = 32                          # rows of every stream's windows together in one round
++SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
++
++
++# -- settings ------------------------------------------------------------------------------------------------------
++def fill_rows(prefill_rows: int, grid: int = 0, value: str | None = None) -> int:
++    """TF_GLM_FILL_ROWS: rows of a prompt chunk while other streams decode (default 1,024 or the engine's prompt
++    chunk if smaller): a multiple of 64 and of the prompt grid, at most the prompt chunk (TF_GLM_PREFILL_ROWS)."""
++
++    value = os.environ.get("TF_GLM_FILL_ROWS", "") if value is None else value
++    value = value.strip()
++    rows = min(1024, prefill_rows) if value == "" else int(value) if value.isdecimal() else -1
++    if rows < 64 or rows % 64 or rows > prefill_rows or (grid and rows % grid):
++        raise ValueError(f"TF_GLM_FILL_ROWS: a multiple of 64{f' and of the {grid}-token prompt grid' if grid else ''}"
++                         f" up to the {prefill_rows}-row prompt chunk, not {value!r}")
++    return rows
++
++
++def fill_share(value: str | None = None) -> float:
++    """TF_GLM_FILL_SHARE: the share of iterations prompt chunks take while other streams decode (default 0.5: a
++    chunk, a round, a chunk, ...); 1 fills every prompt before decoding on."""
++
++    value = os.environ.get("TF_GLM_FILL_SHARE", "") if value is None else value
++    try:
++        share = 0.5 if value.strip() == "" else float(value)
++    except ValueError:
++        share = -1.0
++    if not 0 < share <= 1:
++        raise ValueError(f"TF_GLM_FILL_SHARE: a share above 0 and at most 1, not {value!r}")
++    return share
++
++
++def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
++    """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
++    policy its DFlash2 twin; without a draft model, serial."""
++
++    kind = code[0]
++    if kind == 0 or not dflash:
++        return [0, 0, 0, 0]
++    if kind in (4, 5):
++        return list(dflash_policy)
++    return [kind + 10] + list(code[1:]) if kind < 10 else list(code)
++
++
++def trim(drafts: list[list[int]], cap: int = MAX_WINDOW) -> list[list[int]]:
++    """Cut drafts until every window (a pending token and its drafts) fits ``cap`` rows together: one draft at a
++    time off the longest window (the latest of equals)."""
++
++    drafts = [list(d) for d in drafts]
++    total = sum(1 + len(d) for d in drafts)
++    while total > cap:
++        k = max(range(len(drafts)), key=lambda i: (len(drafts[i]), i))
++        if not drafts[k]:
++            break
++        drafts[k].pop()
++        total -= 1
++    return drafts
++
++
++def _f64(x: float) -> list[int]:
++    import struct
++
++    return list(struct.unpack("<2i", struct.pack("<d", float(x))))
++
++
++def _unf64(lo: int, hi: int) -> float:
++    import struct
++
++    return struct.unpack("<d", struct.pack("<2i", lo, hi))[0]
++
++
++def pack_sampling(sampling) -> list[int]:
++    """10 int32 words: the seed (3 words of 31, 31 and 2 bits), temperature, top_k, top_p, min_p."""
++
++    seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
++    return [seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
++            *_f64(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
++            *_f64(sampling.top_p if sampling else 1.0), *_f64(sampling.min_p if sampling else 0.0)]
++
++
++def unpack_sampling(w: Sequence[int]):
++    from tensorfold.engine.exact_sampling import Sampling
++
++    s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi = w
++    temperature = _unf64(t_lo, t_hi)
++    if temperature <= 0:
++        return None
++    return Sampling((s_top << 62) | (s_hi << 31) | s_lo, temperature, top_k, _unf64(p_lo, p_hi), _unf64(m_lo, m_hi))
++
++
++# -- DFlash2 contexts per slot ---------------------------------------------------------------------------------------
++def draft_window(ctx, n: int) -> list[torch.Tensor]:
++    """A copy of a stream's DFlash2 window rows before n (``dflash2_multi.DraftContext``, or a solo ``Drafter``):
++    what a later block pass at n or past it reads. A ring's are copied by ``take_snapshot`` already."""
++
++    from .decode import _drafter_views, _ring_window
++
++    return _ring_window(ctx, n) if getattr(ctx, "ring", 0) else [v.clone() for v in _drafter_views(ctx, n)]
++
++
++def put_draft_window(ctx, n: int, rows: list[torch.Tensor]) -> None:
++    """Put a kept prompt's DFlash2 window back and end the context at n."""
++
++    from .decode import _drafter_views, _put_ring_window
++
++    if getattr(ctx, "ring", 0):
++        _put_ring_window(ctx, n, rows)
++    else:
++        views = _drafter_views(ctx, n)
++        if len(views) != len(rows):
++            raise ValueError("a kept state's DFlash2 window does not match the drafter's context")
++        for dst, src in zip(views, rows):
++            dst.copy_(src)
++    ctx.context_end = n
++    ctx.pos_dev.fill_(n)
++
++
++# -- the verify seam -------------------------------------------------------------------------------------------------
++def verify_kind(value: str | None = None) -> str:
++    """TF_GLM_MULTI_VERIFY: how a round's windows are verified: batched (the default: one forward over every stream's
++    rows, the segmented kernels) or serial (the reference: each stream's window as its own forward)."""
++
++    value = (os.environ.get("TF_GLM_MULTI_VERIFY", "") if value is None else value).strip().lower() or "batched"
++    if value not in ("batched", "serial"):
++        raise ValueError(f"TF_GLM_MULTI_VERIFY: batched or serial, not {value!r}")
++    return value
++
++
++def forward_streams(verify, segments: Sequence[Segment]) -> Verified:
++    """The seam: every segment's logits (and taps) of one round, by ``verify`` (``verify.SerialVerify`` or
++    ``verify.BatchedVerify``, the same two calls)."""
++
++    return verify.forward(segments)
++
++
++def sample_streams(w, parts: Sequence[tuple]) -> list[list[int]]:
++    """parts [(logits [R, V/world], positions, sampling)] -> each part's tokens, as ``decode.sample_rows`` samples
++    each alone: every top-k (and greedy) part's candidates in ONE all-gather, a nucleus part (top_k off) through the
++    shared nucleus rule (its own gathers), in part order on every rank."""
++
++    from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
++    from tensorfold.engine.exact_sampling import MARGIN, choose_rows
++
++    out: list[list[int] | None] = [None] * len(parts)
++    packed, layout = [], []
++    for k, (logits, positions, sampling) in enumerate(parts):
++        greedy = sampling is None or sampling.temperature <= 0
++        if not greedy and not sampling.top_k:
++            continue
++        n = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
++        vals, ids = torch.topk(logits.float(), n, dim=-1)
++        ids = (ids + w.vocab_offset).to(torch.int32)
++        packed.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++        layout.append((k, logits.shape[0], n))
++    if packed:
++        flat = torch.cat(packed) if len(packed) > 1 else packed[0]
++        if w.comm is None:
++            host = flat.view(1, -1).cpu()
++        else:
++            got = torch.empty((w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
++            w.comm.all_gather(flat.contiguous(), got)
++            host = got.view(w.world, -1).cpu()
++        at = 0
++        for k, R, n in layout:
++            g = host[:, at:at + R * 2 * n].reshape(host.shape[0], R, 2 * n)
++            at += R * 2 * n
++            values = torch.cat([g[r, :, :n] for r in range(g.shape[0])], dim=1).numpy().astype(np.float32)
++            tokens = torch.cat([g[r, :, n:].contiguous().view(torch.int32) for r in range(g.shape[0])],
++                               dim=1).numpy().astype(np.int64)
++            _, positions, sampling = parts[k]
++            if sampling is None or sampling.temperature <= 0:
++                order = np.lexsort((tokens, -values), axis=-1)
++                out[k] = [int(tokens[i, order[i, 0]]) for i in range(R)]
++            else:
++                out[k] = choose_rows(values, tokens, positions, sampling)
++    for k, (logits, positions, sampling) in enumerate(parts):
++        if out[k] is None:
++            out[k] = nucleus_rows(logits, positions, sampling, offset=w.vocab_offset,
++                                  gather=one_rank if w.comm is None else comm_gather(w.comm))
++    return out
++
++
++# -- streams -------------------------------------------------------------------------------------------------------------
++@dataclass(eq=False)
++class Lane:
++    """An admitted stream: its request (``Stream``), slot, extent, state views and decoding state (both ranks)."""
++
++    s: Stream
++    sid: int
++    slot: int
++    extent: Any
++    st: Any
++    order: int
++    code: list[int]
++    spec: str = ""
++    policy: Any = None                 # decode.DepthPolicy (DFlash2), None: one row a round
++    dflash: bool = False               # the stream drafts with DFlash2 (its slot's context holds its taps)
++    depth: int = 0
++    copies: Any = None
++    feed: Any = None
++    constraint: Any = None
++    window: Any = None                 # the grammar's window of this round's rows
++    stops: list[int] = field(default_factory=list)   # prompt positions whose states are kept (before the end)
++    point: int | None = None           # where the prompt's own state is kept (engine.grid_point), or None
++    shared: list[int] = field(default_factory=list)
++    decoding: bool = False
++    paused: bool = False
++    t0: float = 0.0
++    copy_rounds: int = 0
++    copy_drafted: int = 0
++    copy_accepted: int = 0
++
++
++class NoRoom(RuntimeError):
++    """The pool cannot place a stream now (it waits for others to finish)."""
++
++
++class MultiDecoder:
++    """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
++
++    def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None) -> None:
++        """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
++        drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
++        ``SerialVerify``)."""
++        from .engine import DFLASH_POLICY, encode_policy
++
++        self.g = engine
++        self.e = e = engine.e
++        self.w = e.w
++        self.rank = engine.rank
++        self.count = streams
++        if e.slots.count < streams:
++            raise ValueError(f"the engine holds {e.slots.count} stream slots, not {streams}")
++        self.rows_max = e.rows                           # a stream's window (decode.MAX_ROWS)
++        self.pool = Pool(e.caches.rows)
++        self.arena = e.caches.arena
++        self.grid = engine.grid
++        self.fill_rows = fill_rows(e.prefill_rows, self.grid)
++        self.share = fill_share()
++        self.credit = 0.0
++        self.drafts = drafts
++        if self.drafts is None and engine.drafter is not None:
++            from .dflash2_multi import MultiDrafter
++
++            self.drafts = MultiDrafter(engine.drafter, streams=streams)
++            graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
++            if graphs and torch.cuda.is_available():
++                self.drafts.capture()
++        if verify is None:
++            if verify_kind() == "batched":
++                taps = engine.drafter.tap_layers if engine.drafter is not None else ()
++                verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
++                # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
++                if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
++                    verify.capture()
++            else:
++                verify = SerialVerify(e, taps=self.drafts is not None)
++        self.verify = verify
++        self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
++        self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
++        self.next_sid = self.next_kid = self.next_order = 0
++        self.outbox: list[int] = []
++        self.idle = True
++        self.broken: Exception | None = None
++        self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
++        self.eos = tuple(self.w.cfg.eos)
++        self.dflash_code = encode_policy(DFLASH_POLICY)
++
++    # -- the scheduler's view ----------------------------------------------------------------------------------------
++    @property
++    def streams(self) -> dict[int, Stream]:
++        """Decoding streams (``Scheduler._yield`` and /health read it)."""
++        return {sid: lane.s for sid, lane in self.lanes.items() if lane.decoding}
++
++    @property
++    def filling(self) -> list[Stream]:
++        return [lane.s for lane in self.lanes.values() if not lane.decoding]
++
++    def live(self) -> int:
++        return len(self.lanes)
++
++    def health(self) -> dict:
++        lanes = list(self.lanes.values())
++        return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
++                            "filling": sum(not l.decoding for l in lanes),
++                            "paused": sum(l.decoding and l.paused for l in lanes)},
++                "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
++                "kept_prompts": len(self.kept)}
++
++    def _check(self) -> None:
++        if self.broken is not None:
++            raise RuntimeError("the two ranks are out of step after an error; restart both") from self.broken
++
++    # -- messages --------------------------------------------------------------------------------------------------------
++    def _emit(self, op: int, payload: Sequence[int]) -> list[int]:
++        payload = [int(v) for v in payload]
++        self.outbox += [op, len(payload), *payload]
++        return payload
++
++    def _flush(self) -> None:
++        """Rank 0: this iteration's ops to rank 1, one message (after the doorbell when rank 1 idles)."""
++
++        if self.idle:
++            self.g._ring()
++            self.idle = False
++        msg, self.outbox = self.outbox, []
++        self.g._share(msg)
++
++    @staticmethod
++    def parse(msg: Sequence[int]) -> list[tuple[int, list[int]]]:
++        ops, i = [], 0
++        while i < len(msg):
++            op, n = int(msg[i]), int(msg[i + 1])
++            ops.append((op, [int(v) for v in msg[i + 2:i + 2 + n]]))
++            i += 2 + n
++        return ops
++
++    # -- admission (rank 0 decides) ---------------------------------------------------------------------------------------
++    def _need(self, prompt: int) -> int:
++        return align_up(prompt + self.rows_max)
++
++    def fits(self, s: Stream) -> bool:
++        """Whether ``s`` can be placed now (else it waits, in order, for streams to finish): the free rows and the
++        kept-only extents cover its prompt, with a block of headroom for each decoding stream to grow into."""
++
++        if not self.lanes:
++            return True                  # everything can be evicted; a prompt past the pool fails in ``admit``
++        need = self._need(len(s.prompt))
++        room = self.pool.free_rows() + sum(x.size for x in self.pool.extents if x.owner is None)
++        return room >= need + ALIGN * sum(l.decoding for l in self.lanes.values())
++
++    def admit(self, s: Stream) -> None:
++        """Rank 0: place a request (slot, extent; resumed from the longest kept prefix of its prompt when it drafts)
++        and queue its ADMIT; its prompt is prefilled chunk by chunk in later iterations."""
++
++        from .engine import grid_point, shared_points
++        from .engine import VisionFeed
++
++        self._check()
++        g = self.g
++        prompt = [int(t) for t in s.prompt]
++        if not prompt:
++            raise ValueError("a request needs at least one prompt token")
++        if len(prompt) >= g.limit:
++            raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {g.limit}")
++        s.count = max(1, min(int(s.count), g.limit - len(prompt)))
++        if self._need(len(prompt)) > self.pool.rows:
++            raise ValueError(f"a prompt of {len(prompt)} tokens does not fit the {self.pool.rows}-token pool")
++        info = getattr(s, "glm", None) or {}
++        draft = bool(s.draft) and not g.serial_only
++        code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None and draft,
++                          self.dflash_code) if draft else [0, 0, 0, 0]
++        positions: list[int] = []
++        feed = None
++        if s.vision is not None:              # encoded before anything is decided or sent: a failure stops here
++            if g.vision is None:
++                raise ValueError("image inputs require starting this server with --vision")
++            positions = [int(p) for p in s.vision.positions]
++            if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
++                raise ValueError("image rows must sit at increasing positions inside the prompt")
++            t = time.perf_counter()
++            torch.cuda.empty_cache()
++            rows = g.vision.features(s.vision)
++            torch.cuda.empty_cache()
++            if rows.shape[0] != len(positions):
++                raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
++            feed = VisionFeed(g, positions, rows)
++            feed.encode_s = time.perf_counter() - t
++        slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
++        if slot is None:
++            raise NoRoom(f"every one of the {self.count} stream slots is taken")
++        hit = self._resume(prompt) if draft and feed is None else None
++        need = self._need(len(prompt))
++        # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
++        copy = 0
++        base = None
++        if hit is not None and hit.extent.owner is None:
++            x = hit.extent
++            for c in list(x.kept):            # kept prompts the stream would overwrite: gone
++                if len(c.ids) > len(hit.ids) and prompt[:len(c.ids)] != c.ids:
++                    self._evict(c)
++            if self._grow(x, need, protect=[x]):
++                base = x.base
++            else:
++                hit = None
++        if base is None:
++            base = self._room(need, [hit.extent] if hit is not None else [])
++            if base is None and hit is not None:          # no room beside the kept rows: start fresh
++                hit = None
++                base = self._room(need)
++            if base is None:
++                raise NoRoom(f"no room for a {need}-token extent in the {self.pool.rows}-token pool now")
++            copy = int(hit is not None)
++        cut = len(hit.ids) if hit is not None else 0
++        shared: list[int] = []
++        if draft and feed is None and g.shared:
++            known = [np.asarray(c.ids, dtype=np.int64) for c in self.kept]
++            shared = shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
++                                   g.opener)
++        sid = self.next_sid
++        payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
++                   int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
++                   len(prompt), *prompt]
++        from tensorfold.engine.grammar import pack
++
++        packed = pack(s.constraint)
++        payload += [len(packed), *packed, len(positions), *positions]
++        self._emit(ADMIT, payload)
++        try:
++            self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
++        except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
++            self.broken = exc
++            raise
++
++    @staticmethod
++    def _parse_admit(p: list[int]) -> dict:
++        (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
++        sampling = unpack_sampling(p[9:19])
++        shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
++        i = 19 + SHARED_SLOTS
++        code = p[i:i + 4]
++        i += 4
++        n = p[i]
++        prompt = p[i + 1:i + 1 + n]
++        i += 1 + n
++        n = p[i]
++        packed = p[i + 1:i + 1 + n]
++        i += 1 + n
++        n = p[i]
++        positions = p[i + 1:i + 1 + n]
++        return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
++                    draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed,
++                    positions=positions)
++
++    def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
++        """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
++
++        from .engine import decode_policy, grid_point
++        from .forward import State
++
++        g, e = self.g, self.e
++        hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
++        prompt = a["prompt"]
++        s.prompt = list(prompt)
++        cut = len(hit.ids) if hit is not None else 0
++        if hit is not None and hit.ids != prompt[:cut]:
++            raise RuntimeError(f"the kept prompt {a['kid']} is not a prefix of stream {a['sid']}'s prompt")
++        if hit is not None and not a["copy"]:
++            x = hit.extent
++            if (x.base, x.size) != (a["base"], a["size"]) or x.owner is not None:
++                raise RuntimeError(f"stream {a['sid']} takes over extent {x.eid} at [{x.base}, {x.end}), "
++                                   f"rank 0 said [{a['base']}, {a['base'] + a['size']})")
++        else:
++            x = self.pool.add(a["base"], a["size"])
++            if hit is not None:
++                self.arena.copy(hit.extent.base, x.base, cut)
++        x.owner = a["sid"]
++        st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
++        code = a["code"]
++        dflash = code[0] >= 10 and self.drafts is not None
++        policy = decode_policy(code, g.costs) if code[0] else None
++        lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
++                    constraint=constraint)
++        self.next_sid = max(self.next_sid, a["sid"] + 1)
++        self.next_order += 1
++        s.sid, s.cached = a["sid"], cut
++        # the slot's state: the kept prompt's, or fresh
++        st.reset()
++        if self.drafts is not None:
++            self._ctx(lane).reset()
++        if hit is not None:
++            st.rec[st.cur[0]].copy_(hit.rec)
++            st.conv.copy_(hit.conv)
++            st.set_pos(cut)
++            if dflash:
++                if hit.drafter_end != cut or hit.drafter_rows is None:
++                    raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
++                put_draft_window(self._ctx(lane), cut, hit.drafter_rows)
++            self._touch(hit)
++        # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
++        if a["draft"] and feed is None:
++            lane.point = grid_point(len(prompt), cut, self.grid)
++            lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
++            lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
++                                              else [])
++        s.started = time.perf_counter()
++        lane.t0 = s.started
++        self.lanes[lane.sid] = lane
++
++    def _ctx(self, lane: Lane):
++        """The lane's slot's DFlash2 context."""
++        return self.drafts.contexts[lane.slot]
++
++    # -- kept prompts ------------------------------------------------------------------------------------------------------
++    def _kept_by_id(self, kid: int):
++        for c in self.kept:
++            if c.kid == kid:
++                return c
++        raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
++
++    def _resume(self, prompt: list[int]):
++        best = None
++        for c in self.kept:
++            n = len(c.ids)
++            fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
++            fits = fits and not (self.grid and n % self.grid)
++            if fits and n < len(prompt) and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
++                best = c
++        return best
++
++    def _touch(self, c) -> None:
++        self.kept = [k for k in self.kept if k is not c] + [c]
++
++    def _keep(self, lane: Lane, n: int) -> None:
++        """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent."""
++
++        from .decode import take_snapshot
++
++        prev = self.e.use(lane.st)
++        try:
++            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None)
++        finally:
++            self.e.use(prev)
++        snap.drafter_end = -1
++        if lane.dflash:
++            snap.drafter_end = n
++            snap.drafter_rows = draft_window(self._ctx(lane), n)
++        snap.kid = self.next_kid
++        self.next_kid += 1
++        snap.extent = lane.extent
++        for c in [c for c in self.kept if c.ids == snap.ids]:
++            self._drop(c)
++        lane.extent.kept.append(snap)
++        self.kept.append(snap)
++        while len(self.kept) > max(1, self.g.cache_entries):
++            self._drop(self.kept[0])
++
++    def _drop(self, c) -> None:
++        """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
++
++        self.kept = [k for k in self.kept if k is not c]
++        x = c.extent
++        x.kept = [k for k in x.kept if k is not c]
++        c.rec = c.conv = None
++        c.drafter_rows = None
++        self._settle(x)
++
++    def _settle(self, x) -> None:
++        if x.owner is not None:
++            return
++        if not x.kept:
++            self.pool.remove(x)
++            return
++        size = align_up(max(len(k.ids) for k in x.kept))
++        if size < x.size:
++            self.pool.resize(x, size)
++
++    def _evict(self, c) -> None:
++        """Rank 0: drop a kept prompt on both ranks."""
++
++        self._emit(EVICT, [c.kid])
++        self._drop(c)
++
++    # -- room --------------------------------------------------------------------------------------------------------------
++    def _used(self, x) -> int:
++        used = max([len(k.ids) for k in x.kept], default=0)
++        if x.owner is not None:
++            used = max(used, self.lanes[x.owner].st.pos)
++        return used
++
++    def _move(self, x, base: int, size: int) -> None:
++        """Both ranks: relocate extent x (its used rows copied) to [base, base + size)."""
++
++        used = self._used(x)
++        old = self.pool.move(x, base, size)
++        self.arena.copy(old, base, used)
++        if x.owner is not None:
++            self.lanes[x.owner].st.bind(x.base, x.size)
++
++    def _resize(self, x, size: int) -> None:
++        self.pool.resize(x, size)
++        if x.owner is not None:
++            self.lanes[x.owner].st.bind(x.base, x.size)
++
++    def _victims(self, protect) -> list:
++        keep = set(id(x) for x in protect)
++        return [c for c in self.kept if c.extent.owner is None and id(c.extent) not in keep]
++
++    def _compact(self) -> None:
++        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range."""
++
++        at = 0
++        for x in list(self.pool.extents):
++            if x.base != at:
++                self._emit(MOVE, [x.eid, at, x.size])
++                self._move(x, at, x.size)
++            at += x.size
++
++    def _room(self, need: int, protect=()) -> int | None:
++        """Rank 0: a base with ``need`` free rows, evicting kept prompts (least recently used first, never
++        ``protect``'s extents) and compacting as needed; None if even that leaves too little."""
++
++        base = self.pool.place(need)
++        while base is None:
++            victims = self._victims(protect)
++            if not victims:
++                break
++            self._evict(victims[0])
++            base = self.pool.place(need)
++        if base is None and self.pool.free_rows() >= need:
++            self._compact()
++            base = self.pool.place(need)
++        return base
++
++    def _grow(self, x, size: int, protect=()) -> bool:
++        """Rank 0: extent x to at least ``size`` rows, in place or moved (evicting and compacting as needed)."""
++
++        size = align_up(size)
++        if size <= x.size:
++            return True
++        protect = list(protect) + [x]
++        while True:
++            if self.pool.room_after(x) >= size - x.size:
++                self._emit(GROW, [x.eid, size])
++                self._resize(x, size)
++                return True
++            base = self.pool.place(size, ignore=[x])
++            if base is not None:
++                self._emit(MOVE, [x.eid, base, size])
++                self._move(x, base, size)
++                return True
++            victims = self._victims(protect)
++            if not victims:
++                break
++            self._evict(victims[0])
++        if self.pool.free_rows() + x.size >= size:
++            self._compact()
++            if self.pool.room_after(x) >= size - x.size:
++                self._emit(GROW, [x.eid, size])
++                self._resize(x, size)
++                return True
++            base = self.pool.place(size, ignore=[x])
++            if base is not None:
++                self._emit(MOVE, [x.eid, base, size])
++                self._move(x, base, size)
++                return True
++        return False
++
++    # -- iterations ---------------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def round(self) -> list[Stream]:
++        """Rank 0: one prompt chunk or one decode round; returns the streams that finished."""
++
++        self._check()
++        try:
++            return self._iterate()
++        except Exception as exc:
++            self.broken = exc
++            raise
++
++    def _fill_turn(self) -> Lane | None:
++        filling = [l for l in self.lanes.values() if not l.decoding]
++        if not filling:
++            return None
++        decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
++        if decoding:
++            self.credit += self.share
++            if self.credit < 1:
++                return None
++            self.credit -= 1
++        s = next_fill([l.s for l in filling])
++        return self.lanes[s.sid]
++
++    def _iterate(self) -> list[Stream]:
++        lane = self._fill_turn()
++        if lane is not None:
++            stop = self._stop(lane)
++            self._emit(FILL, [lane.sid, stop])
++            self._flush()
++            first = self._fill(lane, stop)
++            if first is not None:
++                lane.s.take([first], self._ends(lane))
++            return [lane.s] if lane.s.done else []
++        lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
++        for l in lanes:                       # room for this round's widest window, else paused
++            l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
++        active = [l for l in lanes if not l.paused]
++        if not active:
++            done = []
++            if lanes and not any(not l.decoding for l in self.lanes.values()):
++                done = self._give_back()      # every stream waits for room: the youngest goes back to the queue
++            if self.outbox:                   # what was decided (evictions, moves, a stream given back) goes now
++                self._flush()
++            return done
++        plan = [(l.sid, l.depth) for l in active]
++        self._emit(ROUND, [len(plan), *[v for p in plan for v in p]])
++        self._flush()
++        self._round(active)
++        return [l.s for l in active if l.s.done]
++
++    def _stop(self, lane: Lane) -> int:
++        pos, n = lane.st.pos, len(lane.s.prompt)
++        stop = next((p for p in lane.stops if p > pos), n)
++        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
++        rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
++        return min(stop, pos + rows)
++
++    def _ends(self, lane: Lane) -> tuple[int, ...]:
++        return self.eos if lane.s.stop_eos else ()
++
++    @torch.no_grad()
++    def _fill(self, lane: Lane, stop: int) -> int | None:
++        """Both ranks: the lane's prompt rows pos .. stop in one chunk; its kept states; at the prompt's end its first
++        token (the stream then decodes)."""
++
++        from .copy_drafts import CopyDrafts
++        from .decode import prefill_chunk
++
++        e = self.e
++        s = lane.s
++        prompt = s.prompt
++        n = len(prompt)
++        start = lane.st.pos
++        if not start < stop <= n or stop - start > e.prefill_rows:
++            raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
++        t = time.perf_counter()
++        prev = e.use(lane.st)
++        try:
++            out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
++                                feed=lane.feed, mtp=False, head=stop == n)
++            if stop < n:
++                if stop in lane.stops:
++                    self._keep(lane, stop)
++                return None
++            if lane.point == n:
++                self._keep(lane, n)
++            logits = out[:1]
++            if lane.constraint is not None:             # the first token's row, under the reply's grammar
++                lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
++            first = sample_streams(self.w, [(logits, [n], s.sampling)])[0][0]
++            if lane.constraint is not None:
++                lane.constraint.advance([first])
++        finally:
++            e.use(prev)
++            s.prefill_s += time.perf_counter() - t
++        lane.decoding = True
++        s.started = time.perf_counter()
++        if lane.policy is not None and self.g.copy is not None:
++            lane.copies = CopyDrafts(list(prompt) + [first], self.g.copy.match, self.g.copy.most)
++        if lane.policy is not None:
++            lane.depth = min(lane.policy.next(0, 0), s.count - 1)
++        return first
++
++    @torch.no_grad()
++    def _round(self, lanes: list[Lane], depths: list[int] | None = None) -> None:
++        """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1)."""
++
++        from .decode import copy_room
++        from .dflash2_multi import DraftRequest
++
++        if depths is not None and [l.depth for l in lanes] != depths:
++            raise RuntimeError(f"rank {self.rank}'s draft depths {[l.depth for l in lanes]} are not rank 0's {depths}")
++        drafts: list[list[int]] = []
++        copied: list[bool] = []
++        asks = []
++        for l in lanes:
++            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None else []
++            copied.append(bool(c))
++            drafts.append(list(c))
++            if not c and l.dflash and l.depth > 0:
++                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling,
++                                                           l.policy.confidence, **l.policy.chain_rule)))
++        if asks:
++            got = self.drafts.propose([a for _, a in asks])
++            for (k, _), d in zip(asks, got):
++                drafts[k] = list(d)
++        drafts = trim(drafts, MAX_WINDOW)
++        segments = []
++        for l, d in zip(lanes, drafts):
++            tokens = [l.s.out[-1]] + d
++            l.window = None
++            if l.constraint is not None:                # the chain cut at its first draft the grammar rejects
++                l.window = l.constraint.window(tokens, list(range(-1, len(tokens) - 1)))
++                tokens = list(l.window.tokens)
++            segments.append(Segment(l.st, tokens))
++        v = forward_streams(self.verify, segments)
++        parts = []
++        for l, seg, logits in zip(lanes, segments, v.logits):
++            if l.window is not None:
++                l.constraint.mask(logits, l.window, self.w.vocab_offset)
++            parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
++        sampled = sample_streams(self.w, parts)
++        keeps = []
++        for l, seg, rows in zip(lanes, segments, sampled):
++            keep = 1
++            for i, d in enumerate(seg.tokens[1:]):
++                if rows[i] != d or (l.s.stop_eos and rows[i] in self.eos):
++                    break
++                keep += 1
++            keeps.append(keep)
++        self.verify.commit(segments, keeps)
++        if self.drafts is not None:
++            items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(lanes, keeps)) if l.dflash]
++            if items:
++                self.drafts.commit(items)
++        for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
++            s = l.s
++            new = rows[:keep]
++            if l.constraint is not None:
++                l.constraint.advance(new)
++            if l.copies is not None:
++                l.copies.extend(new)
++            ndrafts = len(seg.tokens) - 1
++            s.counted(len(seg.tokens))                     # Stream.take counts the accepted drafts
++            if was_copy:
++                l.copy_rounds += 1
++                l.copy_drafted += ndrafts
++                l.copy_accepted += keep - 1
++            room = s.count - len(s.out)
++            s.take(new[:max(0, room)], self._ends(l))
++            if l.policy is not None:
++                l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
++                              max(0, s.count - len(s.out)))
++
++    # -- ends ----------------------------------------------------------------------------------------------------------------
++    def finish(self, done: list[Stream]) -> None:
++        """Rank 0: finished (or cancelled) streams leave on both ranks; an idle rank 1 is told to wait for the bell."""
++
++        for s in done:
++            lane = self.lanes.get(s.sid)
++            if lane is None or lane.s is not s:
++                continue
++            reason = CANCELLED if s.error is None and len(s.out) < s.count and not (
++                s.out and s.out[-1] in self._ends(lane)) else DONE
++            self._emit(FINISH, [lane.sid, reason])
++            self._finish(lane.sid)
++        if not self.lanes and not self.idle and self.broken is None:
++            self._emit(IDLE, [])
++            self._flush()
++            self.idle = True
++
++    def _finish(self, sid: int) -> None:
++        """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
++
++        lane = self.lanes.pop(sid)
++        x = lane.extent
++        x.owner = None
++        self._settle(x)
++        lane.s.finished = lane.s.finished or time.perf_counter()
++
++    def _give_back(self) -> list[Stream]:
++        """Rank 0: the youngest stream (one without a grammar or images, which cannot replay) leaves its slot and
++        extent and returns to the queue; it replays later, its sent tokens owed, not sent again. If every stream has
++        a grammar or images, the youngest fails instead (returned, to be finished)."""
++
++        lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
++        lane = next((l for l in lanes if l.constraint is None and l.feed is None), None)
++        if lane is None:
++            lane = lanes[0]
++            lane.s.error = NoRoom("the pool is full: every stream waits for room, and the youngest cannot replay "
++                                  "(a grammar or images)")
++            lane.s.done = True
++            return [lane.s]
++        for c in list(lane.extent.kept):
++            self._evict(c)
++        self._emit(FINISH, [lane.sid, REQUEUED])
++        self._finish(lane.sid)
++        self.requeue.append(lane.s)
++        return []
++
++    def drop(self) -> list[Stream]:
++        """After an error in an iteration: forget every stream (the ranks can no longer be trusted to agree)."""
++
++        live = [l.s for l in self.lanes.values()]
++        self.lanes = {}
++        if self.broken is None:
++            self.broken = RuntimeError("an iteration failed")
++        return live
++
++    def stats(self, s: Stream) -> dict:
++        """A finished request's stats (as ``GlmEngine.generate`` reports them)."""
++
++        out = s.stats()
++        out["decode_s"] = round(max((s.finished or time.perf_counter()) - s.started, 0.0), 4)
++        tokens = list(s.out[:s.count])
++        out.update(sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16],
++                   tokens_per_round=round((len(tokens) - 1) / max(s.rounds, 1), 3), parallel=self.count)
++        lane_info = getattr(s, "glm_lane", None)
++        if lane_info:
++            out.update(lane_info)
++        return out
++
++    # -- rank 1 --------------------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def follow(self, once: bool = False) -> None:
++        """Rank 1: apply rank 0's messages forever (``once``: one message)."""
++
++        while True:
++            if self.idle:
++                self.g._await_bell()
++                self.idle = False
++            self.apply(self.g._share(None))
++            if once:
++                return
++
++    def apply(self, msg: Sequence[int]) -> None:
++        """Rank 1: one iteration's ops, in order."""
++
++        from tensorfold.engine.exact_sampling import Sampling  # noqa: F401
++
++        for op, p in self.parse(msg):
++            if op == ADMIT:
++                a = self._parse_admit(p)
++                s = Stream(list(a["prompt"]), a["count"], a["sampling"], draft=a["draft"], stop_eos=a["stop_eos"],
++                           sid=a["sid"])
++                constraint = None
++                if a["packed"]:
++                    from tensorfold.engine import grammar
++
++                    constraint = grammar.compiler(self.g, self.g.model_dir, self.g.eos).follow(a["packed"])
++                    s.constraint = constraint
++                feed = None
++                if a["positions"]:
++                    from .engine import VisionFeed
++
++                    feed = VisionFeed(self.g, list(a["positions"]), None)
++                    s.vision = feed
++                self._admitted(a, s, feed, constraint)
++            elif op == EVICT:
++                self._drop(self._kept_by_id(p[0]))
++            elif op == MOVE:
++                self._move(self.pool.get(p[0]), p[1], p[2])
++            elif op == GROW:
++                self._resize(self.pool.get(p[0]), p[1])
++            elif op == FILL:
++                lane = self.lanes[p[0]]
++                if p[1] != self._stop_bound(lane, p[1]):
++                    raise RuntimeError(f"rank 1: stream {p[0]}'s prompt chunk to {p[1]} passes a kept point")
++                first = self._fill(lane, p[1])
++                if first is not None:
++                    lane.s.take([first], self._ends(lane))
++            elif op == ROUND:
++                n = p[0]
++                sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
++                self._round([self.lanes[sid] for sid in sids], depths)
++            elif op == FINISH:
++                self._finish(p[0])
++            elif op == IDLE:
++                if self.lanes:
++                    raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
++                self.idle = True
++            else:
++                raise RuntimeError(f"rank 1: unknown op {op}")
++
++    def _stop_bound(self, lane: Lane, stop: int) -> int:
++        """The stop rank 0 sent, if it passes no kept point (else where it should have stopped)."""
++
++        nxt = next((q for q in lane.stops if q > lane.st.pos), len(lane.s.prompt))
++        return min(stop, nxt)
++
++
++# -- the scheduler ----------------------------------------------------------------------------------------------------
++class GlmScheduler(Scheduler):
++    """``cuda.scheduler.Scheduler`` for the GLM decoder: a request's GLM settings ride on its stream (``glm``); a
++    request the pool cannot place yet waits at the head of the queue (``MultiDecoder.fits``); streams the decoder gives
++    back (every stream waiting for room) return to the queue to replay."""
++
++    def __init__(self, decoder: MultiDecoder, *, max_streams: int) -> None:
++        self.held = None
++        super().__init__(decoder, max_streams=max_streams)
++
++    def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
++               emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
++               constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
++        box: queue.Queue = queue.Queue()
++        stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
++                        constraint=constraint, background=background)
++        stream.glm = dict(glm or {})
++        cancel = [False]
++        stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
++        self.waiting.put((stream, box))
++        while True:
++            kind, value = box.get()
++            if kind == "tokens":
++                if not cancel[0] and emit(value):
++                    cancel[0] = True                 # the client left or a stop string: the stream ends next round
++            elif kind == "error":
++                raise value
++            else:
++                return value
++
++    def _admit(self, first=None) -> list[Stream]:
++        done: list[Stream] = []
++        while self.decoder.live() < self.max_streams:
++            if first is not None:
++                item, first = first, None
++            elif self.held is not None:
++                item, self.held = self.held, None
++            else:
++                try:
++                    item = self.waiting.get_nowait()
++                except queue.Empty:
++                    break
++            stream, box = item
++            if not self.decoder.fits(stream):
++                self.held = item                     # waits, first in line, for room
++                break
++            self.boxes[id(stream)] = box
++            try:
++                self.decoder.admit(stream)
++            except NoRoom:
++                self.boxes.pop(id(stream))
++                self.held = item
++                break
++            except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                self.boxes.pop(id(stream)).put(("error", exc))
++                continue
++            if stream.done:
++                done.append(stream)
++        return done
++
++    def _yield(self) -> None:
++        """``Scheduler._yield``, the stream's GLM settings carried to its replay."""
++
++        if self.decoder.live() < self.max_streams or not self.waiting.foreground():
++            return
++        live = list(self.decoder.streams.values())
++        stream = next((s for s in reversed(live) if s.background and not s.done and s.constraint is None
++                       and s.vision is None and len(s.out) < s.count), None)
++        if stream is None:
++            return
++        box = self.boxes.pop(id(stream))
++        self.decoder.finish([stream])
++        self.yields += 1
++        again = stream.continued()
++        again.glm = getattr(stream, "glm", {})
++        self.waiting.put((again, box))
++
++    def _requeue(self) -> None:
++        for stream in self.decoder.requeue:
++            box = self.boxes.pop(id(stream), None)
++            if box is None:
++                continue
++            again = stream.continued()
++            again.glm = getattr(stream, "glm", {})
++            self.yields += 1
++            self.waiting.put((again, box))
++        self.decoder.requeue = []
++
++    def _loop(self) -> None:
++        while True:
++            self._yield()
++            idle = not self.decoder.live() and self.held is None
++            done = self._admit(self.waiting.get() if idle else None)     # idle: wait for a request
++            try:
++                done += self.decoder.round()
++            except Exception as exc:                 # noqa: BLE001  (the live requests fail)
++                for s in self.decoder.drop():
++                    self._reply(s, "error", exc)
++            self._requeue()
++            try:
++                self.decoder.finish(done)
++            except Exception as exc:                 # noqa: BLE001
++                for s in self.decoder.drop():
++                    self._reply(s, "error", exc)
++            for s in done:
++                self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
++            if self.held is not None and not self.decoder.live():
++                time.sleep(0)                        # the held request retries next iteration (now alone)
+diff --git tensorfold/families/glm5_next/cuda/pool.py tensorfold/families/glm5_next/cuda/pool.py
+new file mode 100644
+index 0000000..1313652
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/pool.py
+@@ -0,0 +1,223 @@
++"""GLM-5.3-Flash's per-token state as one shared pool: arenas of rows every stream draws from, and the extents that cut
++them up.
++
++An ``Arena`` holds planes of device rows (per DSA layer its latents; per indexed layer its index keys, gates and
++pooled keys; the MTP layer's), each ``rows // div + pad`` rows: latents div 1, pooled keys (a pool of 4 tokens) div 4
++with 2 rows of pad (the token selection reads up to 2 pools past a window). What a plane holds and in which element
++type (bf16, FP8 with scales, a ring) is the cache module's business (``forward.Caches``); the arena only views,
++copies and places rows.
++
++An extent [base, base + size), both multiples of ``ALIGN``, views every plane at [base // div, (base + size) // div +
++pad): the single-stream code (prefill, decode windows, snapshots) runs on those views exactly as on tensors of its
++own. The pad rows of one extent's pooled keys are the next extent's first rows: they are only ever read (and masked),
++never written (``sparse._pool_keys`` writes complete pools, all inside the extent).
++
++``Pool`` is the host-side bookkeeping of the extents (no device work): lowest-base first fit, growth in place,
++placement for relocations. Both ranks apply the same operations in the same order (rank 0 decides, rank 1 applies
++what it is sent), so their pools stay equal."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Iterable
++
++ALIGN = 2048          # extents start and end on multiples of this many tokens (the pooled keys at base / 4)
++
++
++def align_up(n: int, align: int = ALIGN) -> int:
++    return -(-int(n) // align) * align
++
++
++class Plane:
++    """One cache tensor over the arena's rows: row r of token t at t // div (``div`` tokens a row), ``pad`` rows
++    past the last token's."""
++
++    def __init__(self, tensor, div: int = 1, pad: int = 0) -> None:
++        self.tensor, self.div, self.pad = tensor, int(div), int(pad)
++
++    def rows_for(self, tokens: int) -> int:
++        return tokens // self.div
++
++    def view(self, base: int, size: int):
++        return self.tensor[base // self.div:(base + size) // self.div + self.pad]
++
++
++class Arena:
++    """Planes over ``rows`` tokens (a multiple of ``ALIGN`` when shared by several extents)."""
++
++    def __init__(self, rows: int, planes: list[Plane]) -> None:
++        self.rows = int(rows)
++        self.planes = planes
++        for p in planes:
++            want = self.rows // p.div + p.pad
++            if p.tensor.shape[0] != want:
++                raise ValueError(f"a plane of {p.tensor.shape[0]} rows over {self.rows} tokens (div {p.div}, pad "
++                                 f"{p.pad}): want {want}")
++
++    def view(self, i: int, base: int, size: int):
++        if base < 0 or base + size > self.rows:
++            raise ValueError(f"extent [{base}, {base + size}) outside the arena's {self.rows} tokens")
++        return self.planes[i].view(base, size)
++
++    def nbytes(self) -> int:
++        return sum(p.tensor.numel() * p.tensor.element_size() for p in self.planes)
++
++    def token_bytes(self) -> float:
++        """Device bytes a token of every plane takes (the pad aside)."""
++        return sum(p.tensor[0].numel() * p.tensor.element_size() / p.div for p in self.planes)
++
++    def copy(self, src: int, dst: int, n: int) -> None:
++        """Tokens [src, src + n) of every plane to [dst, dst + n): a whole last row of a plane whose rows hold
++        several tokens (``div``) goes too (its tokens past n are the source's, which nothing reads). Overlapping
++        ranges copy in pieces that never read a row already written."""
++
++        if n <= 0 or src == dst:
++            return
++        if min(src, dst) < 0 or max(src, dst) + n > self.rows:
++            raise ValueError(f"a copy of {n} tokens from {src} to {dst} reaches outside the arena's {self.rows}")
++        for p in self.planes:
++            a, b = src // p.div, dst // p.div
++            m = -(-n // p.div)
++            m = min(m, p.tensor.shape[0] - max(a, b))
++            _move(p.tensor, a, b, m)
++
++
++def _move(t, a: int, b: int, m: int) -> None:
++    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap."""
++
++    gap = abs(a - b)
++    if gap >= m:
++        t[b:b + m].copy_(t[a:a + m])
++        return
++    step = gap
++    starts = range(0, m, step) if b < a else reversed(range(0, m, step))
++    for s in starts:                       # down: front to back; up: back to front
++        k = min(step, m - s)
++        t[b + s:b + s + k].copy_(t[a + s:a + s + k])
++
++
++@dataclass(eq=False)
++class Extent:
++    """Pool rows [base, base + size). ``owner``: the live stream writing into it (its sid), or None; ``kept``: the
++    kept prompts whose rows it holds (each a prefix of the rows)."""
++
++    base: int
++    size: int
++    eid: int = 0
++    owner: int | None = None
++    kept: list = field(default_factory=list)
++
++    @property
++    def end(self) -> int:
++        return self.base + self.size
++
++    def free(self) -> bool:
++        return self.owner is None and not self.kept
++
++
++class Pool:
++    """Extents over ``rows`` pool rows, host side only. Placement is lowest base first; every call is deterministic
++    in the calls before it, so two ranks making the same calls hold the same extents."""
++
++    def __init__(self, rows: int, align: int = ALIGN) -> None:
++        if rows <= 0 or rows % align:
++            raise ValueError(f"a pool of {rows} rows: a positive multiple of {align}")
++        self.rows, self.align = int(rows), int(align)
++        self.extents: list[Extent] = []           # by base
++        self.next_id = 0
++
++    # -- queries -------------------------------------------------------------------------------------------------
++    def gaps(self, ignore: Iterable[Extent] = ()) -> list[tuple[int, int]]:
++        """Free (base, size) ranges by base, the extents in ``ignore`` counted as free."""
++
++        skip = set(id(x) for x in ignore)
++        out, at = [], 0
++        for x in self.extents:
++            if id(x) in skip:
++                continue
++            if x.base > at:
++                out.append((at, x.base - at))
++            at = max(at, x.end)
++        if at < self.rows:
++            out.append((at, self.rows - at))
++        return _merge(out)
++
++    def free_rows(self) -> int:
++        return self.rows - sum(x.size for x in self.extents)
++
++    def place(self, size: int, ignore: Iterable[Extent] = ()) -> int | None:
++        """The lowest base with ``size`` free rows (``ignore``'s rows free), or None."""
++
++        size = align_up(size, self.align)
++        for base, n in self.gaps(ignore):
++            if n >= size:
++                return base
++        return None
++
++    def room_after(self, x: Extent) -> int:
++        """Free rows right after x (before the next extent or the pool's end)."""
++
++        nxt = min((y.base for y in self.extents if y.base >= x.end and y is not x), default=self.rows)
++        return nxt - x.end
++
++    def get(self, eid: int) -> Extent:
++        for x in self.extents:
++            if x.eid == eid:
++                return x
++        raise KeyError(f"no extent {eid}")
++
++    # -- changes -------------------------------------------------------------------------------------------------
++    def add(self, base: int, size: int) -> Extent:
++        """A new extent at exactly [base, base + size) (rank 0's placement, applied on both ranks)."""
++
++        size = align_up(size, self.align)
++        if base % self.align or base < 0 or base + size > self.rows:
++            raise ValueError(f"extent [{base}, {base + size}) is not an aligned range of the {self.rows}-row pool")
++        if any(x.base < base + size and base < x.end for x in self.extents):
++            raise ValueError(f"extent [{base}, {base + size}) overlaps another")
++        x = Extent(base, size, self.next_id)
++        self.next_id += 1
++        self.extents.append(x)
++        self.extents.sort(key=lambda y: y.base)
++        return x
++
++    def alloc(self, size: int) -> Extent | None:
++        base = self.place(size)
++        return None if base is None else self.add(base, size)
++
++    def resize(self, x: Extent, size: int) -> None:
++        """Grow in place (the rows after it free) or shrink (from its end)."""
++
++        size = align_up(size, self.align)
++        if size > x.size and size - x.size > self.room_after(x):
++            raise ValueError(f"extent {x.eid} cannot grow to {size} rows in place")
++        if size <= 0:
++            raise ValueError("an extent keeps at least one aligned block")
++        x.size = size
++
++    def move(self, x: Extent, base: int, size: int | None = None) -> int:
++        """Place x at ``base`` (with ``size`` rows): the bookkeeping only (the caller copies the rows). Returns the old
++        base."""
++
++        size = x.size if size is None else align_up(size, self.align)
++        if base % self.align or base < 0 or base + size > self.rows:
++            raise ValueError(f"extent [{base}, {base + size}) is not an aligned range of the pool")
++        if any(y is not x and y.base < base + size and base < y.end for y in self.extents):
++            raise ValueError(f"extent {x.eid} cannot move to [{base}, {base + size}): taken")
++        old = x.base
++        x.base, x.size = base, size
++        self.extents.sort(key=lambda y: y.base)
++        return old
++
++    def remove(self, x: Extent) -> None:
++        self.extents = [y for y in self.extents if y is not x]
++
++
++def _merge(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
++    out: list[tuple[int, int]] = []
++    for base, n in ranges:
++        if out and out[-1][0] + out[-1][1] == base:
++            out[-1] = (out[-1][0], out[-1][1] + n)
++        elif n > 0:
++            out.append((base, n))
++    return out
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+new file mode 100644
+index 0000000..2d13572
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -0,0 +1,244 @@
++"""The verify seam of GLM-5.3-Flash's concurrent streams (``multi.forward_streams``): a round's windows, one per
++stream (its state: extent and slot views; its tokens: the pending token, then its drafts), in, each window's logits
++and DFlash2 taps out, then each stream's commit of the rows it keeps. Two implementations of the same two calls:
++
++- ``SerialVerify``: each window as its own forward on its own state (the solo kernels: exact by construction; a CUDA
++  graph where the state is the one they were captured on);
++- ``BatchedVerify``: ONE forward over every stream's rows back to back: the row-independent parts (embeddings,
++  hyper-connection glue, projections, MLP / MoE, head) on the whole window, KDA layers through the segmented chain
++  (``kda.chain_segments``: each segment from its slot's state, into its slot's other parity), DSA layers through the
++  segmented latent / sparse attention over the streams' extents (``forward.dsa_segments``, ``segments.SegRows``);
++  the commit replays each segment's kept rows (``kda.replay_layers_segments``) and shifts its conv window
++  (``forward.conv_shift_segments``). Every segment's rows get the bits of that stream's window alone.
++
++The scheduler (``multi.MultiDecoder``) only sees ``forward`` / ``commit``."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Sequence
++
++import torch
++
++
++@dataclass
++class Segment:
++    """One stream's rows of a round's verify window: its state (extent and slot views) and tokens (the pending
++    token, then its drafts)."""
++
++    st: Any
++    tokens: list[int]
++
++
++@dataclass
++class Verified:
++    logits: list[torch.Tensor]              # per segment [rows, V / world] (this rank's vocabulary columns)
++    taps: list[torch.Tensor | None]         # per segment [rows, taps * D] (DFlash2's inputs), or None
++
++
++class SerialVerify:
++    """The reference: each segment's window as its own forward on its own state. Logits and taps are copied out
++    before the next segment's forward reuses the buffers; each slot keeps its own KDA window scratch, so the commits
++    can come after every forward."""
++
++    def __init__(self, e, *, taps: bool) -> None:
++        self.e, self.taps = e, taps
++
++    def forward(self, segments: Sequence[Segment]) -> Verified:
++        e = self.e
++        logits, taps = [], []
++        for seg in segments:
++            prev = e.use(seg.st)
++            try:
++                R = len(seg.tokens)
++                logits.append(e.forward(seg.tokens)[:R].clone())
++                taps.append(e.tap_rows(R).clone() if self.taps else None)
++            finally:
++                e.use(prev)
++        return Verified(logits, taps)
++
++    def commit(self, segments: Sequence[Segment], keeps: Sequence[int]) -> None:
++        from .forward import commit
++
++        e = self.e
++        for seg, keep in zip(segments, keeps):
++            commit(e.w, seg.st, e.buf, len(seg.tokens), keep)
++
++
++class BatchedVerify:
++    """One forward over every segment's rows (``rows`` at most, ``segments.MAX_SEGS`` streams), on buffers of its
++    own; see the module docstring. ``taps``: the drafter's tap layers (DFlash2's inputs), or ()."""
++
++    def __init__(self, e, *, taps: Sequence[int] = (), rows: int = 32) -> None:
++        from . import kda as kda_mod
++        from . import latent
++        from .forward import Buffers
++        from .segments import MAX_SEGS, SegRows, SelectScratch
++
++        if not latent.ENABLED:
++            raise ValueError("batched verify windows need the latent cache (TF_GLM_LATENT=1)")
++        w = e.w
++        c = w.cfg
++        self.e, self.w, self.rows_max = e, w, rows
++        dev = w.device
++        self.b = Buffers(w, rows, e.caches.rows)
++        if taps:
++            self.b.set_taps(tuple(taps), c.hidden)
++        self.taps = bool(taps)
++        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS)
++        self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
++        kda_layers = [l for l in w.layers if l.kind == "kda"]
++        n = len(kda_layers)
++        LL = c.lin_heads // w.world
++        width = kda_layers[0].kda.proj.n if kda_layers else 0
++        self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
++        self.dsa_index = {l.index: i for i, l in enumerate(l for l in w.layers if l.kind == "dsa")}
++        self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
++        self.scratch = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
++        self.kseg = torch.zeros((MAX_SEGS, kda_mod.SEG_COLS), dtype=torch.int32, device=dev)
++        self.kseg_host = torch.zeros((MAX_SEGS, kda_mod.SEG_COLS), dtype=torch.int32,
++                                     pin_memory=torch.cuda.is_available())
++        self.staged = torch.cuda.Event() if torch.cuda.is_available() else None
++        self.segments: list[Segment] = []
++        self.R = 0
++        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.replays = {"graph": 0, "eager": 0}
++
++    @torch.no_grad()
++    def capture(self, rows: Sequence[int] | None = None) -> None:
++        """CUDA graphs of the window for each row count (default 1 .. its rows), both ranks together: positions,
++        extents, slots and parities live in the device tables, so one graph a row count covers every mix. Captured on
++        a window of slot 0 at the pool's first rows (the warm-up runs write there; slot 0's states are cleared after,
++        so capture before any stream is admitted). With the indexer the graphs always run the token selection (its
++        dense rows ignore it: the same bits as a window that skips it)."""
++
++        from .forward import compute
++        from .sparse import SPARSE_FROM
++
++        e, w, b = self.e, self.w, self.b
++        index = e.caches.index is not None
++        pool = torch.cuda.graph_pool_handle()
++        for R in rows or range(1, self.rows_max + 1):
++            self._stage([0] * R)
++            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self._write_table([(R, 0, 0, 0, R)])
++            run = lambda: compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, index))  # noqa: E731
++            for _ in range(2):
++                run()
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(g, pool=pool):
++                run()
++            self.graphs[R] = g
++        torch.cuda.synchronize()
++        e.slots.rec[0].zero_()
++        e.slots.conv[0].zero_()
++
++    # -- the window's tables -------------------------------------------------------------------------------------------
++    def _tables(self, segments: Sequence[Segment], keeps: Sequence[int] | None = None) -> None:
++        """The KDA segment table (row0, rows, slot, parity, conv slot, keep) into the device copy, in place (a captured
++        graph reads the same tensor); unused segments have 0 rows."""
++
++        self._write_table([(len(s.tokens), s.st.slot, s.st.cur[0] if s.st.cur else 0, s.st.slot,
++                            len(s.tokens) if keeps is None else keeps[k]) for k, s in enumerate(segments)])
++
++    def _write_table(self, rows) -> None:
++        from . import kda as kda_mod
++
++        table = kda_mod.segment_table(rows, "cpu", out=torch.zeros_like(self.kseg_host))
++        if self.staged is not None:
++            self.staged.synchronize()
++        self.kseg_host.copy_(table)
++        self.kseg.copy_(self.kseg_host, non_blocking=True)
++        if self.staged is not None:
++            self.staged.record()
++
++    def _stage(self, tokens: list[int]) -> None:
++        b = self.b
++        R = len(tokens)
++        if R > b.rows:
++            raise ValueError(f"a window of {R} rows, the batched buffers hold {b.rows}")
++        b.staged.synchronize()
++        b.ids_host[:R].numpy()[:] = tokens
++        b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
++        b.staged.record()
++
++    # -- the seam --------------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def forward(self, segments: Sequence[Segment]) -> Verified:
++        from .forward import check_room, compute
++        from .sparse import SPARSE_FROM
++
++        w, b = self.w, self.b
++        index = self.e.caches.index is not None
++        spans = []
++        for seg in segments:
++            check_room(w, seg.st, len(seg.tokens))
++            spans.append((seg.st.base, seg.st.pos, len(seg.tokens)))
++        tokens = [t for seg in segments for t in seg.tokens]
++        R = len(tokens)
++        self._stage(tokens)
++        self.seg_rows.set(spans, sparse_from=SPARSE_FROM if index else None)
++        self._tables(segments)
++        self.segments, self.R = list(segments), R
++        g = self.graphs.get(R)
++        if g is not None:
++            self.replays["graph"] += 1
++            g.replay()
++            logits = b.logits[:R]
++        else:
++            self.replays["eager"] += 1
++            select = index and self.seg_rows.any_sparse()
++            logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
++        out, taps, at = [], [], 0
++        for seg in segments:
++            n = len(seg.tokens)
++            out.append(logits[at:at + n])
++            taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
++            at += n
++        return Verified(out, taps)
++
++    def _mixer(self, layer, R: int, select: bool):
++        """A layer's KDA or DSA block over the whole window, each segment on its own stream's state."""
++
++        from . import prof
++        from .forward import dsa_segments, kda_segments
++
++        e = self.e
++        if layer.kind == "kda":
++            with prof.timed("kda"):
++                return kda_segments(layer, self.w, self.b, R, self.kseg, e.slots, self.proj, self.scratch,
++                                    self.kda_index[layer.index])
++        caches = e.caches
++        di = self.dsa_index[layer.index]
++        planes = caches.arena.planes
++        lc = planes[caches.kc[di]].tensor
++        index = None if caches.index is None else tuple(planes[i].tensor for i in caches.index[di])
++        with prof.timed("dsa (total)"):
++            return dsa_segments(layer, self.w, lc, self.b, R, self.seg_rows, self.sel, index, select=select)
++
++    @torch.no_grad()
++    def commit(self, segments: Sequence[Segment], keeps: Sequence[int]) -> None:
++        """Each segment keeps its first ``keeps[k]`` rows: its KDA states replayed to them (when it keeps fewer than
++        its rows), its conv window shifted, its parity flipped, its position advanced."""
++
++        from . import kda as kda_mod
++        from .forward import conv_shift_segments
++
++        if [id(s) for s in segments] != [id(s) for s in self.segments]:
++            raise ValueError("commit takes the segments of the last forward")
++        for seg, keep in zip(segments, keeps):
++            if not 1 <= keep <= len(seg.tokens):
++                raise ValueError("keep must be in 1..rows")
++        e = self.e
++        if self.scratch is not None:
++            self._tables(segments, keeps)
++            if any(k < len(s.tokens) for s, k in zip(segments, keeps)):
++                kda_mod.replay_layers_segments(self.kseg, e.slots.rec, self.scratch)
++            conv_shift_segments(e.slots.conv, self.proj, self.kseg)
++        for seg, keep in zip(segments, keeps):
++            st = seg.st
++            if st.cur:
++                st.cur = [1 - st.cur[0]] * len(st.cur)
++            st.set_pos(st.pos + keep)
++        self.segments = []

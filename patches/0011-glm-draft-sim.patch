@@ -1,0 +1,1107 @@
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 309104e..0ca8c5d 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -144,9 +144,10 @@ def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int,
+ 
+ 
+ def _quantize4(w: torch.Tensor) -> qmm.Q4:
+-    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled (``qmm.quantize4``)."""
++    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled: min / max ranges (``qmm.quantize4``) or,
++    with TF_GLM_DRAFT_QUANT=mse, least-squares clipped ones (``qmm.quantize4_mse``). Drafts only: replies keep."""
+ 
+-    return qmm.quantize4(w)
++    return qmm.draft_quantize4(w)
+ 
+ 
+ def _mm(x: torch.Tensor, w: qmm.Q4, xs: torch.Tensor | None = None, *, f32: bool = False) -> torch.Tensor:
+diff --git tensorfold/families/glm5_next/cuda/draft_dump.py tensorfold/families/glm5_next/cuda/draft_dump.py
+new file mode 100644
+index 0000000..9d420b9
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/draft_dump.py
+@@ -0,0 +1,181 @@
++"""TF_GLM_DRAFT_DUMP=<dir>: teacher-forced DFlash2 records for the offline draft simulator (``draft_sim``).
++
++With it set (on both ranks: the engine refuses to start otherwise), a request that would draft with DFlash2 decodes
++one token a round instead, through the same one-row verify as ``serial_decode``, so its reply is serial's
++(``draft: false``). Before each round it runs the DFlash2 block for the pending token as ``dflash_decode`` would and
++records, for the block's positions: the merged candidates and their logits, the selector's edge scores between
++consecutive candidates, the request's keyed Gumbel draws for them, the drafter's projected rows, and the chain the
++production rule (``fc5:0.3``) would propose; after the verify, the target's top-32 logits and the committed token.
++Both ranks run every call (the block and the target's top-32 gather are collectives); rank 0 writes one ``.npz`` per
++request into <dir>. Off (unset), nothing here runs.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import time
++from collections.abc import Sequence
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from tensorfold.engine.exact_sampling import Sampling, uniform_rows
++
++from . import dflash2
++from .decode import DecodeResult, _sync, commit
++
++DUMP_ENV = "TF_GLM_DRAFT_DUMP"
++TARGET_K = 32          # the target's top candidates kept a row (>= top_k 20 + MARGIN 8, so its sample re-derives)
++VERSION = 1
++PROD_MOST, PROD_CONFIDENCE = 5, 0.3      # engine.DFLASH_POLICY, the chain recorded as ``prod_chain``
++
++_count = 0
++
++
++def dump_dir(env: dict | None = None) -> Path | None:
++    """TF_GLM_DRAFT_DUMP's directory, or None when unset or empty (off)."""
++
++    value = (os.environ if env is None else env).get(DUMP_ENV, "")
++    return Path(value) if value else None
++
++
++def edges(drafter, tokens: np.ndarray, proj: np.ndarray, anchor: int) -> tuple[np.ndarray, np.ndarray]:
++    """The selector edges Drafter.chain computes, for every pair it could meet: (pending -> depth-0 candidates [K],
++    depth d-1 candidate a -> depth d candidates [D - 1, K, K]); each the chain's own float64 expression (same bits)."""
++
++    depth, k = tokens.shape
++    e0 = drafter.succ[tokens[0]].astype(np.float64) @ (drafter.pred[anchor].astype(np.float64) * proj[0])
++    out = np.zeros((max(depth - 1, 0), k, k), dtype=np.float64)
++    for d in range(1, depth):
++        succ = drafter.succ[tokens[d]].astype(np.float64)
++        for a in range(k):
++            out[d - 1, a] = succ @ (drafter.pred[int(tokens[d - 1, a])].astype(np.float64) * proj[d])
++    return e0, out
++
++
++def target_top(w, row: torch.Tensor, k: int = TARGET_K) -> tuple[np.ndarray, np.ndarray, float]:
++    """The target's top-k over the whole vocabulary of one logits row (this rank's slice [1, V/world]) by (value desc,
++    id asc), and the row's logsumexp; gathered from every rank alike."""
++
++    k = min(k, row.shape[1])
++    x = row.float()
++    vals, ids = torch.topk(x, k, dim=-1)
++    lse = torch.logsumexp(x, dim=-1, keepdim=True)
++    ids = (ids + w.vocab_offset).to(torch.int32)
++    packed = torch.cat([vals, ids.view(torch.float32), lse], dim=1).contiguous()
++    if w.comm is None:
++        g = packed.view(1, -1).cpu()
++    else:
++        got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=packed.device)
++        w.comm.all_gather(packed.view(-1), got)
++        g = got.view(w.world, -1).cpu()
++    values = g[:, :k].reshape(-1).numpy().astype(np.float64)
++    tokens = g[:, k:2 * k].contiguous().view(torch.int32).reshape(-1).numpy().astype(np.int64)
++    lses = g[:, 2 * k].numpy().astype(np.float64)
++    order = np.lexsort((tokens, -values))[:k]
++    return tokens[order], values[order], float(np.logaddexp.reduce(lses))
++
++
++@torch.no_grad()
++def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None, *, out_dir: Path | None,
++                stop_eos: bool = False, on_tokens=None, meta: dict | None = None) -> DecodeResult:
++    """``serial_decode``'s tokens (one-row verifies), with the DFlash2 block run and recorded before each; rank 0
++    passes ``out_dir`` and writes the records there, every rank runs the same calls."""
++
++    w, st, b = e.w, e.st, e.buf
++    depth = drafter.block - 1
++    sampled = sampling is not None and sampling.temperature > 0
++    out = [pending]
++    rec: dict[str, list] = {k: [] for k in ("first", "cand_ids", "cand_vals", "proj", "noise", "edge0", "edges",
++                                            "prod_chain", "tgt_ids", "tgt_vals", "tgt_lse")}
++    stages = {"block": 0.0, "forward": 0.0, "sample": 0.0, "commit": 0.0}
++    _sync(w)
++    start = time.perf_counter()
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++        t0 = time.perf_counter()
++        if drafter.context_end != st.pos:
++            raise RuntimeError(f"draft dump: the drafter's context ends at {drafter.context_end}, "
++                               f"the reply at {st.pos}")
++        first = drafter.context_end + 1
++        tokens, values, proj = drafter.candidates(out[-1], depth)
++        e0, ed = edges(drafter, tokens, proj, out[-1])
++        noise = (-np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
++                 if sampled else None)
++        most = min(PROD_MOST, depth)
++        chain = drafter.chain(tokens[:most], values[:most], proj[:most], out[-1], first, sampling, PROD_CONFIDENCE)
++        t1 = time.perf_counter()
++        logits = e.forward(e.verify_window([out[-1]]))
++        torch.cuda.synchronize()
++        t2 = time.perf_counter()
++        tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
++        top_ids, top_vals, lse = target_top(w, logits[:1])
++        e.follow([tok])
++        t3 = time.perf_counter()
++        commit(w, st, b, 1, 1)
++        drafter.add_taps(e.tap_rows(1))
++        t4 = time.perf_counter()
++        stages["block"] += t1 - t0
++        stages["forward"] += t2 - t1
++        stages["sample"] += t3 - t2
++        stages["commit"] += t4 - t3
++        rec["first"].append(first)
++        rec["cand_ids"].append(tokens.astype(np.int32))
++        rec["cand_vals"].append(values.astype(np.float32))       # float32 logits widened by candidates(): exact
++        rec["proj"].append(proj.astype(np.float32))
++        if noise is not None:
++            rec["noise"].append(noise)
++        rec["edge0"].append(e0)
++        rec["edges"].append(ed)
++        rec["prod_chain"].append(chain + [-1] * (depth - len(chain)))
++        rec["tgt_ids"].append(top_ids.astype(np.int32))
++        rec["tgt_vals"].append(top_vals.astype(np.float32))
++        rec["tgt_lse"].append(lse)
++        out.append(tok)
++        if on_tokens is not None:
++            on_tokens([tok])
++    _sync(w)
++    res = DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
++    if out_dir is not None:
++        info = dict(meta or {})
++        info.update(version=VERSION, block=drafter.block, selector_top_k=drafter.top_k, edge=dflash2.EDGE,
++                    noise=dflash2.NOISE, prod_most=PROD_MOST, prod_confidence=PROD_CONFIDENCE, stop_eos=bool(stop_eos),
++                    eos=[int(t) for t in w.cfg.eos], count=int(count), steps=len(out) - 1,
++                    seed=int(sampling.seed) if sampling is not None else 0,
++                    temperature=float(sampling.temperature) if sampling is not None else 0.0,
++                    top_k=int(sampling.top_k) if sampling is not None else 0,
++                    top_p=float(sampling.top_p) if sampling is not None else 1.0,
++                    min_p=float(sampling.min_p) if sampling is not None else 0.0,
++                    sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
++        res.dump_path = str(write(out_dir, info, out, rec, depth, drafter.top_k))
++    return res
++
++
++def write(out_dir: Path, meta: dict, tokens: Sequence[int], rec: dict, depth: int, k: int) -> Path:
++    """One request's records as a compressed .npz (written to a temporary name, then renamed)."""
++
++    global _count
++    _count += 1
++    out_dir.mkdir(parents=True, exist_ok=True)
++    n = len(rec["first"])
++
++    def stack(key, shape, dtype):
++        return np.stack(rec[key]).astype(dtype) if rec[key] else np.zeros((0, *shape), dtype=dtype)
++
++    arrays = dict(meta=np.array(json.dumps(meta)), tokens=np.asarray(tokens, dtype=np.int64),
++                  first=np.asarray(rec["first"], dtype=np.int64), cand_ids=stack("cand_ids", (depth, k), np.int32),
++                  cand_vals=stack("cand_vals", (depth, k), np.float32),
++                  proj=np.stack(rec["proj"]) if rec["proj"] else np.zeros((0, depth, 0), np.float32),
++                  noise=stack("noise", (depth, k), np.float64) if rec["noise"] else np.zeros((0,), np.float64),
++                  edge0=stack("edge0", (k,), np.float64), edges=stack("edges", (max(depth - 1, 0), k, k), np.float64),
++                  prod_chain=stack("prod_chain", (depth,), np.int32), tgt_ids=stack("tgt_ids", (TARGET_K,), np.int32),
++                  tgt_vals=stack("tgt_vals", (TARGET_K,), np.float32),
++                  tgt_lse=np.asarray(rec["tgt_lse"], dtype=np.float64).reshape(n))
++    name = f"dump-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_count:04d}"
++    tmp = out_dir / f".{name}.tmp.npz"
++    np.savez_compressed(tmp, **arrays)
++    path = out_dir / f"{name}.npz"
++    os.replace(tmp, path)
++    return path
+diff --git tensorfold/families/glm5_next/cuda/draft_sim.py tensorfold/families/glm5_next/cuda/draft_sim.py
+new file mode 100644
+index 0000000..64d4f54
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/draft_sim.py
+@@ -0,0 +1,775 @@
++"""Offline DFlash2 draft-policy simulator over TF_GLM_DRAFT_DUMP records (``draft_dump``): pure numpy, CPU only.
++
++A dump holds, for every committed position of a serial (``draft: false``-equal) reply, what the DFlash2 block proposed
++there (its merged top-k candidates, their logits, the selector's edge scores, the keyed Gumbel draws of the request)
++and what the target committed. Sampling is keyed by (seed, position, token), so a round that starts at position i and
++proposes a chain keeps exactly the drafts that equal the committed tokens i + 1, i + 2, ... (up to the first mismatch)
++plus one sampled token. A policy's rounds are therefore replayed exactly (up to the drafter's numerics: the dump's
++context taps come from one-row verifies, a live round's from wider windows), and a cost table (verify window V(R)
++for R = 1..8 rows, the block, per-round overhead) turns them into ms a round and tokens a second.
++
++Policies (``parse_policy``):
++  fc<N>:<p>        today's rule: up to N drafts while the product of the chain's (noise-free) confidences holds p
++  f<N>             N drafts every round
++  fa[:LOW:HIGH]    DepthPolicy's adaptive 1-3 drafts
++  nc<N>:<p>[:B]    noise-aware product: each draft's confidence is softmax((score + g) / B) at the pick, where g are the
++                   target's own keyed Gumbel draws (known before the verify); B defaults to --beta
++  cost<N>:<pred>   the depth k <= N maximizing E[tokens | k] / (V(k + 1) + block + overhead), E from the per-draft
++                   acceptance predictor <pred>: conf (today's confidence), noisy[:B], const (per-depth rates), logit
++  oracle<N>        hindsight: the per-round depths that minimize the reply's total time (an upper bound)
++Any policy takes ``@noise=W,edge=E,trunc=1`` to change the chain's pick: the weight of the keyed noise (0.7 today;
++1.0 is the drafter's estimate of the target's keyed sample), of the selector edges (0.6), and whether picks are cut to
++the drafter's own top-k / top-p nucleus like the target's sampler.
++
++Run: python -m tensorfold.families.glm5_next.cuda.draft_sim DUMP.npz ... [--policy SPEC ...] [--train DUMP ...]
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import math
++import sys
++from collections.abc import Sequence
++from dataclasses import asdict, dataclass, field, replace
++from pathlib import Path
++
++import numpy as np
++
++# the measured EXL3 + DFlash2 costs (ms): verify windows of 1..8 rows and one DFlash2 block
++VERIFY_MS = (29.2, 35.6, 42.6, 48.8, 53.6, 58.9, 64.5, 66.0)
++BLOCK_MS = 3.08
++EDGE = 0.6          # dflash2.EDGE
++NOISE = 0.7         # dflash2.NOISE
++MARGIN = 8          # exact_sampling.MARGIN
++
++
++# -- dumps ------------------------------------------------------------------------------------------------------------
++@dataclass
++class Dump:
++    """One request's teacher-forced records; step i: pending token tokens[i], drafts for tokens[i + 1 ...]."""
++
++    meta: dict
++    tokens: np.ndarray          # [n + 1] int64: the reply (the first token, then one a step)
++    first: np.ndarray           # [n] int64: position of draft 0 (the drafter's context_end + 1), = the target's
++    cand_ids: np.ndarray        # [n, D, K] int64: merged candidates by (value desc, id asc), D = block - 1
++    cand_vals: np.ndarray       # [n, D, K] float64 (float32 logits)
++    edge0: np.ndarray           # [n, K] float64: selector edge, pending token -> depth-0 candidates
++    edges: np.ndarray           # [n, D - 1, K, K] float64: edge from depth d-1 candidate a to depth d candidate b
++    noise: np.ndarray | None    # [n, D, K] float64 keyed Gumbel draws (None: greedy)
++    tgt_ids: np.ndarray         # [n, T] int64: the target's top-T at the committed row
++    tgt_vals: np.ndarray        # [n, T] float64
++    tgt_lse: np.ndarray         # [n] float64: logsumexp of the whole row (raw logits)
++    prod_chain: np.ndarray      # [n, D] int64: the engine's own chain under its production rule, -1 padded
++    path: str = ""
++    proj: np.ndarray | None = None   # [n, D, rank] float32: the selector's projected rows (edges already hold them)
++
++    @property
++    def n(self) -> int:
++        return int(self.first.shape[0])
++
++    @property
++    def depth(self) -> int:
++        return int(self.cand_ids.shape[1])
++
++    @property
++    def sampled(self) -> bool:
++        return self.noise is not None
++
++    @property
++    def temperature(self) -> float:
++        return float(self.meta["temperature"]) if self.sampled else 1.0
++
++    @property
++    def eos(self) -> frozenset:
++        return frozenset(int(t) for t in self.meta.get("eos", ())) if self.meta.get("stop_eos") else frozenset()
++
++    def room(self, i: int) -> int:
++        """Drafts a round at step i may propose (dflash_decode's count - len(out)): up to the request's max_tokens
++        when the reply ended at an EOS (drafts past it are rejected there), else up to the reply's end."""
++
++        if self.eos and int(self.tokens[-1]) in self.eos and "count" in self.meta:
++            return int(self.meta["count"]) - (i + 1)
++        return self.n - i
++
++    def accepted(self, i: int, drafts: Sequence[int]) -> int:
++        """Drafts a round at step i keeps: equal to the committed tokens, a matched EOS not counted (as the loop)."""
++
++        k = 0
++        for d in drafts:
++            if i + 1 + k > self.n:
++                break
++            t = int(self.tokens[i + 1 + k])
++            if d != t or t in self.eos:
++                break
++            k += 1
++        return k
++
++
++def load_dump(path: str | Path) -> Dump:
++    with np.load(path, allow_pickle=False) as z:
++        meta = json.loads(str(z["meta"]))
++        noise = z["noise"].astype(np.float64) if "noise" in z.files and z["noise"].size else None
++        return Dump(meta, z["tokens"].astype(np.int64), z["first"].astype(np.int64), z["cand_ids"].astype(np.int64),
++                    z["cand_vals"].astype(np.float64), z["edge0"].astype(np.float64), z["edges"].astype(np.float64),
++                    noise, z["tgt_ids"].astype(np.int64), z["tgt_vals"].astype(np.float64),
++                    z["tgt_lse"].astype(np.float64), z["prod_chain"].astype(np.int64), str(path),
++                    z["proj"] if "proj" in z.files and z["proj"].size else None)
++
++
++def load_dumps(paths: Sequence[str]) -> list[Dump]:
++    files: list[str] = []
++    for p in paths:
++        q = Path(p)
++        files += sorted(str(f) for f in q.glob("*.npz")) if q.is_dir() else sorted(glob.glob(p)) or [p]
++    return [load_dump(f) for f in files]
++
++
++# -- the chain --------------------------------------------------------------------------------------------------------
++@dataclass(frozen=True)
++class PickRule:
++    edge: float = EDGE
++    noise: float = NOISE
++    trunc: bool = False         # cut picks to the drafter's own top-k / top-p nucleus (the target sampler's shape)
++
++
++RULE = PickRule()      # today's pick
++
++
++@dataclass
++class Trace:
++    """A chain walked to its full depth (no stop): per depth the pick and what a stop rule or predictor reads."""
++
++    tokens: list[int]
++    j: list[int]
++    score: list[np.ndarray]      # (logits + edge * EDGE) / temperature, as Drafter.chain
++    keep: list[np.ndarray]       # bool mask of pickable candidates (all, or the nucleus with trunc)
++    noise: np.ndarray | None
++
++
++def _nucleus(score: np.ndarray, top_k: int, top_p: float) -> np.ndarray:
++    order = np.argsort(-score, kind="stable")
++    keep = np.zeros(score.shape, dtype=bool)
++    k = min(top_k, len(score)) if top_k else len(score)
++    s = score[order[:k]]
++    p = np.exp(s - s.max())
++    p /= p.sum()
++    kept = int((np.cumsum(p) < top_p).sum()) + 1 if 0.0 < top_p < 1.0 else k
++    keep[order[:kept]] = True
++    return keep
++
++
++def walk(d: Dump, i: int, depth: int, rule: PickRule = RULE, confidence: float = 0.0) -> Trace:
++    """Drafter.chain at step i, bit for bit with the default rule (same float64 operations in the same order);
++    ``confidence`` > 0 stops as fc does (product of noise-free confidences, the first draft always kept)."""
++
++    depth = min(depth, d.depth)
++    temp = d.temperature
++    tr = Trace([], [], [], [], d.noise[i, :depth] if d.sampled else None)
++    chain = 1.0
++    prev = -1
++    top_k = int(d.meta.get("top_k") or 0)
++    top_p = float(d.meta.get("top_p", 1.0))
++    for k in range(depth):
++        edge = d.edge0[i] if k == 0 else d.edges[i, k - 1, prev]
++        score = (d.cand_vals[i, k] + rule.edge * edge) / temp
++        pick = score + rule.noise * tr.noise[k] if tr.noise is not None else score
++        keep = _nucleus(score, top_k, top_p) if rule.trunc and d.sampled else np.ones(score.shape, dtype=bool)
++        if rule.trunc and d.sampled:
++            pick = np.where(keep, pick, -np.inf)
++        j = int(np.argmax(pick))
++        if confidence > 0:
++            p = np.exp(score - score.max())
++            chain *= float(p[j] / p.sum())
++            if k > 0 and chain < confidence:
++                break
++        prev = j
++        tr.tokens.append(int(d.cand_ids[i, k, j]))
++        tr.j.append(j)
++        tr.score.append(score)
++        tr.keep.append(keep)
++    return tr
++
++
++FEATURES = ("conf", "log_conf", "log_cum_conf", "noisy_prob", "log_noisy_prob", "noisy_margin", "top_gap", "depth",
++            "bias")
++
++
++def features(tr: Trace, beta: float = 1.0) -> np.ndarray:
++    """[depth, len(FEATURES)] for a trace's drafts (see FEATURES); greedy: noise-aware columns equal the plain ones."""
++
++    rows = []
++    cum = 0.0
++    for k, (score, keep, j) in enumerate(zip(tr.score, tr.keep, tr.j)):
++        s = np.where(keep, score, -np.inf)
++        p = np.exp(s - s.max())
++        conf = float(p[j] / p.sum())
++        cum += math.log(max(conf, 1e-300))
++        z = s + tr.noise[k] if tr.noise is not None else s
++        q = _softmax_at(z / beta, j)
++        others = np.delete(z, j)
++        margin = float(z[j] - others.max()) if others.size and np.isfinite(others.max()) else 30.0
++        top = np.sort(s[np.isfinite(s)])[::-1]
++        gap = float(top[0] - top[1]) if top.size > 1 else 30.0
++        rows.append((conf, math.log(max(conf, 1e-300)), cum, q, math.log(max(q, 1e-300)), min(margin, 30.0),
++                     min(gap, 30.0), float(k), 1.0))
++    return np.array(rows, dtype=np.float64).reshape(len(rows), len(FEATURES))
++
++
++def _softmax_at(z: np.ndarray, j: int) -> float:
++    e = np.exp(z - z.max())
++    return float(e[j] / e.sum())
++
++
++# -- predictors of a draft's acceptance (given the drafts before it were accepted) -----------------------------------
++class Predictor:
++    name = "?"
++
++    def fit(self, X: np.ndarray, y: np.ndarray) -> Predictor:
++        return self
++
++    def predict(self, X: np.ndarray) -> np.ndarray:
++        raise NotImplementedError
++
++
++class ConfPredictor(Predictor):
++    """Today's belief: a draft is kept with its noise-free confidence."""
++
++    name = "conf"
++
++    def predict(self, X):
++        return X[:, FEATURES.index("conf")]
++
++
++class NoisyPredictor(Predictor):
++    """softmax((score + g) / beta) at the pick: the target's scaled logits taken as the drafter's plus iid Gumbel(beta)
++    errors, the keyed draws g known, make exactly this the probability that the target's keyed sample is the pick.
++    ``fit`` picks beta on a grid by log loss (its features must be made with beta 1)."""
++
++    name = "noisy"
++
++    def __init__(self, beta: float = 1.0) -> None:
++        self.beta = beta
++
++    def predict(self, X):
++        return X[:, FEATURES.index("noisy_prob")]
++
++
++class ConstPredictor(Predictor):
++    """The mean acceptance at each depth (a baseline that knows nothing of the round)."""
++
++    name = "const"
++
++    def __init__(self) -> None:
++        self.rates = np.full(8, 0.5)
++
++    def fit(self, X, y):
++        dep = X[:, FEATURES.index("depth")].astype(int)
++        for k in range(len(self.rates)):
++            m = dep == k
++            self.rates[k] = (y[m].sum() + 1) / (m.sum() + 2)
++        return self
++
++    def predict(self, X):
++        return self.rates[np.minimum(X[:, FEATURES.index("depth")].astype(int), len(self.rates) - 1)]
++
++
++class LogisticPredictor(Predictor):
++    """Logistic regression (Newton / IRLS, a small L2) on chosen FEATURES columns."""
++
++    name = "logit"
++
++    def __init__(self, cols: Sequence[str] = ("log_conf", "log_noisy_prob", "noisy_margin", "top_gap", "depth", "bias"),
++                 l2: float = 1e-3) -> None:
++        self.cols = tuple(cols)
++        self.idx = [FEATURES.index(c) for c in self.cols]
++        self.l2 = l2
++        self.w = np.zeros(len(self.idx))
++
++    def fit(self, X, y):
++        A = X[:, self.idx]
++        w = np.zeros(A.shape[1])
++        for _ in range(50):
++            p = 1 / (1 + np.exp(-np.clip(A @ w, -40, 40)))
++            g = A.T @ (p - y) + self.l2 * w
++            H = (A * (p * (1 - p))[:, None]).T @ A + self.l2 * np.eye(len(w))
++            step = np.linalg.solve(H, g)
++            w -= step
++            if np.abs(step).max() < 1e-9:
++                break
++        self.w = w
++        return self
++
++    def predict(self, X):
++        return 1 / (1 + np.exp(-np.clip(X[:, self.idx] @ self.w, -40, 40)))
++
++    def describe(self) -> str:
++        return ", ".join(f"{c} {v:+.3f}" for c, v in zip(self.cols, self.w))
++
++
++def training_rows(dumps: Sequence[Dump], rule: PickRule = RULE, depth: int = 7,
++                  beta: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
++    """(X, y) over every step of the dumps: each draft of the full chain while the drafts before it were accepted,
++    labelled 1 when it equals the committed token (a round's conditional acceptance, the quantity E[tokens] needs)."""
++
++    X, y = [], []
++    for d in dumps:
++        for i in range(d.n):
++            tr = walk(d, i, min(depth, d.n - i), rule)
++            if not tr.tokens:
++                continue
++            F = features(tr, beta)
++            kept = d.accepted(i, tr.tokens)
++            rows = min(kept + 1, len(tr.tokens))
++            X.append(F[:rows])
++            y.append((np.arange(rows) < kept).astype(np.float64))
++    if not X:
++        return np.zeros((0, len(FEATURES))), np.zeros(0)
++    return np.concatenate(X), np.concatenate(y)
++
++
++def fit_beta(dumps: Sequence[Dump], rule: PickRule, depth: int = 7,
++             grid: Sequence[float] = (0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0, 2.8, 4.0)) -> tuple[float, float]:
++    """The NoisyPredictor beta with the least log loss on the dumps: (beta, log loss)."""
++
++    best = (1.0, math.inf)
++    for b in grid:
++        X, y = training_rows(dumps, rule, depth, b)
++        if not len(y):
++            break
++        loss = log_loss(NoisyPredictor(b).predict(X), y)
++        if loss < best[1]:
++            best = (b, loss)
++    return best
++
++
++def log_loss(p: np.ndarray, y: np.ndarray) -> float:
++    p = np.clip(p, 1e-6, 1 - 1e-6)
++    return float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean()) if len(y) else float("nan")
++
++
++def scores(p: np.ndarray, y: np.ndarray) -> dict:
++    """Log loss, Brier score and the ranking AUC of acceptance predictions."""
++
++    out = {"rows": len(y), "rate": float(y.mean()) if len(y) else float("nan"), "log_loss": log_loss(p, y),
++           "brier": float(((p - y) ** 2).mean()) if len(y) else float("nan")}
++    pos, neg = p[y > 0.5], p[y < 0.5]
++    if len(pos) and len(neg):
++        ranks = np.argsort(np.argsort(np.concatenate([pos, neg]), kind="stable"), kind="stable") + 1.0
++        out["auc"] = float((ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
++    return out
++
++
++# -- costs and policies -----------------------------------------------------------------------------------------------
++@dataclass(frozen=True)
++class Costs:
++    verify: tuple[float, ...] = VERIFY_MS    # V(R), R = 1..len
++    block: float = BLOCK_MS                  # one DFlash2 block (a round that drafts)
++    overhead: float = 0.0                    # every round: sampling, commit, host work
++    taps_row: float = 0.0                    # each kept row's context update
++
++    def round_ms(self, drafted: int, kept: int, drafting: bool) -> float:
++        return self.verify[drafted] + (self.block if drafting else 0.0) + self.overhead + self.taps_row * kept
++
++
++COSTS = Costs()
++
++
++class Policy:
++    """A round's drafts at step i (at most ``room``), then what the round kept."""
++
++    spec = "?"
++    rule = RULE
++
++    def most(self) -> int:
++        raise NotImplementedError
++
++    def propose(self, d: Dump, i: int, room: int, costs: Costs) -> list[int]:
++        raise NotImplementedError
++
++    def record(self, drafted: int, accepted: int) -> None:
++        pass
++
++
++class ProductPolicy(Policy):
++    """fc<N>:<p> (``conf``) and f<N> (p = 0): Drafter.propose with DepthPolicy(N, fixed=True, confidence=p)."""
++
++    def __init__(self, most: int, confidence: float, rule: PickRule = RULE, spec: str = "") -> None:
++        self.n, self.confidence, self.rule, self.spec = most, confidence, rule, spec
++
++    def most(self):
++        return self.n
++
++    def propose(self, d, i, room, costs):
++        depth = min(self.n, room)
++        return walk(d, i, depth, self.rule, self.confidence).tokens if depth > 0 else []
++
++
++class AdaptivePolicy(ProductPolicy):
++    """fa[:LOW:HIGH]: DepthPolicy's running acceptance rate chooses 1, 2 or 3 drafts."""
++
++    def __init__(self, low: float = 0.8, high: float = 0.9, rule: PickRule = RULE, spec: str = "") -> None:
++        super().__init__(3, 0.0, rule, spec)
++        self.low, self.high, self.rate = low, high, 0.8
++        self.first = True
++
++    def propose(self, d, i, room, costs):
++        n = max(1, min(3, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
++        depth = min(n, room)
++        return walk(d, i, depth, self.rule).tokens if depth > 0 else []
++
++    def record(self, drafted, accepted):
++        if drafted:
++            self.rate = 0.875 * self.rate + 0.125 * (accepted / drafted)
++
++
++class NoisyProductPolicy(ProductPolicy):
++    """nc<N>:<p>[:B]: stop when the product of noise-aware confidences softmax((score + g) / B)[pick] drops below p,
++    always keeping the first draft (the fc rule with the keyed draws taken into account)."""
++
++    def __init__(self, most: int, confidence: float, beta: float, rule: PickRule = RULE, spec: str = "") -> None:
++        super().__init__(most, confidence, rule, spec)
++        self.beta = beta
++
++    def propose(self, d, i, room, costs):
++        depth = min(self.n, room)
++        if depth <= 0:
++            return []
++        tr = walk(d, i, depth, self.rule)
++        q = features(tr, self.beta)[:, FEATURES.index("noisy_prob")]
++        chain, out = 1.0, []
++        for k, t in enumerate(tr.tokens):
++            chain *= q[k]
++            if k > 0 and chain < self.confidence:
++                break
++            out.append(t)
++        return out
++
++
++def best_depth(p: np.ndarray, costs: Costs, drafting_cost: bool = True) -> int:
++    """The k (0..len(p)) maximizing E[tokens | k drafts] / round ms, p the conditional acceptances of the drafts."""
++
++    alive = np.concatenate([[1.0], np.cumprod(p)])          # P(the first j drafts all kept), j = 0..len(p)
++    expect = np.cumsum(alive)                               # 1 + sum_{j <= k} P(first j kept)
++    ms = np.array([costs.round_ms(k, 1, drafting_cost) for k in range(len(p) + 1)])
++    return int(np.argmax(expect / ms))
++
++
++class CostPolicy(Policy):
++    """cost<N>:<pred>: walk the whole chain, predict each draft's conditional acceptance, keep the most profitable
++    prefix (E[tokens] / ms, the block counted in every round since it ran to decide)."""
++
++    def __init__(self, most: int, predictor: Predictor, beta: float = 1.0, rule: PickRule = RULE,
++                 spec: str = "") -> None:
++        self.n, self.predictor, self.beta, self.rule, self.spec = most, predictor, beta, rule, spec
++
++    def most(self):
++        return self.n
++
++    def propose(self, d, i, room, costs):
++        depth = min(self.n, room)
++        if depth <= 0:
++            return []
++        tr = walk(d, i, depth, self.rule)
++        p = self.predictor.predict(features(tr, self.beta))
++        return tr.tokens[:best_depth(p, costs)]
++
++
++# -- the replay -------------------------------------------------------------------------------------------------------
++@dataclass
++class SimResult:
++    spec: str
++    tokens: int = 0             # committed tokens past the first (what DecodeResult.tokens_per_second counts)
++    rounds: int = 0
++    drafted: int = 0
++    accepted: int = 0
++    ms: float = 0.0
++    keeps: list[int] = field(default_factory=list)
++    depths: list[int] = field(default_factory=list)
++
++    def add(self, other: SimResult) -> None:
++        self.tokens += other.tokens
++        self.rounds += other.rounds
++        self.drafted += other.drafted
++        self.accepted += other.accepted
++        self.ms += other.ms
++        self.keeps += other.keeps
++        self.depths += other.depths
++
++    def summary(self) -> dict:
++        r = max(self.rounds, 1)
++        return {"policy": self.spec, "tokens": self.tokens, "rounds": self.rounds,
++                "tokens_per_round": self.tokens / r, "drafts_per_round": self.drafted / r,
++                "accept_rate": self.accepted / self.drafted if self.drafted else 0.0,
++                "ms_per_round": self.ms / r, "tok_per_s": 1e3 * self.tokens / self.ms if self.ms else 0.0}
++
++
++def simulate(d: Dump, policy: Policy, costs: Costs = COSTS) -> SimResult:
++    """dflash_decode's rounds over the dump's reply: every round verifies the pending token and the policy's drafts
++    and keeps the matching prefix plus one sampled token; the reply ends where the dump's does."""
++
++    res = SimResult(policy.spec)
++    i = 0
++    while i < d.n:                                   # out holds tokens[:i + 1]; the loop runs while len(out) < count
++        room = d.room(i)
++        drafts = policy.propose(d, i, room, costs)
++        kept = d.accepted(i, drafts)
++        res.ms += costs.round_ms(len(drafts), kept + 1, min(policy.most(), room) > 0)
++        res.rounds += 1
++        res.drafted += len(drafts)
++        res.accepted += kept
++        res.keeps.append(kept + 1)
++        res.depths.append(len(drafts))
++        policy.record(len(drafts), kept)
++        i += kept + 1
++    res.tokens = min(i, d.n)          # a last round whose drafts all held: its extra sample lies past max_tokens
++    return res
++
++
++def oracle(d: Dump, most: int, costs: Costs = COSTS, rule: PickRule = RULE) -> SimResult:
++    """The least total time any per-round depth choice (<= most) of this pick rule could reach, by dynamic
++    programming over positions with hindsight: an upper bound for stop rules."""
++
++    n = d.n
++    run = np.zeros(n, dtype=np.int64)                # how many drafts of the full chain at i would be kept
++    for i in range(n):
++        run[i] = d.accepted(i, walk(d, i, min(most, n - i), rule).tokens)
++    best = np.full(n + 1, np.inf)
++    choice = np.zeros(n + 1, dtype=np.int64)
++    best[n] = 0.0
++    for i in range(n - 1, -1, -1):
++        for k in range(min(most, n - i) + 1):
++            kept = min(k, int(run[i]))
++            t = costs.round_ms(k, kept + 1, k > 0) + best[min(i + kept + 1, n)]
++            if t < best[i]:
++                best[i], choice[i] = t, k
++    res = SimResult(f"oracle{most}")
++    i = 0
++    while i < n:
++        k = int(choice[i])
++        kept = min(k, int(run[i]))
++        res.ms += costs.round_ms(k, kept + 1, k > 0)
++        res.rounds += 1
++        res.drafted += k
++        res.accepted += kept
++        res.keeps.append(kept + 1)
++        res.depths.append(k)
++        i += kept + 1
++    res.tokens = min(i, n)
++    return res
++
++
++def parse_rule(text: str) -> PickRule:
++    rule = RULE
++    for part in filter(None, text.split(",")):
++        key, _, value = part.partition("=")
++        if key == "noise":
++            rule = replace(rule, noise=float(value))
++        elif key == "edge":
++            rule = replace(rule, edge=float(value))
++        elif key == "trunc":
++            rule = replace(rule, trunc=value not in ("0", "false", ""))
++        else:
++            raise ValueError(f"pick rule {text!r}: noise=W, edge=E or trunc=0/1")
++    return rule
++
++
++def parse_policy(spec: str, predictors: dict[str, Predictor] | None = None, beta: float = 1.0) -> Policy | str:
++    """A policy from its spec (module docstring); ``oracle<N>`` comes back as its spec (``oracle``, not a Policy)."""
++
++    base, _, rule_text = spec.partition("@")
++    rule = parse_rule(rule_text)
++    predictors = predictors or {}
++    try:
++        if base.startswith("oracle"):
++            return spec
++        if base.startswith("cost"):
++            most, name = base[4:].split(":", 1)
++            key, _, arg = name.partition(":")
++            if key == "noisy":
++                return CostPolicy(int(most), NoisyPredictor(), float(arg) if arg else beta, rule, spec)
++            if key == "conf":
++                return CostPolicy(int(most), ConfPredictor(), beta, rule, spec)
++            if name in predictors:
++                return CostPolicy(int(most), predictors[name], beta, rule, spec)
++            raise ValueError(f"no predictor {name!r} (conf, noisy[:B], or a fitted one: {', '.join(predictors)})")
++        if base.startswith("fa"):
++            parts = base.split(":")
++            low, high = (float(parts[1]), float(parts[2])) if len(parts) == 3 else (0.8, 0.9)
++            return AdaptivePolicy(low, high, rule, spec)
++        if base.startswith("fc"):
++            most, conf = base[2:].split(":")
++            return ProductPolicy(int(most), float(conf), rule, spec)
++        if base.startswith("nc"):
++            parts = base[2:].split(":")
++            return NoisyProductPolicy(int(parts[0]), float(parts[1]), float(parts[2]) if len(parts) > 2 else beta,
++                                      rule, spec)
++        if base.startswith("f"):
++            return ProductPolicy(int(base[1:]), 0.0, rule, spec)
++    except (IndexError, ValueError) as err:
++        raise ValueError(f"policy {spec!r}: {err}") from None
++    raise ValueError(f"policy {spec!r}: fc<N>:<p>, f<N>, fa[:LOW:HIGH], nc<N>:<p>[:B], cost<N>:<pred>, oracle<N>")
++
++
++def run_policy(dumps: Sequence[Dump], spec: str, costs: Costs, predictors: dict[str, Predictor] | None = None,
++               beta: float = 1.0) -> SimResult:
++    total = SimResult(spec)
++    for d in dumps:
++        pol = parse_policy(spec, predictors, beta)
++        if isinstance(pol, str):
++            base, _, rule_text = spec.partition("@")
++            total.add(oracle(d, int(base[6:] or d.depth), costs, parse_rule(rule_text)))
++        else:
++            total.add(simulate(d, pol, costs))
++    total.spec = spec
++    return total
++
++
++# -- checks -----------------------------------------------------------------------------------------------------------
++def check(d: Dump) -> dict:
++    """Consistency of a dump: its keyed draws, the target's top-T resampling to the committed token, and the sim's
++    replay of the engine's production chain (``prod_chain``, bit for bit)."""
++
++    from tensorfold.engine.exact_sampling import Sampling, choose_rows, uniform_rows
++
++    out = {"file": d.path, "steps": d.n}
++    m = d.meta
++    if d.sampled:
++        s = Sampling(int(m["seed"]), float(m["temperature"]), int(m["top_k"]), float(m["top_p"]),
++                     float(m.get("min_p", 0.0)))
++        g = np.stack([-np.log(-np.log(uniform_rows(s.seed, d.first[i] + np.arange(d.depth), d.cand_ids[i])))
++                      for i in range(d.n)]) if d.n else d.noise
++        out["noise_ok"] = bool(np.array_equal(g, d.noise))
++        if s.top_k and s.top_k + MARGIN <= d.tgt_ids.shape[1]:
++            w = s.top_k + MARGIN
++            got = [choose_rows(d.tgt_vals[i:i + 1, :w], d.tgt_ids[i:i + 1, :w], [int(d.first[i])], s)[0]
++                   for i in range(d.n)]
++            out["target_ok"] = float(np.mean(np.array(got) == d.tokens[1:])) if d.n else 1.0
++    else:
++        order = [np.lexsort((d.tgt_ids[i], -d.tgt_vals[i]))[0] for i in range(d.n)]
++        got = [int(d.tgt_ids[i, o]) for i, o in enumerate(order)]
++        out["target_ok"] = float(np.mean(np.array(got) == d.tokens[1:])) if d.n else 1.0
++    most, conf = int(m.get("prod_most", 5)), float(m.get("prod_confidence", 0.3))
++    same = 0
++    for i in range(d.n):
++        mine = walk(d, i, min(most, d.depth), PickRule(float(m.get("edge", EDGE)), float(m.get("noise", NOISE))),
++                    conf).tokens
++        theirs = [int(t) for t in d.prod_chain[i] if t >= 0]
++        same += mine == theirs
++    out["prod_chain_ok"] = same / d.n if d.n else 1.0
++    return out
++
++
++def depth_table(dumps: Sequence[Dump], rule: PickRule = RULE, depth: int = 7) -> list[dict]:
++    """Per depth: how often the full chain's draft is kept given the drafts before it were, and the mean confidences."""
++
++    X, y = training_rows(dumps, rule, depth)
++    rows = []
++    for k in range(depth):
++        mk = X[:, FEATURES.index("depth")] == k
++        if not mk.any():
++            break
++        rows.append({"depth": k + 1, "rows": int(mk.sum()), "kept": float(y[mk].mean()),
++                     "conf": float(X[mk, FEATURES.index("conf")].mean()),
++                     "noisy_prob": float(X[mk, FEATURES.index("noisy_prob")].mean())})
++    return rows
++
++
++# -- command line -----------------------------------------------------------------------------------------------------
++DEFAULT_POLICIES = ("fc5:0.3", "f1", "f2", "f3", "f4", "f5", "f7", "fc7:0.3", "fc5:0.2", "fc5:0.4", "fa",
++                    "fc5:0.3@noise=1.0", "fc5:0.3@noise=1.0,trunc=1", "nc7:0.3", "nc7:0.3@noise=1.0,trunc=1",
++                    "cost7:conf", "cost7:noisy", "cost7:const", "cost7:logit", "cost7:logit@noise=1.0,trunc=1",
++                    "oracle7")
++
++
++def _split(dumps: list[Dump]) -> tuple[list[Dump], list[Dump], str]:
++    if len(dumps) >= 2:
++        return dumps[0::2], dumps[1::2], "fit on the even-numbered dumps, evaluated on the odd-numbered ones"
++    return dumps, dumps, "one dump: fitted and evaluated on the same records (in-sample)"
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    head, _, rest = __doc__.partition("\n\n")
++    ap = argparse.ArgumentParser(prog="draft_sim", description=head, epilog=rest,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("dumps", nargs="+", help=".npz dumps, globs or directories (evaluated on)")
++    ap.add_argument("--train", nargs="*", default=None,
++                    help="dumps to fit predictors on (default: every other one of DUMPS, the rest evaluated)")
++    ap.add_argument("--policy", action="append", default=None, help="a policy spec (repeatable; default: a sweep)")
++    ap.add_argument("--verify", default=",".join(map(str, VERIFY_MS)), help="V(R) ms for R = 1..8, comma separated")
++    ap.add_argument("--block", type=float, default=BLOCK_MS, help="DFlash2 block ms")
++    ap.add_argument("--overhead", type=float, default=0.0, help="ms every round beyond V(R) and the block")
++    ap.add_argument("--taps-row", type=float, default=0.0, help="ms a kept row's context update")
++    ap.add_argument("--beta", type=float, default=0.0, help="noise-aware temperature (0: fitted on the train dumps)")
++    ap.add_argument("--check", action="store_true", help="verify each dump's consistency first")
++    ap.add_argument("--json", action="store_true", help="print JSON lines instead of a table")
++    ap.add_argument("--only", choices=("sampled", "greedy"), help="keep only sampled (temperature > 0) or greedy dumps")
++    args = ap.parse_args(argv)
++
++    keep = (lambda d: d.sampled == (args.only == "sampled")) if args.only else (lambda d: True)
++    dumps = [d for d in load_dumps(args.dumps) if keep(d)]
++    if not dumps:
++        print("draft_sim: no dumps", file=sys.stderr)
++        return 1
++    costs = Costs(tuple(float(v) for v in args.verify.split(",")), args.block, args.overhead, args.taps_row)
++    if args.train is not None:
++        train, test, how = [d for d in load_dumps(args.train) if keep(d)], dumps, "fit on --train, evaluated on DUMPS"
++    else:
++        train, test, how = _split(dumps)
++    emit = (lambda obj: print(json.dumps(obj))) if args.json else None
++    if args.check:
++        for d in dumps:
++            c = check(d)
++            emit(c) if emit else print("check", c)
++
++    specs = args.policy or list(DEFAULT_POLICIES)
++    rules = {parse_rule(s.partition("@")[2]) for s in specs}
++    beta = args.beta
++    if beta <= 0:
++        beta, loss = fit_beta(train, PickRule())
++        note = {"beta": beta, "log_loss": loss}
++        emit(note) if emit else print(f"noise-aware beta {beta:g} (log loss {loss:.4f} on the train dumps)")
++    predictors_by_rule: dict[PickRule, dict[str, Predictor]] = {}
++    for rule in rules:
++        Xtr, ytr = training_rows(train, rule, 7, beta)
++        Xte, yte = training_rows(test, rule, 7, beta)
++        fitted: dict[str, Predictor] = {"const": ConstPredictor().fit(Xtr, ytr),
++                                        "logit": LogisticPredictor().fit(Xtr, ytr)}
++        predictors_by_rule[rule] = fitted
++        report = {"rule": asdict(rule), "split": how}
++        for name, pred in [("conf", ConfPredictor()), ("noisy", NoisyPredictor(beta))] + list(fitted.items()):
++            report[name] = scores(pred.predict(Xte), yte) if len(yte) else {}
++        report["logit_weights"] = fitted["logit"].describe()
++        if emit:
++            emit({"predictors": report})
++        else:
++            print(f"\npredictors ({report['rule']}; {how}):")
++            for name in ("conf", "noisy", "const", "logit"):
++                s = report[name]
++                if s:
++                    print(f"  {name:6s} rows {s['rows']:6d}  kept {s['rate']:.3f}  log loss {s['log_loss']:.4f}  "
++                          f"brier {s['brier']:.4f}  auc {s.get('auc', float('nan')):.3f}")
++            print(f"  logit weights: {report['logit_weights']}")
++    table = depth_table(test)
++    if emit:
++        emit({"depths": table})
++    else:
++        print("\nper-depth acceptance of the full chain (today's pick), given the drafts before were kept:")
++        for r in table:
++            print(f"  depth {r['depth']}: rows {r['rows']:6d}  kept {r['kept']:.3f}  conf {r['conf']:.3f}  "
++                  f"noisy {r['noisy_prob']:.3f}")
++        print(f"\n{'policy':34s} {'tok/round':>9s} {'drafts':>7s} {'accept':>7s} {'ms/round':>9s} {'tok/s':>7s}")
++    for spec in specs:
++        rule = parse_rule(spec.partition("@")[2])
++        s = run_policy(test, spec, costs, predictors_by_rule.get(rule), beta).summary()
++        if emit:
++            emit(s)
++        else:
++            print(f"{spec:34s} {s['tokens_per_round']:9.3f} {s['drafts_per_round']:7.2f} {s['accept_rate']:7.3f} "
++                  f"{s['ms_per_round']:9.2f} {s['tok_per_s']:7.2f}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 3c2b10e..613a0f7 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -252,10 +252,17 @@ class GlmEngine:
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
++        # TF_GLM_DRAFT_DUMP=<dir>: DFlash2 requests decode serially and record the drafter's view for the offline
++        # simulator (``draft_dump``, ``draft_sim``); TF_GLM_DRAFT_QUANT=minmax|mse: how DFlash2's 4-bit copies are made
++        from .draft_dump import dump_dir
++        from .qmm import DRAFT_QUANTS, draft_quant
++
++        self.dump = dump_dir() if drafter is not None and not serial_only else None
++        quant_code = DRAFT_QUANTS.index(draft_quant())
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + \
+-            [int(self.mtp_on), int(DRAFT_RING)]
++                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + [
++                int(self.dump is not None), quant_code, int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -264,7 +271,8 @@ class GlmEngine:
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, "
+-                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
++                               "TF_GLM_DRAFT_QUANT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -299,6 +307,12 @@ class GlmEngine:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+                 print(f"[tensorfold] {self.split.describe()}", flush=True)
++        if rank == 0 and self.dump is not None:
++            print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
++                  f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
++        if rank == 0 and quant_code:
++            print("[tensorfold] TF_GLM_DRAFT_QUANT=mse: DFlash2's 4-bit copies (and an EXL3 draft head) with "
++                  "least-squares clipped ranges", flush=True)
+         if rank == 0 and self.grid:
+             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                   f"(TF_GLM_PROMPT_GRID)", flush=True)
+@@ -601,6 +615,16 @@ class GlmEngine:
+             copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
++        elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded
++            from .draft_dump import dump_decode
++
++            meta = None if self.rank else dict(
++                prompt_tokens=len(prompt), cached=cut, policy=list(code), images=feed is not None,
++                prompt_sha256=hashlib.sha256(json.dumps(list(prompt)).encode()).hexdigest()[:16])
++            res = dump_decode(self.e, drafter, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
++                              out_dir=self.dump if self.rank == 0 else None, meta=meta)
++            if self.rank == 0:
++                stats["draft_dump"] = res.dump_path
+         elif auto:
+             greedy = sampling is None or sampling.temperature <= 0
+             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 6377c42..3c40295 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -211,6 +211,29 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
+     return make_q4(words, scales.contiguous(), biases.contiguous())
+ 
+ 
++DRAFT_QUANTS = ("minmax", "mse")
++
++
++def draft_quant(value: str | None = None) -> str:
++    """TF_GLM_DRAFT_QUANT: how the draft-only 4-bit copies (DFlash2's matrices, an EXL3 checkpoint's draft head) are
++    made: minmax (the default: each group's full min / max range, ``quantize4``) or mse (the least-squares clipping of
++    ``quantize4_mse``). Drafts only propose, so either keeps every reply; only acceptance can move."""
++
++    import os
++
++    kind = os.environ.get("TF_GLM_DRAFT_QUANT", "") if value is None else value
++    kind = kind or "minmax"
++    if kind not in DRAFT_QUANTS:
++        raise ValueError(f"TF_GLM_DRAFT_QUANT is minmax or mse, not {kind!r}")
++    return kind
++
++
++def draft_quantize4(w: torch.Tensor, kind: str | None = None) -> Q4:
++    """A draft-only 4-bit copy of bf16 ``w`` by TF_GLM_DRAFT_QUANT (``draft_quant``); never used to verify."""
++
++    return quantize4_mse(w) if draft_quant(kind) == "mse" else quantize4(w)
++
++
+ def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
+     return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
+ 
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 766a3b0..55bb452 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -13,7 +13,8 @@ from tensorfold.cuda import experts as grouped
+ 
+ from .exl3_mm import Exl3Experts, words as exl3_words
+ from . import latent
+-from .qmm import B16, F8, Q4, as_i32, dense_kind, make_b16, make_f8, make_q4, quantize4, stack_b16, stack_f8, stack_q4
++from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, make_b16, make_f8, make_q4, stack_b16, stack_f8,
++                  stack_q4)
+ 
+ PREFIX = "model.language_model."
+ 
+@@ -430,7 +431,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         if exl3:
+             raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+             head = dense(raw)
+-            draft_head = quantize4(raw)    # Draft steps use the quantized head; verification keeps the original head.
++            # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
++            draft_head = draft_quantize4(raw)
+         else:
+             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
+             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),

@@ -1,0 +1,31 @@
+# kindling spark-os: the DFlash2 drafter's and the GLM vision tower's loaders copy each tensor out of the safetensors
+# mmap before it goes to the GPU. On kindling's 64 KiB-page kernel a pageable copy to the GPU straight from a file mmap
+# hangs in the driver (cuMemcpyHtoDAsync) once the process holds GPU memory, and both loaders run after the main
+# weights: the server never finished starting (the vision tower's first upload, after the drafter timings, on three
+# Sparks; the drafter's first upload in an earlier recipe). A clone is an ordinary host buffer: the same bytes, one
+# copy per tensor at start. The main weights use direct reads and are unaffected. tools/mmap_upload_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -274,7 +274,7 @@ class Drafter:
+ 
+         with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
+             def get(name: str) -> torch.Tensor:
+-                return f.get_tensor(name)
++                return f.get_tensor(name).clone()
+ 
+             self.fc = quantize4(gpu(get("fc.weight")))
+             self.hidden_norm = gpu(get("hidden_norm.weight"))
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -347,7 +347,7 @@ class GlmVisionTower:
+             with safe_open(str(model_dir / file), framework="pt", device="cpu") as f:
+                 for n in names:
+                     if index[n] == file:
+-                        t[n[len("model.visual."):]] = f.get_tensor(n).to(device=device, dtype=torch.bfloat16)
++                        t[n[len("model.visual."):]] = f.get_tensor(n).clone().to(device=device, dtype=torch.bfloat16)
+         self.weight_bytes = sum(x.numel() * x.element_size() for x in t.values())
+         self.t = t
+         self.device = device

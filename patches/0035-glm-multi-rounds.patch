@@ -1,0 +1,833 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index eb427d0..ed74101 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -160,7 +160,9 @@ class Engine:
+             g = self.graphs.main.get((R, self.st.parity))
+         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
+             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+-            bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
++            # the pool buckets the graphs were captured for: the home view's (a stream at home with a smaller
++            # extent scores pools past its own too, all past its visible ones: -inf, the same selection)
++            bucket = pool_bucket(self.st.pos, R, self.home.index[0][2].shape[0] - 2)
+             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
+         if g is not None:
+             self.replays[kind] += 1
+@@ -181,7 +183,7 @@ class Engine:
+             g = self.graphs.mtp.get(n)
+         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
+               and self.st.mtp_len >= self.w.cfg.dense_limit):
+-            bucket = pool_bucket(self.st.mtp_len, n, self.st.index[-1][2].shape[0] - 2)
++            bucket = pool_bucket(self.st.mtp_len, n, self.home.index[-1][2].shape[0] - 2)
+             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
+         if g is not None:
+             self.replays[kind] += 1
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 127ea01..b5dcd26 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -501,11 +501,14 @@ class Drafter:
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+               sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
+-              round_ms: tuple[float, ...] | None = None) -> list[int]:
++              round_ms: tuple[float, ...] | None = None, confs: list | None = None) -> list[int]:
+         """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
+         keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
+         ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
+-        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same."""
++        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same. ``confs``
++        (a list): the chain is walked whole and each pick's confidence (noise-aware with ``beta``, else the
++        softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
++        allocation)."""
+ 
+         depth = tokens.shape[0]
+         sampled = sampling is not None and sampling.temperature > 0
+@@ -522,7 +525,13 @@ class Drafter:
+             score = (values[d] + EDGE * edge) / temp
+             pick = score + NOISE * noise[d] if noise is not None else score
+             j = int(np.argmax(pick))
+-            if noisy:
++            if confs is not None:
++                if noisy:
++                    confs.append(noisy_confidence(score, noise[d] if noise is not None else None, j, beta))
++                else:
++                    p = np.exp(score - score.max())
++                    confs.append(float(p[j] / p.sum()))
++            elif noisy:
+                 c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
+                 if round_ms is not None:
+                     conf.append(c)
+@@ -537,7 +546,7 @@ class Drafter:
+                     break
+             prev = int(tokens[d, j])
+             out.append(prev)
+-        if noisy and round_ms is not None:
++        if noisy and round_ms is not None and confs is None:
+             out = out[:best_depth(conf, round_ms)]
+         return out
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 66fa9ca..32c01f3 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -502,17 +502,24 @@ class GlmEngine:
+ 
+         self.dump = dump_dir() if drafter is not None and not serial_only and parallel == 1 else None
+         quant_code = DRAFT_QUANTS.index(draft_quant())
++        from tensorfold.cuda.sampling import union_cover
++
+         verify_code = 0
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+ 
+             verify_code = 1 + ("batched", "serial").index(verify_kind())
++            from .multi_tune import MultiSettings
++
++            verify_code = [verify_code] + MultiSettings.from_env().code()
++        else:
++            verify_code = [verify_code]
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+-                                 parallel, verify_code, MAX_ROWS, len(WIDE_GRAPHS), sum(WIDE_GRAPHS),
+-                                 max(WIDE_GRAPHS, default=0)]
++                                 parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
++                                 sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -523,7 +530,8 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+-                               "TF_GLM_MULTI_VERIFY, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
++                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE, "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -641,7 +649,10 @@ class GlmEngine:
+                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+                       f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+-                      f"{self.multi.share:g})", flush=True)
++                      f"{self.multi.share:g}); {self.multi.tune.describe()}", flush=True)
++                if self.multi.row_ms is not None:
++                    print("[tensorfold] --parallel batched window ms by rows: " +
++                          " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+ 
+     def _calibrate(self) -> dict:
+         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index bf316fd..d1ed1f4 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -39,12 +39,14 @@ import torch
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
++from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE = range(1, 9)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT = range(1, 10)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE"}
++       IDLE: "IDLE", SLOT: "SLOT"}
++LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+ MAX_WINDOW = 32                          # rows of every stream's windows together in one round
+ SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST)
+@@ -266,7 +268,8 @@ class NoRoom(RuntimeError):
+ class MultiDecoder:
+     """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
+ 
+-    def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None) -> None:
++    def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
++                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None) -> None:
+         """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
+         drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
+         ``SerialVerify``)."""
+@@ -304,6 +307,22 @@ class MultiDecoder:
+             else:
+                 verify = SerialVerify(e, taps=self.drafts is not None)
+         self.verify = verify
++        # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
++        self.tune = tune if tune is not None else MultiSettings.from_env()
++        self.profiles = None
++        if self.tune.profile and self.rank == 0:
++            self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
++                             True: RoundProfile(self.tune.profile, label="lone stream, one-stream graphs")}
++        self.profile = None                              # the current round's (``profiles``), or None
++        self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
++        graphs = getattr(e, "graphs", None)
++        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
++        self.row_ms = list(row_ms) if row_ms is not None else None
++        if self.tune.depth == "joint" and self.row_ms is None:
++            self.row_ms = self._time_rows()
++        if self.profiles is not None and isinstance(self.verify, BatchedVerify) and self.verify.graphs:
++            self._compare_paths()
++        self.msg = None                                  # TF_GLM_MULTI_ASYNC: rank 0's pinned message staging
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
+         self.next_sid = self.next_kid = self.next_order = 0
+@@ -352,7 +371,82 @@ class MultiDecoder:
+             self.g._ring()
+             self.idle = False
+         msg, self.outbox = self.outbox, []
+-        self.g._share(msg)
++        if self.tune.async_msg:
++            self._send(msg)
++        else:
++            self.g._share(msg)
++
++    def _send(self, values: list[int]) -> None:
++        """Rank 0, TF_GLM_MULTI_ASYNC: ``GlmEngine._share``'s two all-gathers (the length, then the values) without
++        reading anything back: the values go through a pinned staging buffer (reused once its last copy has left),
++        so the host does not wait for the GPU. Rank 1 receives them with its ``_share`` as ever."""
++
++        n = len(values)
++        dev = self.w.device
++        if self.msg is None or self.msg[0].numel() < n + 1:
++            if self.msg is not None:
++                self.msg[2].synchronize()
++            size = max(4096, 2 * (n + 1))
++            pinned = torch.cuda.is_available()
++            self.msg = (torch.zeros((size,), dtype=torch.int32, pin_memory=pinned),
++                        torch.zeros((size,), dtype=torch.int32, device=dev),
++                        torch.cuda.Event() if pinned else None)
++        host, buf, ready = self.msg
++        if ready is not None:
++            ready.synchronize()                          # the last message's copy has left the staging buffer
++        host[0] = n
++        if n:
++            host[1:1 + n].numpy()[:] = values
++        buf[:1 + n].copy_(host[:1 + n], non_blocking=True)
++        if ready is not None:
++            ready.record()
++        comm = self.g.comm
++        got = torch.empty((2,), dtype=torch.int32, device=dev)
++        comm.all_gather(buf[:1], got)
++        allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
++        comm.all_gather(buf[1:1 + n], allv)
++
++    def _time_rows(self, reps: int = 5) -> list[float]:
++        """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
++        ``reps``), the larger of both ranks' (so both allocate alike)."""
++
++        v = self.verify
++        if not isinstance(v, BatchedVerify) or not v.graphs:
++            raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
++                             "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
++        mine = torch.tensor(v.time_rows(reps), dtype=torch.float32, device=self.w.device)
++        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device=self.w.device)
++        self.g.comm.all_gather(mine, got)
++        return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
++
++    def _compare_paths(self, reps: int = 5) -> None:
++        """TF_GLM_MULTI_PROFILE (rank 0, at startup): a lone stream's verify window on the one-stream graphs and on
++        the batched graphs, ms by rows (fastest of ``reps``; slot 0's states cleared after)."""
++
++        e, v = self.e, self.verify
++        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        solo = v.time_rows(reps)
++        out = []
++        for R in range(1, self.lone_rows + 1):
++            g = e.graphs.main.get((R, e.home.parity))
++            if g is None:
++                continue
++            best = float("inf")
++            for _ in range(reps + 1):
++                start.record()
++                g.replay()
++                stop.record()
++                stop.synchronize()
++                best = min(best, start.elapsed_time(stop))
++            out.append(f"{R}: {best:.2f} vs {solo[R - 1]:.2f}")
++        e.slots.rec[0].zero_()
++        e.slots.conv[0].zero_()
++        print("[tensorfold] multi profile: a lone stream's verify window ms, one-stream graphs vs batched graphs, by "
++              "rows: " + ", ".join(out), flush=True)
++
++    def _row_cost(self, rows: int) -> float:
++        ms = self.row_ms
++        return ms[min(max(rows, 1), len(ms)) - 1] + max(0, rows - len(ms)) * (ms[-1] - ms[-2] if len(ms) > 1 else 0)
+ 
+     @staticmethod
+     def parse(msg: Sequence[int]) -> list[tuple[int, list[int]]]:
+@@ -720,16 +814,21 @@ class MultiDecoder:
+         return self.lanes[s.sid]
+ 
+     def _iterate(self) -> list[Stream]:
++        prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
+         if lane is not None:
++            t = time.perf_counter()
+             stop = self._stop(lane)
+             self._emit(FILL, [lane.sid, stop])
+             self._flush()
+             first = self._fill(lane, stop)
+             if first is not None:
+                 lane.s.take([first], self._ends(lane))
++            if prof is not None:
++                prof.fill(time.perf_counter() - t)
+             return [lane.s] if lane.s.done else []
+         lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
++        t_begin = time.perf_counter()
+         for l in lanes:                       # room for this round's widest window, else paused
+             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
+         active = [l for l in lanes if not l.paused]
+@@ -740,12 +839,65 @@ class MultiDecoder:
+             if self.outbox:                   # what was decided (evictions, moves, a stream given back) goes now
+                 self._flush()
+             return done
++        lone = False
++        if (self.tune.lone and len(active) == 1 and len(self.lanes) == 1 and self.lone_rows
++                and active[0].s.count - len(active[0].s.out) >= LONE_LEFT):
++            lone = self._home(active[0])
++        prof = self.profile = self.profiles[lone] if self.profiles is not None else None
++        if prof is not None:
++            prof.begin(t_begin)
+         plan = [(l.sid, l.depth) for l in active]
+-        self._emit(ROUND, [len(plan), *[v for p in plan for v in p]])
++        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone)])
++        if prof is not None:
++            prof.mark("plan")
+         self._flush()
+-        self._round(active)
++        if prof is not None:
++            prof.mark("message")
++        self._round(active, lone=lone)
+         return [l.s for l in active if l.s.done]
+ 
++    def _home(self, lane: Lane) -> bool:
++        """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
++        kept prompts in the way evicted and its extent MOVEd); True once it is there."""
++
++        if self.e.graphed(lane.st):
++            return True
++        if lane.slot != 0:
++            self._emit(SLOT, [lane.sid, 0])
++            self._reslot(lane, 0)
++        x = lane.extent
++        if x.base != 0:
++            for c in list(self.kept):                  # kept prompts in [0, x.size) make way
++                y = c.extent
++                if y is not x and y.base < x.size and c in self.kept:
++                    self._evict(c)
++            if any(y is not x and y.base < x.size for y in self.pool.extents):
++                return False                           # something else holds the home rows (cannot happen alone)
++            self._emit(MOVE, [x.eid, 0, x.size])
++            self._move(x, 0, x.size)
++        return self.e.graphed(lane.st)
++
++    def _reslot(self, lane: Lane, slot: int) -> None:
++        """Both ranks: the lane's slot state (KDA states, conv windows, DFlash2 context) copied into ``slot``."""
++
++        from .forward import State
++
++        e, old = self.e, lane.slot
++        if any(l.slot == slot for l in self.lanes.values() if l is not lane):
++            raise RuntimeError(f"stream {lane.sid} cannot take slot {slot}: another stream holds it")
++        e.slots.rec[slot].copy_(e.slots.rec[old])
++        e.slots.conv[slot].copy_(e.slots.conv[old])
++        if self.drafts is not None:
++            a, b = self.drafts.contexts[old], self.drafts.contexts[slot]
++            for dst, src in zip(list(b.kc) + list(b.vc), list(a.kc) + list(a.vc)):
++                dst.copy_(src)
++            b.context_end = a.context_end
++            b.pos_dev.copy_(a.pos_dev)
++        st = State(self.w, lane.extent.size, e.rows, caches=e.caches, base=lane.extent.base, slots=e.slots, slot=slot)
++        st.set_pos(lane.st.pos)
++        st.cur = list(lane.st.cur)
++        lane.st, lane.slot = st, slot
++
+     def _stop(self, lane: Lane) -> int:
+         pos, n = lane.st.pos, len(lane.s.prompt)
+         stop = next((p for p in lane.stops if p > pos), n)
+@@ -802,14 +954,17 @@ class MultiDecoder:
+         return first
+ 
+     @torch.no_grad()
+-    def _round(self, lanes: list[Lane], depths: list[int] | None = None) -> None:
+-        """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1)."""
++    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
++        """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
++        stream at home, verified through the one-stream graphs when its window fits them."""
+ 
+         from .decode import copy_room
+         from .dflash2_multi import DraftRequest
+ 
+         if depths is not None and [l.depth for l in lanes] != depths:
+             raise RuntimeError(f"rank {self.rank}'s draft depths {[l.depth for l in lanes]} are not rank 0's {depths}")
++        prof = self.profile
++        tune = self.tune
+         drafts: list[list[int]] = []
+         copied: list[bool] = []
+         asks = []
+@@ -818,13 +973,20 @@ class MultiDecoder:
+             copied.append(bool(c))
+             drafts.append(list(c))
+             if not c and l.dflash and l.depth > 0:
++                conf = l.policy.confidence
++                if tune.depth == "scale":
++                    conf = scaled_confidence(conf, len(lanes), tune.alpha)
+                 asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling,
+-                                                           l.policy.confidence, **l.policy.chain_rule)))
+-        if asks:
++                                                           conf, **l.policy.chain_rule)))
++        if asks and tune.depth == "joint":
++            self._joint(lanes, drafts, asks)
++        elif asks:
+             got = self.drafts.propose([a for _, a in asks])
+             for (k, _), d in zip(asks, got):
+                 drafts[k] = list(d)
+         drafts = trim(drafts, MAX_WINDOW)
++        if prof is not None:
++            prof.mark("propose")
+         segments = []
+         for l, d in zip(lanes, drafts):
+             tokens = [l.s.out[-1]] + d
+@@ -833,13 +995,26 @@ class MultiDecoder:
+                 l.window = l.constraint.window(tokens, list(range(-1, len(tokens) - 1)))
+                 tokens = list(l.window.tokens)
+             segments.append(Segment(l.st, tokens))
+-        v = forward_streams(self.verify, segments)
++        verify = self.verify
++        if lone:
++            if not self.e.graphed(lanes[0].st):
++                raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
++            if len(segments[0].tokens) <= self.lone_rows:
++                verify = self.solo_verify
++        if prof is not None:
++            prof.gpu_start()
++        v = forward_streams(verify, segments)
++        if prof is not None:
++            prof.gpu_stop()
++            prof.mark("verify")
+         parts = []
+         for l, seg, logits in zip(lanes, segments, v.logits):
+             if l.window is not None:
+                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
+             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
+-        sampled = sample_streams(self.w, parts)
++        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
++        if prof is not None:
++            prof.mark("sample")
+         keeps = []
+         for l, seg, rows in zip(lanes, segments, sampled):
+             keep = 1
+@@ -848,11 +1023,17 @@ class MultiDecoder:
+                     break
+                 keep += 1
+             keeps.append(keep)
+-        self.verify.commit(segments, keeps)
++        if prof is not None:
++            prof.mark("accept")
++        verify.commit(segments, keeps)
++        if prof is not None:
++            prof.mark("commit")
+         if self.drafts is not None:
+             items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(lanes, keeps)) if l.dflash]
+             if items:
+                 self.drafts.commit(items)
++        if prof is not None:
++            prof.mark("taps")
+         for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
+             s = l.s
+             new = rows[:keep]
+@@ -871,6 +1052,32 @@ class MultiDecoder:
+             if l.policy is not None:
+                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
+                               max(0, s.count - len(s.out)))
++        if prof is not None:
++            prof.mark("emit")
++            prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
++                     sum(len(g.tokens) - 1 for g in segments))
++
++    def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
++        """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
++        round's rows allocated across them by expected tokens per ms (``multi_tune.allocate``). The picks are each
++        policy's; only where each chain stops differs (drafts never change a reply)."""
++
++        md = self.drafts
++        live = [(k, r) for k, r in asks if min(r.depth, md.block - 1) >= 1 and r.ctx.context_end > 0]
++        if not live:
++            return
++        got = md.candidates([(r.ctx, r.pending, min(r.depth, md.block - 1)) for _, r in live])
++        reach = []
++        for (k, r), (tokens, values, proj) in zip(live, got):
++            confs: list[float] = []
++            drafts[k] = md.d.chain(tokens, values, proj, r.pending, r.ctx.context_end + 1, r.sampling, 0.0,
++                                   beta=r.beta, confs=confs)
++            reach.append(reach_of(confs))
++        asked = {k for k, _ in live}
++        fixed = sum(1 + (0 if k in asked else len(d)) for k, d in enumerate(drafts))
++        take = allocate(reach, fixed, self._row_cost, self.tune.overhead_ms, MAX_WINDOW)
++        for (k, _), n in zip(live, take):
++            drafts[k] = drafts[k][:n]
+ 
+     # -- ends ----------------------------------------------------------------------------------------------------------------
+     def finish(self, done: list[Stream]) -> None:
+@@ -992,7 +1199,10 @@ class MultiDecoder:
+             elif op == ROUND:
+                 n = p[0]
+                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
+-                self._round([self.lanes[sid] for sid in sids], depths)
++                lone = bool(p[1 + 2 * n]) if len(p) > 1 + 2 * n else False
++                self._round([self.lanes[sid] for sid in sids], depths, lone=lone)
++            elif op == SLOT:
++                self._reslot(self.lanes[p[0]], p[1])
+             elif op == FINISH:
+                 self._finish(p[0])
+             elif op == IDLE:
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+new file mode 100644
+index 0000000..4020b91
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -0,0 +1,303 @@
++"""Speed settings of GLM-5.3-Flash's concurrent rounds (``multi``), none of which changes a reply's bits:
++
++- TF_GLM_MULTI_SAMPLER=streams|packed: ``streams`` (the default) samples as ``multi.sample_streams`` did: every
++  top-k stream's candidates in one all-gather, each nucleus (top_k off) stream through ``nucleus_rows``' own two
++  gathers and host syncs. ``packed``: every stream's rows in two all-gathers whatever the samplings: the top-k
++  candidates and the nucleus rows' maxima together, then every nucleus row's candidates and shard masses together
++  (``sample_packed``: row for row the arithmetic ``nucleus_rows`` does; a stream whose nucleus runs past the
++  candidates falls back to whole shards on its own, as it does alone).
++- TF_GLM_MULTI_DEPTH=policy|joint|scale:A: how many drafts each stream verifies. ``policy`` (the default): each its
++  own DFlash2 policy, as alone. ``joint``: every drafting stream's chain walked to its policy's most, then the rows
++  of the round allocated across the streams by expected tokens per ms (``allocate``) on the startup-timed curve of
++  the batched window's ms by rows plus TF_GLM_MULTI_OVERHEAD_MS (default 12) for the rest of a round.
++  ``scale:A``: each stream's chain stop threshold raised to min(0.95, p * S**A) with S streams in the round.
++- TF_GLM_MULTI_ASYNC=1: rank 0 sends each iteration's message without waiting for the GPU (a pinned staging copy;
++  the same two all-gathers rank 1 reads), so its host runs ahead into the next round's host work.
++- TF_GLM_MULTI_LONE=1 (the default; 0: off): a stream decoding alone (no other stream decoding or filling) moves
++  once into the one-stream CUDA graphs' home (slot 0 at the pool's first rows) and verifies its windows through them
++  (``verify.SerialVerify``, the single-stream forward) while they fit the graphs; a second stream joins it on the
++  batched path at the next round boundary.
++- TF_GLM_MULTI_PROFILE=N: rank 0 logs a round's time breakdown every N decode rounds, lone-stream rounds (one-stream
++  graphs) and batched ones apart (``RoundProfile``), and at startup both paths' window ms for one stream.
++
++All but the profile change the collectives or the drafts, so both ranks must agree: ``MultiSettings.code`` joins the
++engine's two-rank settings comparison."""
++
++from __future__ import annotations
++
++import math
++import os
++import time
++from dataclasses import dataclass
++from typing import Callable, Sequence
++
++import numpy as np
++import torch
++
++
++@dataclass
++class MultiSettings:
++    sampler: str = "streams"
++    depth: str = "policy"
++    alpha: float = 0.0
++    overhead_ms: float = 12.0
++    async_msg: bool = False
++    profile: int = 0
++    lone: bool = True
++
++    @classmethod
++    def from_env(cls, env=None) -> "MultiSettings":
++        env = os.environ if env is None else env
++        s = cls()
++        s.sampler = (env.get("TF_GLM_MULTI_SAMPLER", "") or "streams").strip().lower()
++        if s.sampler not in ("streams", "packed"):
++            raise ValueError(f"TF_GLM_MULTI_SAMPLER: streams or packed, not {s.sampler!r}")
++        depth = (env.get("TF_GLM_MULTI_DEPTH", "") or "policy").strip().lower()
++        if depth.startswith("scale:"):
++            try:
++                s.alpha = float(depth[6:])
++            except ValueError:
++                s.alpha = -1.0
++            if not 0 < s.alpha <= 4:
++                raise ValueError(f"TF_GLM_MULTI_DEPTH=scale:A: A above 0 and at most 4, not {depth[6:]!r}")
++            depth = "scale"
++        if depth not in ("policy", "joint", "scale"):
++            raise ValueError(f"TF_GLM_MULTI_DEPTH: policy, joint or scale:A, not {depth!r}")
++        s.depth = depth
++        try:
++            s.overhead_ms = float(env.get("TF_GLM_MULTI_OVERHEAD_MS", "") or 12.0)
++        except ValueError:
++            s.overhead_ms = -1.0
++        if not 0 <= s.overhead_ms <= 1000:
++            raise ValueError("TF_GLM_MULTI_OVERHEAD_MS: 0 to 1,000 ms")
++        a = (env.get("TF_GLM_MULTI_ASYNC", "") or "0").strip()
++        if a not in ("0", "1"):
++            raise ValueError(f"TF_GLM_MULTI_ASYNC: 0 or 1, not {a!r}")
++        s.async_msg = a == "1"
++        lone = (env.get("TF_GLM_MULTI_LONE", "") or "1").strip()
++        if lone not in ("0", "1"):
++            raise ValueError(f"TF_GLM_MULTI_LONE: 0 or 1, not {lone!r}")
++        s.lone = lone == "1"
++        p = (env.get("TF_GLM_MULTI_PROFILE", "") or "0").strip()
++        if not p.isdecimal():
++            raise ValueError(f"TF_GLM_MULTI_PROFILE: 0 (off) or the rounds between reports, not {p!r}")
++        s.profile = int(p)
++        return s
++
++    def code(self) -> list[int]:
++        """What both ranks must agree on (the profile is rank 0's alone)."""
++
++        return [("streams", "packed").index(self.sampler), ("policy", "joint", "scale").index(self.depth),
++                int(round(self.alpha * 1000)), int(round(self.overhead_ms * 1000)), int(self.async_msg),
++                int(self.lone)]
++
++    def describe(self) -> str:
++        depth = f"scale:{self.alpha:g}" if self.depth == "scale" else self.depth
++        return (f"sampler {self.sampler}, depth {depth}"
++                f"{f' (overhead {self.overhead_ms:g} ms)' if self.depth == 'joint' else ''}, async messages "
++                f"{'on' if self.async_msg else 'off'}, lone stream on the one-stream graphs "
++                f"{'on' if self.lone else 'off'}{f', profile every {self.profile} rounds' if self.profile else ''}")
++
++
++def scaled_confidence(p: float, streams: int, alpha: float) -> float:
++    """TF_GLM_MULTI_DEPTH=scale:A: a stream's chain stop threshold with ``streams`` streams in the round."""
++
++    if p <= 0 or alpha <= 0 or streams <= 1:
++        return p
++    return min(0.95, p * streams ** alpha)
++
++
++def allocate(reach: Sequence[Sequence[float]], fixed: int, cost: Callable[[int], float], overhead: float,
++             cap: int) -> list[int]:
++    """TF_GLM_MULTI_DEPTH=joint: drafts to verify per stream. ``reach[s][k]``: the chance stream s's draft k is kept
++    (the product of its chain's confidences up to k), non-increasing in k; ``fixed``: the round's rows that are
++    decided (every pending token, copied drafts); ``cost(rows)``: the verify window's ms. Rows are added best reach
++    first while the expected tokens per ms (``fixed`` streams' pending tokens count 1 each, a draft its reach) grows,
++    at most ``cap`` rows in all. Deterministic in its inputs, so both ranks allocate alike."""
++
++    take = [0] * len(reach)
++    rows = fixed
++    tokens = float(len(reach))
++    best = tokens / (cost(rows) + overhead)
++    while rows < cap:
++        k = max(range(len(reach)), key=lambda s: (reach[s][take[s]] if take[s] < len(reach[s]) else -1.0, -s),
++                default=None)
++        if k is None or take[k] >= len(reach[k]):
++            break
++        gain = reach[k][take[k]]
++        rate = (tokens + gain) / (cost(rows + 1) + overhead)
++        if rate <= best:
++            break
++        take[k] += 1
++        rows += 1
++        tokens += gain
++        best = rate
++    return take
++
++
++def reach_of(confs: Sequence[float]) -> list[float]:
++    return [float(x) for x in np.cumprod(np.asarray(confs, dtype=np.float64))] if len(confs) else []
++
++
++# -- sampling --------------------------------------------------------------------------------------------------------
++def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
++    """parts [(logits [R, V/world], positions, sampling)] -> each part's tokens, bit for bit what ``decode.sample_rows``
++    gives each part alone, in two all-gathers for every part: (1) every top-k / greedy part's top candidates (values,
++    ids as fp32 bits) and every nucleus part's row maxima (fp64 as two fp32 words), (2) every nucleus row's
++    ``NUCLEUS`` best (value, id, mass), its shard's mass and width. Row by row the arithmetic is ``nucleus_rows``' and
++    ``sample_rows``'; a nucleus part some row of which runs past the candidates reads whole shards on its own."""
++
++    from tensorfold.cuda.sampling import MASS, NUCLEUS, WIDER, _draw, _shares, comm_gather, one_rank, union_cover
++    from tensorfold.engine.exact_sampling import MARGIN, choose_rows
++
++    gather = one_rank if w.comm is None else comm_gather(w.comm)
++    world = 1 if w.comm is None else w.world
++    out: list[list[int] | None] = [None] * len(parts)
++    words, topk, nucl = [], [], []
++    at = 0                                                         # each part's first word in the first gather
++    for k, (logits, positions, sampling) in enumerate(parts):
++        greedy = sampling is None or sampling.temperature <= 0
++        if greedy or sampling.top_k:
++            n = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
++            vals, ids = torch.topk(logits.float(), n, dim=-1)
++            ids = (ids + w.vocab_offset).to(torch.int32)
++            words.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++            topk.append((k, logits.shape[0], n, at))
++            at += logits.shape[0] * 2 * n
++        else:
++            scaled = logits.float().double() / max(float(sampling.temperature), 1e-6)
++            words.append(scaled.max(dim=-1).values.contiguous().view(torch.float32).view(-1))
++            nucl.append((k, scaled, at))
++            at += 2 * logits.shape[0]
++    if not words:
++        return []
++    flat = torch.cat(words) if len(words) > 1 else words[0]
++    got1 = gather(flat.contiguous())                              # [world, words]
++    host2 = None
++    if nucl:
++        # every rank's maxima of each nucleus row, then the rows' masses and candidates (nucleus_rows' arithmetic)
++        scaled_all, tops = [], []
++        for k, scaled, off in nucl:
++            R = scaled.shape[0]
++            m = got1[:, off:off + 2 * R].contiguous().view(torch.float64)        # [world, R]
++            tops.append(m.reshape(world, R).max(dim=0).values)
++            scaled_all.append(scaled)
++        scaled = torch.cat(scaled_all) if len(scaled_all) > 1 else scaled_all[0]
++        top = torch.cat(tops) if len(tops) > 1 else tops[0]
++        mass = torch.floor(torch.exp(scaled - top[:, None]) * MASS).to(torch.int64)
++        rows, width = scaled.shape
++        count = NUCLEUS
++        vals, cols = torch.topk(scaled, min(count, width), dim=-1)
++        ids = cols + int(w.vocab_offset)
++        pad = count - vals.shape[1]
++        if pad:
++            vals = torch.cat([vals, vals.new_full((rows, pad), float("-inf"))], dim=1)
++            ids = torch.cat([ids, ids.new_full((rows, pad), -1)], dim=1)
++        kept = mass.gather(1, cols)
++        kept = torch.cat([kept, kept.new_zeros((rows, pad))], dim=1) if pad else kept
++        shard = torch.tensor([[width]], dtype=torch.int64, device=scaled.device).expand(rows, 1)
++        packed = torch.cat([vals.view(torch.int64), ids, kept, mass.sum(dim=-1, keepdim=True), shard], dim=1)
++        words2 = packed.contiguous().view(torch.float32).view(-1)
++        host2 = gather(words2).reshape(-1, words2.numel()).view(torch.int64).reshape(-1, rows, 3 * count + 2)
++        host2 = host2.cpu().numpy()
++    host1 = got1.cpu()
++    for k, R, n, at in topk:
++        g = host1[:, at:at + R * 2 * n].reshape(host1.shape[0], R, 2 * n)
++        values = torch.cat([g[r, :, :n] for r in range(g.shape[0])], dim=1).numpy().astype(np.float32)
++        tokens = torch.cat([g[r, :, n:].contiguous().view(torch.int32) for r in range(g.shape[0])],
++                           dim=1).numpy().astype(np.int64)
++        _, positions, sampling = parts[k]
++        if sampling is None or sampling.temperature <= 0:
++            order = np.lexsort((tokens, -values), axis=-1)
++            out[k] = [int(tokens[i, order[i, 0]]) for i in range(R)]
++        else:
++            out[k] = choose_rows(values, tokens, positions, sampling)
++    if nucl:
++        r0 = 0
++        for k, scaled_k, _ in nucl:
++            R = scaled_k.shape[0]
++            both = host2[:, r0:r0 + R]
++            got = (np.ascontiguousarray(both[:, :, :count]).view(np.float64), both[:, :, count:2 * count],
++                   both[:, :, 2 * count:3 * count], both[:, :, 3 * count], both[:, :, 3 * count + 1])
++            _, positions, sampling = parts[k]
++            drawn = _draw(got, positions, sampling)
++            m_k = mass[r0:r0 + R]
++            if drawn is None and union_cover() and int(got[4].max()) > WIDER:     # as nucleus_rows: wider first
++                drawn = _draw(_shares(gather, scaled_k, m_k, WIDER, int(w.vocab_offset), None), positions, sampling)
++            if drawn is None:              # a row's nucleus runs past the candidates: this part reads whole shards
++                drawn = _draw(_shares(gather, scaled_k, m_k, int(got[4].max()), int(w.vocab_offset), None),
++                              positions, sampling)
++            out[k] = [token for token, _ in drawn]
++            r0 += R
++    return out
++
++
++# -- the profile -------------------------------------------------------------------------------------------------------
++class RoundProfile:
++    """TF_GLM_MULTI_PROFILE=N (rank 0): where a decode round's wall time goes, averaged over the last N rounds, and
++    the prompt chunks' share of the wall time between reports. Stages are host wall time between marks; ``verify``
++    also has the window's GPU time from CUDA events, read after the sampler has waited for it anyway."""
++
++    STAGES = ("plan", "message", "propose", "verify", "sample", "accept", "commit", "taps", "emit")
++
++    def __init__(self, every: int, log=print, label: str = "") -> None:
++        self.every, self.log, self.label = every, log, label
++        self.cuda = torch.cuda.is_available()
++        self.ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if self.cuda else None
++        self._reset()
++        self.t_report = time.perf_counter()
++
++    def _reset(self) -> None:
++        self.rounds = 0
++        self.sums = dict.fromkeys(self.STAGES + ("wall", "gpu"), 0.0)
++        self.rows = self.streams = self.tokens = self.drafted = 0
++        self.fill_s = 0.0
++        self.fills = 0
++
++    def begin(self, t0: float | None = None) -> None:
++        self.t0 = time.perf_counter() if t0 is None else t0
++        self.t = self.t0
++
++    def mark(self, stage: str) -> None:
++        now = time.perf_counter()
++        self.sums[stage] += now - self.t
++        self.t = now
++
++    def gpu_start(self) -> None:
++        if self.cuda:
++            self.ev[0].record()
++
++    def gpu_stop(self) -> None:
++        if self.cuda:
++            self.ev[1].record()
++
++    def fill(self, seconds: float) -> None:
++        self.fills += 1
++        self.fill_s += seconds
++
++    def end(self, streams: int, rows: int, tokens: int, drafted: int) -> None:
++        self.sums["wall"] += time.perf_counter() - self.t0
++        if self.cuda:
++            self.sums["gpu"] += self.ev[0].elapsed_time(self.ev[1]) / 1e3
++        self.rounds += 1
++        self.streams += streams
++        self.rows += rows
++        self.tokens += tokens
++        self.drafted += drafted
++        if self.rounds >= self.every:
++            self.report()
++
++    def report(self) -> None:
++        n = max(self.rounds, 1)
++        ms = {k: 1e3 * v / n for k, v in self.sums.items()}
++        staged = sum(ms[k] for k in self.STAGES)
++        span = time.perf_counter() - self.t_report
++        self.log(f"[tensorfold] multi profile{' (' + self.label + ')' if self.label else ''}, {self.rounds} rounds: {self.streams / n:.2f} streams, "
++                 f"{self.rows / n:.1f} rows ({self.drafted / n:.1f} drafted), {self.tokens / n:.2f} tokens a round; "
++                 f"ms a round: wall {ms['wall']:.1f} = " +
++                 " + ".join(f"{k} {ms[k]:.1f}" for k in self.STAGES) +
++                 f" + other {ms['wall'] - staged:.1f}; verify GPU {ms['gpu']:.1f}; "
++                 f"{self.tokens / max(self.sums['wall'], 1e-9):.1f} tok/s in rounds; prompt chunks {self.fills} "
++                 f"({1e3 * self.fill_s:.0f} ms, {100 * self.fill_s / max(span, 1e-9):.1f}% of {span:.1f} s)")
++        self._reset()
++        self.t_report = time.perf_counter()
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 2d13572..676a151 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -135,6 +135,33 @@ class BatchedVerify:
+         e.slots.conv[0].zero_()
+ 
+     # -- the window's tables -------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def time_rows(self, reps: int = 5) -> list[float]:
++        """ms of the captured window of each size (1 .. its rows): the fastest of ``reps`` replays, on the capture's
++        own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted."""
++
++        from .sparse import SPARSE_FROM
++
++        index = self.e.caches.index is not None
++        out = []
++        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        for R in range(1, self.rows_max + 1):
++            g = self.graphs[R]
++            self._stage([0] * R)
++            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self._write_table([(R, 0, 0, 0, R)])
++            best = float("inf")
++            for _ in range(reps + 1):
++                start.record()
++                g.replay()
++                stop.record()
++                stop.synchronize()
++                best = min(best, start.elapsed_time(stop))
++            out.append(best)
++        self.e.slots.rec[0].zero_()
++        self.e.slots.conv[0].zero_()
++        return out
++
+     def _tables(self, segments: Sequence[Segment], keeps: Sequence[int] | None = None) -> None:
+         """The KDA segment table (row0, rows, slot, parity, conv slot, keep) into the device copy, in place (a captured
+         graph reads the same tensor); unused segments have 0 rows."""

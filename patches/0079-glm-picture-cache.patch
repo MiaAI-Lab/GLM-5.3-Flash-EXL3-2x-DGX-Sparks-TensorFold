@@ -1,0 +1,199 @@
+# Our picture frontend cache: a request carries its whole conversation and every picture in it used to be decoded,
+# fitted and hashed again on every turn. Measured on two Sparks, 1920x1080 PNGs, prompt hot, engine prefill taken
+# out: 29.8 ms a picture -- 70 pictures 2.43 s of the first token before the engine saw the prompt. What reading a
+# source cost is remembered, keyed by the source's bytes: a later turn hands back the row count and the key without
+# reading it again. Host memory only; TENSORFOLD_GLM_PICTURE_CACHE=0 turns it off, ..._MB caps the source bytes.
+# vision/glm.py is identical in the v0.6.0-5e01f1bb74d8 and v0.6.0-9f73cca659a1 images; verified against both.
+# Apache-2.0.
+
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -16,6 +16,7 @@
+ import math
+ import os
+ import time
++from collections import OrderedDict
+ from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ from typing import Any
+@@ -44,6 +45,18 @@
+     return int(value)
+ 
+ 
++# A request carries the whole conversation, pictures and all, and every picture used to be decoded, fitted and hashed
++# again on every turn. Measured on two Sparks (v1.4, 1920x1080 PNGs, prompt hot, engine prefill taken out): 29.8 ms a
++# picture -- 10 pictures 0.64 s, 70 pictures 2.43 s of the first token before the engine saw the prompt. A source's
++# pixels never change, so what reading them cost is remembered here, keyed by the source's bytes: a hit hands back the
++# row count and the key, and the canvas while it is still in hand.
++# Host memory only, nothing on disk. TENSORFOLD_GLM_PICTURE_CACHE=0 turns it off; ..._MB caps the source bytes kept.
++PICTURE_CACHE = os.environ.get("TENSORFOLD_GLM_PICTURE_CACHE", "1").strip().lower() not in ("0", "off", "no", "false")
++PICTURE_CACHE_MB = _env_int("TENSORFOLD_GLM_PICTURE_CACHE_MB", 384, 16, 8192)
++PICTURE_CANVASES = _env_int("TENSORFOLD_GLM_PICTURE_CANVASES", 8, 0, 64)
++PICTURE_UNCAPPED = 8 * 1024 * 1024        # a decode with less room than this was squeezed; not worth remembering
++
++
+ @dataclass(frozen=True, slots=True)
+ class GlmVisionLimits:
+     """Token caps: the checkpoint allows 8,000 tokens a picture and 240,000 a clip; these keep a request's
+@@ -430,6 +443,26 @@
+ 
+ 
+ # -- the frontend ------------------------------------------------------------------------------------------------
++@dataclass(eq=False)
++class FittedPicture:
++    """A picture an earlier request with the same bytes already read: its placeholder count, its key and its pixels.
++
++    ``GlmPrepared.items`` holds one of these in place of a canvas; ``canvas`` is filled in when the picture is fitted
++    and dropped again once it is old, so the tower can ask for it (``GlmVision._canvas``) on the rare occasion it has
++    to encode a picture the prompt's resume did not keep."""
++
++    rows: int                          # the placeholder tokens the prompt spells out for it: (H // 28) * (W // 28)
++    key: int                           # 62-bit key of its kind, shape and pixels (prompt reuse tells pictures apart)
++    shape: tuple                       # the fitted canvas's shape: all ``_rows`` needs
++    pixels: int                        # the decoded picture's width * height (the request's pixel budget counts it)
++    digest: bytes                      # sha256 of the canvas: the prompt's content hash keeps its meaning
++    data: bytes = b""                  # the source's bytes, to fit it again if its canvas has been let go
++    detail: str = "auto"
++    tokens: int = 0
++    min_tokens: int = 16
++    canvas: Any = None
++
++
+ class GlmVision:
+     """What the server needs for GLM pictures and clips: ``prepare`` (rendered text -> tokens and items),
+     ``load_videos``, and the tower's ``features`` (rank 0)."""
+@@ -450,6 +483,8 @@
+             raise ValueError("the tokenizer's <|image|> id does not match config.json's image_token_id")
+         self.tower = GlmVisionTower(model_dir, device)
+         self.weight_bytes = self.tower.weight_bytes
++        self._pictures = OrderedDict()      # (bytes, detail, tokens, min_tokens) -> FittedPicture, LRU by bytes
++        self._canvases = OrderedDict()      # the last few fitted canvases, oldest first (by the record itself)
+ 
+     @property
+     def image_limits(self):
+@@ -470,7 +505,11 @@
+         return self.limits.max_videos
+ 
+     def load_images(self, sources) -> list:
+-        """The request's pictures, each decoded and fitted to its canvas (uint8 [3, H, W]) in turn."""
++        """The request's pictures, each decoded and fitted to its canvas (uint8 [3, H, W]) in turn.
++
++        A picture whose bytes, detail and token budget were seen before is not read again: what reading it cost is
++        remembered instead (``_remember``), which is what keeps a long chat from paying for all of its pictures on
++        every turn. The request's byte, pixel and time budgets still count every picture, read or remembered."""
+ 
+         from .images import _check_source, _data_bytes, _decode
+         from .images_http import fetch_image
+@@ -493,14 +532,69 @@
+                                       deadline=min(deadline, time.monotonic() + L.timeout_seconds),
+                                       max_redirects=L.max_redirects, max_url_chars=L.max_url_chars)
+             total_bytes += len(data)
+-            decoded = _decode(data, source.detail, L, L.max_total_pixels - total_pixels)
+-            total_pixels += decoded.width * decoded.height
+-            out.append(self._picture(decoded, tokens))
+-            del decoded
++            budget = L.max_total_pixels - total_pixels
++            key = (hashlib.sha256(data).digest(), source.detail, int(tokens), self.limits.min_tokens)
++            seen = self._pictures.get(key) if PICTURE_CACHE else None
++            if seen is not None:
++                self._pictures.move_to_end(key)
++                total_pixels += seen.pixels
++                out.append(seen)
++            else:
++                decoded = _decode(data, source.detail, L, budget)
++                total_pixels += decoded.width * decoded.height
++                out.append(self._remember(key, data, source.detail, tokens, decoded, budget))
++                del decoded
+             if time.monotonic() >= deadline:
+                 raise ImageInputError("image request exceeds the total time limit")
+         return out
+ 
++    def _remember(self, key: tuple, data: bytes, detail: str, tokens: int, decoded, budget: int) -> FittedPicture:
++        """Fit a picture that was not seen before and remember what that cost (its bytes too, to fit it again)."""
++
++        canvas = self._picture(decoded, tokens)
++        if not PICTURE_CACHE:
++            return canvas                     # off: the fitted canvas, exactly the path before this cache existed
++        head = b"image" + json.dumps(list(canvas.shape)).encode()
++        raw = canvas.numpy().tobytes()
++        seen = FittedPicture(rows=canvas.shape[1] // 28 * (canvas.shape[2] // 28),
++                             key=int.from_bytes(hashlib.sha256(head + b"\0" + raw).digest()[:8], "big") >> 2,
++                             shape=tuple(canvas.shape), pixels=int(decoded.width) * int(decoded.height),
++                             digest=hashlib.sha256(raw).digest(), data=data, detail=detail,
++                             tokens=int(tokens), min_tokens=self.limits.min_tokens, canvas=canvas)
++        if budget >= PICTURE_UNCAPPED:                        # a decode squeezed by the pixel budget is not kept
++            self._pictures[key] = seen
++            held = sum(len(x.data) for x in self._pictures.values())
++            while held > PICTURE_CACHE_MB * 1024 * 1024 and len(self._pictures) > 1:
++                held -= len(self._pictures.popitem(last=False)[1].data)
++        self._hold_canvas(seen)
++        return seen
++
++    def _hold_canvas(self, seen: FittedPicture) -> None:
++        """Keep the last few canvases in hand: a request re-encodes the pictures a resume did not keep, usually one."""
++
++        if not PICTURE_CANVASES:
++            return
++        self._canvases[seen] = True                # by the record itself: two sources can fit to the same canvas
++        while len(self._canvases) > PICTURE_CANVASES:
++            old = next(iter(self._canvases))
++            del self._canvases[old]
++            if old is not seen:
++                old.canvas = None
++
++    def _canvas(self, picture: FittedPicture):
++        """A remembered picture's pixels, read again from its bytes (the tower only needs the pictures a resume did
++        not keep: in practice the ones the request just brought, which were misses and are still in hand)."""
++
++        from .images import _decode
++
++        L = self.image_limits
++        decoded = _decode(picture.data, picture.detail, L, L.max_total_pixels)
++        canvas = self._picture(decoded, picture.tokens)
++        del decoded
++        picture.canvas = canvas
++        self._hold_canvas(picture)
++        return canvas
++
+     def load_videos(self, sources) -> list[GlmClip]:
+         from .videos import DEFAULT_VIDEO_LIMITS as L, VIDEO_MEDIA_TYPES
+         from .images import _data_bytes
+@@ -557,8 +651,11 @@
+                 break
+             if v < 0 or 0 <= i < v:
+                 picture = next(image_iter)          # load_images fits pictures as it decodes them
+-                picture = picture if hasattr(picture, "dim") else self._picture(picture, tokens)
+-                n = picture.shape[1] // 28 * (picture.shape[2] // 28)
++                if isinstance(picture, FittedPicture):
++                    n = picture.rows                # an earlier request with these bytes already fitted it
++                else:
++                    picture = picture if hasattr(picture, "dim") else self._picture(picture, tokens)
++                    n = picture.shape[1] // 28 * (picture.shape[2] // 28)
+                 pieces.append(rest[:i] + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
+                 items.append(("image", picture))
+                 rest = rest[i + len(IMAGE_SPAN):]
+@@ -583,6 +680,11 @@
+         digest = hashlib.sha256(b"tensorfold-glm-vision-v1\0")
+         keys = []
+         for kind, x in items:
++            if isinstance(x, FittedPicture):                # hashed when it was read
++                digest.update(kind.encode() + json.dumps(list(x.shape)).encode())
++                digest.update(x.digest)
++                keys.append(x.key)
++                continue
+             head = kind.encode() + json.dumps(list(x.shape)).encode()
+             data = x.numpy().tobytes()
+             digest.update(head)
+@@ -596,7 +698,11 @@
+         return pairs * (x.shape[-2] // 28) * (x.shape[-1] // 28)
+ 
+     def features(self, prepared: GlmPrepared):
+-        return self.tower.features(prepared.items)
++        """The tower's rows for a prompt's items, fitting a remembered picture only if the tower needs its pixels."""
++
++        items = [(kind, x.canvas if x.canvas is not None else self._canvas(x)) if isinstance(x, FittedPicture)
++                 else (kind, x) for kind, x in prepared.items]
++        return self.tower.features(items)
+ 
+     def warm(self) -> None:
+         """Run a small picture through the tower once, so its kernels are loaded before the first request."""

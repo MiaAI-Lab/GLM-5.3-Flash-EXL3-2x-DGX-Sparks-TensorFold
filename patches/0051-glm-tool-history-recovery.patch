@@ -1,0 +1,71 @@
+diff --git tensorfold/families/glm5_next/prompts.py tensorfold/families/glm5_next/prompts.py
+index 8763a93..2ec5dfa 100644
+--- tensorfold/families/glm5_next/prompts.py
++++ tensorfold/families/glm5_next/prompts.py
+@@ -3,10 +3,9 @@
+ from __future__ import annotations
+ 
+ import json
++import sys
+ from typing import Any
+ 
+-from tensorfold.server.errors import RequestError
+-
+ EFFORT_LINE = "<|system|>Reasoning Effort: Max"
+ OPENED = "<|assistant|><think>"
+ 
+@@ -20,7 +19,12 @@ def _call_id(message: Any) -> Any:
+ def agent_history(messages: Any) -> Any:
+     """A chat as GLM-5.3's template can render every part of it: a call's arguments sent as "" or null are no
+     arguments (the template reads them as a mapping), and results whose ids match none of their calls' ids are
+-    rendered in the order sent (the template sorts results by id and silently drops one it cannot place)."""
++    rendered in the order sent (the template sorts results by id and silently drops one it cannot place).
++
++    A call whose arguments are not a JSON object (a truncated or garbled string from a model, client or proxy) is
++    left out with its result, logged, rather than refused: an agent replays its history on every later turn, so a
++    refusal would end the conversation. Its message keeps its other calls, content and reasoning; its result is the
++    one with the call's id, else (no ids) the one in the call's place."""
+ 
+     if not isinstance(messages, list):
+         return messages
+@@ -29,7 +33,7 @@ def agent_history(messages: Any) -> Any:
+         calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
+         if not isinstance(calls, list) or not calls:
+             continue
+-        fixed = []
++        fixed, bad = [], []
+         for j, call in enumerate(calls):
+             function = call.get("function") if isinstance(call, dict) else None
+             arguments = function.get("arguments") if isinstance(function, dict) else {}
+@@ -41,13 +45,28 @@ def agent_history(messages: Any) -> Any:
+                 except ValueError:
+                     parsed = None
+                 if not isinstance(parsed, dict):
+-                    raise RequestError(f"messages[{i}].tool_calls[{j}].function.arguments must be a JSON object "
+-                                       f"(or empty), not {arguments[:80]!r}")
++                    print(f"[tensorfold] messages[{i}].tool_calls[{j}] ({_call_id(call)!r}): arguments are not a JSON "
++                          f"object ({arguments[:80]!r}); the call and its result are left out of the prompt",
++                          file=sys.stderr, flush=True)
++                    bad.append(j)
++                    continue
+             fixed.append(call)
+-        out[i] = {**message, "tool_calls": fixed}
+         end = i + 1
+         while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
+             end += 1
++        if bad:
++            ids = {_call_id(calls[j]) for j in bad} - {None}
++            by_place = not ids and end - i - 1 == len(calls)      # no ids: results in their calls' order
++            out[i + 1:end] = [r for k, r in enumerate(out[i + 1:end])
++                              if not (_call_id(r) in ids or (by_place and k in bad))]
++            end = i + 1
++            while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
++                end += 1
++        if fixed:
++            out[i] = {**message, "tool_calls": fixed}
++        else:
++            out[i] = {k: v for k, v in message.items() if k != "tool_calls"}
++            continue
+         known = {_call_id(call) for call in fixed}
+         if any(_call_id(result) and _call_id(result) not in known for result in out[i + 1:end]):
+             out[i + 1:end] = [{k: v for k, v in result.items() if k not in ("tool_call_id", "id")}

@@ -1,0 +1,282 @@
+# A stopped serial request (PARALLEL=1: client gone, stop string, a gate) ends on every rank within a round: rank 0's
+# stop rides on the round's sample all-gather; --parallel N>1 without DFlash2 refused up front (issue #38). MiaAI-Lab,
+# Apache-2.0.
+
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 70a5c34..ee97e62 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -437,7 +437,8 @@ class App:
+             return delta, raw
+ 
+         def on_tokens(new: list[int]) -> bool:
+-            # True stops the engine after this round; engines that finish on both ranks keep calling and get True
++            # True stops the engine after this round (two-rank GLM: every rank after the next one, ``StopVote``);
++            # an engine still running keeps calling and gets True
+             if playout is not None and playout.gone:
+                 stopped["client"] = True
+             if stopped["client"] or stopped["stop"] or failed:
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 40aa44e..eeb54be 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -19,15 +19,68 @@ from .sparse import pool_bucket
+ from .weights import Weights
+ 
+ 
++class StopVote:
++    """A serial run's stop (issue #38): rank 0's ``on_tokens`` asks for it (the client has gone, a stop string, a
++    gate's cut), and every rank learns it from the next verify sample's all-gather, which carries one float32 word
++    more for it (``sample_rows``' ``vote``), so all ranks end the run after the same round with no exchange of its
++    own. Wraps ``on_tokens``: a true result is this rank's wish (rank 1's callback never wishes); ``stop`` is the
++    agreed decision, alike on every rank. Only when the run ends changes: the tokens sampled never do."""
++
++    def __init__(self, on_tokens=None) -> None:
++        self.fn = on_tokens
++        self.mine = False               # this rank's on_tokens asked to stop (sticky)
++        self.agreed = False             # some rank asked, as of the last verify sample (sticky)
++        self.flags: torch.Tensor | None = None      # the last sample's gathered words, read when ``stop`` is asked
++
++    def __call__(self, tokens) -> bool:
++        if self.fn is not None and self.fn(tokens):
++            self.mine = True
++        return self.mine
++
++    def gather(self, gather):
++        """``gather`` (every rank's float32 words, [world, n]) with this rank's wish as one word more on its first
++        call (a sample's first exchange), the results given back without it."""
++
++        first = [True]
++
++        def voting(words: torch.Tensor) -> torch.Tensor:
++            if not first[0]:
++                return gather(words)
++            first[0] = False
++            flag = torch.full((1,), 1.0 if self.mine else 0.0, dtype=words.dtype, device=words.device)
++            got = gather(torch.cat([words.reshape(-1), flag]))
++            self.flags = got[:, -1]
++            return got[:, :-1].contiguous()
++
++        return voting
++
++    @property
++    def stop(self) -> bool:
++        if self.flags is not None:
++            self.agreed = self.agreed or bool((self.flags > 0).any())
++            self.flags = None
++        return self.agreed
++
++
++def stopped(e) -> bool:
++    """Whether every rank agreed to end this run (``StopVote``); False outside a voting run."""
++
++    vote = getattr(e, "vote", None)
++    return vote is not None and vote.stop
++
++
+ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None,
+-                offset: int | None = None, probs: list[float] | None = None) -> list[int]:
+-    """Rows of (this rank's vocabulary slice of) logits at their absolute positions -> tokens, same on all ranks."""
++                offset: int | None = None, probs: list[float] | None = None,
++                vote: StopVote | None = None) -> list[int]:
++    """Rows of (this rank's vocabulary slice of) logits at their absolute positions -> tokens, same on all ranks;
++    ``vote``: a ``StopVote`` whose wish rides on the sample's (first) all-gather."""
+ 
+     R = logits.shape[0]
+     greedy = sampling is None or sampling.temperature <= 0
+     if not greedy and not sampling.top_k:           # top_k off: the shared nucleus rule over every rank's shard
++        gather = one_rank if w.comm is None else comm_gather(w.comm)
+         return nucleus_rows(logits, positions, sampling, offset=w.vocab_offset if offset is None else offset,
+-                            gather=one_rank if w.comm is None else comm_gather(w.comm), probs=probs)
++                            gather=gather if vote is None else vote.gather(gather), probs=probs)
+     k = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
+     if probs is not None and greedy:
+         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
+@@ -36,11 +89,16 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+     if w.comm is None:
+         values = vals.cpu().numpy().astype(np.float32)
+         tokens = ids.cpu().numpy().astype(np.int64)
++        if vote is not None:
++            vote.gather(one_rank)(vals.new_zeros((0,)))
+     else:
+         packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
+-        got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
+-        w.comm.all_gather(packed.view(-1), got)
+-        g = got.view(w.world, R, 2 * k).cpu()
++        if vote is None:
++            got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
++            w.comm.all_gather(packed.view(-1), got)
++        else:
++            got = vote.gather(comm_gather(w.comm))(packed.view(-1))
++        g = got.reshape(w.world, R, 2 * k).cpu()
+         values = torch.cat([g[r, :, :k] for r in range(w.world)], dim=1).numpy().astype(np.float32)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w.world)], dim=1).numpy()
+         tokens = tokens.astype(np.int64)
+@@ -140,6 +198,7 @@ class Engine:
+         self.last_hidden: torch.Tensor | None = None
+         self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
+         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
++        self.vote: StopVote | None = None               # a serial run's stop vote, carried by each verify sample
+         self.draft_n = w.head.n
+         self.graphs = None
+         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
+@@ -218,7 +277,8 @@ class Engine:
+         if not draft and self.constraint is not None and self.window is not None:
+             self.constraint.mask(logits, self.window, self.w.vocab_offset)   # this rank's vocabulary columns
+             self.window = None
+-        return sample_rows(self.w, logits, positions, sampling, None, probs)
++        vote = None if draft else getattr(self, "vote", None)
++        return sample_rows(self.w, logits, positions, sampling, None, probs, vote)
+ 
+     def verify_window(self, tokens: list[int]) -> list[int]:
+         """The window a reply's grammar keeps (a chain cut at its first rejected draft), masked at the next sample."""
+@@ -649,8 +709,9 @@ class _Late:
+     """``on_tokens`` one round late: a round's tokens go to the caller once the next verify window is queued on the
+     GPU (``flush`` right after ``Engine.forward``), so the server's work on them (detokenizing, stop strings, the
+     stream write) runs while the GPU verifies instead of between rounds, where the GPU would wait for it. The loops
+-    never read on_tokens' result (both ranks decode to the end), so only when the tokens arrive changes: one round
+-    later, all of them before the loop returns (``flush`` again at its end)."""
++    never read on_tokens' result themselves: a stop it asks for reaches every rank through ``StopVote`` (the next
++    verify sample's all-gather), and the loops end after that round (``stopped``). Only when the tokens arrive
++    changes: one round later, all of them before the loop returns (``flush`` again at its end)."""
+ 
+     def __init__(self, on_tokens) -> None:
+         self.fn, self.held = on_tokens, None
+@@ -677,7 +738,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+     clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+-    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         clock.start()
+         logits = e.forward(e.verify_window([out[-1]]))
+         clock.stop()
+@@ -756,7 +817,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         depth = min(policy.next(0, 0), count - len(out))
+         drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+     stages["draft"] += time.perf_counter() - t0
+-    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+         R = len(tokens)
+@@ -789,7 +850,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         stages["forward"] += clock.seconds()
+         stages["sample"] += t2 - t1
+         stages["commit"] += t3 - t2
+-        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
++        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos) or stopped(e):
+             break
+         t4 = time.perf_counter()
+         was_copy = bool(copied)
+@@ -826,7 +887,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     _sync(w)
+     start = time.perf_counter()
+     depth = min(policy.next(0, 0), count - len(out))
+-    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         t0 = time.perf_counter()
+         copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+         if copied:
+diff --git tensorfold/families/glm5_next/cuda/draft_dump.py tensorfold/families/glm5_next/cuda/draft_dump.py
+index 9d420b9..425ea9d 100644
+--- tensorfold/families/glm5_next/cuda/draft_dump.py
++++ tensorfold/families/glm5_next/cuda/draft_dump.py
+@@ -25,7 +25,7 @@ import torch
+ from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+ 
+ from . import dflash2
+-from .decode import DecodeResult, _sync, commit
++from .decode import DecodeResult, _sync, commit, stopped
+ 
+ DUMP_ENV = "TF_GLM_DRAFT_DUMP"
+ TARGET_K = 32          # the target's top candidates kept a row (>= top_k 20 + MARGIN 8, so its sample re-derives)
+@@ -94,7 +94,7 @@ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None,
+     stages = {"block": 0.0, "forward": 0.0, "sample": 0.0, "commit": 0.0}
+     _sync(w)
+     start = time.perf_counter()
+-    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         t0 = time.perf_counter()
+         if drafter.context_end != st.pos:
+             raise RuntimeError(f"draft dump: the drafter's context ends at {drafter.context_end}, "
+diff --git tensorfold/families/glm5_next/cuda/drafter_choice.py tensorfold/families/glm5_next/cuda/drafter_choice.py
+index 01ad045..4652da5 100644
+--- tensorfold/families/glm5_next/cuda/drafter_choice.py
++++ tensorfold/families/glm5_next/cuda/drafter_choice.py
+@@ -8,7 +8,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import Sampling
+ 
+-from .decode import DecodeResult, DepthPolicy, Engine, _Clock, _Late, _sync, absorb, copy_room, draft
++from .decode import DecodeResult, DepthPolicy, Engine, _Clock, _Late, _sync, absorb, copy_room, draft, stopped
+ from .forward import commit
+ 
+ 
+@@ -94,7 +94,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+-    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
++    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         room = count - len(out)
+         t0 = time.perf_counter()
+         copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 64549a8..be14353 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -493,6 +493,13 @@ class GlmEngine:
+ 
+         if world not in SIZES:
+             raise ValueError(f"GLM-5.3-Flash's CUDA engine runs on {', '.join(map(str, SIZES))} ranks, not {world}")
++        if int(parallel) > 1 and drafter is None and not serial_only:
++            # before any connection or memory: the MTP head is not loaded under --parallel (``mtp_on`` below), so
++            # this used to fail later as "TF_GLM_MTP=0 leaves no MTP head" whatever TF_GLM_MTP said (issue #38)
++            raise ValueError(f"--parallel {int(parallel)}: concurrent requests draft with DFlash2 only (the "
++                             "checkpoint's MTP head drafts one request at a time, --parallel 1): give every rank "
++                             "the DFlash2 draft model (--drafter), serve with --parallel 1 for MTP drafts, or pass "
++                             f"--no-drafts to every rank to decode {int(parallel)} requests together without drafts")
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank, self.world = rank, world
+@@ -1071,12 +1078,13 @@ class GlmEngine:
+         try:
+             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
+         finally:
+-            self.e.constraint = self.e.window = None
++            self.e.constraint = self.e.window = self.e.vote = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                   feed=None, shared=()) -> dict[str, Any]:
+-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot, whole
++        from .decode import (DepthPolicy, StopVote, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot,
++                             whole)
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+@@ -1130,9 +1138,14 @@ class GlmEngine:
+         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+         stats.update(prefill_s=prefill_s, cached=cut)
++        # rank 0's on_tokens may ask to stop (the client has gone, a stop string, a gate's cut); rank 1's never does.
++        # Every rank hears it on the next round's verify sample (``decode.StopVote``) and ends after that round, so
++        # a stopped request frees the engine within a round or two instead of decoding to max_tokens (issue #38)
++        on_tokens = StopVote(on_tokens)
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
++        self.e.vote = on_tokens                     # on every rank alike: each verify gather carries one word more
+         policy = decode_policy(code, self.costs)
+         copies = None
+         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+@@ -1172,6 +1185,8 @@ class GlmEngine:
+         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
+                      tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
+                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
++        if on_tokens.stop:                          # ended early on a stop rank 0 asked for (``StopVote``)
++            stats["stopped"] = True
+         if res.arms:
+             stats.update(drafters=res.arms, keeps=res.keeps)
+         if policy is not None:

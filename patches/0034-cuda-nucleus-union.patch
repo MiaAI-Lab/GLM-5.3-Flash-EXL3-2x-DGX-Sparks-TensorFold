@@ -1,0 +1,75 @@
+diff --git tensorfold/cuda/sampling.py tensorfold/cuda/sampling.py
+index bf058e8..3def71f 100644
+--- tensorfold/cuda/sampling.py
++++ tensorfold/cuda/sampling.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ from collections.abc import Callable, Sequence
+ from fractions import Fraction
+ import math
++import os
+ 
+ import numpy as np
+ import torch
+@@ -119,6 +120,8 @@ def nucleus_rows(logits: torch.Tensor, positions: Sequence[int], sampling: Sampl
+     mass = torch.floor(torch.exp(scaled - top[:, None]) * MASS).to(torch.int64)
+     got = _shares(gather, scaled, mass, NUCLEUS, offset, id_map)
+     drawn = _draw(got, positions, sampling)
++    if drawn is None and union_cover() and int(got[4].max()) > WIDER:     # wider candidates first (the same draw)
++        drawn = _draw(_shares(gather, scaled, mass, WIDER, offset, id_map), positions, sampling)
+     if drawn is None:                           # some row's nucleus runs past the candidates: every whole shard
+         drawn = _draw(_shares(gather, scaled, mass, int(got[4].max()), offset, id_map), positions, sampling)
+     if probs is not None:
+@@ -145,17 +148,52 @@ def _shares(gather, scaled, mass, count, offset, id_map):
+             both[:, :, 2 * count:3 * count], both[:, :, 3 * count], both[:, :, 3 * count + 1])
+ 
+ 
++def union_cover() -> bool:
++    """TENSORFOLD_NUCLEUS_UNION=1: ``_draw``'s top_p coverage test on every rank's candidates together (the same
++    draws, fewer whole-shard reads on several ranks); every rank must be given the same setting."""
++
++    return os.environ.get("TENSORFOLD_NUCLEUS_UNION", "0") == "1"
++
++
++def _union_covers(vals, ids, mass, widths, r: int, need: int) -> bool:
++    """Whether row r's top_p nucleus lies inside the ranks' candidates taken together: walking them merged (value
++    down, then id) to the cumulative mass ``need`` stops at a value v* above the last candidate of every rank that
++    did not send its whole shard. A token no rank sent is at or below its rank's last candidate, below v*, so the
++    merged walk is the whole vocabulary's up to v*: the same nucleus, the same draw as from whole shards."""
++
++    partial = [k for k in range(vals.shape[0]) if int((ids[k, r] >= 0).sum()) != widths[k, r]]
++    if not partial:                                              # every rank sent its whole shard
++        return True
++    v, i, m = vals[:, r].reshape(-1), ids[:, r].reshape(-1), mass[:, r].reshape(-1)
++    order = np.lexsort((i, -v))
++    order = order[i[order] >= 0]
++    at = np.nonzero(np.cumsum(m[order]) >= need)[0]
++    if not len(at):
++        return False
++    top = v[order][int(at[0])]
++    for k in partial:
++        if not top > vals[k, r][ids[k, r] >= 0].min():
++            return False
++    return True
++
++
++WIDER = 16 * NUCLEUS    # TENSORFOLD_NUCLEUS_UNION: candidates a rank reads when a row's nucleus runs past NUCLEUS
++
++
+ def _draw(got, positions, s: Sampling) -> list[tuple[int, float]] | None:
+     """Each row's (token, its share of the mass) from every rank's candidates; None if a row needs whole shards."""
+ 
+     vals, ids, mass, sums, widths = got
+     cut = 0.0 < s.top_p < 1.0
++    union = cut and union_cover()
+     drawn = []
+     for r, position in enumerate(positions):
+         total = int(sums[:, r].sum())
+         need = math.ceil(Fraction(s.top_p) * total) if cut else None
+         floor = vals[:, r, :].max() + s.min_log                   # the min_p cut (-inf when off)
+-        for k in range(vals.shape[0]):                            # a rank's share must end inside its candidates
++        if union and not _union_covers(vals, ids, mass, widths, r, need):
++            return None
++        for k in range(0 if not union else vals.shape[0], vals.shape[0]):  # a rank's share inside its candidates
+             real = int((ids[k, r] >= 0).sum())
+             if real == widths[k, r]:                              # its whole shard
+                 continue

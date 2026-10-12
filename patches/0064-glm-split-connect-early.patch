@@ -1,0 +1,22 @@
+# TF_GLM_HC_SPLIT=1: the split's send/receive connection opens before the weights and the cache pool, so NCCL's
+# buffer registration no longer fails with ENOMEM on some Spark pairs (issue #36). MiaAI-Lab, Apache-2.0.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e4170a4..87f265f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -590,6 +590,14 @@ class GlmEngine:
+             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
+                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
++        if self.split.split and self.split.exchange == "p2p" and getattr(self.comm, "world", 2) == 2 \
++                and hasattr(self.comm, "exchange"):
++            # both ranks: open the split's send/receive connection before the weights and the cache pool take the
++            # memory; opened at the split's warm-up (after the pool), NCCL's buffer registration could fail with
++            # ENOMEM (ibv_reg_mr, issue #36). The connection stays open; nothing it sends changes
++            a = torch.zeros((1,), dtype=torch.float32, device="cuda")
++            self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
++            torch.cuda.synchronize()
+         w = load(model_dir, rank=rank, mtp=self.mtp_on)
+         w.comm = self.comm
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL

@@ -1,0 +1,129 @@
+# Rank messages sealed with a sequence number and a checksum (a desync is a named error), TF_GLM_MULTI_WATCHDOG_EXIT=1
+# (a stalled server exits after its stack dump), /health iteration_s (issue #29 diagnostics). MiaAI-Lab, Apache-2.0.
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 840d182..4c7f64e 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -71,13 +71,25 @@ def watchdog_seconds(value: str | None = None) -> float:
+     return s
+ 
+ 
++def watchdog_exits(value: str | None = None) -> bool:
++    """TF_GLM_MULTI_WATCHDOG_EXIT: 1 ends the process after the watchdog's first stack dump (a stalled server then
++    exits with code 1, so a supervisor can restart it, instead of holding its requests forever); 0 (default): dumps
++    every TF_GLM_MULTI_WATCHDOG_S and keeps waiting."""
++
++    raw = (os.environ.get("TF_GLM_MULTI_WATCHDOG_EXIT", "") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_MULTI_WATCHDOG_EXIT: 0 or 1, not {raw!r}")
++    return raw == "1"
++
++
+ def _watch(seconds: float, what: str) -> None:
+     if seconds > 0:
+         import faulthandler
+         import sys
+ 
++        stop = watchdog_exits()
+         try:                                              # the process's stderr (a test may have swapped sys.stderr)
+-            faulthandler.dump_traceback_later(seconds, repeat=True, file=sys.__stderr__, exit=False)
++            faulthandler.dump_traceback_later(seconds, repeat=not stop, file=sys.__stderr__, exit=stop)
+         except (ValueError, OSError, AttributeError):     # no file descriptor to write to: no watchdog
+             pass
+ 
+@@ -89,6 +101,36 @@ def _unwatch(seconds: float) -> None:
+         faulthandler.cancel_dump_traceback_later()
+ 
+ 
++SEAL_MOD = 2_147_483_647                 # a message's checksum, modulo this prime (int32 on the wire)
++
++
++def seal(msg: Sequence[int], seq: int) -> list[int]:
++    """Rank 0: an iteration's message with its sequence number and a checksum appended (``unseal`` on rank 1)."""
++
++    return [*msg, seq, digest(msg, seq)]
++
++
++def digest(msg: Sequence[int], seq: int) -> int:
++    a = np.asarray(msg, dtype=np.int64) % SEAL_MOD
++    w = np.arange(1, len(a) + 1, dtype=np.int64) % SEAL_MOD
++    return int((int((a * w % SEAL_MOD).sum()) + seq * 1_000_003) % SEAL_MOD)
++
++
++def unseal(msg: Sequence[int], seq: int) -> list[int]:
++    """Rank 1: the message rank 0 sealed as number ``seq``, or a RuntimeError naming what differs: the ranks would
++    otherwise apply different ops and wait on each other's collectives forever (issue #29's hangs had no error)."""
++
++    if len(msg) < 2:
++        raise RuntimeError(f"rank 1: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
++                           "the ranks are out of step: restart both")
++    body, got_seq, got = list(msg[:-2]), int(msg[-2]), int(msg[-1])
++    if got_seq != seq or got != digest(body, got_seq):
++        raise RuntimeError(f"rank 1: expected rank 0's message {seq}, received number {got_seq} "
++                           f"({'checksum matches' if got == digest(body, got_seq) else 'checksum differs'}, "
++                           f"{len(body)} values): the ranks are out of step: restart both")
++    return body
++
++
+ LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+ MAX_WINDOW = 32                          # rows of every stream's windows together in one round
+@@ -414,6 +456,9 @@ class MultiDecoder:
+             self._compare_paths()
+         self.msg = None                                  # TF_GLM_MULTI_ASYNC: rank 0's pinned message staging
+         self.watchdog = watchdog_seconds()               # stack dumps of a stalled iteration (TF_GLM_MULTI_WATCHDOG_S)
++        watchdog_exits()                                  # TF_GLM_MULTI_WATCHDOG_EXIT read now: a typo fails at start
++        self.iteration_since = None                       # when rank 0's current iteration began (/health)
++        self.sent = self.received = 0                     # messages sealed on rank 0, unsealed on rank 1
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
+         self.next_sid = self.next_kid = self.next_order = 0
+@@ -445,7 +490,10 @@ class MultiDecoder:
+                             "filling": sum(not l.decoding for l in lanes),
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+-                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {})}
++                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
++                "iteration_s": round(time.monotonic() - since, 1)
++                if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+ 
+     def _check(self) -> None:
+         if self.broken is not None:
+@@ -463,7 +511,8 @@ class MultiDecoder:
+         if self.idle:
+             self.g._ring()
+             self.idle = False
+-        msg, self.outbox = self.outbox, []
++        msg, self.outbox = seal(self.outbox, self.sent), []
++        self.sent = (self.sent + 1) % SEAL_MOD
+         if self.tune.async_msg or (self.fill_budget and (self.partial is not None or self.short_round_due)):
+             self._send(msg)
+         else:
+@@ -1002,6 +1051,7 @@ class MultiDecoder:
+ 
+         self._check()
+         _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
++        self.iteration_since = time.monotonic()           # /health's iteration_s
+         try:
+             return self._iterate()
+         except Exception as exc:
+@@ -1533,6 +1583,7 @@ class MultiDecoder:
+             self._flush()
+             self.idle = True
+         _unwatch(self.watchdog)
++        self.iteration_since = None
+ 
+     def _finish(self, sid: int) -> None:
+         """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
+@@ -1609,7 +1660,8 @@ class MultiDecoder:
+                 self.g._await_bell()
+                 self.idle = False
+             _watch(self.watchdog, "rank 1 message")       # busy: rank 0's next message is due within a round
+-            self.apply(self.g._share(None))
++            self.apply(unseal(self.g._share(None), self.received))
++            self.received = (self.received + 1) % SEAL_MOD
+             _unwatch(self.watchdog)
+             if once:
+                 return

@@ -1,0 +1,883 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 83f1ecc..b800c81 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -148,6 +148,8 @@ def make_handler(app: App):
+                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+                 if result["final"]:
+                     emit(result["final"])
++                for delta in result.get("call_deltas") or ():      # the end of calls streamed as they were written
++                    emit(delta)
+                 if result["calls"]:
+                     for i, call in enumerate(result["calls"]):
+                         if i < result.get("calls_streamed", 0):      # sent as deltas already
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+index 6fa1026..2f63be4 100644
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -1,4 +1,8 @@
+-"""The CUDA server's reply text: streamed decoding, think blocks and tool-call parsing (the Mac lane server's rules)."""
++"""The CUDA server's reply text: streamed decoding, think blocks and tool-call parsing (the Mac lane server's rules).
++
++Parts adapted from jayleaton/glm53-tensorfold-spark patch 0620 (Apache-2.0): the rule that calls written inside the
++think block are the reply's calls when they end it (its ``trailing_calls``), in ``ThinkSplit``.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -8,8 +12,8 @@ import uuid
+ from typing import Any
+ 
+ from tensorfold.server.stopping import StopPolicy
+-from tensorfold.server.tools import parse_glm_tool_call_block
+-from tensorfold.tool_parameters import decode_parameter, parameter_schemas
++from tensorfold.server.tools import _GLM_NAME_RE as _GLM_NAME, parse_glm_tool_call_block
++from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+@@ -155,4 +159,212 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+     return "".join(residue).strip(), calls or None
+ 
+ 
++_THINK_CLOSE = "</think>"
++_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
++THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
++
++
++def _call_run(text: str, start: int, finished: bool) -> tuple[int, str]:
++    """(where the run of complete ``<tool_call>`` blocks from ``start`` ends, what it is): ``"calls"`` when the reply
++    ended on it (nothing after it but whitespace and a closing ``</think>``), ``"pending"`` while that may still
++    come true, ``"reasoning"`` once text follows it (more reasoning, or an answer after the think block)."""
++
++    end = pos = start
++    while (block := _CALL_BLOCK.match(text, pos)) is not None:
++        end = block.end()
++        pos = len(text) - len(text[end:].lstrip())
++    after = text[end:].lstrip()
++    if after.startswith(_THINK_CLOSE) and not after[len(_THINK_CLOSE):].strip():
++        after = ""
++    if not after:
++        return end, "calls" if finished and end > start else "pending"
++    if not finished and (after.startswith(_CALL_OPEN) or _CALL_OPEN.startswith(after)
++                         or _THINK_CLOSE.startswith(after)):
++        return end, "pending"                   # a block, or the think block's close, being written
++    return end, "reasoning"
++
++
++class ThinkSplit:
++    """(reasoning, answer) of a thinking GLM reply with tools, streamed or whole: the think block ends at its
++    ``</think>``, and calls the model wrote inside it are its calls only when they end the reply (nothing after them
++    but whitespace and the block's close; theirs is the D5 rule of jayleaton/glm53-tensorfold-spark patch 0620, and
++    upstream's split read any call in an unclosed block as the answer). A call in the think block is held: its text
++    stays out of the reasoning until the reply ends on it (a call) or text follows it (reasoning after all). With
++    ``hold``, a held call longer than ``hold`` characters is taken as a call at once (``committed``) so a long file
++    write streams while it is written; nothing after it can make it reasoning again.
++
++    ``stream_from`` is where the text a call streamer reads begins once known (the answer, or a committed call); a
++    reply whose calls it never reaches has them from the end parser."""
++
++    def __init__(self, hold: int | None = None) -> None:
++        self.hold = hold
++        self.floor = 0                  # calls before this are reasoning
++        self.committed: int | None = None
++        self.stream_from: int | None = None
++
++    def __call__(self, text: str, finished: bool) -> tuple[str, str]:
++        if self.committed is not None:
++            at = self.committed
++            return text[:at], text[at:].replace(_THINK_CLOSE, "", 1).lstrip()
++        close = text.find(_THINK_CLOSE)
++        while True:
++            call = text.find(_CALL_OPEN, self.floor)
++            if close >= 0 and (call < 0 or close < call):
++                self.stream_from = close + len(_THINK_CLOSE)
++                return text[:close], text[self.stream_from:].lstrip("\n")
++            if call < 0:
++                held = 0 if finished else max(_partial_tag(text, tag) for tag in (_THINK_CLOSE, _CALL_OPEN))
++                return text[:len(text) - held], ""
++            end, kind = _call_run(text, call, finished)
++            if kind == "calls":
++                return text[:call], text[call:end]
++            if kind == "reasoning":
++                self.floor = max(end, call + len(_CALL_OPEN))
++                continue
++            if self.hold is not None and len(text) - call > self.hold and close < 0:
++                self.committed = self.stream_from = call
++                return self(text, finished)
++            return text[:call], ""
++
++
++_KEY, _KEY_END, _VALUE, _VALUE_END = "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"
++_VALUE_OPENS = re.compile(r"\s*<arg_value>")
++
++
++def _json(value: Any) -> str:
++    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++
++
++class GlmCallStreamer:
++    """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
++    deltas while they are written: a header (index, id, name) once the name is whole, then the arguments' JSON in
++    pieces, a string value as it arrives and a typed one when whole, joining to what ``parse_tool_calls`` gives.
++
++    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas. A block it cannot
++    follow (not GLM's markup, a tool the request did not offer) is skipped and stays with the end parser."""
++
++    def __init__(self, tools: list[dict[str, Any]]) -> None:
++        self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
++        self.schemas = parameter_schemas(tools)
++        self.calls: list[dict[str, Any]] = []          # every call whose header was sent, its arguments as sent
++        self.skipped: list[str] = []                    # whole blocks it did not follow, for the end parser
++        self.pos, self.state, self.start = 0, "outside", 0
++        self.open = False                               # the last call's header went out, its </tool_call> has not
++        self.schema: dict[str, Any] = {}               # the current call's parameter schemas
++        self.value_schema: dict[str, Any] | None = None     # the current typed value's schema, None for text
++        self.maybe_null = False                         # a nullable text value that may still be ``null``: held
++
++    def _args(self, out: list[dict[str, Any]], piece: str) -> None:
++        index = len(self.calls) - 1
++        self.calls[index]["function"]["arguments"] += piece
++        last = out[-1]["tool_calls"][0] if out else None
++        if last is not None and last["index"] == index and "id" not in last:      # one delta a call a feed
++            last["function"]["arguments"] += piece
++        else:
++            out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
++
++    def feed(self, text: str) -> list[dict[str, Any]]:
++        out: list[dict[str, Any]] = []
++        while True:
++            rest = text[self.pos:]
++            if self.state == "outside":
++                at = rest.find(_CALL_OPEN)
++                if at < 0:
++                    return out
++                self.start = self.pos + at
++                self.pos, self.state = self.start + len(_CALL_OPEN), "name"
++            elif self.state == "name":                  # the end parser's name: the text before <arg_key> or the end
++                ends = [at for at in (rest.find(_KEY), rest.find(_CALL_CLOSE)) if at >= 0]
++                if not ends:
++                    if len(rest) > 256:
++                        self.state = "skip"
++                        continue
++                    return out
++                name = rest[:min(ends)].strip()
++                if not self._callable(name):
++                    self.state = "skip"
++                    continue
++                name, id_ = self.known[name.lower()], f"call_{uuid.uuid4().hex[:24]}"
++                self.calls.append({"id": id_, "type": "function", "function": {"name": name, "arguments": ""}})
++                self.open = True
++                out.append({"tool_calls": [{"index": len(self.calls) - 1, "id": id_, "type": "function",
++                                            "function": {"name": name, "arguments": ""}}]})
++                self.schema = self.schemas.get(name.lower(), {})
++                self.pos, self.state = self.pos + min(ends), "arguments"
++            elif self.state == "skip":                  # a block the end parser decides: to its end
++                at = rest.find(_CALL_CLOSE)
++                if at < 0:
++                    return out
++                self.pos, self.state = self.pos + at + len(_CALL_CLOSE), "outside"
++                self.skipped.append(text[self.start:self.pos])
++            elif self.state == "arguments":             # text between arguments is ignored, as the end parser does
++                key, close = rest.find(_KEY), rest.find(_CALL_CLOSE)
++                if close >= 0 and (key < 0 or close < key):
++                    self._args(out, "}" if self.calls[-1]["function"]["arguments"] else "{}")
++                    self.pos, self.state, self.open = self.pos + close + len(_CALL_CLOSE), "outside", False
++                elif key >= 0:
++                    self.pos, self.state = self.pos + key + len(_KEY), "key"
++                else:
++                    return out
++            elif self.state == "key":
++                end = rest.find(_KEY_END)
++                opens = _VALUE_OPENS.match(rest, end + len(_KEY_END)) if end >= 0 else None
++                if opens is None:
++                    after = rest[end + len(_KEY_END):] if end >= 0 else ""
++                    cut = _CALL_CLOSE in (rest if end < 0 else after)
++                    if not cut and (end < 0 or not after.strip() or _VALUE.startswith(after.lstrip())):
++                        return out                      # the key or its value's opener is still being written
++                    self.state = "arguments"            # not an argument the end parser reads the same way
++                    continue
++                key = rest[:end].strip()
++                schema = self.schema.get(key, {})
++                self.value_schema = schema if typed_parameter(schema) else None
++                self.maybe_null = self.value_schema is None and nullable_text(schema)
++                opened = "{" if not self.calls[-1]["function"]["arguments"] else ","
++                quote = "" if self.value_schema is not None or self.maybe_null else '"'
++                self._args(out, opened + _json(key) + ":" + quote)
++                self.pos, self.state = self.pos + opens.end(), "value"
++            elif self.state == "value":
++                end = rest.find(_VALUE_END)
++                if self.value_schema is not None:       # typed: decoded whole, as the end parser does
++                    if end < 0:
++                        return out
++                    self._args(out, _json(decode_parameter(rest[:end], self.value_schema, python=False)))
++                elif self.maybe_null:                   # text or null: held while it may still be ``null``
++                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                    if end >= 0 and written == "null":
++                        self._args(out, "null")
++                    elif end < 0 and "null".startswith(written):
++                        return out
++                    else:
++                        self._args(out, '"')
++                        self.maybe_null = False
++                        continue
++                else:                                   # text: as it arrives, less a tail that may begin the closer
++                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                    piece = _json(written)[1:-1] + ('"' if end >= 0 else "")
++                    if piece:
++                        self._args(out, piece)
++                    if end < 0:
++                        self.pos += len(written)
++                        return out
++                self.pos, self.state = self.pos + end + len(_VALUE_END), "arguments"
++
++    def _callable(self, name: str) -> bool:
++        """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
++
++        if _GLM_NAME.fullmatch(name) is None or name.lower() not in self.known:
++            return False
++        try:
++            json.loads(name)                            # a name that is JSON (``true``, ``1``) is read as JSON
++        except ValueError:
++            return True
++        return False
++
++    def rest(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
++        """The calls the end parser reads in the blocks this streamer skipped (JSON or Qwen markup): sent at the end."""
++
++        return [call for block in self.skipped for call in parse_tool_calls(block, tools)[1] or []]
++
++
+ # -- chat template -------------------------------------------------------------------------
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 3707349..8a3ab2b 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -24,7 +24,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
++from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
++                                        hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+@@ -309,23 +310,40 @@ class App:
+         stopped = {"client": False, "stop": False}
+         failed: list[Exception] = []
+         stream = StreamDecoder(self.tok, ends)
+-        # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
+-        calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
++        # a streamed reply's GLM calls go out while they are written (a long file write would otherwise send nothing
++        # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
++        glm_calls = bool(tools) and self._glm_calls()
++        calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
++        # end parser
++        xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+         answer_raw = [""]
++        # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
++        think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
++                 else None)
+ 
+-        def visible(finished: bool) -> tuple[str, str]:
++        def split(raw: str, finished: bool) -> tuple[str, str]:
++            if not (chat and thinking):
++                return "", raw
++            return think(raw, finished) if think is not None else split_thinking(raw, finished=finished)
++
++        def call_text(raw: str) -> str:
++            """The text the call streamer reads: the answer, or a long call taken from the think block; "" before."""
++
++            if think is None:
++                return raw
++            return raw[think.stream_from:] if think.stream_from is not None else ""
++
++        def visible(finished: bool) -> tuple[str, str, str]:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
+-            if chat and thinking:
+-                reasoning, answer = split_thinking(raw, finished=finished)
+-            else:
+-                reasoning, answer = "", raw
++            reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+                 answer = (policy.content(answer, finished=finished) if policy.single
+                           else hide_tool_calls(answer, finished=finished))
+-            return reasoning, answer
++            return reasoning, answer, raw
+ 
+         serving: list[Any] = [None]
+ 
+@@ -346,7 +364,7 @@ class App:
+                 else:
+                     out.extend(new)
+                 stream.add(new)
+-                reasoning, answer = visible(False)
++                reasoning, answer, raw = visible(False)
+                 delta: dict[str, Any] = {}
+                 if len(reasoning) > sent["reasoning"]:
+                     delta["reasoning_content"] = reasoning[sent["reasoning"]:]
+@@ -354,10 +372,13 @@ class App:
+                 if len(answer) > sent["content"]:
+                     delta["content"] = answer[sent["content"]:]
+                     sent["content"] = len(answer)
+-                if delta and not emit(delta):
++                parts = [delta] if delta else []
++                if calls_stream is not None:
++                    parts += calls_stream.feed(call_text(raw))
++                if not all(emit(part) for part in parts):
+                     stopped["client"] = True
+-                if calls_stream is not None and not stopped["client"]:
+-                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
++                if xml_stream is not None and not stopped["client"]:
++                    for call_delta in xml_stream.feed(answer_raw[0]):     # never the reasoning
+                         if not emit(call_delta):
+                             stopped["client"] = True
+                             break
+@@ -442,29 +463,42 @@ class App:
+         if stopped["client"]:                                        # as the Mac server: nothing more is written
+             raise RequestCancelled("the client left during the reply")
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
+-        reasoning, answer = visible(True)
++        reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
+-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
++        raw_answer = split(text, True)[1]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
++        call_deltas, streamed = [], 0
++        # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the end
++        # (never streamed) are the end parser's, sent whole
++        if calls_stream is not None and (think is None or think.stream_from is not None):
++            call_deltas = calls_stream.feed(call_text(raw))
++            streamed = len(calls_stream.calls)
++            calls = [*calls_stream.calls, *calls_stream.rest(tools)] or None
++        cut = calls_stream is not None and calls_stream.open        # a streamed call the reply ended inside
++        if cut:                                 # its text went out as a call already, not again as content
++            content = answer.strip()
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail
+-        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
++        finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
++                                                         else "length")
+         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
+             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
+         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
+                     if probabilities is not None else None)
+         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
+-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+-        return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
++        if xml_stream is not None and xml_stream.streamed:
++            streamed = xml_stream.index + 1
++        return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
++                "finish": finish, "content": content, "reasoning": reasoning,
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+-                "stats": stats, "calls_streamed": streamed}
++                "stats": stats}
+ 
+     def _turns(self) -> Turns:
+         """The engine's turns (one request at a time, background ones last), made on first use."""
+@@ -482,6 +516,14 @@ class App:
+             close += self.tok.encode("\n\n", add_special_tokens=False).ids
+         return ThinkBudget(prepared.think_budget, close, think_end)
+ 
++    def _glm_calls(self) -> bool:
++        """Whether this model writes GLM's ``<arg_key>``/``<arg_value>`` calls (streamed while they are written): its
++        tokenizer has those marks as tokens."""
++
++        lookup = getattr(self.tok, "token_to_id", None)
++        return lookup is not None and all(lookup(mark) is not None for mark in ("<tool_call>", "<arg_key>",
++                                                                                "</arg_value>"))
++
+     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
+         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
+ 
+diff --git tensorfold/engine/tool_draft.py tensorfold/engine/tool_draft.py
+index bd64ae6..83497ba 100644
+--- tensorfold/engine/tool_draft.py
++++ tensorfold/engine/tool_draft.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import re
+ from typing import Any, Sequence
+ 
+-from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
++from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _OPEN = "<tool_call>"
+ _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
+@@ -252,6 +252,7 @@ class ToolCallStreamer:
+         self.schemas = parameter_schemas(tools)
+         self.current_schema = {}
+         self.typed = False
++        self.maybe_null = False     # a nullable text value that may still be ``null``: held in value_buffer
+         self.value_buffer = ""
+         self.known = {name.lower(): name for name in tool_schema(tools)}
+         self.pos = 0
+@@ -307,9 +308,10 @@ class ToolCallStreamer:
+                 if m is not None:
+                     self.value_schema = self.current_schema.get(m.group(1).strip(), {})
+                     self.typed = typed_parameter(self.value_schema)
++                    self.maybe_null = not self.typed and nullable_text(self.value_schema)
+                     self.value_buffer = ""
+-                    out.append(self._args(("," if self.args_open else "{")
+-                                          + self._esc_key(m.group(1).strip()) + (':' if self.typed else ':"')))
++                    out.append(self._args(("," if self.args_open else "{") + self._esc_key(m.group(1).strip())
++                                          + (':' if self.typed or self.maybe_null else ':"')))
+                     self.args_open = True
+                     self.pos += m.end()
+                     self.state = "value"
+@@ -339,11 +341,16 @@ class ToolCallStreamer:
+                     self.held = piece[len(keep):]
+                 if self.typed:
+                     self.value_buffer += keep
++                elif self.maybe_null:
++                    self.value_buffer += keep
++                    if not "null".startswith(self.value_buffer):    # text after all: the held part first
++                        out.append(self._args('"' + self._esc(self.value_buffer)))
++                        self.value_buffer, self.maybe_null = "", False
+                 elif keep:
+                     out.append(self._args(self._esc(keep)))
+                 if end < 0:
+                     break
+-                if self.typed:
++                if self.typed or self.maybe_null:
+                     import json
+                     out.append(self._args(json.dumps(decode_parameter(self.value_buffer, self.value_schema), ensure_ascii=False)))
+                 else:
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 350e5b0..c776de5 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -6,18 +6,25 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+-from tensorfold.families.glm5_next.prompts import thinking_off
++from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
++from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
+ 
+ 
+ class ThinkingOffTemplate:
+-    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``)."""
++    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
++    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
++    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
++    ``kept_reasoning.KeptReasoning``; None: off)."""
+ 
+-    def __init__(self, inner) -> None:
++    def __init__(self, inner, kept: KeptReasoning | None = None) -> None:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
++        self.kept = kept
+ 
+     def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
++        if self.kept is not None:
++            messages = self.kept.restore(messages)
++        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                  allow_images=allow_images)
+         return text if enable_thinking else thinking_off(text)
+ 
+@@ -48,7 +55,7 @@ class GlmApp(App):
+         super().__init__(engine, model_dir, served, **kwargs)
+         if self.vision is not None:
+             media_template(self.template, Path(model_dir))
+-        self.template = ThinkingOffTemplate(self.template)
++        self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env())
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+@@ -76,4 +83,9 @@ class GlmApp(App):
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+-        return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        kept = getattr(self.template, "kept", None)
++        if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
++            # the calls' reasoning, for a client that will not send it back
++            kept.remember(body.get("messages"), result["calls"], result.get("reasoning"))
++        return result
+diff --git tensorfold/families/glm5_next/cuda/kept_reasoning.py tensorfold/families/glm5_next/cuda/kept_reasoning.py
+new file mode 100644
+index 0000000..297326c
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kept_reasoning.py
+@@ -0,0 +1,155 @@
++"""The reasoning of GLM's tool-calling replies, put back into later requests whose client dropped it.
++
++Parts adapted from jayleaton/glm53-tensorfold-spark patch 0620 (Apache-2.0): its ``reasoning`` fix (the
++``ReasoningMemory`` LRU, keyed by the server's call ids and by a signature of the calls for clients that renumber
++ids). Here the signature covers the whole conversation before the calls, not only the last user message, so a reply
++is only ever put back into the conversation it was written for.
++
++GLM-5.3's template renders the reasoning of every assistant step after the last user message (interleaved thinking
++inside one tool loop). A client that does not send a step's reasoning back (spark-bench, many agent frameworks) gets
++``<think></think>`` for it: a context the model never wrote, and a prompt that stops matching the previous one at
++that step, so the prefix cache re-reads the rest. With the reasoning kept here, each prompt of a chain continues the
++last one as it was generated. A step that carries its own reasoning (``reasoning_content`` or ``reasoning``, or a
++``<think>`` block in its content) is never changed; an empty one (clients that send ``""`` for every step) is none.
++
++``TF_GLM_KEEP_REASONING``: replies kept (default 1024; 0 turns this off); ``TF_GLM_KEEP_REASONING_MB``: their text
++at most (default 32 MiB); the oldest go first.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import threading
++from collections import OrderedDict
++from typing import Any
++
++_OUR_ID = re.compile(r"^call_[0-9a-f]{24}$")      # the ids ``parse_tool_calls`` / ``GlmCallStreamer`` make
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        value = int(raw)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected a whole number") from None
++    if value < 0:
++        raise ValueError(f"{name}={raw!r}: expected 0 or more")
++    return value
++
++
++def _text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
++    return ""
++
++
++def _arguments(value: Any) -> Any:
++    if isinstance(value, str):
++        try:
++            return json.loads(value) if value.strip() else {}
++        except ValueError:
++            return value
++    return {} if value is None else value
++
++
++def _calls(calls: Any) -> list[list[Any]]:
++    """Calls as [name, arguments]: ids dropped (clients renumber them), arguments parsed (clients re-serialise)."""
++
++    out = []
++    for call in calls if isinstance(calls, list) else []:
++        fn = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
++        out.append([str(fn.get("name") or ""), _arguments(fn.get("arguments"))])
++    return out
++
++
++def signature(history: list[Any], calls: Any) -> str:
++    """The key of ``calls`` written after ``history``: each message's role, text (stripped, as the template renders
++    it) and calls, without ids or reasoning, then the calls."""
++
++    shape = []
++    for m in history:
++        if not isinstance(m, dict):
++            continue
++        entry = [str(m.get("role") or ""), _text(m.get("content")).strip()]
++        if m.get("role") == "assistant" and m.get("tool_calls"):
++            entry.append(_calls(m.get("tool_calls")))
++        shape.append(entry)
++    text = json.dumps([shape, _calls(calls)], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
++    return "sig:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
++
++
++def _keys(history: list[Any], calls: Any) -> list[str]:
++    ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
++    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [signature(history, calls)]
++
++
++class KeptReasoning:
++    """Recent tool-calling replies' reasoning (LRU, bounded in replies and characters), found by any of its keys."""
++
++    def __init__(self, entries: int = 1024, chars: int = 32 << 20) -> None:
++        self.entries, self.chars = int(entries), int(chars)
++        self.items: OrderedDict[int, tuple[str, tuple[str, ...]]] = OrderedDict()
++        self.by_key: dict[str, int] = {}
++        self.size = self.next = 0
++        self.lock = threading.Lock()
++
++    @classmethod
++    def from_env(cls) -> "KeptReasoning | None":
++        entries = _env_int("TF_GLM_KEEP_REASONING", 1024)
++        return cls(entries, _env_int("TF_GLM_KEEP_REASONING_MB", 32) << 20) if entries else None
++
++    def __len__(self) -> int:
++        return len(self.items)
++
++    def remember(self, messages: Any, calls: Any, reasoning: Any) -> None:
++        """Keep the ``reasoning`` of a reply that made ``calls`` after the request's ``messages``."""
++
++        if not calls or not isinstance(reasoning, str) or not reasoning.strip() or len(reasoning) > self.chars:
++            return
++        keys = tuple(_keys(messages if isinstance(messages, list) else [], calls))
++        with self.lock:
++            n, self.next = self.next, self.next + 1
++            self.items[n] = (reasoning, keys)
++            self.size += len(reasoning)
++            for key in keys:                    # a key kept again points at the newer reply
++                self.by_key[key] = n
++            while len(self.items) > self.entries or self.size > self.chars:
++                old, (text, old_keys) = self.items.popitem(last=False)
++                self.size -= len(text)
++                for key in old_keys:
++                    if self.by_key.get(key) == old:
++                        del self.by_key[key]
++
++    def _find(self, keys: list[str]) -> str | None:
++        with self.lock:
++            for key in keys:
++                n = self.by_key.get(key)
++                if n is not None:
++                    self.items.move_to_end(n)
++                    return self.items[n][0]
++        return None
++
++    def restore(self, messages: Any) -> Any:
++        """``messages`` with the kept reasoning of each assistant step that calls tools and carries none (a copy;
++        the caller's list and messages are left alone)."""
++
++        if not isinstance(messages, list) or not self.items:
++            return messages
++        out = None
++        for i, m in enumerate(messages):
++            if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
++                    and not _text(m.get("reasoning_content")).strip() and not _text(m.get("reasoning")).strip()
++                    and "</think>" not in _text(m.get("content"))):
++                continue
++            kept = self._find(_keys(messages[:i], m["tool_calls"]))
++            if kept is not None:
++                out = out if out is not None else list(messages)
++                out[i] = {**m, "reasoning_content": kept}
++        return messages if out is None else out
+diff --git tensorfold/families/glm5_next/prompts.py tensorfold/families/glm5_next/prompts.py
+index 0bf8532..8763a93 100644
+--- tensorfold/families/glm5_next/prompts.py
++++ tensorfold/families/glm5_next/prompts.py
+@@ -2,12 +2,59 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from typing import Any
+ 
++from tensorfold.server.errors import RequestError
++
+ EFFORT_LINE = "<|system|>Reasoning Effort: Max"
+ OPENED = "<|assistant|><think>"
+ 
+ 
++def _call_id(message: Any) -> Any:
++    """The id GLM's template matches a tool result or call by (its ``id_of``)."""
++
++    return message.get("tool_call_id") or message.get("id") if isinstance(message, dict) else None
++
++
++def agent_history(messages: Any) -> Any:
++    """A chat as GLM-5.3's template can render every part of it: a call's arguments sent as "" or null are no
++    arguments (the template reads them as a mapping), and results whose ids match none of their calls' ids are
++    rendered in the order sent (the template sorts results by id and silently drops one it cannot place)."""
++
++    if not isinstance(messages, list):
++        return messages
++    out = list(messages)
++    for i, message in enumerate(out):
++        calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
++        if not isinstance(calls, list) or not calls:
++            continue
++        fixed = []
++        for j, call in enumerate(calls):
++            function = call.get("function") if isinstance(call, dict) else None
++            arguments = function.get("arguments") if isinstance(function, dict) else {}
++            if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
++                call = {**call, "function": {**function, "arguments": {}}}
++            elif isinstance(arguments, str):
++                try:
++                    parsed = json.loads(arguments)
++                except ValueError:
++                    parsed = None
++                if not isinstance(parsed, dict):
++                    raise RequestError(f"messages[{i}].tool_calls[{j}].function.arguments must be a JSON object "
++                                       f"(or empty), not {arguments[:80]!r}")
++            fixed.append(call)
++        out[i] = {**message, "tool_calls": fixed}
++        end = i + 1
++        while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
++            end += 1
++        known = {_call_id(call) for call in fixed}
++        if any(_call_id(result) and _call_id(result) not in known for result in out[i + 1:end]):
++            out[i + 1:end] = [{k: v for k, v in result.items() if k not in ("tool_call_id", "id")}
++                              for result in out[i + 1:end]]
++    return out
++
++
+ def thinking_off(text: str) -> str:
+     """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
+ 
+@@ -25,6 +72,7 @@ class GlmTokenizer:
+         return getattr(self._inner, name)
+ 
+     def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
++        messages = agent_history(messages)
+         if kwargs.get("enable_thinking", True) is not False:
+             return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
+         text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
+diff --git tensorfold/server/messages.py tensorfold/server/messages.py
+index dde2b67..2679969 100644
+--- tensorfold/server/messages.py
++++ tensorfold/server/messages.py
+@@ -73,6 +73,11 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+         elif not isinstance(content, str):
+             raise RequestError("message content must be text or an array of text parts")
+         item = message if content is message.get("content") else {**message, "content": content}
++        if (role == "assistant" and not isinstance(message.get("reasoning_content"), str)
++                and isinstance(message.get("reasoning"), str)):
++            # vLLM's newer replies and OpenRouter's name a step's reasoning ``reasoning``; templates read
++            # ``reasoning_content``, and without it a tool step's reasoning is dropped from the resent history
++            item = {**item, "reasoning_content": message["reasoning"]}
+         if role in ("system", "developer"):
+             if not out:
+                 instructions.append(item)
+diff --git tensorfold/tool_parameters.py tensorfold/tool_parameters.py
+index d722004..6e07f31 100644
+--- tensorfold/tool_parameters.py
++++ tensorfold/tool_parameters.py
+@@ -1,4 +1,9 @@
+-"""Schema-aware decoding of Qwen XML parameter text."""
++"""Schema-aware decoding of Qwen XML parameter text.
++
++Parts adapted from jayleaton/glm53-tensorfold-spark patch 0620 (Apache-2.0): ``const`` schemas, and ``null`` read as
++None for a nullable string (its ``typed_value``), here in the shared decoder that every parser and both streamers use.
++Its coercions that change what a resent history renders (quoted scalars, Python literals, integral floats) are not.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -24,9 +29,39 @@ def parameter_schemas(tools: Sequence[dict[str, Any]] | None) -> dict[str, dict[
+     return result
+ 
+ 
+-def typed_parameter(schema: dict[str, Any]) -> bool:
++_TYPED = frozenset({"array", "object", "boolean", "integer", "number", "null"})
++_KINDS = {bool: "boolean", int: "integer", float: "number", str: "string", type(None): "null", list: "array",
++          dict: "object"}
++
++
++def schema_types(schema: dict[str, Any]) -> frozenset[str]:
++    """The JSON types a parameter schema admits: its ``type`` (a name or a list of names), else those of its
++    ``anyOf`` / ``oneOf`` members (none if a member is untyped), else those of its ``enum`` values or ``const``."""
++
+     kind = schema.get("type")
+-    return isinstance(kind, str) and kind in {"array", "object", "boolean", "integer", "number", "null"}
++    if isinstance(kind, str):
++        return frozenset({kind})
++    if isinstance(kind, list):
++        return frozenset(k for k in kind if isinstance(k, str))
++    for key in ("anyOf", "oneOf"):
++        members = schema.get(key)
++        if isinstance(members, list) and members:
++            found = [schema_types(m) if isinstance(m, dict) else frozenset() for m in members]
++            return frozenset().union(*found) if all(found) else frozenset()
++    enum = schema.get("enum")
++    if isinstance(enum, list) and enum:
++        return frozenset(_KINDS.get(type(v), "string") for v in enum)
++    if "const" in schema:
++        return frozenset({_KINDS.get(type(schema["const"]), "string")})
++    return frozenset()
++
++
++def typed_parameter(schema: dict[str, Any]) -> bool:
++    """Whether a value is read as JSON: every type the schema admits is a JSON one other than string (a union with
++    string, such as ``["string", "null"]``, keeps the text as written)."""
++
++    kinds = schema_types(schema)
++    return bool(kinds) and kinds <= _TYPED
+ 
+ 
+ def closed_json(text: str) -> str | None:
+@@ -68,22 +103,39 @@ def _python_literal(text: str) -> Any:
+         raise ValueError(str(exc)) from None
+ 
+ 
++def nullable_text(schema: dict[str, Any]) -> bool:
++    """Whether a text value may also be null (``["string", "null"]``, pydantic's ``Optional[str]``): its value
++    ``null`` is None, as vLLM's GLM and Qwen parsers read it and as the templates render a None argument."""
++
++    kinds = schema_types(schema)
++    return "string" in kinds and "null" in kinds
++
++
+ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True) -> Any:
+-    """``value`` as the schema's type when it spells one, else the text; ``python`` also reads Python's spelling."""
++    """A parameter's text read by its schema: a string schema keeps the text (a nullable one reads ``null`` as None,
++    which the template renders back as ``null``); a typed one reads JSON of an admitted type, or the value closed
++    (#87), and with ``python`` (Qwen's parsers) Python's spelling of one (``True``, ``None``, ``['a']``). Anything
++    else stays as written, so a resent history renders the tokens the model wrote: GLM's parsers pass python=False
++    (a quoted ``"5"``, Python's ``True`` or ``2.0`` for an integer are not coerced: their JSON would render
++    differently)."""
+ 
+     if not typed_parameter(schema):
+-        return value
+-    kind = schema["type"]
+-    valid = {
+-        "array": lambda v: isinstance(v, list),
+-        "object": lambda v: isinstance(v, dict),
+-        "boolean": lambda v: isinstance(v, bool),
+-        "integer": lambda v: type(v) is int,
+-        "number": lambda v: type(v) in (int, float),
+-        "null": lambda v: v is None,
+-    }[kind]
++        return None if nullable_text(schema) and value == "null" else value
++    kinds = schema_types(schema)
++
++    def admitted(parsed: Any) -> bool:
++        valid = {
++            "array": isinstance(parsed, list),
++            "object": isinstance(parsed, dict),
++            "boolean": isinstance(parsed, bool),
++            "integer": type(parsed) is int,
++            "number": type(parsed) in (int, float),
++            "null": parsed is None,
++        }
++        return any(valid[kind] for kind in kinds)
++
+     # a model can end an object or array value one closer short (#87): the value closed is what it meant
+-    for text in (value, closed_json(value) if kind in ("array", "object") else None):
++    for text in (value, closed_json(value) if kinds & {"array", "object"} else None):
+         if text is None:
+             continue
+         try:
+@@ -91,7 +143,7 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
+             json.dumps(parsed, allow_nan=False)
+         except (ValueError, TypeError):
+             continue
+-        return parsed if valid(parsed) else value
++        return parsed if admitted(parsed) else value
+     # not JSON: Python's spelling (True, None, single-quoted strings), as vLLM's Qwen parsers also accept
+     if not python:
+         return value
+@@ -100,4 +152,4 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
+         json.dumps(parsed, allow_nan=False)
+     except (ValueError, TypeError):
+         return value
+-    return parsed if valid(parsed) else value
++    return parsed if admitted(parsed) else value

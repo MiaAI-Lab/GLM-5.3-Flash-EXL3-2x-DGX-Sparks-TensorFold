@@ -1,0 +1,46 @@
+diff --git tensorfold/server/request_options.py tensorfold/server/request_options.py
+index 041c873..ad97a21 100644
+--- tensorfold/server/request_options.py
++++ tensorfold/server/request_options.py
+@@ -38,13 +38,13 @@ def parse_numbers(fields: dict[str, Any]) -> dict[str, Any]:
+     return parsed
+ 
+ 
+-EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
++EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+ 
+ 
+ def effort_levels(template: str | None) -> frozenset[str]:
+-    """The efforts a chat template names: Qwen3.8's low, medium and xhigh; GLM-5.3's low and high."""
++    """The efforts a chat template names: Qwen3.8's low, medium and xhigh; GLM-5.3's low, high and max."""
+ 
+-    return frozenset(re.findall(r"""['"](minimal|low|medium|high|xhigh)['"]""", template or ""))
++    return frozenset(re.findall(r"""['"](minimal|low|medium|high|xhigh|max)['"]""", template or ""))
+ 
+ 
+ def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> str | None:
+@@ -52,11 +52,12 @@ def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> s
+ 
+     if effort is None:
+         return None
+-    # OpenAI's "high" and "minimal" are "xhigh" and "low" unless the template names them (GLM-5.3 names "high")
+-    if effort in levels or effort not in ("high", "minimal"):
++    # OpenAI's "high" and "minimal" are "xhigh" and "low" unless the template names them (GLM-5.3 names "high"),
++    # and "max" is the template's own top level where it names one (GLM-5.3's default), else "xhigh"
++    if effort in levels or effort not in ("high", "minimal", "max"):
+         chosen = effort
+     else:
+-        chosen = "xhigh" if effort == "high" else "low"
++        chosen = {"high": "xhigh", "minimal": "low", "max": "xhigh"}[effort]
+     # GLM lists high and leaves medium unnamed. medium is that high. xhigh stays xhigh, and the template renders Max.
+     if chosen == "medium" and "high" in levels and "medium" not in levels:
+         return "high"
+@@ -79,7 +80,7 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset())
+         effort = kwargs.get("reasoning_effort")           # where vLLM's clients put it
+     if effort is not None:
+         if not isinstance(effort, str) or effort not in EFFORTS:
+-            raise RequestError("reasoning_effort must be none, minimal, low, medium, high or xhigh")
++            raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max")
+         fields["reasoning_effort"] = coerce_effort(effort, levels)
+         fields["enable_thinking"] = effort != "none"
+     if isinstance(kwargs, dict) and "enable_thinking" in kwargs:          # an explicit switch wins

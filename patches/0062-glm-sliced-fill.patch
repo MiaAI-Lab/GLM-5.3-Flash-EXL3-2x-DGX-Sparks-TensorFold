@@ -1,0 +1,819 @@
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 21f81ef..70a5c34 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -540,6 +540,9 @@ class App:
+                     from tensorfold.vision.qwen_processing import continued
+ 
+                     extra["vision"] = continued(prepared.vision, ids, self.vision.frontend.config)
++            # generate_gated wraps on_tokens: attach the poll to the actual callback
++            # reaching the scheduler, without invoking its streaming/pacing state.
++            feed.cancelled = cancelled
+             stats = self.engine.generate(ids, count, sampling, feed, **extra)
+             if not cached:
+                 cached.append(int((stats or {}).get("cached") or 0))
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 9b80e31..be872ae 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -558,6 +558,25 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
+     return out
+ 
+ 
++def prefill_chunk_steps(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
++                        head: bool = True):
++    """The concurrent prompt path, with a yield per layer and commit only after the final slice."""
++    from .forward import compute_steps
++
++    w, st, b = e.w, e.st, e.pbuf
++    chunk = list(prompt[start:start + R])
++    inject = feed.chunk(start, R) if feed is not None else None
++    out = yield from compute_steps(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R),
++                                   host_pos=st.pos, inject=inject, head=head)
++    out = out.clone() if head else None
++    e.last_hidden = b.fnormed[R - 1:R].clone()
++    if drafter is not None:
++        drafter.add_taps(e.tap_rows(R, b))
++    with prof.timed("commit"):
++        commit(w, st, b, R, R)
++    return out
++
++
+ def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
+     """A prompt's rows into the MTP cache through the prefill buffers (the prefill arithmetic, like the prompt)."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 267e84c..e4170a4 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -533,7 +533,9 @@ class GlmEngine:
+             verify_code = 1 + ("batched", "serial").index(verify_kind())
+             from .multi_tune import MultiSettings
+ 
+-            verify_code = [verify_code] + MultiSettings.from_env().code()
++            from .sliced_fill import budget_ms
++
++            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
+         else:
+             verify_code = [verify_code]
+         # both ranks must run the same calls: refuse to start when they were given different settings
+@@ -679,7 +681,8 @@ class GlmEngine:
+                       f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+-                      f"{self.multi.tune.describe()}", flush=True)
++                      f"{self.multi.tune.describe()}"
++                      f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms' if self.multi.fill_budget else ''}", flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index c32686e..f1c4d14 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -856,8 +856,8 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
+-def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+-                 mixer=None) -> None:
++def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++                      mixer=None):
+     """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
+     (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
+     the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean.
+@@ -890,10 +890,60 @@ def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, hos
+                 sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
+                         taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None, front=front)
+             done = sp.own() if front is not None else None
++            yield layer.index
+     finally:
+         sp.finish()
+ 
+ 
++def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++                 mixer=None) -> None:
++    for _ in split_layer_steps(w, st, b, R, nch, host_pos, mixer):
++        pass
++
++
++def compute_steps(w: Weights, st: State, b: Buffers, R: int, *, nch: int | None = None,
++                  host_pos: int | None = None, inject=None, head: bool = True, mixer=None):
++    """Prompt-only forward yielding after each complete layer; returns the head on exhaustion.
++
++    All live rows, taps and overlapped fronts stay in the engine's dedicated pbuf. A split boundary retains
++    only this rank's hidden rows plus the already prepared next front, exactly as the uninterrupted split loop.
++    The scheduler drains CUDA before a decode round; verify never borrows pbuf. KDA's global temporary scratch
++    is consumed inside a layer, so nothing in it needs to survive this yield.
++    """
++    if not b.prefill:
++        raise ValueError("layer-sliced forwards require prompt buffers")
++    c = w.cfg
++    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    if inject is not None:
++        rows, features = inject
++        b.x.index_copy_(0, rows, features.repeat(1, c.streams))
++    split = b.split is not None and b.split.applies(R)
++    if split:
++        steps = split_layer_steps(w, st, b, R, nch, host_pos, mixer)
++        try:
++            for i in steps:
++                b.split.finish()                    # main stream joins the overlap exchanges/fronts
++                yield i
++                # A decode round may have used the main stream since the last yield. Geometry and prompt
++                # buffers remain intact; the overlap stream must join the new main-stream work before reuse.
++                if b.split.stream is not None:
++                    b.split.stream.wait_stream(torch.cuda.current_stream())
++                b.split.active = True
++        finally:
++            steps.close()
++    else:
++        for layer in w.layers:
++            layer_forward(layer, w, st, b, R, nch, host_pos, None, mixer)
++            for slot in b.tap_at.get(layer.index, ()):
++                glue.stream_mean(b.x[:R], b.taps[slot][:R])
++            yield layer.index
++        glue.stream_mean(b.x[:R], b.hidden[:R])
++    glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if head:
++        return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
++    return None
++
++
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+     pos = st.pos if pos is None else pos
+     if pos + R > w.cfg.dense_limit and st.index is None:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 9c66222..1b2efbc 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -8,7 +8,8 @@ window scratch; a DFlash2 context, ``dflash2_multi.DraftContext``; host side its
+ 
+ Iterations (``GlmScheduler``, one worker thread on rank 0): admissions, then either one prompt chunk of the oldest
+ filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the engine's prompt chunk alone) or one
+-decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. With
++decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. TF_GLM_FILL_BUDGET_MS>0
++yields between layer slices of a busy fill, retaining its prompt buffers while a decode round runs. With
+ TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
+ stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
+ budget). A round: each
+@@ -16,10 +17,14 @@ decoding stream (admission order) proposes drafts under its own DFlash2 policy (
+ window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
+ (``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
+ DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own forward; TF_GLM_MULTI_VERIFY),
+-one packed all-gather for the samplers, each stream accepts and commits its own.
++one packed all-gather for the samplers, each stream accepts and commits its own. Between prompt slices, a
++round takes one token per stream without drafts to keep its latency and the newcomer's inserted work small;
++TF_GLM_FILL_SHARE applies to unsliced fills, slices alternate with these short rounds. Contiguous layer ranges
++are balanced within the budget without adding rounds; GPU layer cost, finalization and dispatch overhead are
++learned separately so extra slices cannot inflate every layer cost.
+ 
+ Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
+-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, ROUND, FINISH, IDLE, which both ranks apply
++ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH, IDLE, which both ranks apply
+ in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
+ sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
+ ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
+@@ -42,14 +47,14 @@ import torch
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill
++from . import multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART = range(1, 13)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL"}
++       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -337,6 +342,12 @@ class MultiDecoder:
+         self.arena = e.caches.arena
+         self.grid = engine.grid
+         self.fill_rows = fill_rows(e.prefill_rows, self.grid)
++        self.fill_budget = sliced_fill.budget_ms()
++        self.fill_drafts = sliced_fill.drafted_rounds()     # rank 0 decides; the ROUND message carries it
++        self.partial = None
++        self.fill_costs = None
++        self.decode_due = False
++        self.short_round_due = False
+         self.share = fill_share()
+         self.credit = 0.0
+         # TF_GLM_MULTI_PREFILL: rank 0 groups filling streams into one chunk (rank 1 applies whatever MFILL it gets)
+@@ -394,6 +405,8 @@ class MultiDecoder:
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+         self.eos = tuple(self.w.cfg.eos)
+         self.dflash_code = encode_policy(DFLASH_POLICY)
++        if self.fill_budget:
++            self.fill_costs = self._time_prompt_layers()
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -433,7 +446,7 @@ class MultiDecoder:
+             self.g._ring()
+             self.idle = False
+         msg, self.outbox = self.outbox, []
+-        if self.tune.async_msg:
++        if self.tune.async_msg or (self.fill_budget and (self.partial is not None or self.short_round_due)):
+             self._send(msg)
+         else:
+             self.g._share(msg)
+@@ -486,6 +499,45 @@ class MultiDecoder:
+         self.g.comm.all_gather(mine, got)
+         return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
+ 
++    @torch.no_grad()
++    def _time_prompt_layers(self):
++        """Both ranks calibrate isolated prompt forwards before requests are admitted (0 budget: no work)."""
++        from .decode import prefill_chunk_steps
++        from .verify import timing_tokens
++
++        e = self.e
++        samples = {}
++        prev = e.use(e.home)
++        try:
++            # Warm kernels first; this never publishes a kept prompt or draft context.
++            e.reset()
++            for _ in prefill_chunk_steps(e, timing_tokens(self.w.cfg.vocab, 64), 0, 64, head=False):
++                pass
++            for rows in sorted({min(r, self.fill_rows) for r in (64, 256, 512, 1024)} | {self.fill_rows}):
++                e.reset()
++                for _ in prefill_chunk_steps(e, timing_tokens(self.w.cfg.vocab, rows), 0, rows, head=False):
++                    pass                            # shape-specific warmup before its measured pass
++                e.reset()
++                events = [torch.cuda.Event(enable_timing=True) for _ in range(len(self.w.layers) + 2)]
++                steps = prefill_chunk_steps(e, timing_tokens(self.w.cfg.vocab, rows), 0, rows, head=False)
++                events[0].record()
++                for i, _ in enumerate(steps):
++                    events[i + 1].record()
++                events[-1].record()
++                events[-1].synchronize()
++                costs = [events[i].elapsed_time(events[i + 1]) for i in range(len(self.w.layers))]
++                mine = torch.tensor(costs, dtype=torch.float32, device=self.w.device)
++                if self.w.comm is not None:
++                    got = torch.empty((self.w.world * mine.numel(),), dtype=mine.dtype, device=mine.device)
++                    self.w.comm.all_gather(mine, got)
++                    costs = got.view(self.w.world, -1).max(dim=0).values.cpu().tolist()
++                samples[rows] = costs
++        finally:
++            e.reset()
++            e.last_hidden = None
++            e.use(prev)
++        return sliced_fill.LayerCosts(samples)
++
+     def _compare_paths(self, reps: int = 5) -> None:
+         """TF_GLM_MULTI_PROFILE (at startup, on both ranks: the graphs all-gather; rank 0 prints): a lone stream's
+         verify window on the one-stream graphs and on the batched graphs, ms by rows up to the one-stream graphs'
+@@ -526,8 +578,18 @@ class MultiDecoder:
+     def parse(msg: Sequence[int]) -> list[tuple[int, list[int]]]:
+         ops, i = [], 0
+         while i < len(msg):
++            if i + 2 > len(msg):
++                raise RuntimeError("truncated multi-stream op header")
+             op, n = int(msg[i]), int(msg[i + 1])
+-            ops.append((op, [int(v) for v in msg[i + 2:i + 2 + n]]))
++            if op not in OPS or n < 0 or i + 2 + n > len(msg):
++                raise RuntimeError("invalid multi-stream op or payload length")
++            p = [int(v) for v in msg[i + 2:i + 2 + n]]
++            if op == FILLPART and (len(p) != 4 or not 0 <= p[2] < p[3]):
++                raise RuntimeError("invalid FILLPART payload")
++            if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0]
++                                    or not 0 <= p[1] < p[2]):
++                raise RuntimeError("invalid MFILLPART payload")
++            ops.append((op, p))
+             i += 2 + n
+         return ops
+ 
+@@ -832,6 +894,8 @@ class MultiDecoder:
+         used = max([len(k.ids) for k in x.kept], default=0)
+         if x.owner is not None:
+             used = max(used, self.lanes[x.owner].st.pos)
++        if self.partial is not None:
++            used = max([used] + [stop for lane, stop in self.partial.group if lane.extent is x])
+         return used
+ 
+     def _move(self, x, base: int, size: int) -> None:
+@@ -930,7 +994,12 @@ class MultiDecoder:
+         if not filling:
+             return None
+         decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
+-        if decoding:
++        if decoding and self.fill_budget and self.decode_due:
++            self.decode_due = False
++            return None
++        if self.partial is not None:
++            return self.partial.group[0][0]
++        if decoding and not self.fill_budget:
+             self.credit += self.share
+             if self.credit < 1:
+                 return None
+@@ -939,9 +1008,26 @@ class MultiDecoder:
+         return self.lanes[s.sid]
+ 
+     def _iterate(self) -> list[Stream]:
++        if self.fill_budget:
++            cancelled = []
++            for lane in self.lanes.values():
++                poll = getattr(lane.s.emit, "cancelled", None)
++                if not lane.decoding and not lane.s.done and poll is not None and poll():
++                    lane.s.done = True
++                    lane.s.started = lane.s.finished = time.perf_counter()
++                    cancelled.append(lane.s)
++            if cancelled:
++                return cancelled                 # finish() mirrors cancellation and retires partial groups
+         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
++        if self.partial is not None and lane is not None:
++            return self._part_iteration()
+         group = self._group(lane) if lane is not None and self.group else None
++        busy = any(l.decoding and not l.s.done and not l.paused for l in self.lanes.values())
++        if lane is not None and busy and self.fill_budget and lane.head is None:
++            self.partial = sliced_fill.PendingFill(group if group is not None else [(lane, self._stop(lane))],
++                                                  many=group is not None)
++            return self._part_iteration()
+         if group is not None:
+             t = time.perf_counter()
+             rows = sum(stop - l.st.pos for l, stop in group)
+@@ -988,15 +1074,87 @@ class MultiDecoder:
+         if prof is not None:
+             prof.begin(t_begin)
+         plan = [(l.sid, l.depth) for l in active]
+-        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone)])
++        short = self.short_round_due
++        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone), int(short)])
+         if prof is not None:
+             prof.mark("plan")
+         self._flush()
++        self.short_round_due = False
+         if prof is not None:
+             prof.mark("message")
+-        self._round(active, lone=lone)
++        self._round(active, lone=lone, short=short)
+         return [l.s for l in active if l.s.done]
+ 
++    def _part_iteration(self) -> list[Stream]:
++        pending = self.partial
++        lo = pending.layer
++        busy = any(l.decoding and not l.paused and not l.s.done for l in self.lanes.values())
++        hi = self.fill_costs.stop(pending.rows, lo, self.fill_budget) if busy else len(self.w.layers)
++        if pending.many:
++            payload = [len(pending.group), lo, hi, *[v for lane, stop in pending.group for v in (lane.sid, stop)]]
++            self._emit(MFILLPART, payload)
++        else:
++            lane, stop = pending.group[0]
++            self._emit(FILLPART, [lane.sid, stop, lo, hi])
++        self._flush()
++        done = self._part(pending.group, lo, hi, pending.many)
++        pending.layer_ms += pending.slice_layer_ms
++        if hi == len(self.w.layers):
++            tail = max(0.0, pending.slice_wall_ms - pending.slice_layer_ms - self.fill_costs.overhead)
++            self.fill_costs.observe_tail(pending.rows, tail)
++            self.fill_costs.observe(pending.rows, 0, hi, pending.layer_ms)
++        else:
++            self.fill_costs.observe_overhead(max(0.0, pending.slice_wall_ms - pending.slice_layer_ms))
++        self.decode_due = True
++        self.short_round_due = not self.fill_drafts
++        return done
++
++    @torch.no_grad()
++    def _part(self, group, lo: int, hi: int, many: bool) -> list[Stream]:
++        """Both ranks: apply one contiguous slice, including publication only on its final layer."""
++        if not group or any(l.decoding or stop != self._stop_bound(l, stop) for l, stop in group):
++            raise RuntimeError("a prompt slice contains a decoding stream or crosses a kept point")
++        if self.partial is None:
++            if lo:
++                raise RuntimeError("a resumed prompt slice has no pending chunk")
++            self.partial = sliced_fill.PendingFill(list(group), many=many)
++        pending = self.partial
++        if pending.many != many or [(l.sid, stop) for l, stop in group] != [(l.sid, stop) for l, stop in pending.group]:
++            raise RuntimeError("a prompt slice changed its chunk")
++        t = time.perf_counter()
++        begin = torch.cuda.Event(enable_timing=True)
++        pending.layer_event = torch.cuda.Event(enable_timing=True)
++        begin.record()
++        before = [lane.s.prefill_s for lane, _ in group]
++        if many:
++            firsts = self._fill_many(group, layers=(lo, hi))
++        else:
++            lane, stop = group[0]
++            firsts = [self._fill(lane, stop, layers=(lo, hi))]
++        if hi < len(self.w.layers):
++            pending.layer_event.record()
++        # finish() joins HC overlap; drain all device work before the next iteration can run decode graphs.
++        torch.cuda.synchronize(self.w.device)
++        dt = time.perf_counter() - t
++        pending.slice_wall_ms = dt * 1000
++        pending.slice_layer_ms = begin.elapsed_time(pending.layer_event)
++        for (lane, _), elapsed in zip(group, before):
++            lane.s.prefill_s = elapsed + dt           # include the slice's GPU execution, not just its enqueue
++        for (lane, _), first in zip(group, firsts):
++            if first is not None and lane.sid not in pending.retired:
++                lane.s.take([first], self._ends(lane))
++        done = [l.s for l, _ in group if l.s.done and l.sid not in pending.retired]
++        if hi == len(self.w.layers):
++            pending.close()
++            self.partial = None
++            for sid in pending.retired:
++                self._finish(sid)
++            if many and self.rank == 0:
++                self.grouped["chunks"] += 1
++                self.grouped["pieces"] += len(group)
++                self.grouped["rows"] += pending.rows
++        return done
++
+     def _home(self, lane: Lane) -> bool:
+         """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
+         kept prompts in the way evicted and its extent MOVEd); True once it is there."""
+@@ -1083,11 +1241,11 @@ class MultiDecoder:
+         return self.eos if lane.s.stop_eos else ()
+ 
+     @torch.no_grad()
+-    def _fill(self, lane: Lane, stop: int) -> int | None:
++    def _fill(self, lane: Lane, stop: int, *, layers=None) -> int | None:
+         """Both ranks: the lane's prompt rows pos .. stop in one chunk; its kept states; at the prompt's end its first
+         token (the stream then decodes)."""
+ 
+-        from .decode import prefill_chunk
++        from .decode import prefill_chunk, prefill_chunk_steps
+ 
+         e = self.e
+         s = lane.s
+@@ -1103,8 +1261,16 @@ class MultiDecoder:
+             if replay:
+                 out, lane.head = lane.head, None
+             else:
+-                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+-                                    feed=lane.feed, mtp=False, head=stop == n)
++                if layers is None:
++                    out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
++                                        feed=lane.feed, mtp=False, head=stop == n)
++                else:
++                    complete, out = sliced_fill.advance(self.partial, *layers, len(self.w.layers),
++                        lambda: prefill_chunk_steps(e, prompt, start, stop - start,
++                            drafter=self._ctx(lane) if lane.dflash else None, feed=lane.feed, head=stop == n),
++                        before_finalize=self.partial.layer_event.record)
++                    if not complete:
++                        return None
+             if stop < n:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+@@ -1140,7 +1306,7 @@ class MultiDecoder:
+             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
+ 
+     @torch.no_grad()
+-    def _fill_many(self, group: Sequence[tuple[Lane, int]]) -> list[int | None]:
++    def _fill_many(self, group: Sequence[tuple[Lane, int]], *, layers=None) -> list[int | None]:
+         """Both ranks, TF_GLM_MULTI_PREFILL: every (lane, stop)'s prompt rows pos .. stop in ONE chunk
+         (``multi_prefill.prefill_pieces``: each lane's rows the bits of a chunk of their own); then per lane, in
+         order, what ``_fill`` does after its chunk: its kept states, and at its prompt's end its first token (all
+@@ -1157,9 +1323,21 @@ class MultiDecoder:
+             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                               drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
+         t = time.perf_counter()
+-        heads = multi_prefill.prefill_pieces(e, pieces)
++        if layers is None:
++            heads = multi_prefill.prefill_pieces(e, pieces)
++        else:
++            complete, heads = sliced_fill.advance(self.partial, *layers, len(self.w.layers),
++                                                   lambda: multi_prefill.prefill_piece_steps(e, pieces),
++                                                   before_finalize=self.partial.layer_event.record)
++            if not complete:
++                dt = time.perf_counter() - t
++                for lane, _ in group:
++                    lane.s.prefill_s += dt
++                return [None] * len(group)
+         parts, who = [], []
+         for k, ((lane, stop), out) in enumerate(zip(group, heads)):
++            if self.partial is not None and lane.sid in self.partial.retired:
++                continue
+             n = len(lane.s.prompt)
+             if stop < n:
+                 if stop in lane.stops:
+@@ -1187,9 +1365,11 @@ class MultiDecoder:
+         return firsts
+ 
+     @torch.no_grad()
+-    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
++    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False,
++               short: bool = False) -> None:
+         """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
+-        stream at home, verified through the one-stream graphs when its window fits them."""
++        stream at home, verified through the one-stream graphs when its window fits them. ``short``: between fill
++        slices, commit one token per stream without proposing drafts (the same keyed sample, lower round cost)."""
+ 
+         from .decode import copy_room
+         from .dflash2_multi import DraftRequest
+@@ -1202,10 +1382,10 @@ class MultiDecoder:
+         copied: list[bool] = []
+         asks = []
+         for l in lanes:
+-            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None else []
++            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and not short else []
+             copied.append(bool(c))
+             drafts.append(list(c))
+-            if not c and l.dflash and l.depth > 0:
++            if not short and not c and l.dflash and l.depth > 0:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
+@@ -1245,7 +1425,9 @@ class MultiDecoder:
+             if l.window is not None:
+                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
+             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
+-        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
++        # A short round has one row per stream: pack nucleus gathers too, avoiding
++        # repeated rank exchanges between prompt slices with the same exact draws.
++        sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
+         if prof is not None:
+             prof.mark("sample")
+         keeps = []
+@@ -1282,7 +1464,9 @@ class MultiDecoder:
+                 l.copy_accepted += keep - 1
+             room = s.count - len(s.out)
+             s.take(new[:max(0, room)], self._ends(l))
+-            if l.policy is not None:
++            if short:
++                l.depth = min(l.depth, max(0, s.count - len(s.out)))
++            elif l.policy is not None:
+                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
+                               max(0, s.count - len(s.out)))
+         if prof is not None:
+@@ -1325,6 +1509,7 @@ class MultiDecoder:
+             self._emit(FINISH, [lane.sid, reason])
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
++            self.decode_due = self.short_round_due = False
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True
+@@ -1333,6 +1518,17 @@ class MultiDecoder:
+     def _finish(self, sid: int) -> None:
+         """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
+ 
++        pending = self.partial
++        if pending is not None and pending.contains(sid):
++            pending.retired.add(sid)
++            if len(pending.retired) < len(pending.group):
++                self.lanes[sid].s.done = True
++                return                              # reserved slot/extent until the shared forward completes
++            pending.close()
++            torch.cuda.synchronize(self.w.device)
++            self.partial = None
++            for retired in pending.retired - {sid}:
++                self._finish(retired)
+         lane = self.lanes.pop(sid)
+         x = lane.extent
+         x.owner = None
+@@ -1363,6 +1559,9 @@ class MultiDecoder:
+         """After an error in an iteration: forget every stream (the ranks can no longer be trusted to agree)."""
+ 
+         live = [l.s for l in self.lanes.values()]
++        if self.partial is not None:
++            self.partial.close()
++            self.partial = None
+         self.lanes = {}
+         if self.broken is None:
+             self.broken = RuntimeError("an iteration failed")
+@@ -1442,11 +1641,19 @@ class MultiDecoder:
+                 for (lane, _), first in zip(group, self._fill_many(group)):
+                     if first is not None:
+                         lane.s.take([first], self._ends(lane))
++            elif op == FILLPART:
++                sid, stop, lo, hi = p
++                self._part([(self.lanes[sid], stop)], lo, hi, False)
++            elif op == MFILLPART:
++                n, lo, hi = p[:3]
++                group = [(self.lanes[sid], stop) for sid, stop in zip(p[3::2], p[4::2])]
++                self._part(group, lo, hi, True)
+             elif op == ROUND:
+                 n = p[0]
+                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
+                 lone = bool(p[1 + 2 * n]) if len(p) > 1 + 2 * n else False
+-                self._round([self.lanes[sid] for sid in sids], depths, lone=lone)
++                short = bool(p[2 + 2 * n]) if len(p) > 2 + 2 * n else False
++                self._round([self.lanes[sid] for sid in sids], depths, lone=lone, short=short)
+             elif op == SLOT:
+                 self._reslot(self.lanes[p[0]], p[1])
+             elif op == FINISH:
+@@ -1487,6 +1694,7 @@ class GlmScheduler(Scheduler):
+         stream.glm = dict(glm or {})
+         cancel = [False]
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
++        stream.emit.cancelled = getattr(emit, "cancelled", None)
+         self.waiting.put((stream, box))
+         while True:
+             kind, value = box.get()
+diff --git tensorfold/families/glm5_next/cuda/multi_prefill.py tensorfold/families/glm5_next/cuda/multi_prefill.py
+index da57788..474753d 100644
+--- tensorfold/families/glm5_next/cuda/multi_prefill.py
++++ tensorfold/families/glm5_next/cuda/multi_prefill.py
+@@ -183,3 +183,29 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
+     for p in pieces:
+         commit(w, p.st, b, p.rows, p.rows)
+     return heads
++
++
++def prefill_piece_steps(e, pieces: Sequence[Piece]):
++    """Sliced counterpart of prefill_pieces; no position/tap publication before the final slice."""
++    from . import latent
++    from .forward import commit, compute_steps, mm
++
++    if not latent.ENABLED:
++        raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
++    w, b = e.w, e.pbuf
++    R = layout(pieces, b.rows)
++    _stage(w, b, pieces, R)
++    yield from compute_steps(w, None, b, R, head=False, mixer=PieceMixer(w, b, pieces, R))
++    heads = []
++    for p in pieces:
++        if p.head:
++            r = p.lo + p.rows - 1
++            heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
++        else:
++            heads.append(None)
++    for p in pieces:
++        if p.drafter is not None:
++            p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
++    for p in pieces:
++        commit(w, p.st, b, p.rows, p.rows)
++    return heads
+diff --git tensorfold/families/glm5_next/cuda/sliced_fill.py tensorfold/families/glm5_next/cuda/sliced_fill.py
+new file mode 100644
+index 0000000..26e82c5
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/sliced_fill.py
+@@ -0,0 +1,169 @@
++"""CPU policy and saved control state for opt-in layer-sliced concurrent prompt fills.
++
++The GPU rows live in Engine.pbuf, already counted by the startup memory estimate. Only one prompt chunk may
++be suspended; its generator retains the HC split loop's next-front/done state. No additional GPU storage.
++"""
++from __future__ import annotations
++
++import math
++import os
++from dataclasses import dataclass, field
++from typing import Any, Sequence
++
++
++def budget_ms(value: str | None = None) -> float:
++    value = os.environ.get("TF_GLM_FILL_BUDGET_MS", "") if value is None else value
++    try:
++        ms = float(value.strip() or "0")
++    except ValueError:
++        ms = -1.0
++    if not math.isfinite(ms) or ms < 0:
++        raise ValueError(f"TF_GLM_FILL_BUDGET_MS: finite milliseconds >= 0 (0: off), not {value!r}")
++    return ms
++
++
++def drafted_rounds(value: str | None = None) -> bool:
++    """TF_GLM_FILL_DRAFTS: 1 makes the decode rounds between prompt slices full drafted rounds (more tokens for the
++    decoding streams during a fill, a later first token for the filling one); 0 (default): one token per stream."""
++
++    raw = (os.environ.get("TF_GLM_FILL_DRAFTS", "") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_FILL_DRAFTS: 0 or 1, not {raw!r}")
++    return raw == "1"
++
++
++class LayerCosts:
++    """Startup timings at several row counts, interpolated separately for every KDA/DSA/dense layer.
++
++    The first cost includes embedding. Tail work and per-slice overhead are learned separately. A layer slower than the budget runs alone: CUDA
++    kernels cannot be preempted, so this setting is a target, not a hard latency guarantee.
++    """
++    def __init__(self, samples: dict[int, Sequence[float]]) -> None:
++        if not samples:
++            raise ValueError("prompt cost model needs samples")
++        self.samples = {r: tuple(float(v) for v in costs) for r, costs in sorted(samples.items())}
++        self.layers = len(next(iter(self.samples.values())))
++        if (not self.layers or any(r <= 0 or len(c) != self.layers or
++                                  any(not math.isfinite(v) or v <= 0 for v in c)
++                                  for r, c in self.samples.items())):
++            raise ValueError("prompt costs need positive rows and equally sized finite positive layer timings")
++        self.scale = 1.0
++        self.overhead = 0.0
++        self.tails: dict[int, float] = {}
++
++    def tail_cost(self, rows: int) -> float:
++        if not self.tails:
++            return 0.0
++        lo = max((r for r in self.tails if r <= rows), default=min(self.tails))
++        hi = min((r for r in self.tails if r >= rows), default=max(self.tails))
++        if lo == hi:
++            return self.tails[lo] * rows / lo
++        t = (rows - lo) / (hi - lo)
++        return self.tails[lo] + t * (self.tails[hi] - self.tails[lo])
++
++    def observe_tail(self, rows: int, ms: float) -> None:
++        if rows > 0 and math.isfinite(ms) and ms >= 0:
++            self.tails[rows] = 0.8 * self.tails[rows] + 0.2 * ms if rows in self.tails else ms
++
++    def observe_overhead(self, ms: float) -> None:
++        if math.isfinite(ms) and ms >= 0:
++            self.overhead = 0.8 * self.overhead + 0.2 * ms
++
++    def costs(self, rows: int) -> tuple[float, ...]:
++        keys = list(self.samples)
++        lo = max((r for r in keys if r <= rows), default=keys[0])
++        hi = min((r for r in keys if r >= rows), default=keys[-1])
++        if lo == hi:
++            return tuple(v * self.scale for v in self.samples[lo])
++        t = (rows - lo) / (hi - lo)
++        return tuple((a + t * (b - a)) * self.scale for a, b in zip(self.samples[lo], self.samples[hi]))
++
++    def stop(self, rows: int, lo: int, budget: float) -> int:
++        if not 0 <= lo < self.layers or not math.isfinite(budget) or budget <= 0:
++            raise ValueError("slice needs a valid first layer and positive finite budget")
++        costs = list(self.costs(rows))
++        costs[-1] += self.tail_cost(rows)
++        budget = max(0.001, budget - self.overhead)
++        def greedy_end(start):
++            end, ms = start + 1, costs[start]
++            while end < self.layers and ms + costs[end] <= budget:
++                ms += costs[end]
++                end += 1
++            return end
++
++        def pieces(start):
++            count = 0
++            while start < self.layers:
++                start = greedy_end(start)
++                count += 1
++            return count
++
++        # Greedy gives the minimum number of contiguous slices. Among first cuts
++        # that preserve that count, approach the mean cost instead of leaving a
++        # tiny tail after several near-budget stalls. Never exceed the budget
++        # except for one indivisible layer, as on the ordinary greedy path.
++        count = pieces(lo)
++        target = sum(costs[lo:]) / count
++        ends = [hi for hi in range(lo + 1, greedy_end(lo) + 1) if pieces(hi) <= count - 1]
++        return min(ends, key=lambda hi: (abs(sum(costs[lo:hi]) - target), -hi))
++
++    def observe(self, rows: int, lo: int, hi: int, ms: float) -> None:
++        # Layer GPU time only: tail and dispatch cost must not inflate every layer's prediction.
++        predicted = sum(self.costs(rows)[lo:hi])
++        if predicted > 0 and math.isfinite(ms) and ms > 0:
++            self.scale = min(8.0, max(0.5, self.scale * (0.8 + 0.2 * ms / predicted)))
++
++
++@dataclass
++class PendingFill:
++    group: list[tuple[Any, int]]
++    many: bool = False
++    layer: int = 0
++    steps: Any = None
++    retired: set[int] = field(default_factory=set)
++    layer_ms: float = 0.0
++    layer_event: Any = None
++    slice_layer_ms: float = 0.0
++    slice_wall_ms: float = 0.0
++    starts: list[int] = field(init=False)
++
++    def __post_init__(self) -> None:
++        self.starts = [lane.st.pos for lane, _ in self.group]
++
++    @property
++    def rows(self) -> int:
++        return sum(stop - start for (_, stop), start in zip(self.group, self.starts))
++
++    def contains(self, sid: int) -> bool:
++        return any(lane.sid == sid for lane, _ in self.group)
++
++    def close(self) -> None:
++        if self.steps is not None:
++            self.steps.close()
++            self.steps = None
++
++
++def advance(pending: PendingFill, lo: int, hi: int, layers: int, make_steps, before_finalize=None):
++    """Run the requested contiguous layer range; return (complete, forward result)."""
++    if not lo == pending.layer < hi <= layers:
++        raise RuntimeError(f"out-of-order prompt slice [{lo}, {hi}), expected layer {pending.layer} of {layers}")
++    if pending.steps is None:
++        if lo:
++            raise RuntimeError("a resumed prompt slice has no saved forward")
++        pending.steps = make_steps()
++    for _ in range(lo, hi):
++        try:
++            next(pending.steps)
++        except StopIteration as exc:
++            raise RuntimeError("prompt forward ended before its final layer") from exc
++    pending.layer = hi
++    if hi < layers:
++        return False, None
++    if before_finalize is not None:
++        before_finalize()
++    try:
++        next(pending.steps)                   # final norm, taps, commit (after the last layer's yield)
++    except StopIteration as result:
++        pending.steps = None
++        return True, result.value
++    raise RuntimeError("prompt forward has more layers than the slice protocol")

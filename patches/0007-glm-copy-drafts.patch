@@ -1,0 +1,424 @@
+diff --git tensorfold/families/glm5_next/cuda/copy_drafts.py tensorfold/families/glm5_next/cuda/copy_drafts.py
+new file mode 100644
+index 0000000..25e4be7
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/copy_drafts.py
+@@ -0,0 +1,115 @@
++"""Prompt-lookup ("copy") drafts: when the context's last tokens occurred before, propose what followed them.
++
++A reply that quotes or edits its prompt (or repeats itself) is cheap to draft: its last ``match`` tokens (the
++pending token included) are searched in the prompt and the reply so far, and the tokens after the latest earlier
++occurrence become the drafts. They only propose; verification keeps the serial sample, so replies stay exact.
++
++Both ranks hold the same prompt and sample the same tokens, so each computes the same proposals with no exchange.
++Pure numpy (no torch), so it is testable anywhere."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Sequence
++
++import numpy as np
++
++MATCH = 8        # the context's last this many tokens must have occurred before (TF_GLM_COPY_MATCH)
++MOST = 5         # drafts a round: 5 keeps the verify window (6 rows) within the captured graphs (TF_GLM_COPY_MAX)
++
++
++@dataclass(frozen=True)
++class CopySettings:
++    match: int = MATCH
++    most: int = MOST
++
++    @classmethod
++    def from_env(cls, max_drafts: int, env=None) -> CopySettings | None:
++        """TF_GLM_COPY_DRAFTS=1 turns copy drafts on (off by default); TF_GLM_COPY_MATCH and TF_GLM_COPY_MAX tune."""
++
++        env = os.environ if env is None else env
++        on = env.get("TF_GLM_COPY_DRAFTS", "0").strip()
++        if on in ("", "0"):
++            return None
++        if on != "1":
++            raise ValueError(f"TF_GLM_COPY_DRAFTS: 0 or 1, not {on!r}")
++
++        def number(name: str, default: int, low: int, high: int) -> int:
++            text = env.get(name, "").strip()
++            if text == "":
++                return default
++            if not text.isdecimal() or not low <= int(text) <= high:
++                raise ValueError(f"{name}: {low} to {high}, not {text!r}")
++            return int(text)
++
++        return cls(number("TF_GLM_COPY_MATCH", MATCH, 2, 64),
++                   number("TF_GLM_COPY_MAX", min(MOST, max_drafts), 1, max_drafts))
++
++    def code(self) -> list[int]:
++        """The settings as ints both ranks compare at startup (zeros: off)."""
++
++        return [self.match, self.most]
++
++
++class CopyDrafts:
++    """One sequence's context (prompt, then committed reply tokens and the pending one) and its copy proposals."""
++
++    def __init__(self, context: Sequence[int], match: int = MATCH, most: int = MOST) -> None:
++        if match < 1 or most < 1:
++            raise ValueError("match and most must be positive")
++        self.match, self.most = int(match), int(most)
++        n = len(context)
++        self.buf = np.empty((max(1024, 2 * n),), dtype=np.int32)
++        self.buf[:n] = np.asarray(context, dtype=np.int32) if n else 0
++        self.length = n
++
++    def __len__(self) -> int:
++        return self.length
++
++    def tokens(self) -> list[int]:
++        return self.buf[:self.length].tolist()
++
++    def extend(self, tokens: Sequence[int]) -> None:
++        """Committed tokens (the last one is the next round's pending token) join the context."""
++
++        k = len(tokens)
++        if not k:
++            return
++        if self.length + k > self.buf.shape[0]:
++            grown = np.empty((2 * (self.length + k),), dtype=np.int32)
++            grown[:self.length] = self.buf[:self.length]
++            self.buf = grown
++        self.buf[self.length:self.length + k] = np.asarray(tokens, dtype=np.int32)
++        self.length += k
++
++    def starts(self) -> np.ndarray:
++        """Ascending starts of the earlier occurrences of the context's last ``match`` tokens (not the suffix)."""
++
++        L, n = self.length, self.match
++        if L <= n:
++            return np.empty((0,), dtype=np.int64)
++        ctx = self.buf
++        q = ctx[L - n:L]
++        # starts 0 .. L - n - 1 (each leaves a token after its match): by the last token, then the others
++        hits = np.flatnonzero(ctx[n - 1:L - 1] == q[n - 1])
++        for k in range(n - 1):
++            if not hits.size:
++                break
++            hits = hits[ctx[hits + k] == q[k]]
++        return hits
++
++    def propose(self, room: int | None = None) -> list[int]:
++        """Up to ``min(most, room)`` drafts: what followed the latest earlier occurrence that has that many tokens
++        after it, else the most after any occurrence (the earliest); [] when the suffix never occurred before."""
++
++        k = self.most if room is None else min(self.most, int(room))
++        if k < 1:
++            return []
++        hits = self.starts()
++        if not hits.size:
++            return []
++        L, n = self.length, self.match
++        full = hits[hits <= L - n - k]
++        s = int(full[-1]) if full.size else int(hits[0])
++        return self.buf[s + n:min(s + n + k, L)].tolist()
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 4850d92..7c7cf73 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -430,8 +430,11 @@ class DecodeResult:
+     stages: dict[str, float] = field(default_factory=dict)
+     depths: list[int] = field(default_factory=list)
+     keeps: list[int] = field(default_factory=list)
+-    arms: str = ""                          # auto_decode: the drafter of each round, "m" (MTP) or "f" (DFlash2)
++    arms: str = ""                          # auto_decode: each round's drafter, "m" (MTP), "f" (DFlash2) or "c" (copy)
+     pending: torch.Tensor | None = None     # auto_decode: MTP input rows of committed positions not absorbed yet
++    copy_rounds: int = 0                    # rounds whose drafts were copied from the context (``copy_drafts``)
++    copy_drafted: int = 0
++    copy_accepted: int = 0
+ 
+     @property
+     def tokens_per_second(self) -> float:
+@@ -489,23 +492,35 @@ class DepthPolicy:
+         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
+ 
+ 
++def copy_room(copies, count: int, out: list[int]) -> int:
++    """Copy drafts a round may propose: the rows still wanted past the pending token (0 without copy drafts)."""
++
++    return 0 if copies is None else count - len(out) - 1
++
++
+ @torch.no_grad()
+ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
+-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+-    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache."""
++               stop_eos: bool = False, on_tokens=None, copies=None) -> DecodeResult:
++    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the MTP chain (the kept rows are still absorbed)."""
+ 
+     w, st, b = e.w, e.st, e.buf
+     policy = policy or DepthPolicy()
+     out = [pending]
+     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+     rounds = drafted = accepted = 0
++    c_rounds = c_drafted = c_accepted = 0
+     depths: list[int] = []
+     keeps: list[int] = []
+     _sync(w)
+     start = time.perf_counter()
+     t0 = time.perf_counter()
+-    depth = min(policy.next(0, 0), count - len(out))
+-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
++    copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
++    if copied:
++        absorb(e, e.last_hidden, [pending])
++        drafts = copied
++    else:
++        depth = min(policy.next(0, 0), count - len(out))
++        drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+     stages["draft"] += time.perf_counter() - t0
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         t0 = time.perf_counter()
+@@ -527,10 +542,14 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         rounds += 1
+         drafted += len(drafts)
+         accepted += keep - 1
++        if copied:
++            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
+         depths.append(len(drafts))
+         keeps.append(keep)
+         e.follow(sampled[:keep])
+         out.extend(sampled[:keep])
++        if copies is not None:
++            copies.extend(sampled[:keep])
+         if on_tokens is not None:
+             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+         stages["forward"] += t1 - t0
+@@ -539,24 +558,33 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+             break
+         t4 = time.perf_counter()
+-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+-                        policy.confidence) if depth > 0 else [])
++        was_copy = bool(copied)
++        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
++        if copied:                          # the MTP head still takes the kept rows; it drafts nothing this round
++            absorb(e, e.main_hidden(slice(0, keep)), sampled[:keep])
++            drafts = copied
++        else:                               # a copied round's acceptance does not move the MTP depth
++            depth = min(policy.next(*((0, 0) if was_copy else (len(drafts), keep - 1))), count - len(out))
++            drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
++                            policy.confidence) if depth > 0 else [])
+         stages["draft"] += time.perf_counter() - t4
+     _sync(w)
+-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
++    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
++                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
+ 
+ 
+ @torch.no_grad()
+ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
+-                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+-    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
++                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None,
++                  copies=None) -> DecodeResult:
++    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the round's DFlash2 block (the kept taps are still absorbed)."""
+ 
+     w, st, b = e.w, e.st, e.buf
+     policy = policy or DepthPolicy(3, fixed=True)
+     out = [pending]
+     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+     rounds = drafted = accepted = 0
++    c_rounds = c_drafted = c_accepted = 0
+     depths: list[int] = []
+     keeps: list[int] = []
+     _sync(w)
+@@ -564,7 +592,11 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     depth = min(policy.next(0, 0), count - len(out))
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         t0 = time.perf_counter()
+-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
++        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
++        if copied:
++            drafts = copied
++        else:
++            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+         t1 = time.perf_counter()
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+@@ -586,16 +618,22 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         rounds += 1
+         drafted += len(drafts)
+         accepted += keep - 1
++        if copied:
++            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
+         depths.append(len(drafts))
+         keeps.append(keep)
+         e.follow(sampled[:keep])
+         out.extend(sampled[:keep])
++        if copies is not None:
++            copies.extend(sampled[:keep])
+         if on_tokens is not None:
+             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+         stages["draft"] += (t1 - t0) + (t5 - t4)
+         stages["forward"] += t2 - t1
+         stages["sample"] += t3 - t2
+         stages["commit"] += t4 - t3
+-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
++        # a copied round's acceptance does not move DFlash2's depth
++        depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
+     _sync(w)
+-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
++    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
++                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
+diff --git tensorfold/families/glm5_next/cuda/drafter_choice.py tensorfold/families/glm5_next/cuda/drafter_choice.py
+index e018386..b14a7e9 100644
+--- tensorfold/families/glm5_next/cuda/drafter_choice.py
++++ tensorfold/families/glm5_next/cuda/drafter_choice.py
+@@ -8,7 +8,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import Sampling
+ 
+-from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, draft
++from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, copy_room, draft
+ from .forward import commit
+ 
+ 
+@@ -68,8 +68,11 @@ class DrafterChoice:
+ @torch.no_grad()
+ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
+                 choice: DrafterChoice | None,
+-                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+-    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
++                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None,
++                copies=None) -> DecodeResult:
++    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial.
++    ``copies`` (``copy_drafts.CopyDrafts``): a round whose context repeats earlier text drafts the continuation ("c")
++    and runs neither drafter, whose backlogs grow; the choice neither picks nor records it."""
+ 
+     w, st, b = e.w, e.st, e.buf
+     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
+@@ -86,14 +89,19 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     depths: list[int] = []
+     keeps: list[int] = []
+     arms: list[str] = []
+-    last = {"m": (0, 0), "f": (0, 0)}
++    last = {"m": (0, 0), "f": (0, 0), "c": (0, 0)}
++    c_rounds = c_drafted = c_accepted = 0
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+-        arm = choice.pick() if choice is not None else "m"
+         room = count - len(out)
+         t0 = time.perf_counter()
+-        if arm == "m":
++        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
++        arm = "c" if copied else choice.pick() if choice is not None else "m"
++        if copied:
++            backlog = steps = 0
++            drafts = copied
++        elif arm == "m":
+             backlog = len(m_next)
+             depth = max(1, min(m_policy.next(*last["m"]), room))
+             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
+@@ -136,17 +144,21 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+             f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
+             n_f += keep
+         t5 = time.perf_counter()
+-        if choice is not None:
++        if choice is not None and arm != "c":
+             choice.record(arm, R, steps, backlog, keep)
+         last[arm] = (len(drafts), keep - 1)
+         rounds += 1
+         drafted += len(drafts)
+         accepted += keep - 1
++        if copied:
++            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
+         depths.append(len(drafts))
+         keeps.append(keep)
+         arms.append(arm)
+         e.follow(sampled[:keep])
+         out.extend(sampled[:keep])
++        if copies is not None:
++            copies.extend(sampled[:keep])
+         if on_tokens is not None:
+             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+         stages["draft"] += (t1 - t0) + (t5 - t4)
+@@ -158,4 +170,4 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     if drafter is not None and n_f:
+         drafter.add_taps(f_taps[:n_f])          # DFlash2's context ends where the committed rows end
+     return DecodeResult(out[:count], seconds, rounds, drafted, accepted, stages, depths, keeps, "".join(arms),
+-                        m_rows[:len(m_next)])
++                        m_rows[:len(m_next)], c_rounds, c_drafted, c_accepted)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 53ddda9..62a1117 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -141,6 +141,11 @@ class GlmEngine:
+                                               split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
++        from .copy_drafts import CopySettings
++
++        # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
++        # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
++        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank = rank
+@@ -206,7 +211,7 @@ class GlmEngine:
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
++                prefill_rows] + (self.copy.code() if self.copy is not None else [0, 0]) + [int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -214,7 +219,7 @@ class GlmEngine:
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_LATENT, TF_GLM_COPY_*, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -518,6 +523,11 @@ class GlmEngine:
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+         policy = decode_policy(code)
++        copies = None
++        if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
++            from .copy_drafts import CopyDrafts
++
++            copies = CopyDrafts(list(prompt) + [first], self.copy.match, self.copy.most)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif auto:
+@@ -530,13 +540,13 @@ class GlmEngine:
+                                        margin=margin)
+             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
+                               f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
+-                              on_tokens=on_tokens)
++                              on_tokens=on_tokens, copies=copies)
+         elif use_dflash:
+             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                                on_tokens=on_tokens)
++                                on_tokens=on_tokens, copies=copies)
+         else:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                             on_tokens=on_tokens)
++                             on_tokens=on_tokens, copies=copies)
+         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
+         if feed is None:
+             self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+@@ -545,6 +555,10 @@ class GlmEngine:
+                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
+         if res.arms:
+             stats.update(drafters=res.arms, keeps=res.keeps)
++        if policy is not None:
++            stats.update(drafted=res.drafted, accepted=res.accepted)
++        if copies is not None:
++            stats.update(copy_rounds=res.copy_rounds, copy_drafted=res.copy_drafted, copy_accepted=res.copy_accepted)
+         if res.stages:
+             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
+         return stats

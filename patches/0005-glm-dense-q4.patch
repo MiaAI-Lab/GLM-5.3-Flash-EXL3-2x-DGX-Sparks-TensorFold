@@ -1,0 +1,140 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 1c11a54..6492798 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -153,12 +153,14 @@ class GlmEngine:
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+ 
+-        from .qmm import dense_kind, fp8_weights
++        from .qmm import dense_kind, fp8_weights, q4_weights
+ 
+         # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
+         weights_estimate = split_weights(rule)
+         if cfg.quant == "exl3" and dense_kind() == "fp8":
+             weights_estimate = fp8_weights(weights_estimate)
++        elif cfg.quant == "exl3" and dense_kind() == "q4":
++            weights_estimate = q4_weights(weights_estimate)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+         if not self.mtp_on:
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index ca8a066..6377c42 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -176,6 +176,49 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
+     return make_q4(words, scales.contiguous(), biases.contiguous())
+ 
+ 
++def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
++    """TF_GLM_DENSE=q4: bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings
++    (1.0 down to 0.55 of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
++
++    n, k = w.shape
++    words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
++    scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
++    biases = torch.empty_like(scales)
++    for r in range(0, n, chunk):
++        g = w[r:r + chunk].float().view(-1, k // 64, 64)
++        lo0, hi0 = g.amin(-1), g.amax(-1)
++        best_err = best_s = best_b = None
++        for i in range(grid):
++            a = 1.0 - 0.45 * i / (grid - 1)
++            lo, hi = lo0 * a, hi0 * a
++            s = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
++            b = lo.to(torch.bfloat16)
++            q = torch.round((g - b.float()[..., None]) / s.float()[..., None]).clamp(0, 15)
++            err = ((q * s.float()[..., None] + b.float()[..., None] - g) ** 2).sum(-1)
++            if best_err is None:
++                best_err, best_s, best_b = err, s, b
++            else:
++                take = err < best_err
++                best_err = torch.where(take, err, best_err)
++                best_s = torch.where(take, s, best_s)
++                best_b = torch.where(take, b, best_b)
++        q = torch.round((g - best_b.float()[..., None]) / best_s.float()[..., None]).clamp(0, 15).to(torch.int32)
++        q = q.view(-1, k // 8, 8)
++        part = torch.zeros(q.shape[:2], dtype=torch.int32, device=w.device)
++        for j in range(8):
++            part |= q[..., j] << (4 * j)
++        words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
++    return make_q4(words, scales.contiguous(), biases.contiguous())
++
++
++def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
++    return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
++
++
++def stack_dense_q4(parts: list[torch.Tensor]) -> "Q4 | F8":
++    return make_dense_q4(torch.cat([p.to(torch.bfloat16) for p in parts]))
++
++
+ def stack_b16(parts: list[torch.Tensor]) -> B16:
+     """Rows of several BF16 matrices with the same K, stacked in order."""
+ 
+@@ -438,8 +481,8 @@ def dense_kind() -> str:
+     import os
+ 
+     kind = os.environ.get("TF_GLM_DENSE", "bf16")
+-    if kind not in ("bf16", "fp8"):
+-        raise ValueError(f"TF_GLM_DENSE is bf16 or fp8, not {kind!r}")
++    if kind not in ("bf16", "fp8", "q4"):
++        raise ValueError(f"TF_GLM_DENSE is bf16, fp8 or q4, not {kind!r}")
+     return kind
+ 
+ 
+@@ -449,6 +492,24 @@ _F8_NAMES = __import__("re").compile(
+     r"|wk|weights_proj|wq_b|gate_proj|up_proj|down_proj|eh_proj)\.weight|^lm_head\.weight)$")
+ 
+ 
++def q4_weights(base):
++    """fp8_weights, with the 4-bit matrices of TF_GLM_DENSE=q4 (all but the head and kv_b, which stay FP8) at half a
++    byte a value plus a bf16 scale and bias a group of 64."""
++
++    f8 = fp8_weights(base)
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = f8(name, info)
++        shape = info.get("shape") or []
++        if (total and info.get("dtype") == "BF16" and len(shape) == 2 and shape[-1] % 64 == 0
++                and name != "lm_head.weight" and "kv_b_proj" not in name
++                and "experts." not in name.replace("shared_experts.", "") and _F8_NAMES.search(name)):
++            n = base(name, info)[0] // 2
++            return n // 2 + n // 64 * 4, extra
++        return total, extra
++    return transform
++
++
+ def fp8_weights(base):
+     """A split_weights transform that counts the matrices held as FP8 at a byte a value plus their block scales."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index fd9db9d..766a3b0 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -270,15 +270,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
+     # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
+-    fp8 = exl3 and dense_kind() == "fp8"
++    fp8 = exl3 and dense_kind() in ("fp8", "q4")
+     dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
++    # TF_GLM_DENSE=q4: the projections in 4 bits (MSE-searched groups of 64), the head and kv_b in FP8
++    if exl3 and dense_kind() == "q4":
++        from .qmm import make_dense_q4, stack_dense_q4
++
++        big, big_stack = make_dense_q4, stack_dense_q4
++    else:
++        big, big_stack = dense, dense_stack
+ 
+     def q4(name: str) -> Q4 | B16 | F8:
+-        return dense(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++        return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+ 
+     def stack(names: list[str]) -> Q4 | B16 | F8:
+         if exl3:
+-            return dense_stack([t(n + ".weight") for n in names])
++            return big_stack([t(n + ".weight") for n in names])
+         return stack_q4([trip(n) for n in names])
+ 
+     def hc(i: int, site: str) -> HCW:

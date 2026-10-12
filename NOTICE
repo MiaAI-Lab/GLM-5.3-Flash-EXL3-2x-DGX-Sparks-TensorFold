@@ -1,0 +1,136 @@
+GLM-5.3-Flash EXL3 on 2x DGX Spark with TensorFold
+Copyright 2026 MiaAI-Lab
+
+This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see
+LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and state what you
+changed (Apache-2.0, section 4).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
+  MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
+  https://github.com/ashhart/TensorFold".
+  The files in patches/ modify TensorFold v0.6.0 source; scripts/prepare.sh applies them to TensorFold's installed
+  package when it builds the image. The changes in patches/ are this project's work under Apache-2.0 (except the
+  parts credited below); the TensorFold code they modify, and quote as diff context, stays under TensorFold's
+  licenses: Apache-2.0, and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep
+  TensorFold's NOTICE and this copyright and permission notice with any copy of a patched tree:
+
+    Copyright (c) 2026 TensorFold contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+  patches/0044-cuda-context-errors.patch and patches/0045-cuda-metrics.patch extend code TensorFold v0.6.0 has
+  itself: 0044 gives context-window errors OpenAI's "param" field and the same wording and code
+  (context_length_exceeded) for GLM's own window check and image prompts; 0045 adds the CUDA server's /health
+  figures to /metrics as tensorfold_health:* families. Two comments in 0044 still name the upstream commit (68c6e35)
+  whose wording they reuse.
+  patches/0059-server-refused-bodies.patch is upstream TensorFold commit 50dfe38a (v0.6.1, #181, by Dorian /
+  SxMShaDoW) backported to v0.6.0 (merged with 0037's /tokenize routes; its test's oversized body enlarged past
+  0050's 96 MiB limit).
+
+b12x
+  https://github.com/local-inference-lab/b12x
+  Copyright the b12x contributors (local-inference-lab). Apache License, Version 2.0.
+  patches/0006-cuda-roce-allgather.patch: tensorfold/cuda/roce_proxy.c is b12x's RDMA proxy
+  (b12x/comm/roce/_roce_proxy.c at commit 8a99d639410e39d5f39cb4037675331beceea1d4), modified: the multi-Spark
+  (TP=3/4) patch extends it to up to 4 HCAs with a GID index each and per-peer routes (each peer's stripes over the
+  HCAs that share its subnet), proxy ABI 5; with no routes set it behaves as b12x's file. Its header lists these
+  changes. tensorfold/cuda/roce.cu reimplements b12x's CuTe DSL all-gather kernel (b12x/comm/roce/_allgather_cute.py
+  at the same commit) in CUDA C++, with the same stages and memory orderings.
+
+glm53-tensorfold-spark
+  https://github.com/jayleaton/glm53-tensorfold-spark
+  Copyright 2026 Jay Leaton (https://x.com/jayleaton)
+  Apache License, Version 2.0.
+  patches/0036-glm-tool-calls.patch adapts parts of that project's patch 0620:
+    - tensorfold/cuda/reply_text.py: the rule that tool calls written inside the think block are the reply's calls
+      when they end it (its trailing_calls), applied in ThinkSplit.
+    - tensorfold/families/glm5_next/cuda/kept_reasoning.py: its reasoning store (the ReasoningMemory LRU, keyed by the
+      server's call ids and by a signature of the calls). Changed here: the signature covers the whole conversation
+      before the calls, not only the last user message, so a reply is only ever put back into the conversation it
+      was written for.
+    - tensorfold/tool_parameters.py: const schemas, and null read as None for a nullable string (its typed_value),
+      moved into the shared decoder that every parser and both streamers use. Its coercions that change what a
+      resent history renders (quoted scalars, Python literals, integral floats) were not taken. (TensorFold v0.6.0's
+      own decoder reads Python literals for Qwen's parsers; GLM's parsers keep values as written.)
+  The rest of patch 0036 is this project's own implementation.
+  Decode code adapted from that project's patches (Apache-2.0, Copyright 2026 Jay Leaton), in
+  patches/0046-glm-l2-prefetch.patch and patches/0047-glm-exl3-decode-loads.patch:
+    - patches/0046-glm-l2-prefetch.patch: tensorfold/families/glm5_next/cuda/l2pf.cu, l2pf.cpp, l2pf.py
+      (TF_GLM_L2PF): adapted from patch 0460's L2 prefetch (its l2pf.cu / l2pf.py; not its RoCE changes): a
+      side-stream kernel that issues cp.async.bulk.prefetch.L2 (or line prefetches, or loads) for the weights the next
+      kernels read, forked at a layer's attention and FFN all-gathers and after its attention projections and joined
+      before the forward returns; a budget a site; a 4-bit matrix's chunk heads for one-wave launches; the shared
+      expert run before the routed experts while it is on. Changed here: hooks in this project's forward
+      (single-stream and batched multi-stream verify windows, captured and eager); one device table of pre-split
+      (address, bytes) pieces for every site, each site's grid sized at load, one kernel for the three mechanisms;
+      DSA's output site placed after the query absorb, prefetching kv_b's value half (this project's latent layout)
+      before the output projection; the next layer's small KDA / DSA / indexer weights added to the FFN site; no
+      expert or MTP sites; 8 MiB a site by default.
+    - patches/0047-glm-exl3-decode-loads.patch: tensorfold/families/glm5_next/cuda/exl3.cu (dec_kernel's second load
+      path, TF_GLM_EXL3_LOADS=nc), with its setting in exl3.cpp and exl3_mm.py: adapted from patch 0580 (its
+      exl3_ld.cu ld_kernel, LD_NC): 16-byte ld.global.nc.L1::no_allocate loads of the trellis a k step ahead through a
+      staging area in the warp's slice of the reduction buffer, and the item read with its count in one round trip,
+      the first steps' words issued before the member rows reach shared memory. Changed here: built into this
+      project's decode kernel (its expert plan, fused down / gate-up epilogues and per-row input rotation kept), ring
+      depth 1, 2 or 4 as a template parameter, no probe or PDL variants.
+  patches/0058-server-client-gone-poll.patch is Jay Leaton's TensorFold pull request #218
+  (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
+  tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
+  patches/0088-glm-spill-tier.patch (tensorfold/cuda/spill.py and its hooks in the GLM engine and multi.py) is authored
+  by Robert Wojciechowski (wojo, https://github.com/wojo). Its multi-rank design (an NVMe tier for kept prompt states,
+  one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
+  that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
+
+Contributions to this project (Apache-2.0, through its issues and pull requests)
+  patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.
+  patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by MiaAI-Lab.
+  patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).
+
+Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
+  The default checkpoint, Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold, is licensed Apache-2.0 (Mia's AI Lab); it derives
+  from zai-org/GLM-5.3-Flash, MIT-licensed by Z.AI (its license ships with the checkpoint).
+  The earlier default, Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw (a byte-identical mirror of
+  brandonmusic/GLM-5.3-Flash-tr3-4bpw), still selectable with MODEL_ID, is under the ShapleyMcg License 1.0, which
+  requires this attribution:
+
+    This work includes or was produced using ShapleyMcg, created by Brandon M. Music
+    (https://github.com/brandonmmusic-max/shapleymcg). ShapleyMcg is licensed under the ShapleyMcg License v1.0, an
+    attribution-required license that grants no rights to the person known as "0xSero." Use of ShapleyMcg without
+    this attribution is unlicensed.
+
+  The base model, zai-org/GLM-5.3-Flash, is under the license on its model card.
+  The DFlash2 drafter, incoai/GLM-5.3-Flash-DFlash2, is licensed CC BY-NC-ND 4.0: non-commercial use only, no
+  derivatives (commercial licensing: contact@inco.ai, per its model card). DRAFTER=mtp serves without it.
+
+Third-party software in the image
+  The prebuilt image (and the one scripts/prepare.sh builds) is based on NVIDIA's PyTorch container
+  nvcr.io/nvidia/pytorch:26.07-py3, redistributed as a value-added runtime image. The NVIDIA software in it is
+  governed by the NVIDIA Software License Agreement
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the
+  Product-Specific Terms for NVIDIA AI Products
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/), which the
+  container prints at every start; by pulling or running the image you accept them. The image also contains PyAV
+  (BSD) with its FFmpeg libraries (LGPL) and xgrammar (Apache 2.0). This project's Apache License covers its own
+  work only (as described above), not the software in the image.
+
+See CREDITS.md for everyone this project builds on.

@@ -1,0 +1,111 @@
+diff --git tensorfold/cuda/roce.py tensorfold/cuda/roce.py
+index bba421c..93535a4 100644
+--- tensorfold/cuda/roce.py
++++ tensorfold/cuda/roce.py
+@@ -30,6 +30,22 @@ BLOCKS = 8                               # the largest grid; smaller shards laun
+ SPIN_LIMIT = 20_000_000                  # flag polls (~1 us each) before a wait poisons the runtime: ~20 s
+ 
+ 
++def spin_limit() -> int:
++    """TF_ROCE_WAIT_S: how long a GPU wait for the peer's shard may take before it poisons the runtime (default 20 s;
++    graphs keep the value they were captured with)."""
++
++    value = os.environ.get("TF_ROCE_WAIT_S", "").strip()
++    if not value:
++        return SPIN_LIMIT
++    try:
++        seconds = float(value)
++    except ValueError:
++        seconds = -1.0
++    if not 1 <= seconds <= 3600:
++        raise ValueError(f"TF_ROCE_WAIT_S: 1 to 3600 seconds, not {value!r}")
++    return int(seconds * 1_000_000)
++
++
+ def _cache_dir() -> Path:
+     root = os.environ.get("TORCH_EXTENSIONS_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "tensorfold")
+     return Path(root) / "roce"
+@@ -61,7 +77,7 @@ def proxy_library() -> ctypes.CDLL:
+             ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, i, i, p, u64, u64, ctypes.c_char_p, u64]),
+             ("roce_local_blob", i, [p, p, u64]), ("roce_connect", i, [p, p, u64]), ("roce_start", i, [p]),
+             ("roce_stop", None, [p]), ("roce_failed", i, [p]), ("roce_error", ctypes.c_char_p, [p]),
+-            ("roce_destroy", None, [p])):
++            ("roce_stat", u64, [p, i]), ("roce_hca_stat", u64, [p, i, i]), ("roce_destroy", None, [p])):
+         fn = getattr(lib, name)
+         fn.restype, fn.argtypes = res, args
+     if lib.roce_abi_version() != 4:
+@@ -131,6 +147,8 @@ class RoceGather:
+             self.close()
+             raise RuntimeError(f"RoCE all-gather setup failed on some rank: {why}")
+         blobs = b"".join(bytes(r[4:].numpy().tobytes())[:blob_len] for r in rows)
++        self.spin = spin_limit()
++        _ext()                      # its first build (tens of seconds) here, before the verdict all-gather below
+         ok = lib.roce_connect(self.ctx, blobs, len(blobs)) == 0 and lib.roce_start(self.ctx) == 0
+         verdict = torch.tensor([0 if ok else 1], dtype=torch.int32, device="cuda")
+         both = torch.empty(world, dtype=torch.int32, device="cuda")
+@@ -157,7 +175,7 @@ class RoceGather:
+         c = self.counters.data_ptr()
+         _ext().gather(send, recv, packs, nbytes, packs, self.recv, self.flag, self.send, self.ctrl, self.slot_bytes,
+                       c, c + 4 * (1 + klass), c + 4 * (1 + self.classes + klass), c + 4 * (1 + 2 * self.classes),
+-                      SPIN_LIMIT, self.world, self.rank, self.slots, self.flag_stride, len(self.hcas), grid, THREADS)
++                      self.spin, self.world, self.rank, self.slots, self.flag_stride, len(self.hcas), grid, THREADS)
+         if not torch.cuda.is_current_stream_capturing():
+             self.check()
+ 
+@@ -168,7 +186,18 @@ class RoceGather:
+             peer, hca = int(self.ctrl_words[3]), int(self.ctrl_words[6])
+             why = self.lib.roce_error(self.ctx).decode(errors="replace") if self.ctx else ""
+             raise RuntimeError(f"RoCE all-gather failed (sequence {int(self.ctrl_words[2])}, peer {peer}, hca {hca})"
+-                               f"{': ' + why if why else ''}")
++                               f"{': ' + why if why else ''} [{self.stats()}]")
++
++    def stats(self) -> str:
++        """The proxy's counters, for a failure report: the doorbell against what was posted and completed."""
++
++        if not self.ctx:
++            return "no proxy"
++        lib, c = self.lib, self.ctx
++        hcas = " ".join(f"hca{h} completed {lib.roce_hca_stat(c, h, 0)} bytes {lib.roce_hca_stat(c, h, 1)}"
++                        for h in range(len(self.hcas)))
++        return (f"doorbell {int(self.ctrl_words[0])}, posted {lib.roce_stat(c, 0)}, completed {lib.roce_stat(c, 1)}, "
++                f"last {lib.roce_stat(c, 2)}; {hcas}; wait limit {self.spin / 1e6:g} s (TF_ROCE_WAIT_S)")
+ 
+     def close(self) -> None:
+         if getattr(self, "ctx", None):
+@@ -185,6 +214,14 @@ class RoceComm:
+         limit = int(os.environ.get("TF_ROCE_MAX_KB", "256")) << 10 if max_bytes is None else max_bytes
+         self.roce = RoceGather(nccl, rank, world, limit)
+         self.small = self.large = 0
++        self.settled = False
++
++    def settle(self) -> None:
++        """Startup is over on this rank (its engine is built). Until then each eager RoCE gather waits for the peer in
++        an NCCL barrier first: the ranks build their CUDA extensions on their own and can drift tens of seconds apart
++        on a first start, past what a RoCE wait allows; NCCL waits without that limit. Captured gathers never do."""
++
++        self.settled = True
+ 
+     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+         """RoCE for a gather whose size fits, NCCL otherwise: decided by the byte count alone, which every rank's
+@@ -198,6 +235,8 @@ class RoceComm:
+             s = send if send.is_contiguous() and send.data_ptr() % PACK == 0 else send.contiguous().clone()
+             r = recv if recv.is_contiguous() and recv.data_ptr() % PACK == 0 else torch.empty_like(recv,
+                                                                                                memory_format=torch.contiguous_format)
++            if not self.settled and not torch.cuda.is_current_stream_capturing():
++                self.nccl.barrier()
+             self.roce.all_gather(s, r)
+             if r is not recv:
+                 recv.copy_(r)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index f021d02..267e84c 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -683,6 +683,8 @@ class GlmEngine:
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
++        if hasattr(self.comm, "settle"):                # startup is over: RoCE gathers go without a barrier first
++            self.comm.settle()
+ 
+     def _calibrate(self) -> dict:
+         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""

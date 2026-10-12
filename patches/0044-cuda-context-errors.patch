@@ -1,0 +1,127 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 84ae839..dabd045 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -110,11 +110,12 @@ def make_handler(app: App):
+                     _log_error(exc)
+                     return self._json(400, {"error": {"message": _error_message(exc)}})
+                 return self._json(200, reply)
++            field = "messages" if chat else "prompt"            # the field an error's code names (OpenAI's param)
+             try:
+                 prepared = app.prepare(body, chat)
+             except RequestError as exc:
+                 return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc)})
++                                  {"error": error_body(exc, field)})
+             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
+                 _log_error(exc)
+                 return self._json(400, {"error": {"message": _error_message(exc)}})
+@@ -156,7 +157,7 @@ def make_handler(app: App):
+                     self.close_connection = True
+                     return
+                 except RequestError as exc:
+-                    return self._stream_error(error_body(exc))
++                    return self._stream_error(error_body(exc, field))
+                 except Exception as exc:
+                     _log_error(exc)
+                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+@@ -188,7 +189,7 @@ def make_handler(app: App):
+                 return
+             except RequestError as exc:
+                 return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc)})
++                                  {"error": error_body(exc, field)})
+             except Exception as exc:
+                 _log_error(exc)
+                 try:
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index c776de5..8a96996 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -6,6 +6,7 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
++from tensorfold.server.errors import CONTEXT_LIMIT
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+ from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
+ 
+@@ -75,8 +76,10 @@ class GlmApp(App):
+         if need <= limit:
+             return super().check(body, prepared=prepared)
+         detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
+-        return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
+-                f"shorten the prompt or reply{self._restart(need, ' both ranks')}")
++        # v0.6.0 (68c6e35, Apache-2.0): OpenAI's wording, so prepare refuses it as context_length_exceeded
++        return (f"{CONTEXT_LIMIT} {limit} tokens: this request needs a {need}-token context ({detail}), which exceeds "
++                f"the context window this server was started for; shorten the prompt or reply"
++                f"{self._restart(need, ' both ranks')}")
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
+             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
+diff --git tensorfold/server/errors.py tensorfold/server/errors.py
+index e523c5a..b4a47dd 100644
+--- tensorfold/server/errors.py
++++ tensorfold/server/errors.py
+@@ -29,10 +29,11 @@ def refusal(problem: str) -> RequestError:
+     return (ContextLengthError if problem.startswith(CONTEXT_LIMIT) else RequestError)(problem)
+ 
+ 
+-def error_body(exc: Exception) -> dict:
+-    """OpenAI's error object: the message, its type, and the code clients key on where there is one."""
++def error_body(exc: Exception, param: str | None = None) -> dict:
++    """OpenAI's error object: the message, its type, and where there is a code clients key on, the field and code."""
+ 
+     body = {"message": str(exc), "type": "invalid_request_error"}
+     if getattr(exc, "code", None):
++        body["param"] = param
+         body["code"] = exc.code
+     return body
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index ee19680..2b9c05b 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -5,7 +5,7 @@ from dataclasses import dataclass
+ import threading
+ from typing import Any
+ 
+-from tensorfold.server.errors import CapacityError, RequestError
++from tensorfold.server.errors import CapacityError, RequestError, refusal
+ from tensorfold.server.messages import _normalize_tool_call_arguments, normalize_messages
+ 
+ 
+@@ -67,7 +67,7 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+         else:
+             prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+     except (ImageInputError, ValueError, ImportError) as exc:
+-        raise RequestError(str(exc)) from exc
++        raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
+     finally:
+         slot.release()
+     return RenderedPrompt(list(prepared.token_ids), vision=prepared)
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index b6f7dde..0cda666 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -22,6 +22,8 @@ from typing import Any
+ 
+ import numpy as np
+ 
++from tensorfold.server.errors import CONTEXT_LIMIT
++
+ from .images_http import ImageInputError
+ 
+ IMAGE, VIDEO = "<|image|>", "<|video|>"
+@@ -463,8 +465,10 @@ class GlmVision:
+                 rest = rest[v + len(VIDEO_SPAN):]
+         ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+-            raise ValueError(f"the prompt with its images is {len(ids):,} tokens; this server's window is "
+-                             f"{max_prompt_tokens:,}: send fewer or smaller images, or a shorter video")
++            # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
++            raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
++                             f"tokens, which exceeds the context window; send fewer or smaller images, or a shorter "
++                             f"video")
+         positions = [p for p, t in enumerate(ids) if t == self.image_token]
+         rows = sum(self._rows(kind, x) for kind, x in items)
+         if len(positions) != rows:

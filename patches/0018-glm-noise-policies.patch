@@ -1,0 +1,237 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 116000f..946e2d6 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -552,14 +552,24 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+ 
+ 
+ class DepthPolicy:
+-    """Choose a fixed draft count or adapt it to running acceptance."""
++    """Choose a fixed draft count or adapt it to running acceptance. DFlash2 stop rules within a round: the product of
++    the chain's confidences holds ``confidence``; with ``beta`` > 0 those confidences are noise-aware
++    (``dflash2.noisy_confidence``), and with ``round_ms`` too (ms of a round of k drafts, k = 0..) the chain is cut
++    where E[tokens] / ms is largest instead. MTP chains ignore ``beta`` and ``round_ms``."""
+ 
+     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
+-                 confidence: float = 0.0) -> None:
++                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> None:
+         self.most, self.fixed, self.low, self.high = most, fixed, low, high
+         self.confidence = confidence
++        self.beta, self.round_ms = beta, round_ms
+         self.rate = 0.8
+ 
++    @property
++    def chain_rule(self) -> dict:
++        """Drafter.propose's keyword arguments for the noise-aware rules (none for the others)."""
++
++        return {"beta": self.beta, "round_ms": self.round_ms} if self.beta > 0 else {}
++
+     def next(self, drafted: int, accepted: int) -> int:
+         if self.fixed:
+             return self.most
+@@ -675,7 +685,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         if copied:
+             drafts = copied
+         else:
+-            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
++            drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
++                      if depth > 0 else [])
+         t1 = time.perf_counter()
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 62c9373..25947bb 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -21,6 +21,31 @@ from .weights import Weights
+ EDGE = 0.6        # the selector's edge score weight in a chain pick
+ NOISE = 0.7       # the target's keyed noise weight when sampling
+ NO_LIMIT = 1e30
++# the noise-aware stop rules' temperature B (fnc<N>:<p>, fcost<N>:noisy): draft_sim's NoisyPredictor beta, fitted by
++# log loss (``fit_beta``, its grid) on the 9 teacher-forced dumps of 2026-09-30 (7 sampled prose, 2 greedy code):
++# 2.0 on all of them, on the sampled ones alone and on the greedy ones alone (a finer grid: 1.8, log loss -0.2%)
++NOISY_BETA = 2.0
++
++
++def noisy_confidence(score: np.ndarray, noise: np.ndarray | None, j: int, beta: float) -> float:
++    """softmax((score + g) / beta) at the pick j, g the target's keyed Gumbel draws for the candidates (None: greedy,
++    softmax(score / beta)): the chance the target's keyed sample is the pick when its scaled logits are the drafter's
++    plus iid Gumbel(beta) errors. draft_sim's ``noisy_prob`` feature, the same float64 operations in the same order."""
++
++    z = score + noise if noise is not None else score
++    z = z / beta
++    e = np.exp(z - z.max())
++    return float(e[j] / e.sum())
++
++
++def best_depth(q, round_ms) -> int:
++    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional acceptances
++    (``draft_sim.best_depth`` with round_ms[k] = its Costs.round_ms(k, 1, True))."""
++
++    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
++    expect = np.cumsum(alive)
++    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
++    return int(np.argmax(expect / ms))
+ 
+ 
+ @triton.jit
+@@ -464,8 +489,12 @@ class Drafter:
+         return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps cand_host
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+-              sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft."""
++              sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
++              round_ms: tuple[float, ...] | None = None) -> list[int]:
++        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
++        keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
++        ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
++        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same."""
+ 
+         depth = tokens.shape[0]
+         sampled = sampling is not None and sampling.temperature > 0
+@@ -473,27 +502,44 @@ class Drafter:
+         noise = None
+         if sampled:
+             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
++        noisy = beta > 0
+         out: list[int] = []
++        conf: list[float] = []
+         prev, chain = anchor, 1.0
+         for d in range(depth):
+             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
+             score = (values[d] + EDGE * edge) / temp
+             pick = score + NOISE * noise[d] if noise is not None else score
+             j = int(np.argmax(pick))
+-            if confidence > 0:
++            if noisy:
++                c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
++                if round_ms is not None:
++                    conf.append(c)
++                else:
++                    chain *= c
++                    if d > 0 and chain < confidence:
++                        break
++            elif confidence > 0:
+                 p = np.exp(score - score.max())
+                 chain *= float(p[j] / p.sum())
+                 if d > 0 and chain < confidence:
+                     break
+             prev = int(tokens[d, j])
+             out.append(prev)
++        if noisy and round_ms is not None:
++            out = out[:best_depth(conf, round_ms)]
+         return out
+ 
+-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""
++    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
++                beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
++        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end); ``beta``,
++        ``round_ms``: the noise-aware stop rules (``chain``)."""
+ 
+         depth = min(depth, self.block - 1)
+         if depth < 1 or self.context_end == 0:
+             return []
+         tokens, values, proj = self.candidates(pending, depth)
++        if beta > 0:
++            return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, beta=beta,
++                              round_ms=round_ms)
+         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index c4b826e..b626ecf 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -151,11 +151,16 @@ def user_opener(model_dir: Path) -> int | None:
+ 
+ 
+ def encode_policy(spec: str) -> list[int]:
+-    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
++    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2.
++
++    DFlash2 only: ``fncN:P[:B]`` (kind 16: the fcN:P product of noise-aware confidences, B their temperature,
++    default ``dflash2.NOISY_BETA``) and ``fcostN:noisy[:B]`` (kind 17: the depth k <= N maximizing E[tokens] / round
++    ms by the startup cost table, E from the same confidences; N up to the captured verify windows' drafts)."""
+ 
+     spec = str(spec).strip()
+     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
+-                     f"these after f (N from 1 to {MAX_ROWS - 1})")
++                     f"these after f (N from 1 to {MAX_ROWS - 1}), fncN:P[:B] or fcostN:noisy[:B] "
++                     f"(N up to {len(GRAPH_ROWS) - 1})")
+     try:
+         if spec == "auto" or spec.startswith("auto:"):
+             parts = spec.split(":")
+@@ -165,6 +170,8 @@ def encode_policy(spec: str) -> list[int]:
+             if explore < 1 or every < 0 or not 0 <= margin < 1:
+                 raise bad
+             return [4 if len(parts) == 1 else 5, explore, every, int(round(margin * 1e6))]
++        if spec.startswith(("fnc", "fcost")):
++            return _encode_noisy(spec[1:], bad)
+         if spec.startswith("f"):
+             code = encode_policy(spec[1:])
+             return [code[0] + 10] + code[1:] if code[0] else code
+@@ -188,8 +195,30 @@ def encode_policy(spec: str) -> list[int]:
+     return [1 if most > 0 else 0, most, 0, 0]
+ 
+ 
+-def decode_policy(code: list[int]):
+-    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
++def _encode_noisy(spec: str, bad: ValueError) -> list[int]:
++    """``ncN:P[:B]`` -> [16, N, P, B] and ``costN:noisy[:B]`` -> [17, N, B, 0], P and B in millionths (DFlash2 only)."""
++
++    from .dflash2 import NOISY_BETA
++
++    cost = spec.startswith("cost")
++    parts = spec[4 if cost else 2:].split(":")
++    if len(parts) not in (2, 3) or (cost and parts[1] != "noisy"):
++        raise bad
++    most = int(parts[0])
++    beta = float(parts[2]) if len(parts) == 3 else NOISY_BETA
++    if not 0 < most <= len(GRAPH_ROWS) - 1 or not 0 < beta <= 1000 or round(beta * 1e6) < 1:
++        raise bad
++    if cost:
++        return [17, most, int(round(beta * 1e6)), 0]
++    conf = float(parts[1])
++    if not 0 <= conf <= 1:
++        raise bad
++    return [16, most, int(round(conf * 1e6)), int(round(beta * 1e6))]
++
++
++def decode_policy(code: list[int], costs: dict | None = None):
++    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings; ``costs``: the
++    startup cost table (``GlmEngine._calibrate``) the fcost rule weighs a round's depths by."""
+ 
+     from .decode import DepthPolicy
+ 
+@@ -201,9 +230,22 @@ def decode_policy(code: list[int]):
+         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
+     if kind == 3:
+         return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6)
++    if kind == 6:
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
++    if kind == 7:
++        if costs is None:
++            raise ValueError("the fcost policy needs the engine's cost table")
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
+     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+ 
+ 
++def round_costs(costs: dict) -> tuple[float, ...]:
++    """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
++    kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
++
++    return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
++
++
+ def _f64_ints(x: float) -> list[int]:
+     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
+ 
+@@ -738,7 +780,7 @@ class GlmEngine:
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+-        policy = decode_policy(code)
++        policy = decode_policy(code, self.costs)
+         copies = None
+         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+             from .copy_drafts import CopyDrafts

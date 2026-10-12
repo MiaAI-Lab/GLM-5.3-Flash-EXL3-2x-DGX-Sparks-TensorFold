@@ -1,0 +1,344 @@
+# A prompt chunk's DSA indexer scoring (sparse._scores, patch 0086's Triton loop) as a CUDA kernel (prompt_scores.cu)
+# that computes every score with the Triton kernel's own instruction sequence, read from its PTX: the mma K order of
+# Triton's kWidth-4 dot layout, the epilogue's roundings, the head sum's order. A CTA of 8 rows converts each 64-pool
+# FP8 key tile once for all of them. Every score is the Triton kernel's bit for bit. FP8 caches with 32 indexer heads of
+# 128 only (the indexer is replicated: TP=2 and TP=3 alike). The extension (tensorfold_glm_scores_v1) is built / loaded
+# by decode.Engine's constructor, before any request; loaded lazily, a fresh image built it at its first long prompt
+# while every stream waited. TF_GLM_SCORES_CUDA=0: the Triton kernel, which also serves (logged once) under another
+# Triton release than the one whose PTX the kernel reproduces (sparse.TRITON_PTX, 3.7) and when the extension fails to
+# build or load. Applies after patch 0101 (both edit _select_prompt). tools/prompt_scores_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -194,6 +194,14 @@ class Engine:
+         self.caches = Caches(w, pool_rows or capacity, streams=streams,
+                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
+                              kv=kv8.kv_kind() if kv is None else kv, display=display)
++        # patch 0105: the prompt chunks' CUDA pool scoring (sparse._scores_ext) built / loaded now, before any
++        # request: loaded lazily, a fresh image built it at the first long prompt's chunk while every stream waited
++        # (~23 s)
++        if (kv8.kv_kind() if kv is None else kv) == "fp8" and any(l.kind == "dsa" for l in w.layers):
++            from . import sparse
++
++            if sparse.prompt_scores_cuda():
++                sparse._scores_ext()
+         self.slots = Slots(w, streams, max_rows)
+         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
+diff --git tensorfold/families/glm5_next/cuda/prompt_scores.cu tensorfold/families/glm5_next/cuda/prompt_scores.cu
+new file mode 100644
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/prompt_scores.cu
+@@ -0,0 +1,233 @@
++// Patch 0105: the DSA indexer's prompt-chunk scoring (sparse._scores, patch 0086's Triton kernel, as _select_prompt
++// launches it: FP8 pooled keys, 32 heads x 128, 64-pool blocks, 4 warps) as a CUDA kernel that computes every score
++// with the Triton kernel's own instruction sequence, so every bit is the same, while a CTA of RB rows converts each
++// key tile once for all of them (Triton: every row converts and loads it again). tools/prompt_scores_check.py.
++//
++// The Triton kernel, read from its PTX / GPU IR on a GB10 (Triton 3.7):
++//   - the keys' e4m3 codes -> f16x2 (cvt.rn.f16x2.e4m3x2) -> bf16 (exact: every e4m3 value is a bf16 value); keys
++//     past the row's visible pools load as 0 (their scores are -inf whatever the dot);
++//   - dots[32 heads, 64 pools] = mma.sync m16n8k16 bf16 -> fp32, each output one chain over the 8 k16 steps in
++//     ascending order from +0, both operands in the kWidth = 4 dot layout, which spreads a lane's 4 consecutive k
++//     values over two steps: k = 32 b + 16 u + 4 t + 2 h + e (lane t, e < 2) is step 2 b + h, mma slot 8 u + 2 t + e
++//     (the A operand's ld.shared.v2 {a0 of step 2b, a0 of step 2b + 1}; the B operand's linear layout: registers
++//     k + 1, + 2, + 16, lanes k + 4, + 8), so a step's 16 products are not a contiguous k16 group: the natural k16
++//     grouping gives other bits (measured: ~13% of the scores differ);
++//   - per element (dots * ks[pool]) * scale, then max(., 0);
++//   - the head sum: per pool column a lane (g = lane / 4, t = lane % 4) holds heads g, g + 8, 16 + g, 24 + g, summed
++//     as fma(w24, x24, fma(w16, x16, fma(w0, x0, w8 * x8))) with w_h = float(W[h]) * wscale, then over the lanes of
++//     one t: s += shfl_xor(s, 16), then 8, then 4;
++//   - pools past the row's visible ones -> -inf; a block past all of them -> -inf without dots.
++// Every operation below is that one in that order (explicit _rn intrinsics: no contraction or reassociation) and
++// each mma takes the same operands in the same slots. Only the grouping of the work changes: warp w of a CTA is row
++// RB * blockIdx.x + w (its queries in registers), the CTA converts each 64-pool key tile once into shared memory
++// for its RB rows (the next tile's codes read during this tile's dots), LB tiles in turn.
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <stdint.h>
++#include <torch/extension.h>
++
++namespace {
++
++constexpr int H = 32, D = 128, BP = 64, KS = D / 16;   // heads, key width, pools a block, k16 steps
++constexpr int CH = D * 2 / 16;                          // 16-byte chunks of a bf16 key row (16)
++constexpr int RB = 8, LB = 16;                          // rows a CTA (one a warp), tiles a CTA (measured on a GB10)
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++// two e4m3 codes (low byte first) -> their bf16 values (low first), exactly: e4m3 -> f16 -> f32 -> bf16
++__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t two) {
++    uint32_t h2, r;
++    const unsigned short v = (unsigned short)two;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(v));
++    asm("{\n .reg .b16 lo, hi;\n .reg .f32 a, b;\n mov.b32 {lo, hi}, %1;\n cvt.f32.f16 a, lo;\n cvt.f32.f16 b, hi;\n"
++        " cvt.rn.bf16x2.f32 %0, b, a;\n}" : "=r"(r) : "r"(h2));
++    return r;
++}
++
++// The physical 16-byte chunk of logical chunk c in key row p (ldmatrix's 8 rows on distinct bank groups).
++__device__ __forceinline__ int swz(int p, int c) { return c ^ (p & 7); }
++
++// One 64-pool key tile in two halves, so the next tile's global reads run under this tile's dots: ``fetch`` reads a
++// thread's share (GPT 16-byte k16 groups of pool i) and the pool's fp32 scale into registers; ``put`` converts them
++// to bf16 into tile[p][chunk] in mma slot order (logical chunk 2 s + c: step s's slots 8 c .. 8 c + 7) and the
++// scale into ks[p] (1 where p >= NP: never read).
++struct Fetch {
++    static constexpr int T = RB * 32, TPP = T / BP, GPT = KS / TPP;   // threads a pool, k16 groups a thread
++    uint4 c[GPT];
++    float s;
++};
++
++__device__ __forceinline__ void fetch(const uint8_t* __restrict__ PK, int RS, int NP, int pb, Fetch& f) {
++    const int tid = threadIdx.x, i = tid / Fetch::TPP, part = tid % Fetch::TPP;
++    const int p = pb * BP + i;
++    const bool ok = p < NP;
++    const uint8_t* row = PK + (size_t)(ok ? p : 0) * RS;
++#pragma unroll
++    for (int gg = 0; gg < Fetch::GPT; ++gg)
++        f.c[gg] = ok ? *reinterpret_cast<const uint4*>(row + 16 * (part * Fetch::GPT + gg)) : make_uint4(0, 0, 0, 0);
++    f.s = ok && part == 0 ? *reinterpret_cast<const float*>(row + D) : 1.0f;
++}
++
++__device__ __forceinline__ void put(const Fetch& f, uint4* tile, float* ks) {
++    const int tid = threadIdx.x, i = tid / Fetch::TPP, part = tid % Fetch::TPP;
++#pragma unroll
++    for (int gg = 0; gg < Fetch::GPT; ++gg) {
++        const int j = part * Fetch::GPT + gg;                   // k16 group: k = 16 j .. 16 j + 15
++        const uint32_t in[4] = {f.c[gg].x, f.c[gg].y, f.c[gg].z, f.c[gg].w};
++        uint32_t wv[8];                                          // wv[m]: values (2m, 2m + 1) of the group
++#pragma unroll
++        for (int m = 0; m < 8; ++m) wv[m] = e4m3x2_bf16x2(in[m >> 1] >> (16 * (m & 1)));
++        // group j: 32-block b = j / 2, half u = j % 2; word m = 2 t + h goes to step 2 b + h, slots 8 u + 2 t + e
++        tile[i * CH + swz(i, 4 * (j >> 1) + (j & 1))] = make_uint4(wv[0], wv[2], wv[4], wv[6]);       // h = 0
++        tile[i * CH + swz(i, 4 * (j >> 1) + 2 + (j & 1))] = make_uint4(wv[1], wv[3], wv[5], wv[7]);   // h = 1
++    }
++    if (part == 0) ks[i] = f.s;
++}
++
++__global__ void __launch_bounds__(RB * 32) scores_kernel(const __nv_bfloat16* __restrict__ QI,
++                                                         const __nv_bfloat16* __restrict__ W, int w_stride,
++                                                         const uint8_t* __restrict__ PK, int RS,
++                                                         float* __restrict__ OUT, const void* __restrict__ POS,
++                                                         bool pos64, int R, int NP, float scale, float wscale) {
++    __shared__ __align__(16) uint4 tile[BP * CH];               // 16 KB: one key tile, bf16
++    __shared__ float ks[BP];
++    __shared__ __align__(16) float stage[RB][BP];               // a warp's 64 scores before the row's store
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int r = blockIdx.x * RB + warp;
++    const bool live = r < R;
++    const long long P = pos64 ? *static_cast<const int64_t*>(POS) : *static_cast<const int32_t*>(POS);
++    const int npool = live ? (int)((P + r + 1) / 4) : 0;
++    const int rlast = min(R, (int)(blockIdx.x + 1) * RB) - 1;
++    const int nmax = (int)((P + rlast + 1) / 4);                // the CTA's largest visible pool count
++    const int nblk = NP / BP;
++
++    // this warp's row: query fragments of both m16 tiles for the 8 k16 steps (a0 / a1: k = 32 b + 4 t + 2 h, + 1;
++    // a2 / a3: 16 more; step s = 2 b + h), and the 4 head weights a lane sums
++    uint32_t qa[2][KS][4];
++    float wh[4];
++    {
++        const int rr = live ? r : 0;
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++            for (int s = 0; s < KS; ++s) {
++                const __nv_bfloat16* q0 = QI + ((size_t)rr * H + 16 * mt + g) * D;
++                const __nv_bfloat16* q1 = q0 + 8 * D;
++                const int k = 32 * (s >> 1) + 4 * t + 2 * (s & 1);
++                qa[mt][s][0] = *reinterpret_cast<const uint32_t*>(q0 + k);
++                qa[mt][s][1] = *reinterpret_cast<const uint32_t*>(q1 + k);
++                qa[mt][s][2] = *reinterpret_cast<const uint32_t*>(q0 + k + 16);
++                qa[mt][s][3] = *reinterpret_cast<const uint32_t*>(q1 + k + 16);
++            }
++        const int hs[4] = {g, g + 8, 16 + g, 24 + g};
++#pragma unroll
++        for (int x = 0; x < 4; ++x) wh[x] = __fmul_rn(__bfloat162float(W[(size_t)rr * w_stride + hs[x]]), wscale);
++    }
++
++    Fetch f;
++    bool any_next = (int)blockIdx.y * LB < nblk && (int)blockIdx.y * LB * BP < nmax;
++    if (any_next) fetch(PK, RS, NP, blockIdx.y * LB, f);
++    for (int jb = 0; jb < LB; ++jb) {
++        const int pb = blockIdx.y * LB + jb;
++        if (pb >= nblk) break;
++        const int p0 = pb * BP;
++        const bool any = any_next;                               // some row of the CTA sees pools of this block
++        if (any) {
++            __syncthreads();                                     // the previous tile is read
++            put(f, tile, ks);
++            __syncthreads();
++        }
++        any_next = jb + 1 < LB && pb + 1 < nblk && p0 + BP < nmax;
++        if (any_next) fetch(PK, RS, NP, pb + 1, f);             // in flight during this tile's dots
++        if (!live) continue;
++        float* st = stage[warp];
++        if (p0 >= npool) {                                       // the row sees none of them: -inf, no dots
++            st[2 * lane] = -INFINITY;
++            st[2 * lane + 1] = -INFINITY;
++        } else {
++#pragma unroll 2
++            for (int n = 0; n < 8; ++n) {                        // n8 tile: pools p0 + 8 n .. + 7
++                float acc[2][4];
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) acc[mt][c] = 0.0f;
++#pragma unroll
++                for (int j = 0; j < KS; j += 2) {                // steps j, j + 1 from one ldmatrix.x4
++                    uint32_t b[4];
++                    const int pr = 8 * n + (lane & 7), c = 2 * j + (lane >> 3);
++                    ldsm_x4(b, &tile[pr * CH + swz(pr, c)]);
++#pragma unroll
++                    for (int mt = 0; mt < 2; ++mt) {
++                        mma16816(acc[mt], qa[mt][j], b[0], b[1]);
++                        mma16816(acc[mt], qa[mt][j + 1], b[2], b[3]);
++                    }
++                }
++                const int pc = 8 * n + 2 * t;
++                float s[2];
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {                    // pool columns pc, pc + 1
++                    const float k = ks[pc + e];
++                    const float x0 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[0][e], k)), 0.0f);       // head g
++                    const float x8 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[0][2 + e], k)), 0.0f);   // g + 8
++                    const float x16 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[1][e], k)), 0.0f);      // 16 + g
++                    const float x24 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[1][2 + e], k)), 0.0f);  // 24 + g
++                    float v = __fmul_rn(wh[1], x8);
++                    v = __fmaf_rn(wh[0], x0, v);
++                    v = __fmaf_rn(wh[2], x16, v);
++                    v = __fmaf_rn(wh[3], x24, v);
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 16));
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 8));
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 4));
++                    s[e] = p0 + pc + e < npool ? v : -INFINITY;
++                }
++                if (g == 0) *reinterpret_cast<float2*>(&st[pc]) = make_float2(s[0], s[1]);
++            }
++        }
++        __syncwarp();
++        *reinterpret_cast<float2*>(OUT + (size_t)r * NP + p0 + 2 * lane) = *reinterpret_cast<const float2*>(&st[2 * lane]);
++        __syncwarp();
++    }
++}
++
++}  // namespace
++
++// OUT [R, NP] fp32 = the rows' pool scores, sparse._scores' outputs bit for bit: QI [R, 32 * 128] bf16 rows, W bf16
++// head weights (row stride w_stride, unit column stride), PK an FP8 pooled-key cache (rows of 128 e4m3 codes, then
++// the row's fp32 scale; RS bytes apart), POS [1] int32 or int64 (row r's position is POS + r), NP a multiple of 64.
++void scores(const at::Tensor& QI, const at::Tensor& W, int64_t w_stride, const at::Tensor& PK, int64_t RS,
++            at::Tensor OUT, const at::Tensor& POS, int64_t R, int64_t NP, double scale, double wscale) {
++    TORCH_CHECK(QI.is_cuda() && QI.scalar_type() == at::kBFloat16 && W.scalar_type() == at::kBFloat16 &&
++                OUT.scalar_type() == at::kFloat && PK.element_size() == 1 &&
++                (POS.scalar_type() == at::kInt || POS.scalar_type() == at::kLong), "prompt scores: dtypes");
++    TORCH_CHECK(QI.is_contiguous() && QI.size(-1) == H * D && QI.size(0) >= R && W.stride(-1) == 1 &&
++                OUT.is_contiguous() && OUT.numel() >= R * NP, "prompt scores: shapes");
++    TORCH_CHECK(RS % 16 == 0 && RS >= D + 4 && PK.is_contiguous(), "prompt scores: an FP8 key cache of 16-byte rows");
++    TORCH_CHECK(NP % BP == 0 && NP <= PK.numel() / RS, "prompt scores: NP a multiple of 64 within the cache");
++    if (R <= 0 || NP <= 0) return;
++    const c10::cuda::CUDAGuard guard(QI.device());
++    const int nblk = (int)(NP / BP);
++    scores_kernel<<<dim3((unsigned)((R + RB - 1) / RB), (unsigned)((nblk + LB - 1) / LB)), RB * 32, 0,
++                    at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(QI.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
++        (int)w_stride, reinterpret_cast<const uint8_t*>(PK.data_ptr()), (int)RS, OUT.data_ptr<float>(), POS.data_ptr(),
++        POS.scalar_type() == at::kLong, (int)R, (int)NP, (float)scale, (float)wscale);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("scores", &scores); }
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -132,6 +132,54 @@ def _scores(QI, W, w_stride, PK, PKS, OUT, POS, R, NP, scale, wscale, H: tl.cons
+ SCORE_LOOP = 32            # pool blocks a _scores program takes (speed only; GB10: 32 >= 16 > 8 > 4)
+ 
+ 
++TRITON_PTX = "3.7"         # the Triton release whose PTX the CUDA ports reproduce (their bits are its kernels')
++
++
++def triton_matches_ptx() -> bool:
++    """Whether the installed Triton is the release the CUDA ports were read from (TRITON_PTX). Another release may
++    order a kernel's arithmetic differently, and a port would then no longer give its Triton kernel's bits, so the
++    ports are not used with it (logged once; the Triton kernels serve)."""
++    return ".".join(triton.__version__.split(".")[:2]) == TRITON_PTX
++
++
++def prompt_scores_cuda() -> bool:
++    """TF_GLM_SCORES_CUDA (default on): a prompt chunk's FP8 pool scores from prompt_scores.cu, which
++    computes every score with _scores' own instruction sequence (its PTX under Triton TRITON_PTX: the mma K order of
++    Triton's kWidth-4 dot layout, the epilogue's roundings, the head sum's order), so the same bits, with one
++    converted key tile shared by a CTA's 8 rows; 0: _scores (Triton). Off as well when the extension is not used
++    (another Triton release, or a failed build or load: ``_scores_ext``). tools/prompt_scores_check.py."""
++    import os
++
++    return os.environ.get("TF_GLM_SCORES_CUDA", "1") != "0" and _SCORES_FAILED is None
++
++
++_SCORES_EXT = None
++_SCORES_FAILED = None      # why prompt_scores.cu is not used (then _scores serves)
++
++
++def _scores_ext():
++    """The extension, built / loaded once; None when it is not used: under another Triton release than TRITON_PTX,
++    or when its build or load failed (no compiler, a toolkit the kernel does not compile with). Neither stops the
++    start: it is logged once and the Triton kernel serves."""
++    global _SCORES_EXT, _SCORES_FAILED
++    if _SCORES_EXT is None and _SCORES_FAILED is None:
++        from pathlib import Path
++
++        from tensorfold.cuda.build import load
++
++        try:
++            if not triton_matches_ptx():
++                raise RuntimeError(f"Triton {triton.__version__}: the kernel reproduces Triton {TRITON_PTX}'s PTX")
++            _SCORES_EXT = load(name="tensorfold_glm_scores_v1",
++                               sources=[str(Path(__file__).parent / "prompt_scores.cu")],
++                               extra_cuda_cflags=["-O3"], verbose=False)
++        except Exception as exc:
++            _SCORES_FAILED = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[-1][:200]}"
++            print(f"[tensorfold] prompt_scores.cu is not used ({_SCORES_FAILED}); prompt chunks score with the "
++                  "Triton kernel", flush=True)
++    return _SCORES_EXT
++
++
+ @triton.jit
+ def _scores_rows(QI, W, w_stride, PK, PKS, OUT, o_stride, POS, SPR, BASE, R, NP, scale, wscale, H: tl.constexpr,
+                  HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr, SEG: tl.constexpr,
+@@ -493,10 +541,15 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+         n = min(B, R - a)
+         at = pos_dev if a == 0 else pos_dev + a
+         scores = buf[:n * NP].view(n, NP)
+-        _scores[(n, triton.cdiv(triton.cdiv(NP, 64), SCORE_LOOP))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks,
+-                                                                   scores, at, n, NP, D ** -0.5, wscale, H=H,
+-                                                                   HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+-                                                                   L=SCORE_LOOP, RS=rs, FP8=fp8, num_warps=4)
++        ext = _scores_ext() if fp8 and H == 32 and D == 128 and NP % 64 == 0 and prompt_scores_cuda() else None
++        if ext is not None:
++            ext.scores(qi[a:a + n], wts[a:a + n], wts.stride(0), pk, rs, scores, at, n, NP, D ** -0.5, wscale)
++        else:
++            _scores[(n, triton.cdiv(triton.cdiv(NP, 64), SCORE_LOOP))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv,
++                                                                       pks, scores, at, n, NP, D ** -0.5, wscale, H=H,
++                                                                       HP=max(16, triton.next_power_of_2(H)), D=D,
++                                                                       BP=64, L=SCORE_LOOP, RS=rs, FP8=fp8,
++                                                                       num_warps=4)
+         pools = prompt_pools(scores, TOPK_POOLS, cand)                                  # ascending pool index
+         _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
+                       num_warps=4)

@@ -1,0 +1,242 @@
+# Issue #28: pictures and clips in tool results render inside their <tool_response> instead of HTTP 400 (without
+# --vision: as the template's own "unable to process" reminder).
+# Reported by @d4rkdpg. MiaAI-Lab, Apache-2.0.
+
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index d44ae09..fb24558 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -210,7 +210,7 @@ class App:
+         if chat:
+             if not isinstance(body.get("messages"), list):
+                 raise RequestError("messages must be a list")
+-            from tensorfold.server.prompts import has_images, prepare_images
++            from tensorfold.server.prompts import has_images, prepare_images, tool_media_parts
+ 
+             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
+                 try:
+@@ -219,14 +219,20 @@ class App:
+                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
+                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+ 
+-            if has_images(body["messages"]):
++            # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
++            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
++                        and getattr(self, "vision", None) is None else None)
++            if reminded is not None:
++                text = render(reminded, allow_images=True)
++            elif has_images(body["messages"]):
+                 rendered = prepare_images(self.vision, body["messages"],
+                                           lambda messages: render(messages, allow_images=True),
+                                           context_limit=self._context_limit())
+                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+-            text = render(body["messages"])
++            else:
++                text = render(body["messages"])
+             prompt = self.tok.encode(text, add_special_tokens=False).ids
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 8a96996..161f218 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -31,10 +31,12 @@ class ThinkingOffTemplate:
+ 
+ 
+ # the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+-# (Glm5NextProcessor's layout), and every text-only prompt renders as before
++# (Glm5NextProcessor's layout), and every text-only prompt renders as before. A part's ``tf_mark`` (server.prompts'
++# MediaMarks, taken out again before the prompt is encoded) goes before its markers
+ _NO_MEDIA = ('{{- "<reminder>You are unable to process this " ~ media_type ~ " because you don\'t have multi-modal '
+              'input ability. Try different methods.</reminder>" }}')
+-_MEDIA = ("{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>"
++_MEDIA = ("{%- if item.tf_mark is defined -%}{{- item.tf_mark -}}{%- endif -%}"
++          "{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>"
+           "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
+           "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
+ 
+@@ -51,6 +53,8 @@ def media_template(inner, model_dir) -> None:
+ 
+ class GlmApp(App):
+     reads_ignore_eos = True             # ``run`` hands it to the engine's request
++    # without --vision, a tool result's pictures render as the template's own reminder (issue #28): a user's are refused
++    tool_media_reminders = True
+ 
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+diff --git tensorfold/server/messages.py tensorfold/server/messages.py
+index 2679969..4f2a4bf 100644
+--- tensorfold/server/messages.py
++++ tensorfold/server/messages.py
+@@ -49,7 +49,10 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+         content = message.get("content")
+         if isinstance(content, list) and allow_images and any(
+                 isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
+-            if role != "user":
++            # a tool result's pictures reach here only as the parts ``split_images`` makes of them, for a frontend
++            # that renders them in place (``tool_media``); its raw image_url / video_url parts are refused
++            if role != "user" and not (role == "tool" and all(
++                    p.get("type") not in ("image_url", "video_url") for p in content if isinstance(p, dict))):
+                 raise RequestError("images and videos are supported only in user messages")
+             for part in content:
+                 if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index 9c636df..07b2872 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -22,6 +22,29 @@ def has_images(messages):
+                for m in messages or [])
+ 
+ 
++def tool_media_parts(messages):
++    """For a server without a vision frontend whose template answers media with its own reminder (GLM-5.3's "You are
++    unable to process this image ..."): messages whose only pictures and clips are in tool results, those parts as the
++    template's bare media parts (never fetched or decoded), so an agent session that keeps a screenshot in its history
++    goes on (issue #28); None when there are none, or a user (or other) message has some."""
++
++    if not has_images(messages):
++        return None
++    out = []
++    for m in messages:
++        content = m.get('content') if isinstance(m, dict) else None
++        if not (isinstance(content, list)
++                and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in content)):
++            out.append(m)
++            continue
++        if m.get('role') != 'tool':
++            return None
++        out.append({**m, 'content': [{'type': p['type'][:-len('_url')]}
++                                     if isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') else p
++                                     for p in content]})
++    return out
++
++
+ IMAGE_SLOTS = threading.BoundedSemaphore(16)      # requests decoding and processing images at once (host memory)
+ IMAGE_WAITERS = threading.BoundedSemaphore(128)   # requests waiting for a slot; past that, refused at once
+ IMAGE_WAIT_S = 60.0
+@@ -39,6 +62,42 @@ def image_slot():
+     return IMAGE_SLOTS
+ 
+ 
++class MediaMarks:
++    """Each picture's and clip's place in the rendered prompt, for a frontend whose template renders tool results'
++    media (``tool_media``): a template may sort tool results (GLM-5.3's orders them by their calls' ids) or leave
++    one out (``agent_history``), so the media are matched to the markers by a mark rendered before each
++    (``tf_mark``, a per-request nonce), then the marks are taken out: the prompt is the one rendered without them."""
++
++    def __init__(self, template) -> None:
++        import re
++        import secrets
++
++        nonce = secrets.token_hex(8)
++        self.pattern = re.compile("\x00tf-media-" + nonce + r":(\d+)\x00")
++        self.count = 0
++        for message in template:
++            for part in message.get("content") if isinstance(message.get("content"), list) else ():
++                if isinstance(part, dict) and part.get("type") in ("image", "video"):
++                    part["tf_mark"] = f"\x00tf-media-{nonce}:{self.count}\x00"
++                    self.count += 1
++
++    @staticmethod
++    def wanted(template) -> bool:
++        """Whether a tool result carries media (a user's alone keep the prompt as it always rendered)."""
++
++        return any(m.get("role") == "tool" and isinstance(m.get("content"), list)
++                   and any(isinstance(p, dict) and p.get("type") in ("image", "video") for p in m["content"])
++                   for m in template)
++
++    def read(self, text: str) -> tuple[str, list[int]]:
++        """(the text without its marks, the media's indices in the order the template rendered them)."""
++
++        order = [int(m.group(1)) for m in self.pattern.finditer(text)]
++        if any(k >= self.count for k in order):
++            raise ValueError("the rendered prompt's media marks do not match the request's media")
++        return self.pattern.sub("", text), order
++
++
+ def prepare_images(frontend, messages, render, *, context_limit=None):
+     from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
+ 
+@@ -48,9 +107,16 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+     videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
+     # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
+     limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
++    # a frontend that renders tool results' media in place (GLM: inside their <tool_response>)
++    tool_media = bool(getattr(frontend, 'tool_media', False))
+     try:
+         template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
+-                                         max_videos=getattr(frontend, 'max_videos', None))
++                                         max_videos=getattr(frontend, 'max_videos', None), tool_media=tool_media)
++        text = None
++        if tool_media and MediaMarks.wanted(template):
++            marks = MediaMarks(template)
++            text, order = marks.read(render(template))
++            sources = [sources[k] for k in order]          # as rendered: sorted, or left out with their result
+     except (ImageInputError, ValueError) as exc:
+         raise RequestError(str(exc)) from exc
+     slot = image_slot()
+@@ -70,9 +136,11 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+                 from tensorfold.vision.videos import load_videos
+ 
+                 clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+-            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
++            prepared = frontend.prepare(text if text is not None else render(template), images, videos=clips,
++                                        max_prompt_tokens=context_limit)
+         else:
+-            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
++            prepared = frontend.prepare(text if text is not None else render(template), images,
++                                        max_prompt_tokens=context_limit)
+     except (ImageInputError, ValueError, ImportError) as exc:
+         raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
+     finally:
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index d53889d..16c11e8 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -435,6 +435,7 @@ class GlmVision:
+     ``load_videos``, and the tower's ``features`` (rank 0)."""
+ 
+     videos = True
++    tool_media = True       # tool results' pictures and clips, rendered inside their <tool_response> (issue #28)
+ 
+     def __init__(self, model_dir: Path, device, *, allow_urls: bool = False,
+                  limits: GlmVisionLimits | None = None) -> None:
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+index c90a79b..1f5734d 100644
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -114,11 +114,12 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+ 
+ 
+ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
+-                 allow_videos: bool = False, max_videos: int | None = None
++                 allow_videos: bool = False, max_videos: int | None = None, tool_media: bool = False
+                  ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+     """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
+     ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+-    (default: the shared video limits')."""
++    (default: the shared video limits'); ``tool_media``: tool results' parts too (a frontend whose template renders
++    them in place)."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -148,7 +149,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+             elif kind == "video_url" and allow_videos:
+                 from .videos import DEFAULT_VIDEO_LIMITS, video_source
+ 
+-                if role != "user":
++                if role != "user" and not (tool_media and role == "tool"):
+                     raise ImageInputError("video_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                     raise ImageInputError("video_url parts cannot contain other media")
+@@ -159,7 +160,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
+                 parts.append({"type": "video"})
+             elif kind == "image_url":
+-                if role != "user":
++                if role != "user" and not (tool_media and role == "tool"):
+                     raise ImageInputError("image_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
+                     raise ImageInputError("image_url parts cannot contain other media")

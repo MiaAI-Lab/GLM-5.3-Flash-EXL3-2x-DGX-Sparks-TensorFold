@@ -1,0 +1,448 @@
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index adec331..a5bf941 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -612,6 +612,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
+                                            TAPS=taps, BLOCK=1024, num_warps=4)
+ 
+ 
++@triton.jit
++def _conv_shift_seg(CONV, PROJ, SEG, conv_slot, conv_layer, proj_layer, proj_row, C: tl.constexpr,
++                    TAPS: tl.constexpr, COLS: tl.constexpr, BLOCK: tl.constexpr):
++    """Program (layer, channel block, segment): ``_conv_shift`` of the segment's conv slot over its own rows."""
++
++    l = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    e = SEG + tl.program_id(2) * COLS
++    row0 = tl.load(e + 0).to(tl.int64)
++    rows = tl.load(e + 1)
++    cslot = tl.load(e + 4).to(tl.int64)
++    keep = tl.load(e + 5)
++    if rows > 0:
++        conv = CONV + cslot * conv_slot
++        proj = PROJ + row0 * proj_row
++        v0 = _row(conv, proj, l, keep, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v1 = _row(conv, proj, l, keep + 1, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v2 = _row(conv, proj, l, keep + 2, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        tl.store(conv + l * conv_layer + c, v0, mask=c < C)
++        tl.store(conv + l * conv_layer + C + c, v1, mask=c < C)
++        tl.store(conv + l * conv_layer + 2 * C + c, v2, mask=c < C)
++
++
++def conv_shift_segments(conv: torch.Tensor, proj: torch.Tensor, seg: torch.Tensor) -> None:
++    """``_shift_conv`` per segment of a multi-stream window: conv [conv slots, L, 3, C] (in place; each [3, C]
++    contiguous), proj [L, R, W >= C] the window's projection rows; segment i (``kda.segment_table``) has its conv
++    slot take rows keep .. keep + 2 of [conv[slot]; its own proj rows]. Segments of 0 rows are skipped."""
++
++    _, n, taps, C = conv.shape
++    if taps != 3:
++        raise ValueError("the conv shift kernel is written for 4-tap convolutions")
++    if conv.stride(3) != 1 or conv.stride(2) != C:
++        raise ValueError("each conv slot's [3, C] window must be contiguous")
++    if seg.dtype != torch.int32 or seg.dim() != 2 or seg.shape[1] != kda_mod.SEG_COLS or not seg.is_contiguous():
++        raise ValueError("segments: a contiguous int32 [nseg, SEG_COLS] table")
++    _conv_shift_seg[(n, triton.cdiv(C, 1024), seg.shape[0])](
++        conv, proj, seg, conv.stride(0), conv.stride(1), proj.stride(0), proj.stride(1), C=C, TAPS=taps,
++        COLS=kda_mod.SEG_COLS, BLOCK=1024, num_warps=4)
++
++
+ @torch.no_grad()
+ def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
+     """Keep the last forward's first ``keep`` rows; a prompt chunk keeps all, its KDA layers already committed."""
+diff --git tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next/cuda/kda.cpp
+index 4a1315b..c40f527 100644
+--- tensorfold/families/glm5_next/cuda/kda.cpp
++++ tensorfold/families/glm5_next/cuda/kda.cpp
+@@ -14,6 +14,15 @@ void kda_replay_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, co
+ void kda_replay_layers_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, at::Tensor&);
+ 
++void kda_chain_wide_segments_cuda(const at::Tensor&, int64_t, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
++                                  int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
++                                  at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
++                                  const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
++                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
++void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
++                                     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                                     int64_t, int64_t, int64_t, int64_t);
++
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
+ }
+@@ -97,9 +106,77 @@ void replay_layers(const at::Tensor& state_in, int64_t state_stride, const at::T
+                            rows, state_out);
+ }
+ 
++static void check_segments(const at::Tensor& seg) {
++    TORCH_CHECK(seg.is_cuda() && seg.scalar_type() == at::kInt && seg.dim() == 2 && seg.size(1) == 6 &&
++                seg.is_contiguous(), "segments: a contiguous CUDA int32 [nseg, 6] table "
++                "(first row, rows, state slot, parity, conv slot, keep)");
++}
++
++// rec [slots, 2, H, 128, 128] (this layer's states; each [H, 128, 128] contiguous), conv [slots, 3, 3 H 128]
++// (this layer's conv windows; each [3, C] contiguous). Segment i runs rows row0 .. row0 + rows - 1 of P/A/G from
++// rec[slot, parity] and conv[conv slot] into rec[slot, 1 - parity]; conv is read only.
++void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_stride, int64_t b_off,
++                         const at::Tensor& A, int64_t a_stride, const at::Tensor& G, int64_t g_stride,
++                         const at::Tensor& conv, const at::Tensor& cw, at::Tensor rec, const at::Tensor& a_log,
++                         const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps, double lower, int64_t rows,
++                         at::Tensor out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
++                         at::Tensor q_tmp, at::Tensor y_tmp) {
++    check_segments(seg);
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(G, at::kBFloat16, "G");
++    check(conv, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(rec, at::kFloat, "state");
++    check(out, at::kBFloat16, "out");
++    check(k_save, at::kFloat, "k");
++    check(v_save, at::kBFloat16, "v");
++    check(g_save, at::kFloat, "g");
++    check(b_save, at::kFloat, "beta");
++    check(q_tmp, at::kFloat, "q scratch");
++    check(y_tmp, at::kBFloat16, "read-out scratch");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(cw.is_contiguous() && out.is_contiguous(), "conv weight and out must be contiguous");
++    TORCH_CHECK(conv.dim() == 3 && conv.size(1) == 3 && conv.size(2) == 3 * H * 128 && conv.stride(2) == 1 &&
++                conv.stride(1) == 3 * H * 128, "conv state [slots, 3, 3*H*128], each slot contiguous");
++    TORCH_CHECK(rec.dim() == 5 && rec.size(1) == 2 && rec.size(2) == H && rec.size(3) == 128 && rec.size(4) == 128 &&
++                rec.stride(4) == 1 && rec.stride(3) == 128 && rec.stride(2) == 128 * 128,
++                "state [slots, 2, H, 128, 128], each [H, 128, 128] contiguous");
++    TORCH_CHECK(dt_bias.numel() == H * 128 && norm_w.numel() == 128, "dt_bias [H*128], norm [128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4, "conv weight [3*H*128, 4]");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows && out.size(0) >= rows, "rows");
++    TORCH_CHECK(k_save.numel() >= rows * H * 128 && q_tmp.numel() >= rows * H * 128 &&
++                y_tmp.numel() >= rows * H * 128 && b_save.numel() >= rows * H, "scratch rows");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_chain_wide_segments_cuda(seg, seg.size(0), P, p_stride, b_off, A, a_stride, G, g_stride, conv,
++                                 conv.stride(0), cw, rec, rec.stride(0), rec.stride(1), a_log, dt_bias, norm_w, eps,
++                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp);
++}
++
++// rec [slots, 2, layers, H, 128, 128] (each [H, 128, 128] contiguous); segment i with keep < rows replays its
++// first ``keep`` saved rows of every layer from rec[slot, parity] into rec[slot, 1 - parity].
++void replay_layers_segments(const at::Tensor& seg, at::Tensor rec, const at::Tensor& k_save, const at::Tensor& v_save,
++                            const at::Tensor& g_save, const at::Tensor& b_save, int64_t kv_stride, int64_t b_stride,
++                            int64_t layers, int64_t heads) {
++    check_segments(seg);
++    check(rec, at::kFloat, "state");
++    check(k_save, at::kFloat, "k");
++    check(v_save, at::kBFloat16, "v");
++    check(g_save, at::kFloat, "g");
++    check(b_save, at::kFloat, "beta");
++    TORCH_CHECK(rec.dim() == 6 && rec.size(1) == 2 && rec.size(2) >= layers && rec.size(3) == heads &&
++                rec.size(4) == 128 && rec.size(5) == 128 && rec.stride(5) == 1 && rec.stride(4) == 128 &&
++                rec.stride(3) == 128 * 128, "state [slots, 2, layers, H, 128, 128], each [H, 128, 128] contiguous");
++    c10::cuda::CUDAGuard guard(rec.device());
++    kda_replay_layers_segments_cuda(seg, seg.size(0), rec, rec.stride(0), rec.stride(1), rec.stride(2), k_save,
++                                    v_save, g_save, b_save, kv_stride, b_stride, layers, heads);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("chain", &chain);
+     m.def("chain_wide", &chain_wide);
+     m.def("replay", &replay);
+     m.def("replay_layers", &replay_layers);
++    m.def("chain_wide_segments", &chain_wide_segments);
++    m.def("replay_layers_segments", &replay_layers_segments);
+ }
+diff --git tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/cuda/kda.cu
+index 4d458e0..91ac58a 100644
+--- tensorfold/families/glm5_next/cuda/kda.cu
++++ tensorfold/families/glm5_next/cuda/kda.cu
+@@ -352,6 +352,181 @@ __global__ void __launch_bounds__(128) out_kernel(
+     out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+ }
+ 
++// Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
++// parity, conv slot, keep) cuts the window's rows into streams; each segment reads its conv taps from its own
++// conv slot and runs the recurrence from rec[slot, parity] into rec[slot, 1 - parity]. Per row the arithmetic is
++// the solo kernels' line for line (same ``update``), so a segment's bits equal a solo run of its rows. A segment
++// of 0 rows is skipped: a table sized for the most streams serves fewer (grids stay fixed for CUDA graphs).
++constexpr int SEG_COLS = 6, SEG_ROW0 = 0, SEG_ROWS = 1, SEG_SLOT = 2, SEG_PARITY = 3, SEG_CONV = 4, SEG_KEEP = 5;
++
++// prep_kernel for block (row, head) of the whole window; the row's conv taps come from its segment.
++__global__ void __launch_bounds__(512) prep_seg_kernel(
++        int H, const int* __restrict__ seg, int nseg, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++        const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ conv,
++        size_t conv_slot_stride, const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log,
++        const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out, float* __restrict__ k_save,
++        __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save, float* __restrict__ b_save) {
++    const int C = 3 * H * DK;
++    const int r = blockIdx.x, h = blockIdx.y;
++    int row0 = -1, cslot = 0;
++    for (int i = 0; i < nseg; ++i) {
++        const int* e = seg + i * SEG_COLS;
++        if (r >= e[SEG_ROW0] && r < e[SEG_ROW0] + e[SEG_ROWS]) { row0 = e[SEG_ROW0]; cslot = e[SEG_CONV]; }
++    }
++    if (row0 < 0) return;                             // a row no segment covers
++    const int rr = r - row0;                          // the row within its stream's window
++    const __nv_bfloat16* cs = conv + (size_t)cslot * conv_slot_stride;
++    const __nv_bfloat16* Ps = P + (size_t)row0 * p_stride;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float qs[DK], ks[DK];
++    const size_t base = ((size_t)r * H + h) * DK;
++    if (t < 3 * DK) {
++        const int c = (t / DK) * H * DK + h * DK + (t % DK);
++        float acc = 0.0f;
++#pragma unroll
++        for (int tap = 0; tap < TAPS; ++tap) {
++            const int at = rr + tap;
++            const float x = at < TAPS - 1 ? __bfloat162float(cs[(size_t)at * C + c])
++                                          : __bfloat162float(Ps[(size_t)(at - (TAPS - 1)) * p_stride + c]);
++            acc = acc + __bfloat162float(cw[(size_t)c * TAPS + tap]) * x;
++        }
++        const float act = bf(acc / (1.0f + expf(-acc)));
++        if (t < DK) qs[t] = act;
++        else if (t < 2 * DK) ks[t - DK] = act;
++        else v_save[base + t - 2 * DK] = __float2bfloat16_rn(act);
++    } else {
++        const int i = t - 3 * DK;
++        const float decay_rate = expf(a_log[h]);
++        const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
++        g_save[base + i] = expf(lower * sigmoidf_(decay_rate * a));
++        if (i == 0) b_save[r * H + h] = bf(sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h])));
++    }
++    __syncthreads();
++    if (warp < 2) {
++        const float* x = warp == 0 ? qs : ks;
++        float v4[4], ss = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { v4[i] = x[lane * 4 + i]; ss = ss + v4[i] * v4[i]; }
++        ss = warp_sum(ss);
++        float inv = 1.0f / sqrtf(ss + 1e-6f);
++        float* dst = warp == 0 ? q_out : k_save;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            float y = v4[i] * inv;
++            if (warp == 0) y = y * (1.0f / sqrtf((float)DK));
++            dst[base + lane * 4 + i] = y;
++        }
++    }
++}
++
++// step_kernel for block (segment x head, part): the segment's rows from rec[slot, parity] into rec[slot, 1 - parity].
++template <int WARPS, int TR>
++__global__ void __launch_bounds__(WARPS * 32) step_seg_kernel(
++        int H, const int* __restrict__ seg, float* __restrict__ rec, size_t slot_stride, size_t parity_stride,
++        const float* __restrict__ q_in, const float* __restrict__ k_save, const __nv_bfloat16* __restrict__ v_save,
++        const float* __restrict__ g_save, const float* __restrict__ b_save, __nv_bfloat16* __restrict__ y_out) {
++    constexpr int NT = WARPS * 32, VR = WARPS * 4;
++    const int* e = seg + (blockIdx.x / H) * SEG_COLS;
++    const int row0 = e[SEG_ROW0], rows = e[SEG_ROWS], slot = e[SEG_SLOT], parity = e[SEG_PARITY];
++    if (rows <= 0) return;
++    const float* state_in = rec + (size_t)slot * slot_stride + (size_t)parity * parity_stride;
++    float* state_out = rec + (size_t)slot * slot_stride + (size_t)(1 - parity) * parity_stride;
++    const int h = blockIdx.x % H, v0 = blockIdx.y * VR;
++    const int lw = threadIdx.x >> 5, lane = threadIdx.x & 31, warp = blockIdx.y * WARPS + lw;
++    __shared__ __align__(16) float kt[TR][DK];
++    __shared__ __align__(16) float qt[TR][DK];
++    __shared__ __align__(16) float gt[TR][DK];
++    __shared__ __align__(16) float vt[TR][VR];
++    __shared__ float bt[TR];
++    float s[4][4];
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r0 = 0; r0 < rows; r0 += TR) {
++        const int n = rows - r0 < TR ? rows - r0 : TR;
++        __syncthreads();
++        for (int x = threadIdx.x; x < n * DK; x += NT) {
++            const int rr = x / DK, c = x % DK;
++            const size_t base = ((size_t)(row0 + r0 + rr) * H + h) * DK + c;
++            kt[rr][c] = k_save[base];
++            qt[rr][c] = q_in[base];
++            gt[rr][c] = g_save[base];
++        }
++        for (int x = threadIdx.x; x < n * VR; x += NT) {
++            const int rr = x / VR, c = x % VR;
++            vt[rr][c] = __bfloat162float(v_save[((size_t)(row0 + r0 + rr) * H + h) * DV + v0 + c]);
++        }
++        if (threadIdx.x < n) bt[threadIdx.x] = b_save[(row0 + r0 + threadIdx.x) * H + h];
++        __syncthreads();
++        for (int rr = 0; rr < n; ++rr) {
++            const float4 k4 = reinterpret_cast<const float4*>(kt[rr])[lane];
++            const float4 q4 = reinterpret_cast<const float4*>(qt[rr])[lane];
++            const float4 g4 = reinterpret_cast<const float4*>(gt[rr])[lane];
++            const float4 v4 = reinterpret_cast<const float4*>(vt[rr])[lw];
++            float kk[4] = {k4.x, k4.y, k4.z, k4.w}, qq[4] = {q4.x, q4.y, q4.z, q4.w};
++            float gg[4] = {g4.x, g4.y, g4.z, g4.w}, vv[4] = {v4.x, v4.y, v4.z, v4.w};
++            update(s, kk, gg, vv, 0, bt[rr]);
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float o = 0.0f;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++                o = warp_sum(o);
++                if (lane == 0)
++                    y_out[((size_t)(row0 + r0 + rr) * H + h) * DV + warp * 4 + j] = __float2bfloat16_rn(o);
++            }
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
++// replay_layers_kernel for block (segment, layer, head): the segment's first ``keep`` rows from rec[slot, parity]
++// into rec[slot, 1 - parity]; keep == rows (the chain already left that state) or rows == 0 skips the segment.
++__global__ void __launch_bounds__(1024) replay_layers_seg_kernel(
++        int H, int layers, const int* __restrict__ seg, float* __restrict__ rec, size_t slot_stride,
++        size_t parity_stride, size_t layer_stride, const float* __restrict__ k_save,
++        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
++        size_t kv_stride, size_t b_stride) {
++    const int* e = seg + (blockIdx.x / (layers * H)) * SEG_COLS;
++    const int row0 = e[SEG_ROW0], rows = e[SEG_ROWS], slot = e[SEG_SLOT], parity = e[SEG_PARITY];
++    const int keep = e[SEG_KEEP];
++    if (rows <= 0 || keep < 0 || keep >= rows) return;
++    const int layer = (blockIdx.x / H) % layers, h = blockIdx.x % H;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float vs[DV];
++    float s[4][4];
++    const float* sin = rec + (size_t)slot * slot_stride + (size_t)parity * parity_stride + layer * layer_stride;
++    float* sout = rec + (size_t)slot * slot_stride + (size_t)(1 - parity) * parity_stride + layer * layer_stride;
++    const float* ks = k_save + layer * kv_stride + (size_t)row0 * H * DK;
++    const __nv_bfloat16* vsv = v_save + layer * kv_stride + (size_t)row0 * H * DV;
++    const float* gsv = g_save + layer * kv_stride + (size_t)row0 * H * DK;
++    const float* bsv = b_save + layer * b_stride + (size_t)row0 * H;
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = sin[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r = 0; r < keep; ++r) {
++        const size_t base = ((size_t)r * H + h) * DK;
++        if (t < DV) vs[t] = __bfloat162float(vsv[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = ks[base + lane * 4 + i]; gg[i] = gsv[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, bsv[r * H + h]);
++        __syncthreads();
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) sout[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
+ }  // namespace
+ 
+ template <typename T>
+@@ -417,3 +592,43 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
+                                         ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at::Tensor& P, int64_t p_stride,
++                                  int64_t b_off, const at::Tensor& A, int64_t a_stride, const at::Tensor& G,
++                                  int64_t g_stride, const at::Tensor& conv, int64_t conv_slot_stride,
++                                  const at::Tensor& cw, at::Tensor& rec, int64_t slot_stride, int64_t parity_stride,
++                                  const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
++                                  double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
++                                  at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
++                                  at::Tensor& y_tmp) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const dim3 grid((unsigned)rows, (unsigned)H);
++    prep_seg_kernel<<<grid, 512, 0, stream>>>(
++        H, ptr<int>(seg), (int)nseg, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A),
++        (int)a_stride, ptr<__nv_bfloat16>(conv), (size_t)conv_slot_stride, ptr<__nv_bfloat16>(cw), ptr<float>(a_log),
++        ptr<float>(dt_bias), (float)lower, ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
++        ptr<float>(g_save), ptr<float>(b_save));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    constexpr int WARPS = 4, TR = 16;
++    step_seg_kernel<WARPS, TR><<<dim3((unsigned)(nseg * H), DV / 4 / WARPS), WARPS * 32, 0, stream>>>(
++        H, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride, ptr<float>(q_tmp),
++        ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
++        ptr<__nv_bfloat16>(y_tmp));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
++                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void kda_replay_layers_segments_cuda(const at::Tensor& seg, int64_t nseg, at::Tensor& rec, int64_t slot_stride,
++                                     int64_t parity_stride, int64_t layer_stride, const at::Tensor& k_save,
++                                     const at::Tensor& v_save, const at::Tensor& g_save, const at::Tensor& b_save,
++                                     int64_t kv_stride, int64_t b_stride, int64_t layers, int64_t heads) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    replay_layers_seg_kernel<<<(unsigned)(nseg * layers * heads), 1024, 0, stream>>>(
++        (int)heads, (int)layers, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride,
++        (size_t)layer_stride, ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
++        (size_t)kv_stride, (size_t)b_stride);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
+index bd3a28e..394dcd0 100644
+--- tensorfold/families/glm5_next/cuda/kda.py
++++ tensorfold/families/glm5_next/cuda/kda.py
+@@ -114,3 +114,64 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
+ 
+ def replay(state_in: torch.Tensor, scratch: KDAScratch, rows: int, state_out: torch.Tensor) -> None:
+     _ext().replay(state_in, scratch.k, scratch.v, scratch.g, scratch.b, int(rows), state_out)
++
++
++# -- several streams in one window ----------------------------------------------------------------------------
++# A verify window holding several streams' rows back to back ([s1 rows][s2 rows]...) runs as segments: an int32
++# CUDA table [nseg, SEG_COLS] of (first row, rows, state slot, parity, conv slot, keep). Segment i runs from
++# rec[slot, parity] with conv[conv slot]'s taps into rec[slot, 1 - parity]; its outputs and states are the bits of a
++# solo ``chain(..., wide=True)`` / ``replay_layers`` of its rows. A segment of 0 rows is skipped, so a table sized for
++# the most streams (and the grids a CUDA graph captured) serves fewer: rewrite the table in place between replays.
++SEG_COLS = 6
++SEG_ROW0, SEG_ROWS, SEG_SLOT, SEG_PARITY, SEG_CONV, SEG_KEEP = range(SEG_COLS)
++
++
++def segment_table(segments, device, out: torch.Tensor | None = None) -> torch.Tensor:
++    """The table of ``segments`` [(rows, state slot, parity[, conv slot[, keep]])] laid back to back from row 0;
++    conv slot defaults to the state slot, keep to rows. With ``out`` ([n >= len, SEG_COLS] int32) it is written in
++    place (rows past the list become empty segments) and returned."""
++
++    rows_ = []
++    row0 = 0
++    for s in segments:
++        rows, slot, parity = int(s[0]), int(s[1]), int(s[2])
++        conv = int(s[3]) if len(s) > 3 and s[3] is not None else slot
++        keep = int(s[4]) if len(s) > 4 and s[4] is not None else rows
++        if rows < 0 or parity not in (0, 1) or not 0 <= keep <= rows:
++            raise ValueError(f"bad segment {s!r}")
++        rows_.append([row0, rows, slot, parity, conv, keep])
++        row0 += rows
++    n = len(rows_) if out is None else out.shape[0]
++    if len(rows_) > n:
++        raise ValueError(f"{len(rows_)} segments do not fit a table of {n}")
++    rows_ += [[row0, 0, 0, 0, 0, 0]] * (n - len(rows_))
++    host = torch.tensor(rows_, dtype=torch.int32).reshape(n, SEG_COLS)
++    if out is None:
++        return host.to(device)
++    out.copy_(host, non_blocking=False)
++    return out
++
++
++def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor,
++                   conv: torch.Tensor, conv_w: torch.Tensor, rec: torch.Tensor, a_log: torch.Tensor,
++                   dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, lower: float, rows: int,
++                   scratch: KDAScratch) -> torch.Tensor:
++    """One layer's window of ``rows`` rows cut into the segments ``seg`` (``segment_table``): p/a/g as in ``chain``;
++    conv [conv slots, 3, 3 H 128] this layer's conv windows (read only; ``conv_shift_segments`` after the commit);
++    rec [state slots, 2, H, 128, 128] this layer's states (e.g. ``rec[:, :, layer]``). The three-kernel path
++    (``chain_wide``) for any window."""
++
++    q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
++    _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
++                               a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
++                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
++    return scratch.out[:rows]
++
++
++def replay_layers_segments(seg: torch.Tensor, rec: torch.Tensor, scratch: KDAScratchSet) -> None:
++    """Every segment with keep < rows: every layer's state after its first ``keep`` rows, rec[slot, parity] ->
++    rec[slot, 1 - parity] (rec [state slots, 2, layers, H, 128, 128]); keep == rows leaves the chain's state."""
++
++    L, H = scratch.layers, scratch.heads
++    _ext().replay_layers_segments(seg, rec, scratch.k, scratch.v, scratch.g, scratch.b, scratch.rows * H * DK,
++                                  scratch.rows * H, L, H)

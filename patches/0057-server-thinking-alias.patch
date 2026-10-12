@@ -1,0 +1,45 @@
+# PR #25: chat_template_kwargs.thinking read as enable_thinking (also {"type": "enabled"|"disabled"}).
+# Contributed by @Alexbob0 (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#25), extended by MiaAI-Lab. Apache-2.0.
+
+diff --git tensorfold/server/request_options.py tensorfold/server/request_options.py
+index ad97a21..da44c98 100644
+--- tensorfold/server/request_options.py
++++ tensorfold/server/request_options.py
+@@ -70,10 +70,37 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
+     return coerce_effort(default if explicit is None else explicit, levels)
+ 
+ 
++_IGNORED_THINKING: set[str] = set()     # the kinds of unread ``thinking`` values already logged (once each)
++
++
++def thinking_switch(value: Any) -> bool | None:
++    """``chat_template_kwargs.thinking`` as ``enable_thinking``: true / false, or Anthropic's and DeepSeek's
++    ``{"type": "enabled" | "disabled"}``. Null, and any other value (``{"type": "adaptive"}``, a string ...), is
++    unset: the server's default, never a refusal (logged once a kind)."""
++
++    if value is None:
++        return None
++    if isinstance(value, bool):
++        return value
++    kind = value.get("type") if isinstance(value, dict) else None
++    if kind in ("enabled", "disabled"):
++        return kind == "enabled"
++    shown = f"{{'type': {kind!r}}}" if isinstance(value, dict) else type(value).__name__
++    if shown not in _IGNORED_THINKING and len(_IGNORED_THINKING) < 64:
++        _IGNORED_THINKING.add(shown)
++        print(f"[tensorfold] chat_template_kwargs.thinking {shown[:80]}: not true, false or "
++              f'{{"type": "enabled" | "disabled"}}; the server\'s default applies (logged once)', flush=True)
++    return None
++
++
+ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) -> dict[str, Any]:
+     """A request's ``reasoning_effort`` and ``enable_thinking`` where it sets them; unset is the server's default."""
+ 
+     kwargs = body.get("chat_template_kwargs") or {}
++    if isinstance(kwargs, dict) and "thinking" in kwargs and "enable_thinking" not in kwargs:
++        switch = thinking_switch(kwargs["thinking"])      # the switch DeepSeek-V4 clients (pi) send
++        if switch is not None:
++            kwargs = {**kwargs, "enable_thinking": switch}
+     fields: dict[str, Any] = {}
+     effort = body.get("reasoning_effort")
+     if effort is None and isinstance(kwargs, dict):

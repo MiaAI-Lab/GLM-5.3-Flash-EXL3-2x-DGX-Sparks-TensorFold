@@ -1,0 +1,259 @@
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index 908afbe..19b09ff 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -19,7 +19,7 @@ void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tenso
+ void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                    const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+                    int64_t, int64_t, int64_t, int64_t, bool, const at::Tensor&, const at::Tensor&,
+-                   const at::Tensor&, at::Tensor&, double, at::Tensor&);
++                   const at::Tensor&, at::Tensor&, double, at::Tensor&, int64_t);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -115,7 +115,7 @@ void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const
+          const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
+          int64_t P, int64_t SK, int64_t max_items, int64_t slots, int64_t fuse, bool xrow,
+          const at::Tensor& sv0, const at::Tensor& sv1, const at::Tensor& su2, at::Tensor out, double limit,
+-         at::Tensor done) {
++         at::Tensor done, int64_t ld) {
+     const int64_t E = T0.size(0);
+     for (auto* t : {&X0, &X1, &sv0, &sv1, &su2}) check(*t, at::kHalf, "dec: fp16 input");
+     for (auto* t : {&T0, &T1, &items, &counts, &members}) check(*t, at::kInt, "dec: int32 input");
+@@ -125,9 +125,11 @@ void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const
+     TORCH_CHECK(fuse != 1 || (out.scalar_type() == at::kFloat && out.numel() >= P * N), "dec: Y fp32 [P, N]");
+     TORCH_CHECK(fuse != 2 || (out.scalar_type() == at::kHalf && out.numel() >= P * N &&
+                               done.numel() >= max_items * (N / 128)), "dec: Xd fp16 [P, N] and done counts");
++    // loads 1..3 read every block's item row before its count check (one round trip): items sized for the grid
++    TORCH_CHECK(ld == 0 || items.numel() >= 3 * max_items, "dec: items [max_items, 3] for the 16-byte load path");
+     c10::cuda::CUDAGuard guard(X0.device());
+     exl3_dec_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow,
+-                  sv0, sv1, su2, out, limit, done);
++                  sv0, sv1, su2, out, limit, done, ld);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 363fa23..38824db 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -64,6 +64,16 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
+     return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
+ }
+ 
++// 16 bytes of trellis words, read once a window (no L1 allocation); asm volatile keeps it where it stands relative
++// to the (volatile) mma, so the ring depth is what the code says (patches/0580 of jayleaton/glm53-tensorfold-spark).
++__device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
++    uint4 v;
++    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
++                 : "l"(p));
++    return v;
++}
++
+ // Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
+ // SEQ (prompt chunks): grid (.., .., mat); one program runs the SK splits in turn and writes Z[mat][0][pair][n] =
+ // ((0 + split 0) + split 1) + ..., the epilogue's own sum, so an SK = 1 epilogue gives the same bits without the
+@@ -328,7 +338,16 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
+ //   to finish (an atomic count, reset for the next launch) runs gateup_epilogue_kernel's arithmetic on the item's
+ //   rows and 128 columns, reading the partials in split order: the same sums whichever block finishes last.
+ // XROW: X holds one row a token (rot_rows, a layer whose experts share one suh), pair p reads row p / slots.
+-template <int NT, int W, int STEPS, int FUSE, bool XROW>
++// LD (TF_GLM_EXL3_LOADS; data movement only, every chain and sum as above, so the same bits):
++//   0: 32-bit __ldg of word `lane` of each tile, one k step ahead, after the count -> item -> members round trips;
++//   1: adapted from jayleaton/glm53-tensorfold-spark patches/0580 (exl3_ld.cu ld_kernel, LD_NC; Apache-2.0,
++//      Copyright 2026 Jay Leaton). Changes: in our dec_kernel (its items / counts plan, fused epilogues and XROW
++//      inputs kept), PD fixed at compile time, no probes / PDL. The count and the item are read together and the
++//      first PD k steps' trellis words are issued before the member rows reach shared memory; the words come as
++//      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
++//      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
++//      back as word `lane` of each tile.
++template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1>
+ __global__ void __launch_bounds__(W * 32) dec_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
+     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
+@@ -336,9 +355,17 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
+     const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ su2, void* __restrict__ out,
+     float limit, int* __restrict__ done) {
+     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
++    static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
+     const int item = blockIdx.x, nblock = blockIdx.y;
+-    if (item >= counts[0]) return;
+-    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    int e, first, cnt;
++    if constexpr (LD == 0) {
++        if (item >= counts[0]) return;
++        e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    } else {                                             // one round trip: items holds a row for every block
++        const int total = counts[0];
++        e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++        if (item >= total) return;
++    }
+     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
+     const int mat = blockIdx.z / SK, split = blockIdx.z % SK;
+     const half* X = mat ? X1 : X0;
+@@ -348,7 +375,17 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
+     const int KT = K >> 4, NTILES = N >> 4;
+ 
+     __shared__ int rows_sh[16];
+-    __shared__ float red[W][16][NT * 16];
++    __shared__ __align__(16) float red[W][16][NT * 16];
++    constexpr int NV = NT / 4;                           // LD 1: 16-byte loads a lane a k step
++    uint4 rv[LD == 1 ? PD : 1][LD == 1 ? NV : 1];
++    const uint32_t* tbase = T + (((size_t)e * KT + split * (KT / SK) + warp * STEPS) * NTILES + nblock * NT) * 32;
++    const size_t kstep = (size_t)NTILES * 32;            // words from one k tile to the next
++    if constexpr (LD == 1) {
++#pragma unroll
++        for (int d = 0; d < PD; ++d)
++#pragma unroll
++            for (int v = 0; v < NV; ++v) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
++    }
+     if (threadIdx.x < 16) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+     __syncthreads();
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+@@ -367,6 +404,48 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
+ #pragma unroll
+             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+ 
++    if constexpr (LD == 1) {
++        uint32_t ra[PD][4];
++#pragma unroll
++        for (int d = 0; d < PD; ++d) {
++            const int k = (kt0 + d) * 16;
++            ra[d][0] = load_pair(x0 + k, r0 >= 0); ra[d][1] = load_pair(x1 + k, r1 >= 0);
++            ra[d][2] = load_pair(x0 + k + 8, r0 >= 0); ra[d][3] = load_pair(x1 + k + 8, r1 >= 0);
++        }
++        uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
++        for (int kb = 0; kb < STEPS; kb += PD) {
++#pragma unroll
++            for (int d = 0; d < PD; ++d) {
++                const int s = kb + d;
++                const bool more = s + PD < STEPS;
++                uint32_t a[4], words[NT];
++#pragma unroll
++                for (int c = 0; c < 4; ++c) a[c] = ra[d][c];
++                __syncwarp();                            // every lane has read the previous step back
++#pragma unroll
++                for (int v = 0; v < NV; ++v) *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
++                if (more) {                              // the slot's registers are free again
++#pragma unroll
++                    for (int v = 0; v < NV; ++v)
++                        rv[d][v] = ldg_nc_v4(tbase + (size_t)(s + PD) * kstep + 128 * v + 4 * lane);
++                    const int k = (kt0 + s + PD) * 16;
++                    ra[d][0] = load_pair(x0 + k, r0 >= 0); ra[d][1] = load_pair(x1 + k, r1 >= 0);
++                    ra[d][2] = load_pair(x0 + k + 8, r0 >= 0); ra[d][3] = load_pair(x1 + k + 8, r1 >= 0);
++                }
++                __syncwarp();
++#pragma unroll
++                for (int i = 0; i < NT; ++i) words[i] = stage[i * 32 + lane];
++#pragma unroll
++                for (int i = 0; i < NT; ++i) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile(words[i], lane, b0, b1);
++                    mma16816(acc[i][0], a, b0);
++                    mma16816(acc[i][1], a, b1);
++                }
++            }
++        }
++        __syncwarp();                                    // the staging area becomes red[warp] below
++    } else {
+     // grouped_kernel's PF loop as it is (a runtime loop: unrolling it measured slower)
+     uint32_t words[NT], a[4];
+ #pragma unroll
+@@ -402,6 +481,7 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
+         }
+         tile += (size_t)NTILES * 32;
+     }
++    }
+ 
+ #pragma unroll
+     for (int i = 0; i < NT; ++i)
+@@ -916,8 +996,9 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
+                    const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+                    int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+                    int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+-                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done) {
++                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
+     constexpr int NT = 8, W = 4, STEPS = 16;
++    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
+     TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
+                 "decode expert kernel: 16 k steps a warp");
+     TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
+@@ -926,15 +1007,21 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
+-#define DEC(F_, XR_)                                                                                              \
+-    dec_kernel<NT, W, STEPS, F_, XR_><<<grid, W * 32, 0, stream>>>(                                               \
++#define DEC1(F_, XR_, LD_, PD_)                                                                                   \
++    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_><<<grid, W * 32, 0, stream>>>(                                     \
+         h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
+         Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
+         out.data_ptr(), (float)limit, done.data_ptr<int>())
+-    if (fuse == 0) { if (xrow) DEC(0, true); else DEC(0, false); }
+-    else if (fuse == 1) { if (xrow) DEC(1, true); else DEC(1, false); }
+-    else { if (xrow) DEC(2, true); else DEC(2, false); }
++#define DEC(F_, XR_)                                                                                              \
++    if (ld == 0) DEC1(F_, XR_, 0, 1);                                                                             \
++    else if (ld == 1) DEC1(F_, XR_, 1, 1);                                                                        \
++    else if (ld == 2) DEC1(F_, XR_, 1, 2);                                                                        \
++    else DEC1(F_, XR_, 1, 4)
++    if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
++    else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
++    else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
+ #undef DEC
++#undef DEC1
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index f519b9f..d79bfb2 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -46,6 +46,21 @@ def dec_settings() -> tuple[bool, int, bool]:
+     return on, fuse, os.environ.get("TF_GLM_EXL3_XROW", "1") != "0"
+ 
+ 
++LOADS = {"0": 0, "ldg": 0, "1": 1, "nc": 1, "nc1": 1, "nc2": 2, "nc4": 3}
++
++
++def dec_loads() -> int:
++    """TF_GLM_EXL3_LOADS: the decode kernel's trellis loads (the same bits for every value). ``0`` / ``ldg``
++    (default): 32-bit loads one k step ahead; ``nc`` / ``nc1``, ``nc2``, ``nc4``: 16-byte ld.global.nc loads 1, 2 or
++    4 k steps ahead through a staging area, the item read with its count in one round trip and the first steps'
++    words issued before the member rows arrive (after jayleaton/glm53-tensorfold-spark patches/0580, Apache-2.0)."""
++
++    v = (os.environ.get("TF_GLM_EXL3_LOADS", "") or "0").strip().lower()
++    if v not in LOADS:
++        raise ValueError(f"TF_GLM_EXL3_LOADS: 0, nc, nc2 or nc4, not {v!r}")
++    return LOADS[v]
++
++
+ def _seq() -> bool:
+     """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
+     import os
+@@ -58,7 +73,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v18", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v19", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -197,12 +212,13 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+         else:
+             ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+             xg, xu = s.xg, s.xu
++        ld = dec_loads()
+         ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
+-                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done)
++                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, ld)
+         if not fuse & 2:
+             ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
+         ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
+-                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done)
++                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, ld)
+         if not fuse & 1:
+             ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
+         return

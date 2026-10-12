@@ -1,0 +1,124 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index faec521..59d55e3 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
+ from tensorfold.cuda import health
+ from tensorfold.server import metrics, responses
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+-from tensorfold.server.errors import CapacityError, RequestError, error_body
++from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.http import Server
+ from tensorfold.server.stacks import Rearming
+ 
+@@ -46,10 +46,12 @@ def make_handler(app: App):
+         def log_message(self, fmt, *args):  # quiet
+             pass
+ 
+-        def _json(self, code: int, payload: dict[str, Any]) -> None:
++        def _json(self, code: int, payload: dict[str, Any], headers: dict[str, str] | None = None) -> None:
+             data = json.dumps(payload).encode()
+             try:
+                 self.send_response(code)
++                for _k, _v in (headers or {}).items():   # TFCAP-0074
++                    self.send_header(_k, _v)
+                 self.send_header("Content-Type", "application/json")
+                 self.send_header("Content-Length", str(len(data)))
+                 if self.close_connection:                # so a pooling client does not reuse the socket
+@@ -129,8 +131,8 @@ def make_handler(app: App):
+             try:
+                 prepared = app.prepare(body, chat)
+             except RequestError as exc:
+-                return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc, field)})
++                code, _hd = admission_response(exc)      # TFCAP-0074
++                return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
+             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
+                 _log_error(exc)
+                 return self._json(400, {"error": {"message": _error_message(exc)}})
+@@ -203,8 +205,8 @@ def make_handler(app: App):
+                 self.close_connection = True
+                 return
+             except RequestError as exc:
+-                return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc, field)})
++                code, _hd = admission_response(exc)      # TFCAP-0074
++                return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
+             except Exception as exc:
+                 _log_error(exc)
+                 try:
+diff --git tensorfold/server/errors.py tensorfold/server/errors.py
+index b4a47dd..4b0a5df 100644
+--- tensorfold/server/errors.py
++++ tensorfold/server/errors.py
+@@ -3,7 +3,7 @@ class RequestError(ValueError):
+ 
+ 
+ class CapacityError(RequestError):
+-    """A transient capacity refusal: HTTP 503, retry shortly."""
++    """A transient capacity refusal: HTTP 429 + Retry-After (see admission_response)."""
+ 
+ 
+ class RoundError(RuntimeError):
+@@ -23,6 +23,14 @@ class ContextLengthError(RequestError):
+ CONTEXT_LIMIT = "This server's maximum context length is"      # OpenAI's wording, which clients match to compact
+ 
+ 
++def admission_response(exc: Exception) -> tuple[int, dict[str, str] | None]:
++    # TFCAP-0074: how every API layer renders a capacity refusal: a real 429 with a retry hint
++    # (not a bare 503), so the same client backs off instead of stacking invisibly. Deliberate
++    # deviation from vLLM, whose refusals are 503 for a load balancer to route to another
++    # instance: a single-instance LAN deployment has no other instance to route to.
++    return (429, {"Retry-After": "5"}) if isinstance(exc, CapacityError) else (400, None)
++
++
+ def refusal(problem: str) -> RequestError:
+     """A refusal string as its error: a context-window one carries OpenAI's code."""
+ 
+diff --git tensorfold/server/http.py tensorfold/server/http.py
+index 98ac60d..c8ab8d6 100644
+--- tensorfold/server/http.py
++++ tensorfold/server/http.py
+@@ -14,7 +14,7 @@ from tensorfold.engine import grammar
+ from tensorfold.server import responses
+ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
+                                      tool_choice_requires_call)
+-from tensorfold.server.errors import CapacityError, RequestError, error_body
++from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.request_options import parse_numbers, thinking_fields
+ from tensorfold.server.probabilities import probability_options
+ from tensorfold.server.messages import normalize_messages, validate_modalities
+@@ -87,9 +87,12 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+         def log_message(self, format: str, *args: Any) -> None:
+             print(f"[tensorfold] {self.address_string()} {format % args}")
+ 
+-        def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
++        def _send_json(self, payload: dict[str, Any], status: int = 200,
++                       headers: dict[str, str] | None = None) -> None:
+             body = json.dumps(payload).encode("utf-8")
+             self.send_response(status)
++            for _k, _v in (headers or {}).items():   # TFCAP-0074
++                self.send_header(_k, _v)
+             self.send_header("Content-Type", "application/json")
+             self.send_header("Content-Length", str(len(body)))
+             if self.close_connection:                    # so a pooling client does not reuse the socket
+@@ -237,8 +240,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 stream = bool(body.get("stream", False))
+                 tool_policy = ToolCallPolicy(body)
+             except RequestError as exc:
+-                self._send_json({"error": error_body(exc)},
+-                                status=503 if isinstance(exc, CapacityError) else 400)
++                status, _hd = admission_response(exc)    # TFCAP-0074
++                self._send_json({"error": error_body(exc)}, status=status, headers=_hd)
+                 return
+             except Exception as exc:
+                 self._send_json({"error": {"message": str(exc)}}, status=400)
+@@ -486,6 +489,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 )
+             except (BrokenPipeError, ConnectionResetError, RequestCancelled):
+                 pass
++            except CapacityError as exc:  # TFCAP-0074 (order: before RequestError — a CapacityError is one)
++                self._send_json({"error": error_body(exc)}, *admission_response(exc))
+             except RequestError as exc:
+                 self._send_json({"error": error_body(exc)}, status=400)
+             except Exception as exc:  # surface runner errors to the client

@@ -1,0 +1,73 @@
+diff --git tensorfold/families/glm5_next/cuda/display_kv.py tensorfold/families/glm5_next/cuda/display_kv.py
+--- tensorfold/families/glm5_next/cuda/display_kv.py
++++ tensorfold/families/glm5_next/cuda/display_kv.py
+@@ -13,6 +13,13 @@
+ For headless Sparks only: a card with a connected output (a monitor) keeps its reservation, and the start stops.
+ Fails closed: the credited bytes were never budgeted against host memory, so a span that cannot be mapped stops the
+ start instead of falling back to ordinary memory.
++
++kindling spark-os: ``TF_GLM_DISPLAY_KV_BACKEND=dispram`` takes the span from kindling's dispramd instead of a
++DRM dumb buffer. kindling's nvidia_drm runs without modeset (CREATE_DUMB fails ENOSYS) and dispramd owns the
++reservation: its client's ``map_glued`` maps ordinary device memory with the reservation's slice right above it as one
++virtual range (CUDA VMM), the same layout ``map_span`` builds, so everything carved from the span is unchanged. Needs
++the client on the path and the daemon's socket in the container (start.sh mounts both for this backend). ``drm``
++(the default) is upstream's path.
+ """
+ from __future__ import annotations
+ 
+@@ -22,10 +29,19 @@
+ 
+ ENV = "TF_GLM_DISPLAY_KV_MIB"
+ CARD_ENV = "TF_GLM_DISPLAY_KV_CARD"
++BACKEND_ENV = "TF_GLM_DISPLAY_KV_BACKEND"
+ LARGEST_MIB = 2032
+ SYSFS = "/sys/class/drm"
+ 
+ 
++def backend() -> str:
++    """Where the span's reservation half comes from: ``drm`` (the default) or ``dispram`` (kindling spark-os)."""
++    value = (os.environ.get(BACKEND_ENV) or "drm").strip().lower()
++    if value not in ("drm", "dispram"):
++        raise ValueError(f"{BACKEND_ENV}={value!r}: drm or dispram")
++    return value
++
++
+ def mib() -> int:
+     """The display reservation credited to the pool, in MiB; 0 when off."""
+     raw = (os.environ.get(ENV) or "").strip()
+@@ -204,6 +220,26 @@
+         pass                       # unwinding: the first failure is the one to report
+ 
+ 
++def _map_span_dispram(ordinary: int, display: int) -> Span:
++    """``map_span`` from dispramd (kindling spark-os): ``ordinary`` bytes of device memory and at least
++    ``display`` bytes of the reservation right above them, one virtual range. Fails closed like the DRM path: no
++    client, no daemon or a slice short of ``display`` stops the start."""
++    try:
++        import dispram
++    except ImportError as exc:
++        raise RuntimeError(f"{ENV}: {BACKEND_ENV}=dispram, but the dispram client is not importable (mount "
++                           "/opt/kindling/dispram/python and put it on PYTHONPATH)") from exc
++    if not dispram.available():
++        raise RuntimeError(f"{ENV}: {BACKEND_ENV}=dispram, but dispramd does not answer (mount /run/dispram)")
++    total = ordinary + display
++    index = torch.cuda.current_device()
++    torch.cuda.synchronize(index)
++    pointer, _, tail = _step("dispram.map_glued", dispram.map_glued, total, index)
++    if tail < display:
++        raise RuntimeError(f"{ENV}: dispramd lent {tail} B of the reservation, short of {display} B")
++    return Span(pointer, total)
++
++
+ def map_span(ordinary: int, display: int) -> Span:
+     """``ordinary`` bytes of host memory and the ``display`` bytes of the reservation right above them, both
+     registered with CUDA, as one span. Unwound completely on any failure."""
+@@ -211,6 +247,8 @@
+     if busy := connected_outputs(SYSFS, card):
+         raise RuntimeError(f"{ENV}: {', '.join(f'{card}-{o}' for o in busy)} has a display connected, which uses the "
+                            f"reservation; unset {ENV} on a Spark with a monitor")
++    if backend() == "dispram":         # the same refusal first; a scanned-out framebuffer is no place for a pool
++        return _map_span_dispram(ordinary, display)
+     total = ordinary + display
+     system = SYSTEM()
+     fd = handle = base = None

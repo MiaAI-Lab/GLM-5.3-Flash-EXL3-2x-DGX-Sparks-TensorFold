@@ -1,0 +1,82 @@
+# GLM's <|assistant|> role token (154828) ends a reply, like the checkpoint's end tokens <|endoftext|>, <|user|> and
+# <|observation|>. At high reasoning effort the model sometimes wrote it inside its answer and started a second one
+# (an English re-reasoning and the same answer again), and the reply's text carried the raw token to the client, which
+# agents then fed back into the conversation (issue #60, reported by @Lukas-tek-no-logic). The token is read from the
+# checkpoint's tokenizer.json and joins Config.eos, which every decode loop, the multi-stream engine, the grammar and
+# the server's text use on every rank; the startup comparison checks the ranks agree. TF_GLM_ASSISTANT_ENDS=0 keeps the
+# checkpoint's end tokens. Replies without the token are unchanged.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 4de2fb1..473c904 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -665,7 +665,7 @@ class GlmEngine:
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv)]
++                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -678,7 +678,7 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index b768c7d..6746779 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -3,7 +3,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass, field
++from functools import lru_cache
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -19,6 +21,27 @@ from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, kvb_kind, ma
+ PREFIX = "model.language_model."
+ 
+ 
++@lru_cache(maxsize=None)
++def assistant_end(model_dir: str) -> int | None:
++    """The id of GLM's ``<|assistant|>`` role token when it ends a reply (TF_GLM_ASSISTANT_ENDS, default 1; 0: it
++    doesn't), or None without one in the checkpoint's tokenizer. The checkpoint's end tokens are ``<|endoftext|>``,
++    ``<|user|>`` and ``<|observation|>``; at high reasoning effort the model sometimes writes ``<|assistant|>``
++    inside its answer and starts a second one, which reached the client with the token in its text (issue #60). A new
++    assistant turn inside an assistant turn ends it: the reply stops there, as at the other role tokens."""
++
++    on = (os.environ.get("TF_GLM_ASSISTANT_ENDS", "") or "1").strip()
++    if on not in ("0", "1"):
++        raise ValueError(f"TF_GLM_ASSISTANT_ENDS: 0 or 1, not {on!r}")
++    path = Path(model_dir) / "tokenizer.json"
++    if on == "0" or not path.is_file():
++        return None
++    try:
++        added = json.loads(path.read_text()).get("added_tokens", [])
++    except (OSError, ValueError):
++        return None
++    return next((int(t["id"]) for t in added if t.get("content") == "<|assistant|>" and t.get("special")), None)
++
++
+ @dataclass
+ class Config:
+     hidden: int
+@@ -70,6 +93,9 @@ class Config:
+         quant = raw.get("quantization") or raw.get("quantization_config") or {}
+         eos = t.get("eos_token_id", raw.get("eos_token_id"))
+         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
++        end = assistant_end(str(Path(model_dir)))
++        if end is not None and end not in eos:
++            eos += (end,)                     # issue #60: a new assistant turn ends the reply (TF_GLM_ASSISTANT_ENDS)
+         n = int(t["num_hidden_layers"])
+         kinds = ["kda" if k == "linear_attention" else "dsa" for k in t["layer_types"]]
+         dense = int(t.get("first_k_dense_replace", 3))

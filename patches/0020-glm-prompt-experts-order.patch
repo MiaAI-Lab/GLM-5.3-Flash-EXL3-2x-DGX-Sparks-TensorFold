@@ -1,0 +1,320 @@
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index 9755ea8..908afbe 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -14,7 +14,7 @@ void exl3_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
+ void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+-                      double, int64_t, int64_t, bool);
++                      double, int64_t, int64_t, bool, const c10::optional<at::Tensor>&);
+ void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
+ void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                    const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+@@ -96,7 +96,7 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+             const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
+             const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
+             at::Tensor xd, at::Tensor y, int64_t D, int64_t N, int64_t E, int64_t max_items, double limit,
+-            int64_t pass, int64_t slots, bool shx) {
++            int64_t pass, int64_t slots, bool shx, c10::optional<at::Tensor> order) {
+     const at::cuda::CUDAGuard guard(Xg.device());
+     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
+     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
+@@ -104,8 +104,9 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+     check(y, at::kFloat, "prompt: y");
+     TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
+     TORCH_CHECK(slots > 0, "prompt: slots");
++    if (order.has_value()) check(*order, at::kInt, "prompt: order");
+     exl3_prompt_cuda(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                     max_items, limit, pass, slots, shx);
++                     max_items, limit, pass, slots, shx, order);
+ }
+ 
+ // Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 19357c7..363fa23 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -41,6 +41,18 @@ __device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)
+     b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
+ }
+ 
++// decode_tile's values with fewer integer instructions (the prompt kernels): the byte-aligned 16-bit states taken
++// with one PRMT each and w >> 4 shared by two states. The same states, so the same bits.
++__device__ __forceinline__ void decode_tile_p(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    const uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    const uint32_t s = __funnelshift_r(w, p, 20);
++    const uint32_t t = w >> 4;
++    b0[0] = mcg2(__byte_perm(s, 0u, 0x4421), (s >> 4) & 0xffffu);          // (s >> 8) & 0xffff, (s >> 4) & 0xffff
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2(__byte_perm(t, 0u, 0x4421), __byte_perm(w, 0u, 0x4421));   // (w >> 12) & 0xffff, (w >> 8) & 0xffff
++    b1[1] = mcg2(__byte_perm(t, 0u, 0x4410), w & 0xffffu);                  // (w >> 4) & 0xffff, w & 0xffff
++}
++
+ __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                  "{%0,%1,%2,%3};\n"
+@@ -593,7 +605,7 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+ #pragma unroll
+             for (int i = 0; i < C::MT; ++i) {
+                 uint32_t b0[2], b1[2];
+-                decode_tile(ws[((size_t)(warp * C::MT + i) * PKT + kk) * 32 + lane], lane, b0, b1);
++                decode_tile_p(ws[((size_t)(warp * C::MT + i) * PKT + kk) * 32 + lane], lane, b0, b1);
+                 a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
+             }
+ #pragma unroll
+@@ -603,10 +615,11 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+                     const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
+                     ldsm_x4(r, xs + (size_t)row * PXS + kk * 16 + ((lane >> 3) & 1) * 8);
+                     const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
++                    const bool upper = jb * 16 + 8 < cnt;         // members 8..15 of the block (else zero rows)
+ #pragma unroll
+                     for (int i = 0; i < C::MT; ++i) {
+                         mma16816(acc[i][2 * jb], a[i], bl);
+-                        mma16816(acc[i][2 * jb + 1], a[i], bh);
++                        if (upper) mma16816(acc[i][2 * jb + 1], a[i], bh);
+                     }
+                 }
+             }
+@@ -645,19 +658,84 @@ constexpr size_t prompt_smem() {
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+ }
+ 
++// The launch order of a prompt plan's items (ORDER): the items of experts that take one item (their weights come
++// from DRAM, few mma) and of experts that take several (their passes run together and share the weights through L2:
++// mostly mma) merged evenly, each list in plan order, so DRAM and the tensor cores stay busy together instead of in
++// turns. Only which block runs which item changes: every output keeps its bits. The shared expert's items (id E, the
++// plan's last) are left out: order[slot] = item for slot < the routed items, -1 after. One block.
++__global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restrict__ items,
++                                                            const int* __restrict__ counts, int* __restrict__ order,
++                                                            int cap, int E) {
++    __shared__ int wsum[32];
++    __shared__ int routed;
++    const int all = min(counts[0], cap);
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    if (tid == 0) routed = 0;
++    __syncthreads();
++    for (int i = tid; i < all; i += 1024)               // items are in expert order: the routed ones come first
++        if (items[3 * i] < E && (i + 1 == all || items[3 * (i + 1)] >= E)) routed = i + 1;
++    __syncthreads();
++    const int n = routed;
++    const int per = (n + 1023) / 1024;
++    const int lo = min(n, tid * per), hi = min(n, lo + per);
++    auto heavy = [&](int i) {
++        const int e = items[3 * i];
++        return (i > 0 && items[3 * (i - 1)] == e) || (i + 1 < n && items[3 * (i + 1)] == e);
++    };
++    int h = 0;
++    for (int i = lo; i < hi; ++i) h += heavy(i);
++    int v = h;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, v, o);
++        if (lane >= o) v += u;
++    }
++    if (lane == 31) wsum[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += u;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    const int nh = wsum[31], nl = n - nh;
++    int rh = (warp ? wsum[warp - 1] : 0) + v - h;       // heavy items before lo
++    for (int i = lo; i < hi; ++i) {
++        if (heavy(i)) {                                // heavy rank r sits at (r + 1/2) / nh; lights before it: strictly
++            const int r = rh++;
++            const long long X = (2LL * r + 1) * nl;
++            const int cl = X > nh ? (int)min((long long)nl, (X - nh + 2LL * nh - 1) / (2LL * nh)) : 0;
++            order[r + cl] = i;
++        } else {                                       // light rank l at (l + 1/2) / nl; heavies at or before it
++            const int l = i - rh;
++            const long long Y = (2LL * l + 1) * nh;
++            const int ch = Y >= nl ? (int)min((long long)nh, (Y - nl) / (2LL * nl) + 1) : 0;
++            order[l + ch] = i;
++        }
++    }
++    for (int i = n + tid; i < all; i += 1024) order[i] = -1;
++}
++
+ // SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
+ template <int PM, int NW, bool SHX>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
+     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+     const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+-    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit, int slots) {
++    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit, int slots,
++    const int* __restrict__ order) {
+     constexpr int MT = 16 / NW, PH = PM / 2;
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+     __shared__ int rows_sh[PM];
+     __shared__ int xrows_sh[SHX ? PM : 1];              // SHX: the members' token rows
+-    const int cb = blockIdx.x, item = blockIdx.y;
+-    if (item >= counts[0]) return;
++    const int cb = blockIdx.x;
++    if ((int)blockIdx.y >= counts[0]) return;
++    const int item = order ? order[blockIdx.y] : blockIdx.y;
++    if (item < 0) return;                                // ORDER leaves the shared expert's items out
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+     if (e >= E) return;                                  // the shared expert
+     if (threadIdx.x < PM) {
+@@ -699,9 +777,12 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+             v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
+         }
+         fwht128(v, lane);
+-        half* o = xd + (size_t)p * N + n;
+-#pragma unroll
+-        for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++        const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++        const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++        uint2 packed;
++        packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++        packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++        *reinterpret_cast<uint2*>(xd + (size_t)p * N + n) = packed;
+     }
+     }  // halves
+ }
+@@ -710,12 +791,14 @@ template <int PM, int NW>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+     const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
+     const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+-    float* __restrict__ y, int K, int D, int E) {
++    float* __restrict__ y, int K, int D, int E, const int* __restrict__ order) {
+     constexpr int MT = 16 / NW, PH = PM / 2;
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+     __shared__ int rows_sh[PM];
+-    const int cb = blockIdx.x, item = blockIdx.y;
+-    if (item >= counts[0]) return;
++    const int cb = blockIdx.x;
++    if ((int)blockIdx.y >= counts[0]) return;
++    const int item = order ? order[blockIdx.y] : blockIdx.y;
++    if (item < 0) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+     if (e >= E) return;
+     if (threadIdx.x < PM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
+@@ -738,9 +821,11 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+ #pragma unroll
+             for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
+             fwht128(v, lane);
+-            float* o = y + (size_t)p * D + n;
+-#pragma unroll
+-            for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
++            const uint2 sv = *reinterpret_cast<const uint2*>(svh_d + (size_t)e * D + n);
++            const half2 s01 = *reinterpret_cast<const half2*>(&sv.x), s23 = *reinterpret_cast<const half2*>(&sv.y);
++            *reinterpret_cast<float4*>(y + (size_t)p * D + n) =
++                make_float4(v[0] * HAD_SCALE * __low2float(s01), v[1] * HAD_SCALE * __high2float(s01),
++                            v[2] * HAD_SCALE * __low2float(s23), v[3] * HAD_SCALE * __high2float(s23));
+         }
+     }
+     }  // halves
+@@ -860,7 +945,8 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                           const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                           const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+-                          int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx) {
++                          int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx,
++                          const int* order) {
+     constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
+     static bool once = [] {
+         cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+@@ -879,16 +965,16 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+         prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
+             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+-            (float)limit, (int)slots);
++            (float)limit, (int)slots, order);
+     else
+         prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
+             h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+-            (float)limit, (int)slots);
++            (float)limit, (int)slots, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+         reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
+-        members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E);
++        members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+@@ -896,14 +982,25 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
+                       const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                       const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+-                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx) {
++                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx,
++                      const c10::optional<at::Tensor>& order_buf) {
+     TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
++    const int* order = nullptr;
++    if (order_buf.has_value()) {
++        TORCH_CHECK(order_buf->numel() >= max_items, "prompt experts: order buffer too small");
++        int* o = order_buf->data_ptr<int>();
++        prompt_order_kernel<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(items.data_ptr<int>(),
++                                                                              counts.data_ptr<int>(), o,
++                                                                              (int)max_items, (int)E);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        order = o;
++    }
+     if (pass == 128)
+         prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
+-                               E, max_items, limit, slots, shx);
++                               E, max_items, limit, slots, shx, order);
+     else if (pass == 64)
+         prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                             max_items, limit, slots, shx);
++                             max_items, limit, slots, shx, order);
+     else
+         TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
+ }
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index c872731..f519b9f 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -58,7 +58,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v17", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v18", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -130,6 +130,14 @@ def prompt_kernels() -> bool:
+     return os.environ.get("TF_GLM_EXL3_PROMPT", "1") != "0"
+ 
+ 
++def item_order() -> bool:
++    """TF_GLM_EXL3_ORDER (default on): prompt kernels run the items of single-item experts (DRAM-bound) and of
++    multi-item experts (mma-bound, weights shared through L2) interleaved; 0: plan order. The same bits either way."""
++    import os
++
++    return os.environ.get("TF_GLM_EXL3_ORDER", "1") != "0"
++
++
+ def row_rotation() -> bool:
+     """TF_GLM_EXL3_ROWROT (default on): prompt chunks of layers whose experts share one gate/up suh rotate each row's
+     input once and load it once for gate and up (the same fp16 inputs, so the same bits); 0: per pair, as decode."""
+@@ -153,6 +161,8 @@ class Scratch:
+         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
+                                 dtype=torch.int32, device=device)
+         self.rows, self.slots = rows, slots
++        # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
++        self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
+ 
+ 
+ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Experts, s: Scratch, y: torch.Tensor,
+@@ -173,7 +183,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+         ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
+                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
+                                                                                    plan.tile), float(limit),
+-                   plan.tile, slots, shx)
++                   plan.tile, slots, shx, s.order if item_order() else None)
+         return
+     if plan.tile != grouped.TILE:
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")

@@ -1,0 +1,40 @@
+# GLM's dense 4-bit projections of a prompt chunk (forward.mm -> the shared prefill matmul) launch the tile the shape
+# runs fastest on, instead of the extension's default tile 0: tile 9 (128 x 128 on four 64 x 64 warps, two blocks an SM)
+# where K >= 1024 and the grid has 96 or more 128 x 128 blocks, tile 3 (64 x 64) otherwise (forward.prompt_tile,
+# measured on a GB10 at every projection of a 2,048-row chunk). A tile only picks which warp computes an output: every
+# output is the same fp32 mma chain over K, so the bits are tile 0's. TF_GLM_PROMPT_TILE=0: tile 0 as before. Python
+# only. tools/prompt_tile_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -421,11 +421,28 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     return out.view(b.world, R, d)
+ 
+ 
++# patch 0102: TF_GLM_PROMPT_TILE=0 launches every prompt projection on tile 0 as before (an A/B on one image)
++PROMPT_TILES = __import__("os").environ.get("TF_GLM_PROMPT_TILE", "1") != "0"
++
++
++def prompt_tile(m: int, n: int, k: int) -> int:
++    """The shared prefill matmul's tile for an (m, n, k) projection of a prompt chunk (patch 0102). Every tile runs
++    each output's one fp32 mma chain over K in the same order (the tile only picks which warp computes it), so the
++    bits are tile 0's. Tile 9 (128 x 128 on four 64 x 64 warps, two blocks an SM) where its blocks fill the GPU twice
++    over and K is long; tile 3 (64 x 64 blocks) for narrow, short-K or few-block shapes. Measured on a GB10 at every
++    projection one 2,048-row chunk runs on a TP=3 rank: the chunk's dense projections -14% against tile 0 (the
++    default before), outputs identical bit for bit (tools/prompt_tile_check.py)."""
++
++    if not PROMPT_TILES:
++        return 0
++    return 9 if k >= 1024 and -(-m // 128) * -(-n // 128) >= 96 else 3
++
++
+ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
+     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
+ 
+     if b.prefill and isinstance(q, qmm.Q4):
+-        return shared.prefill_matmul(x, q, f32=f32, out=out)
++        return shared.prefill_matmul(x, q, f32=f32, out=out, tile=prompt_tile(x.shape[0], q.n, q.k))
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 

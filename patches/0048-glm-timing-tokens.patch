@@ -1,0 +1,65 @@
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 8741f33..863250c 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -467,14 +467,19 @@ class MultiDecoder:
+         verify window on the one-stream graphs and on the batched graphs, ms by rows up to the one-stream graphs'
+         widest (fastest of ``reps``; slot 0's states cleared after)."""
+ 
++        from .forward import stage
++        from .verify import timing_tokens
++
+         e, v = self.e, self.verify
+         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+         solo = v.time_rows(reps, most=self.lone_rows)
++        tokens = timing_tokens(self.w.cfg.vocab, v.rows_max)       # the rows time_rows gave the batched graphs
+         out = []
+         for R in range(1, self.lone_rows + 1):
+             g = e.graphs.main.get((R, e.home.parity))
+             if g is None:
+                 continue
++            stage(self.w, e.home, e.buf, tokens[:R])
+             best = float("inf")
+             for _ in range(reps + 1):
+                 start.record()
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 3858103..f359bc9 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -65,6 +65,14 @@ class SerialVerify:
+             commit(e.w, seg.st, e.buf, len(seg.tokens), keep)
+ 
+ 
++def timing_tokens(vocab: int, n: int) -> list[int]:
++    """Fixed, distinct token ids for startup timings of verify windows (rows of real text route to many experts)."""
++
++    import numpy as np
++
++    return [int(t) for t in np.random.default_rng(1234).choice(min(vocab, 150000), size=n, replace=False)]
++
++
+ class BatchedVerify:
+     """One forward over every segment's rows (``rows`` at most, ``segments.MAX_SEGS`` streams), on buffers of its
+     own; see the module docstring. ``taps``: the drafter's tap layers (DFlash2's inputs), or ()."""
+@@ -138,16 +146,19 @@ class BatchedVerify:
+     @torch.no_grad()
+     def time_rows(self, reps: int = 5, most: int | None = None) -> list[float]:
+         """ms of the captured window of each size (1 .. its rows): the fastest of ``reps`` replays, on the capture's
+-        own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted."""
++        own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted. The
++        rows are ``timing_tokens`` (distinct tokens: a window of one token repeated routes every row to the same few
++        experts and times a 16-row window at about half of what 16 real rows cost)."""
+ 
+         from .sparse import SPARSE_FROM
+ 
+         index = self.e.caches.index is not None
+         out = []
+         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        tokens = timing_tokens(self.w.cfg.vocab, self.rows_max)
+         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+             g = self.graphs[R]
+-            self._stage([0] * R)
++            self._stage(tokens[:R])
+             self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+             best = float("inf")

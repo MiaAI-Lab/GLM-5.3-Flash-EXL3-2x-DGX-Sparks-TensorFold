@@ -1,0 +1,97 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index d355e85..1e6d712 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -113,7 +113,13 @@ class Engine:
+ 
+             kda_mod.reserve(max(max_rows, prefill_rows), tp.of(w).lin_heads, w.device)
+         self.buf = Buffers(w, max_rows, capacity)
+-        self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
++        # the row split's pad rows past a full chunk (three ranks: 1; ``hcsplit.pad_rows``)
++        pad = 0
++        if split is not None and split.split:
++            from .hcsplit import pad_rows
++
++            pad = pad_rows(prefill_rows, w.world)
++        self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True, pad=pad)
+         if taps:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 7aa889c..96ee202 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -694,6 +694,9 @@ class GlmEngine:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+                 print(f"[tensorfold] {self.split.describe()}", flush=True)
++                if not self.e.pbuf.split.applies(prefill_rows):      # e.g. TF_GLM_HC_SPLIT_MIN_ROWS past a chunk
++                    print(f"[tensorfold] note: a full {prefill_rows}-row prompt chunk runs unsplit at {world} ranks "
++                          "(only shorter ones split)", flush=True)
+         c = self.copy
+         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
+             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 1af69e5..4d6499e 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -35,7 +35,7 @@ def prompt_split_k(w: Weights) -> bool:
+ class Buffers:
+     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
+ 
+-    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False) -> None:
++    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False, pad: int = 0) -> None:
+         c = w.cfg
+         dev = w.device
+         bf, f32 = torch.bfloat16, torch.float32
+@@ -43,6 +43,9 @@ class Buffers:
+         HL = tp.of(w).heads
+         LL = tp.of(w).lin_heads
+         self.rows, self.prefill = rows, prefill
++        # ``pad``: rows held past the largest window, for the row split's pad rows (TF_GLM_HC_SPLIT past two ranks: a
++        # chunk rounded up to whole shares a rank, ``hcsplit.pad_rows``); every buffer below holds them
++        self.alloc_rows = rows = rows + int(pad)
+         head_rows = 1 if prefill else rows
+         self.world = w.world
+         self.ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
+@@ -151,7 +154,8 @@ class Buffers:
+         self.tap_at = {}
+         for i, layer in enumerate(layers):
+             self.tap_at.setdefault(layer, []).append(i)
+-        self.taps = [torch.empty((self.rows, hidden), dtype=torch.bfloat16, device=self.ids.device) for _ in layers]
++        self.taps = [torch.empty((self.alloc_rows, hidden), dtype=torch.bfloat16, device=self.ids.device)
++                     for _ in layers]
+ 
+     def parents(self, R: int) -> torch.Tensor:
+         p = self._parents.get(R)
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 7a44e73..3c14726 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -56,6 +56,16 @@ def _int(env, name: str, default: int, lo: int, hi: int) -> int:
+     return int(value)
+ 
+ 
++def pad_rows(rows: int, world: int) -> int:
++    """Rows a prompt buffer of ``rows`` rows holds past them for the split's pad rows: a chunk of ``rows`` rows rounded
++    up to whole shares a rank (``HcSplit.padded``). 0 at two and four ranks (prompt chunks are a multiple of 64 rows);
++    1 at three, where a 2,048-row chunk splits as 3 x 683 = 2,049 rows: without that row every full chunk failed
++    ``applies`` and ran unsplit (an all-gather of every rank's whole partial at each of the 90 sites, the glue on
++    every row, no overlap)."""
++
++    return -int(rows) % int(world)
++
++
+ @dataclass(frozen=True)
+ class SplitSettings:
+     """What TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP ask for; both ranks must agree (the startup comparison)."""
+@@ -155,7 +165,8 @@ class HcSplit:
+         return -(-R // self.world) * self.world
+ 
+     def applies(self, R: int) -> bool:
+-        return R >= self.settings.min_rows and self.padded(R) <= self.b.rows
++        """Whether a chunk of R rows runs split: long enough, and its pad rows fit the buffers (``pad_rows``)."""
++        return R >= self.settings.min_rows and self.padded(R) <= getattr(self.b, "alloc_rows", self.b.rows)
+ 
+     def warm(self) -> None:
+         """Open the NCCL send/receive connections to the peers at startup (every rank calls this together)."""

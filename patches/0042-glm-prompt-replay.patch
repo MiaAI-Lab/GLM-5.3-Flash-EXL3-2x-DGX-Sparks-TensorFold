@@ -1,0 +1,258 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 2382093..a117edc 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -127,6 +127,7 @@ class Engine:
+         self.slots = Slots(w, streams, max_rows)
+         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
++        self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
+         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
+         self.draft_n = w.head.n
+         self.graphs = None
+@@ -295,6 +296,10 @@ class Snapshot:
+     nbytes: int = 0
+     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+     tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
++    # the head's logits row at ids' end (this rank's vocabulary slice, before any grammar mask), kept with a prompt's
++    # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
++    # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
++    head: torch.Tensor | None = None
+ 
+ 
+ def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+@@ -423,6 +428,7 @@ def snapshot_bytes(snap: Snapshot) -> int:
+     """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
+     the indexer rings' tail and any saved rows."""
+     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
++    held += [snap.head] if snap.head is not None else []
+     held += [t for pair in (snap.tail or []) for t in pair]
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+@@ -455,16 +461,28 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ 
+ 
+ # -- prefill ----------------------------------------------------------------------------------------------------
++def whole(snap: Snapshot | None, prompt: Sequence[int]) -> bool:
++    """Whether ``snap`` is a state of exactly ``prompt`` that kept its head's logits row (a replay resumes there)."""
++
++    return snap is not None and snap.head is not None and len(snap.ids) == len(prompt)
++
++
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+-            resume: Snapshot | None = None, feed=None, sample: bool = True) -> int | None:
+-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample."""
++            resume: Snapshot | None = None, feed=None, sample: bool = True, keep_head: bool = False) -> int | None:
++    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample.
++
++    ``resume`` may also be a state of the whole prompt that kept its head's logits row (``whole``, a replay): the
++    state goes back and the first token is sampled from that row, nothing prefilled. ``keep_head``: the head's
++    logits row of the prompt's end, as sampled from (before a grammar's mask), is left in ``e.head`` for a snapshot."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+     w, st, b = e.w, e.st, e.pbuf
+     use_mtp = mtp and w.mtp is not None
+     begin = 0
++    replay = sample and whole(resume, prompt)
++    e.head = None
+     if resume is None:
+         e.reset()
+         if drafter is not None:
+@@ -473,23 +491,33 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         begin = len(resume.ids)
+         if e.grid and begin % e.grid:
+             raise ValueError(f"a resumed prefill starts on the {e.grid}-row grid, not at {begin}")
+-        if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
+-            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
++        if (begin >= len(prompt) and not replay) or list(prompt[:begin]) != resume.ids:
++            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt (or of the whole "
++                             "prompt with its head's logits row)")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+             raise ValueError("this snapshot's draft caches do not fit the request")
+         restore(e, resume, drafter)
+-        if use_mtp:
++        if use_mtp and replay:
++            # the prompt's last hidden row waits for the first token, as a fresh prefill leaves it (the MTP cache
++            # holds every row before it: mtp_len n - 1)
++            e.last_hidden = resume.pending[-1:].clone()
++        elif use_mtp:
+             k = resume.pending.shape[0]
+             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
+     last = None
+-    prof.active = True
+-    for start in range(begin, len(prompt), e.prefill_rows):
+-        last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter, feed=feed,
+-                             mtp=use_mtp, head=sample)
+-    prof.active = False
+-    prof.report(len(prompt) - begin)
++    if replay:
++        last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
++    else:
++        prof.active = True
++        for start in range(begin, len(prompt), e.prefill_rows):
++            last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter,
++                                 feed=feed, mtp=use_mtp, head=sample)
++        prof.active = False
++        prof.report(len(prompt) - begin)
+     if not sample:
+         return None
++    if keep_head:
++        e.head = last.clone()
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+         e.window = e.constraint.window([0], [-1])
+     first = e.sample(last, [len(prompt)], sampling)[0]
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 2e0d675..032b546 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -827,14 +827,16 @@ class GlmEngine:
+         return auto, auto or not dflash, dflash
+ 
+     def _resume(self, prompt: list[int], code: list[int]):
+-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
++        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
++        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``)."""
+ 
+         _, mtp, dflash = self._drafters(code)
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
+             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
+-            if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
++            short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
++            if fits and short and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+         return best
+@@ -931,7 +933,7 @@ class GlmEngine:
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                   feed=None, shared=()) -> dict[str, Any]:
+-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
++        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot, whole
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+@@ -966,11 +968,18 @@ class GlmEngine:
+             resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                    drafter=drafter)
+             kept.append(resume)
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
++        # a replay of a kept prompt (``decode.whole``: its state and head's logits row) prefills nothing and keeps
++        # nothing new; a prompt's own end state keeps the head's row it sampled from, for a later replay
++        replay = whole(hit, prompt)
++        end = point == len(prompt) and not replay
++        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed,
++                        keep_head=end)
+         prefill_s = time.perf_counter() - t0
+-        if point == len(prompt):
+-            kept.append(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                      drafter=drafter))
++        if end:
++            snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                 drafter=drafter)
++            snap.head, self.e.head = self.e.head, None
++            kept.append(snap)
+         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+         for snap in kept:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 9eafb09..8741f33 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -287,6 +287,7 @@ class Lane:
+     stops: list[int] = field(default_factory=list)   # prompt positions whose states are kept (before the end)
+     point: int | None = None           # where the prompt's own state is kept (engine.grid_point), or None
+     shared: list[int] = field(default_factory=list)
++    head: Any = None                   # a replay's first-token logits row (its kept prompt's, ``decode.whole``)
+     decoding: bool = False
+     paused: bool = False
+     t0: float = 0.0
+@@ -665,6 +666,11 @@ class MultiDecoder:
+                 if hit.drafter_end != cut or hit.drafter_rows is None:
+                     raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
+                 put_draft_window(self._ctx(lane), cut, hit.drafter_rows)
++            if cut == len(prompt):          # a replay: its one FILL samples the kept head's row, prefilling nothing
++                if hit.head is None:
++                    raise RuntimeError(f"the kept prompt {a['kid']} is the whole prompt of stream {a['sid']} but "
++                                       f"kept no head row")
++                lane.head = hit.head.clone()
+             self._touch(hit)
+         # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
+         if a["draft"] and feed is None:
+@@ -688,20 +694,24 @@ class MultiDecoder:
+         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
+ 
+     def _resume(self, prompt: list[int]):
++        """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
++        replay of an earlier prompt), whose DFlash2 window came along."""
+         best = None
+         for c in self.kept:
+             n = len(c.ids)
+             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
+             fits = fits and not (self.grid and n % self.grid)
+-            if fits and n < len(prompt) and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
++            short = n < len(prompt) or (n == len(prompt) and c.head is not None)
++            if fits and short and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
+                 best = c
+         return best
+ 
+     def _touch(self, c) -> None:
+         self.kept = [k for k in self.kept if k is not c] + [c]
+ 
+-    def _keep(self, lane: Lane, n: int) -> None:
+-        """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent."""
++    def _keep(self, lane: Lane, n: int, head=None) -> None:
++        """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
++        ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay)."""
+ 
+         from .decode import take_snapshot
+ 
+@@ -714,6 +724,7 @@ class MultiDecoder:
+         if lane.dflash:
+             snap.drafter_end = n
+             snap.drafter_rows = draft_window(self._ctx(lane), n)
++        snap.head = head
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+@@ -731,7 +742,7 @@ class MultiDecoder:
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+         c.rec = c.conv = None
+-        c.tail = None
++        c.tail = c.head = None
+         c.drafter_rows = None
+         self._settle(x)
+ 
+@@ -970,19 +981,23 @@ class MultiDecoder:
+         prompt = s.prompt
+         n = len(prompt)
+         start = lane.st.pos
+-        if not start < stop <= n or stop - start > e.prefill_rows:
++        replay = lane.head is not None           # resumed at the prompt's end: no rows, the kept head's row
++        if not (start < stop <= n or replay and start == stop == n) or stop - start > e.prefill_rows:
+             raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+         t = time.perf_counter()
+         prev = e.use(lane.st)
+         try:
+-            out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+-                                feed=lane.feed, mtp=False, head=stop == n)
++            if replay:
++                out, lane.head = lane.head, None
++            else:
++                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
++                                    feed=lane.feed, mtp=False, head=stop == n)
+             if stop < n:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 return None
+-            if lane.point == n:
+-                self._keep(lane, n)
++            if lane.point == n and not replay:
++                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)

@@ -1,0 +1,113 @@
+# Queued or memory-held GLM callers acknowledge disconnect before admission, even when all lanes are busy.
+# The scheduler owns removal; active streams still finish through the decoder. Apache-2.0.
+# By @desy0305 (PR #51).
+# Each waiting caller polls with a 0.1 s queue timeout (~10 wakes/s/caller); acknowledgement also waits for a scheduler round.
+# Extends 0058's client-gone poll to queued callers; preserves 0070's decoder/rank stop vote and serial path.
+# Delivery-failure idea by @johnwhited (PR #48); shared-loop ownership pending author agreement.
+# Proposed GLM integration: stop on callback error, then report it after decoder cleanup.
+# No admission limit or HTTP status changes; the generic cuda/scheduler.py delivery fix remains separate.
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1774,19 +1774,79 @@
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background)
+         stream.glm = dict(glm or {})
+-        cancel = [False]
+-        stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+-        stream.emit.cancelled = getattr(emit, "cancelled", None)
++        # The caller polls; only the scheduler removes cancelled queued requests.
++        stop, disconnected, cancel_error = [False], [False], [None]
++        poll = getattr(emit, "cancelled", None)
++
++        def cancelled() -> bool:
++            if not disconnected[0] and cancel_error[0] is None and poll is not None:
++                try:
++                    if poll():                      # sticky: an older False poll must never undo another's True
++                        disconnected[0] = stop[0] = True
++                except Exception as exc:
++                    cancel_error[0], stop[0] = exc, True
++            return disconnected[0] or cancel_error[0] is not None
++
++        stream.emit = lambda new: (box.put(("tokens", new)), stop[0])[1]
++        stream.emit.cancelled = cancelled
++        stream.emit.cancel_requested = lambda: disconnected[0] or cancel_error[0] is not None
++        stream.emit.cancel_error = lambda: cancel_error[0]
+         self.waiting.put((stream, box))
+         while True:
+-            kind, value = box.get()
++            cancelled()
++            try:
++                kind, value = box.get(timeout=0.1)
++            except queue.Empty:
++                continue
+             if kind == "tokens":
+-                if not cancel[0] and emit(value):
+-                    cancel[0] = True                 # the client left or a stop string: the stream ends next round
++                if not stop[0]:
++                    try:
++                        if emit(value):
++                            stop[0] = True           # a normal stop/gate cut is not cancellation
++                    except Exception as exc:
++                        cancel_error[0], stop[0] = exc, True
+             elif kind == "error":
+                 raise value
+             else:
++                if cancel_error[0] is not None:      # report callback failures only after active decoder cleanup
++                    raise cancel_error[0]
++                if disconnected[0]:
++                    from tensorfold.server.cancellation import RequestCancelled
++                    raise RequestCancelled("the client left during the reply")
+                 return value
++
++    def _cancel_item(self, item) -> bool:
++        """Scheduler-owned cancellation of a not-admitted request; no decoder/rank state exists yet."""
++        from tensorfold.server.cancellation import RequestCancelled
++
++        stream, box = item
++        poll = getattr(stream.emit, "cancelled", None)
++        if poll is None or not poll():
++            return False
++        error = getattr(stream.emit, "cancel_error", lambda: None)()
++        box.put(("error", error if error is not None else RequestCancelled("the client left before admission")))
++        return True
++
++    def _cancel_waiting(self) -> None:
++        """Reap waiting/held requests even when every lane is busy; retain exact queue priorities/order."""
++        import heapq
++
++        if self.held is not None and self._cancel_item(self.held):
++            self.held = None
++        removed = []
++        # Never call the socket callback while holding the queue lock: these are caller-latched flags.
++        with self.waiting.mutex:
++            kept = []
++            for entry in self.waiting.queue:
++                stream, _ = entry[2]
++                flag = getattr(stream.emit, "cancel_requested", None)
++                (removed if flag is not None and flag() else kept).append(entry)
++            if removed:
++                self.waiting.queue[:] = kept
++                heapq.heapify(self.waiting.queue)
++                self.waiting.not_full.notify_all()
++        for entry in removed:
++            self._cancel_item(entry[2])
+ 
+     def _admit(self, first=None, until: float | None = None) -> list[Stream]:
+         """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
+@@ -1804,6 +1864,8 @@
+                     item = self.waiting.get(timeout=left) if left > 0 else self.waiting.get_nowait()
+                 except queue.Empty:
+                     break
++            if self._cancel_item(item):
++                continue
+             stream, box = item
+             if not self.decoder.fits(stream):
+                 self.held = item                     # waits, first in line, for room
+@@ -1864,6 +1926,7 @@
+                     self._reply(s, "error", exc)
+ 
+     def _iteration(self) -> None:
++        self._cancel_waiting()
+         self._yield()
+         idle = not self.decoder.live() and self.held is None
+         first = self.waiting.get() if idle else None                # idle: wait for a request

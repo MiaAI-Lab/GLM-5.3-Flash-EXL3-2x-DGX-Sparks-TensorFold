@@ -1,0 +1,184 @@
+# A conversation that quotes a picture or clip marker -- a pasted chat template, a log, this server's own
+# refusal -- used to end every turn that also carried a real picture: the frontend counted the quoted markers as
+# media ('the prompt's image and video markers do not match its images and videos'), and since the quotation sits
+# in the history, the refusal then repeated forever. A real session carried 59 of them. A quoted marker cannot be
+# told from a marker the template wrote -- they are the same bytes -- so server/prompts.py now marks every picture
+# and clip of a request (not only tool results') with a per-request nonce rendered before its marker, and the
+# frontend's escape_quoted neutralizes every marker that does not stand behind one: a quotation stays text (a
+# zero-width space after '<|'), the request's own markers still expand, and a template or client that drops a
+# picture still refuses. A bare mention is escaped the same way. Speed is untouched: prompt preparation, once a
+# request, and only for one that carries media (prose decode measured 62.6-65.9 tok/s, floor 60). Applies after
+# 0074-glm-picture-cache.patch. Apache-2.0.
+
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -30,6 +30,27 @@
+ IMAGE, VIDEO = "<|image|>", "<|video|>"
+ IMAGE_SPAN = "<|begin_of_image|><|image|><|end_of_image|>"     # what the chat template writes for a picture
+ VIDEO_SPAN = "<|begin_of_video|><|video|><|end_of_video|>"     # and for a clip, expanded frame pair by frame pair
++
++_MENTION_ZWSP = "\u200b"           # keeps a marker a conversation merely mentions from being read as the token
++_MENTIONS = ("<|begin_of_image|>", "<|end_of_image|>", "<|begin_of_video|>", "<|end_of_video|>",
++             IMAGE, VIDEO)
++
++
++def _as_text(text: str) -> str:
++    """A marker a conversation mentions -- a patch, a log, this server's own refusal -- must stay text.
++
++    The encoder reads a bare ``<|image|>`` as the picture token itself, and the engine then finds a position
++    with no features for it (``prepare`` counts them). A zero-width space inside the marker leaves the
++    characters there for the model while the encoder tokenizes them as the text they are."""
++
++    if "<|" not in text:
++        return text
++    for mark in _MENTIONS:
++        if mark in text:
++            text = text.replace(mark, mark[:2] + _MENTION_ZWSP + mark[2:])
++    return text
++
++
+ MEAN = (0.48145466, 0.4578275, 0.40821073)                    # CLIP's, from processor_config.json
+ STD = (0.26862954, 0.26130258, 0.27577711)
+ PASS_PATCHES = 8192                  # patches the tower encodes at once (its workspace scales with this): a
+@@ -631,12 +652,51 @@
+         canvas = smart_resize(2, image.height, image.width, tokens, self.limits.min_tokens)
+         return fit(rgb, canvas, content_size(2, image.height, image.width, canvas, self.limits.min_tokens))
+ 
++    @staticmethod
++    def _marker_spans(text: str):
++        """(start, end) of every picture and clip marker in ``text``, left to right."""
++
++        out, pos = [], 0
++        while True:
++            i, v = text.find(IMAGE_SPAN, pos), text.find(VIDEO_SPAN, pos)
++            if i < 0 and v < 0:
++                return out
++            if v < 0 or 0 <= i < v:
++                out.append((i, i + len(IMAGE_SPAN)))
++                pos = i + len(IMAGE_SPAN)
++            else:
++                out.append((v, v + len(VIDEO_SPAN)))
++                pos = v + len(VIDEO_SPAN)
++
++    def escape_quoted(self, text: str, mark_ends) -> str:
++        """``text`` with the markers a conversation only quotes turned into text, for ``server.prompts``.
++
++        A marker the template wrote for this request's own picture or clip stands right behind the mark rendered for
++        it (``MediaMarks``); every other one -- a pasted template, a log, this server's own refusal -- is a
++        quotation. The encoder would read it as the picture token itself and the engine would then find a position
++        with no features for it, so a quotation is escaped (a zero-width space after ``<|``) and ``prepare`` leaves
++        it as the text it is. ``mark_ends`` are where this request's marks end."""
++
++        ends = set(mark_ends)
++        out, pos = [], 0
++        for start, stop in self._marker_spans(text):
++            out.append(_as_text(text[pos:start]))          # the text before it (this request's mark included:
++            own = start in ends                            # the server takes the marks out afterwards)
++            out.append(text[start:stop] if own else _as_text(text[start:stop]))
++            pos = stop
++        out.append(_as_text(text[pos:]))
++        return "".join(out)
++
+     def prepare(self, text: str, images, *, videos=(), max_prompt_tokens: int | None = None) -> GlmPrepared:
+         """The rendered prompt with each picture's and clip's placeholder expanded as Glm5NextProcessor does."""
+ 
+         videos = list(videos or ())
+-        if text.count(IMAGE) != text.count(IMAGE_SPAN) or text.count(IMAGE_SPAN) != len(images) or \
+-                text.count(VIDEO) != len(videos) or text.count(VIDEO_SPAN) != len(videos):
++        # A conversation may mention a marker as text -- a patch, a log, this server's own refusal. What the
++        # template wrote for the request's own pictures and clips is the spans the walk below expands; a mention
++        # is only text, and refusing the prompt over it ended a session that kept such text beside a screenshot
++        # (a text-only request, which never reaches here, sends the mention on as it is). A mention of a whole
++        # span is still refused: it cannot be told from a marker, and the walk would spend a picture on it.
++        if text.count(IMAGE_SPAN) != len(images) or text.count(VIDEO_SPAN) != len(videos):
+             raise ImageInputError("the prompt's image and video markers do not match its images and videos "
+                                   "(is <|image|> or <|video|> in the text?)")
+         tokens = self.limits.picture_tokens(len(images))
+@@ -647,7 +707,7 @@
+         while True:
+             i, v = rest.find(IMAGE_SPAN), rest.find(VIDEO_SPAN)
+             if i < 0 and v < 0:
+-                pieces.append(rest)
++                pieces.append(_as_text(rest))
+                 break
+             if v < 0 or 0 <= i < v:
+                 picture = next(image_iter)          # load_images fits pictures as it decodes them
+@@ -656,7 +716,7 @@
+                 else:
+                     picture = picture if hasattr(picture, "dim") else self._picture(picture, tokens)
+                     n = picture.shape[1] // 28 * (picture.shape[2] // 28)
+-                pieces.append(rest[:i] + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
++                pieces.append(_as_text(rest[:i]) + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
+                 items.append(("image", picture))
+                 rest = rest[i + len(IMAGE_SPAN):]
+             else:
+@@ -664,7 +724,7 @@
+                 n = clip.frames.shape[2] // 28 * (clip.frames.shape[3] // 28)
+                 frames = "".join(f"<|begin_of_image|>{IMAGE * n}<|end_of_image|>{s:.1f} seconds"
+                                  for s in clip.seconds)
+-                pieces.append(rest[:v] + "<|begin_of_video|>" + frames + "<|end_of_video|>")
++                pieces.append(_as_text(rest[:v]) + "<|begin_of_video|>" + frames + "<|end_of_video|>")
+                 items.append(("video", clip.frames))
+                 rest = rest[v + len(VIDEO_SPAN):]
+         ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -63,10 +63,14 @@
+ 
+ 
+ class MediaMarks:
+-    """Each picture's and clip's place in the rendered prompt, for a frontend whose template renders tool results'
+-    media (``tool_media``): a template may sort tool results (GLM-5.3's orders them by their calls' ids) or leave
+-    one out (``agent_history``), so the media are matched to the markers by a mark rendered before each
+-    (``tf_mark``, a per-request nonce), then the marks are taken out: the prompt is the one rendered without them."""
++    """Each picture's and clip's place in the rendered prompt: a template may sort tool results (GLM-5.3's orders
++    them by their calls' ids) or leave one out (``agent_history``), so the media are matched to the markers by a mark
++    rendered before each (``tf_mark``, a per-request nonce), then the marks are taken out: the prompt is the one
++    rendered without them.
++
++    Every request with media is marked, not only one whose pictures sit in tool results: the marks are also what
++    tells a marker the template wrote from one the conversation merely quotes (a pasted template, a log, this
++    server's own refusal), which the frontend's ``escape_quoted`` neutralizes."""
+ 
+     def __init__(self, template) -> None:
+         import re
+@@ -83,18 +87,25 @@
+ 
+     @staticmethod
+     def wanted(template) -> bool:
+-        """Whether a tool result carries media (a user's alone keep the prompt as it always rendered)."""
++        """Whether the request carries pictures or clips at all (a user's and a tool result's alike)."""
+ 
+-        return any(m.get("role") == "tool" and isinstance(m.get("content"), list)
++        return any(isinstance(m.get("content"), list)
+                    and any(isinstance(p, dict) and p.get("type") in ("image", "video") for p in m["content"])
+                    for m in template)
+ 
+-    def read(self, text: str) -> tuple[str, list[int]]:
+-        """(the text without its marks, the media's indices in the order the template rendered them)."""
++    def read(self, text: str, escape=None) -> tuple[str, list[int]]:
++        """(the text without its marks, the media's indices in the order the template rendered them).
+ 
+-        order = [int(m.group(1)) for m in self.pattern.finditer(text)]
++        ``escape`` (a frontend's ``escape_quoted``) is given the text and where this request's marks end, so it can
++        neutralize the markers the conversation only quotes -- without it, a chat that keeps such text beside a
++        picture is refused on every turn that carries one."""
++
++        found = [(m.start(), m.end(), int(m.group(1))) for m in self.pattern.finditer(text)]
++        order = [k for _, _, k in found]
+         if any(k >= self.count for k in order):
+             raise ValueError("the rendered prompt's media marks do not match the request's media")
++        if escape is not None:
++            text = escape(text, [e for _, e, _ in found])
+         return self.pattern.sub("", text), order
+ 
+ 
+@@ -115,7 +126,7 @@
+         text = None
+         if tool_media and MediaMarks.wanted(template):
+             marks = MediaMarks(template)
+-            text, order = marks.read(render(template))
++            text, order = marks.read(render(template), escape=getattr(frontend, 'escape_quoted', None))
+             sources = [sources[k] for k in order]          # as rendered: sorted, or left out with their result
+     except (ImageInputError, ValueError) as exc:
+         raise RequestError(str(exc)) from exc

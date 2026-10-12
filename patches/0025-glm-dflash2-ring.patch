@@ -1,0 +1,13 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 946e2d6..93ab4dc 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -324,7 +324,7 @@ def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
+     DFlash2's window rows."""
+     n = len(snap.ids)
+     views = _row_views(e.st, n, max(snap.mtp_len, 0))
+-    if drafter is not None and snap.drafter_end == n:
++    if drafter is not None and snap.drafter_end == n and not getattr(drafter, "ring", 0):   # a ring's: drafter_rows
+         views += _drafter_views(drafter, n)
+     return views
+ 

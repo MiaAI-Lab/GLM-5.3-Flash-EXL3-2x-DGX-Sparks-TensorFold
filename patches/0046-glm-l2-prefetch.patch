@@ -1,0 +1,628 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index a117edc..9b80e31 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -100,6 +100,13 @@ class Engine:
+         self.w = w
+         self.grid = grid
+         w.meta["long_context"] = long_context
++        from . import l2pf
++
++        pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
++        if pf.on and torch.cuda.is_available() and w.meta.get("l2pf") is None:
++            w.meta["l2pf"] = l2pf.Prefetch(w, pf)
++            if w.rank == 0:
++                print(f"[tensorfold] {w.meta['l2pf'].summary()}", flush=True)
+         self.rows, self.prefill_rows = max_rows, prefill_rows
+         if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
+             from . import kda as kda_mod
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 1aab97c..60250c3 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
++from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -415,7 +415,8 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 
+-def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) -> torch.Tensor | None:
++def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, site: tuple | None = None
++             ) -> torch.Tensor | None:
+     """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
+     [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
+     and runs hc_post itself (``hcsplit.HcSplit``)."""
+@@ -425,17 +426,20 @@ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) ->
+         sp.partial(fill)
+         return None
+     fill(0, R)
++    if site is not None and l2pf.ACTIVE is not None:      # TF_GLM_L2PF: the next reads into L2 during the gather
++        l2pf.ACTIVE.site(*site)
+     if label is None:
+         return gather(w, b, R)
+     with prof.timed(label):
+         return gather(w, b, R)
+ 
+ 
+-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor | None:
++def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int,
++             site: tuple | None = None) -> torch.Tensor | None:
+     def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
+         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
+ 
+-    return partials(w, b, R, fill)
++    return partials(w, b, R, fill, site=site)
+ 
+ 
+ def undone(R: int, done: tuple[int, int] | None) -> list[tuple[int, int]]:
+@@ -478,6 +482,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+             ga = p[:, k.ga_off:k.ga_off + 128]
+             mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+             mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++            l2pf.site(layer.index, "o")
+     cur = st.cur[li]
+     with prof.timed("kda: recurrence"):
+         out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+@@ -487,7 +492,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
++        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: "Slots",
+@@ -506,12 +511,13 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
+         ga = p[:, k.ga_off:k.ga_off + 128]
+         mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+         mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++        l2pf.site(layer.index, "o")
+     with prof.timed("kda: recurrence"):
+         out = kda_mod.chain_segments(seg, p, k.b_off, b.ka[:R], b.kg[:R], slots.conv[:, li], k.conv,
+                                      slots.rec[:, :, li], k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R,
+                                      scratch.views[li])
+     with prof.timed("kda: out + all-gather"):
+-        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
++        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -536,7 +542,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+         dsa_front(layer, w, b, lo, hi)
+     HL = a.heads
+     if a.absorb is not None:
+-        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
++        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
+     if sparse_np is not None:
+         raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
+     mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
+@@ -594,7 +600,7 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
+ 
+ 
+ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
+-                index, host_pos: int | None, sparse_np: int | None = None) -> torch.Tensor:
++                index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1) -> torch.Tensor:
+     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
+ 
+     c = w.cfg
+@@ -614,6 +620,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+             sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
++    l2pf.site(layer, "o")
+     ol = s.ol[:R]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+@@ -635,7 +642,7 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+ 
+ 
+ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+@@ -673,11 +680,12 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+                 tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
++    l2pf.site(layer.index, "o")
+     with prof.timed("dsa: attention"):
+         ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
+ 
+ 
+ def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -690,7 +698,7 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+     m = layer.mlp
+     for lo, hi in undone(R, done):
+         mlp_front(layer, w, b, lo, hi)
+-    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
++    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R, site=(layer.index, "f"))
+ 
+ 
+ def shared_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+@@ -716,6 +724,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+ 
++        if l2pf.ACTIVE is not None and done is None:
++            # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
++            # bits), while the L2 still holds what site "a" prefetched for it
++            shared_front(layer, w, b, 0, R)
++            done = (0, R)
+         with prof.timed("moe: routed (exl3)"):
+             exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+ 
+@@ -732,7 +745,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+                     glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+ 
+-        return partials(w, b, R, fill, "moe: all-gather")
++        return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+     with prof.timed("moe: gate/up"):
+         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
+     with prof.timed("moe: down"):
+@@ -742,7 +755,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         with prof.timed("moe: combine"):
+             glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+ 
+-    return partials(w, b, R, fill, "moe: all-gather")
++    return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+ 
+ 
+ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+@@ -861,6 +874,22 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+             host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
++    c = w.cfg
++    pf = w.meta.get("l2pf")
++    if pf is not None and not b.prefill and R <= pf.s.rows and l2pf.ACTIVE is None:
++        l2pf.ACTIVE = pf                 # TF_GLM_L2PF: this decode window's sites prefetch (joined below)
++        try:
++            return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np,
++                            inject=inject, head=head, mixer=mixer)
++        finally:
++            pf.join()
++            l2pf.ACTIVE = None
++    return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, sparse_np=sparse_np, inject=inject,
++                    head=head, mixer=mixer)
++
++
++def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
++             host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+     if inject is not None:
+diff --git tensorfold/families/glm5_next/cuda/l2pf.cpp tensorfold/families/glm5_next/cuda/l2pf.cpp
+new file mode 100644
+index 0000000..3e9b3b5
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/l2pf.cpp
+@@ -0,0 +1,20 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void l2pf_cuda(const at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
++
++// Prefetch TABLE[first : first + count] ((address, bytes) int64 pieces) into L2; see l2pf.cu.
++void prefetch(const at::Tensor& table, int64_t first, int64_t count, int64_t mode, int64_t blocks, int64_t threads,
++              const at::Tensor& sink) {
++    TORCH_CHECK(table.is_cuda() && table.scalar_type() == at::kLong && table.is_contiguous() && table.dim() == 2 &&
++                table.size(1) == 2, "l2pf: table [n, 2] int64 on the GPU");
++    TORCH_CHECK(first >= 0 && count >= 0 && first + count <= table.size(0), "l2pf: pieces out of the table");
++    TORCH_CHECK(mode >= 0 && mode <= 2 && blocks >= 1 && threads >= 32 && threads % 32 == 0, "l2pf: launch");
++    TORCH_CHECK(sink.is_cuda() && sink.scalar_type() == at::kInt, "l2pf: sink int32 on the GPU");
++    c10::cuda::CUDAGuard guard(table.device());
++    l2pf_cuda(table, first, count, mode, blocks, threads, sink);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("prefetch", &prefetch);
++}
+diff --git tensorfold/families/glm5_next/cuda/l2pf.cu tensorfold/families/glm5_next/cuda/l2pf.cu
+new file mode 100644
+index 0000000..61909d0
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/l2pf.cu
+@@ -0,0 +1,64 @@
++// L2 prefetch of weight ranges for GLM-5.3-Flash's decode windows (l2pf.py): a small kernel on a side stream asks
++// the memory system to bring the next kernels' weights into L2 while the main stream waits on an all-gather or runs
++// latency-bound glue. It only loads or prefetches (no store, atomic or reduction), so no result can change.
++//
++// TABLE [n, 2] int64: (address, bytes) pieces, each 16-byte aligned and at most a few hundred KiB (the host splits).
++// MODE 0 ("bulk"): one cp.async.bulk.prefetch.L2 a piece (the TMA unit walks it; sm_90+).
++// MODE 1 ("lines"): prefetch.global.L2::evict_last on every 128-byte line of a piece, a warp's lanes on adjacent lines.
++// MODE 2 ("touch"): ld.global.cg of every line's first 16 bytes (a real load: the kernel lasts as long as the reads).
++//
++// Adapted from jayleaton/glm53-tensorfold-spark patches/0460 (l2pf.cu; Apache-2.0, Copyright 2026 Jay Leaton).
++// Changes: one kernel for the three modes over a table of pre-split pieces (the host cuts ranges into pieces, so no
++// per-thread chunk loop), lines mode a warp a piece with prefetch.global.L2::evict_last, touch mode as loads here.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cstdint>
++
++namespace {
++
++__global__ void l2pf_kernel(const long long* __restrict__ table, int n, int mode, unsigned* __restrict__ sink) {
++    const int lane = threadIdx.x & 31;
++    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    const int warps = (gridDim.x * blockDim.x) >> 5;
++    if (mode == 0) {
++        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++            const unsigned long long a = (unsigned long long)table[2 * i];
++            const unsigned bytes = (unsigned)table[2 * i + 1];
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "r"(bytes) : "memory");
++#else
++            for (unsigned o = 0; o < bytes; o += 128)
++                asm volatile("prefetch.global.L2 [%0];" :: "l"(a + o));
++#endif
++        }
++        return;
++    }
++    unsigned acc = 0;
++    for (int i = warp; i < n; i += warps) {             // a warp a piece, its lanes on adjacent lines
++        const unsigned long long a = (unsigned long long)table[2 * i];
++        const unsigned bytes = (unsigned)table[2 * i + 1];
++        for (unsigned o = lane * 128u; o < bytes; o += 32u * 128u) {
++            if (mode == 1) {
++                asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(a + o));
++            } else {
++                unsigned x, y, z, w;
++                asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
++                             : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "l"(a + o));
++                acc ^= x ^ y ^ z ^ w;
++            }
++        }
++    }
++    if (mode == 2 && acc == 0x9e3779b9u && sink != nullptr) sink[0] = acc;   // keeps the loads; never true in practice
++}
++
++}  // namespace
++
++void l2pf_cuda(const at::Tensor& table, int64_t first, int64_t count, int64_t mode, int64_t blocks, int64_t threads,
++               const at::Tensor& sink) {
++    if (count <= 0) return;
++    const long long* t = reinterpret_cast<const long long*>(table.data_ptr<int64_t>()) + 2 * first;
++    l2pf_kernel<<<(unsigned)blocks, (unsigned)threads, 0, at::cuda::getCurrentCUDAStream()>>>(
++        t, (int)count, (int)mode, reinterpret_cast<unsigned*>(sink.data_ptr<int>()));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/l2pf.py tensorfold/families/glm5_next/cuda/l2pf.py
+new file mode 100644
+index 0000000..f62a38e
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/l2pf.py
+@@ -0,0 +1,319 @@
++"""L2 prefetch of the next kernels' weights in decode windows (TF_GLM_L2PF, off by default; the same bits).
++
++A decode window's layer alternates DRAM-bound matmuls (projections, routed and shared experts, the head) with phases
++that leave DRAM idle: the two all-gathers a layer (the RoCE wait), the hyper-connection glue, the router and top-k,
++the KDA recurrence and the latent attention core. At a few sites a layer, a small kernel on a side stream asks for
++the weights the main stream reads next to be brought into L2 (``l2pf.cu``) while it is in such a phase; the matmul
++that follows then finds part of its bytes in L2 instead of DRAM. The prefetch only reads, and every model kernel keeps
++its inputs, outputs and stream order, so replies keep their bits.
++
++Sites (``Prefetch.site``, keyed by (layer index, name)):
++
++- ``a``, at the attention block's all-gather: the FFN's hyper-connection weights and norm, the router, and the shared
++  expert's gate/up and down (a dense MLP's gate/up and down); with the prefetcher on, the MoE runs its shared expert
++  before the routed experts (disjoint buffers, the same kernels: the same bits), so the routed experts' ~100+ MB
++  stream does not evict it first.
++- ``f``, at the FFN's all-gather: the next layer's hyper-connection weights and input norm, then its input
++  projections (KDA: proj, f/g low-rank; DSA: proj, q_b, the indexer's keys); after the last layer the final norm and
++  the head.
++- ``o``, after the attention block's input projections, while the recurrence / attention core runs: its output
++  projection.
++
++Each site takes up to TF_GLM_L2PF_MB (default 8) MiB, small tensors first (scales, biases, norms), then the large
++matrices' leading bytes. TF_GLM_L2PF_SITES (default ``afo``) picks the sites. TF_GLM_L2PF=1|bulk (one
++cp.async.bulk.prefetch.L2 per piece), ``lines`` (prefetch.global.L2::evict_last per line) or ``touch`` (ld.global.cg
++per line). Windows over TF_GLM_L2PF_ROWS (default 64) rows and prompt chunks skip every site.
++
++Adapted from jayleaton/glm53-tensorfold-spark patches/0460 (l2pf.py / l2pf.cu; Apache-2.0, Copyright 2026 Jay
++Leaton): the sites at the two all-gathers and after the attention projections, the shared expert first, a budget a
++site, bulk / lines / touch mechanisms, a 4-bit matrix's chunk heads for one-wave launches (``q4_heads``), the side
++stream forked at a site and joined before a forward returns. Changes: written onto this engine's forward (hooks in
++``forward.compute`` / ``partials`` / the KDA and DSA blocks and their multi-stream ``*_segments`` forms, so batched
++verify windows prefetch too); one device table of (address, bytes) pieces for every site with each site's grid sized
++at load; DSA's ``o`` site fires after absorb_q and takes kv_b's value half (this engine's latent layout) before the
++output projection; the next layer's KDA / DSA small weights (f/g low-rank, conv, norms, the indexer's) join site
++``f``; no expert (``e``) or MTP sites; ``touch`` loads inside the same kernel; default 8 MiB a site."""
++
++from __future__ import annotations
++
++import dataclasses
++import os
++from functools import lru_cache
++from typing import Any, Iterable
++
++import torch
++
++MODES = {"1": 0, "bulk": 0, "lines": 1, "touch": 2}
++PIECE = 32 << 10           # bytes a table piece covers at most (a bulk prefetch's size, a warp's walk); TF_GLM_L2PF_KB
++ALIGN = 16                 # cp.async.bulk wants 16-byte addresses and sizes
++
++
++@dataclasses.dataclass
++class Settings:
++    mode: int = -1          # -1: off
++    mb: float = 8.0
++    sites: str = "afo"
++    rows: int = 64
++    blocks: int = 0         # 0: enough for the site's pieces (a thread a piece in bulk mode, a warp a piece else)
++    threads: int = 128
++    piece: int = PIECE
++
++    @classmethod
++    def from_env(cls, env=None) -> "Settings":
++        env = os.environ if env is None else env
++        s = cls()
++        v = (env.get("TF_GLM_L2PF", "") or "0").strip().lower()
++        if v not in ("0", "off", *MODES):
++            raise ValueError(f"TF_GLM_L2PF: 0, 1 (bulk), bulk, lines or touch, not {v!r}")
++        s.mode = MODES.get(v, -1)
++        try:
++            s.mb = float(env.get("TF_GLM_L2PF_MB", "") or 8.0)
++        except ValueError:
++            s.mb = -1.0
++        if not 0 < s.mb <= 64:
++            raise ValueError("TF_GLM_L2PF_MB: above 0 and at most 64 (MiB a site)")
++        s.sites = (env.get("TF_GLM_L2PF_SITES", "") or "afo").strip().lower()
++        if not s.sites or set(s.sites) - set("afo"):
++            raise ValueError(f"TF_GLM_L2PF_SITES: letters of 'afo', not {s.sites!r}")
++        s.rows = int(env.get("TF_GLM_L2PF_ROWS", "") or 64)
++        s.blocks = int(env.get("TF_GLM_L2PF_BLOCKS", "") or 0)
++        s.threads = int(env.get("TF_GLM_L2PF_THREADS", "") or 128)
++        s.piece = int(env.get("TF_GLM_L2PF_KB", "") or PIECE >> 10) << 10
++        if s.blocks < 0 or s.threads < 32 or s.threads % 32 or s.threads > 1024:
++            raise ValueError("TF_GLM_L2PF_BLOCKS / _THREADS: 0 (auto) or more blocks of 32..1024 threads (whole warps)")
++        if not 1 << 10 <= s.piece <= 1 << 20:
++            raise ValueError("TF_GLM_L2PF_KB: 1 .. 1024 KiB a piece")
++        return s
++
++    @property
++    def on(self) -> bool:
++        return self.mode >= 0
++
++    def code(self) -> str:
++        return "off" if not self.on else f"{self.mode}:{self.mb}:{self.sites}:{self.rows}:{self.blocks}:{self.threads}:{self.piece}"
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from pathlib import Path
++
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_l2pf_v2", sources=[str(here / "l2pf.cpp"), str(here / "l2pf.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def tensors(obj: Any) -> list[torch.Tensor]:
++    """The CUDA tensors an object's weights hold (dataclass / plain-object fields in order, lists, tuples), each once."""
++
++    out: list[torch.Tensor] = []
++    seen: set[int] = set()
++
++    def walk(t: Any, depth: int = 0) -> None:
++        if depth > 6 or t is None:
++            return
++        if isinstance(t, torch.Tensor):
++            if t.numel() and t.data_ptr() not in seen:
++                seen.add(t.data_ptr())
++                out.append(t)
++        elif isinstance(t, (list, tuple)):
++            for v in t:
++                walk(v, depth + 1)
++        elif isinstance(t, dict):
++            for v in t.values():
++                walk(v, depth + 1)
++        elif hasattr(t, "__dict__") and not isinstance(t, (int, float, str, bool, torch.device)):
++            for v in vars(t).values():
++                walk(v, depth + 1)
++
++    walk(obj)
++    return out
++
++
++ONE_WAVE = 192             # qmm programs resident at once on GB10 (4 CTAs an SM x 48 SMs)
++
++
++def q4_heads(q, left: int) -> list[tuple[int, int]]:
++    """A 4-bit matrix (``qmm.Q4``: words [N/64, K/64, 8, 32, 2], one contiguous chunk of K * 32 / SK bytes a
++    (64-column tile, K slice), what one decode program streams): the first ``left / chunks`` bytes of EVERY chunk, so
++    each program of a one-wave launch starts on L2 hits and the launch's slowest program is shortened too (a
++    tensor's first bytes would only help its first programs). [] for a launch of more than one wave or heads under
++    512 bytes. (jayleaton/glm53-tensorfold-spark patches/0460 ``_q4_heads``, Apache-2.0, Copyright 2026 Jay Leaton;
++    changes: our qmm's split_k, (address, bytes) pairs.)"""
++
++    from . import qmm
++
++    w = q.weight
++    if not isinstance(w, torch.Tensor) or not w.is_contiguous():
++        return []
++    chunks = -(-int(q.n) // qmm.BN) * qmm.split_k(int(q.n), int(q.k))
++    total = w.numel() * w.element_size()
++    if chunks <= 0 or chunks > ONE_WAVE or total % chunks:
++        return []
++    size = total // chunks
++    per = min(size, left // chunks) // ALIGN * ALIGN
++    if per < 512 or w.data_ptr() % ALIGN or size % ALIGN:
++        return []
++    return [(w.data_ptr() + c * size, per) for c in range(chunks)]
++
++
++def _span(t: torch.Tensor, left: int) -> tuple[int, int] | None:
++    a = t.data_ptr()
++    n = t.numel() * t.element_size()
++    lo = a - a % ALIGN
++    hi = min(a + n, lo + left)
++    hi += (-hi) % ALIGN
++    return (lo, hi - lo) if hi > lo else None
++
++
++def ranges(groups: Iterable[Any], budget: int) -> list[tuple[int, int]]:
++    """(address, bytes) ranges of ``groups`` (weight objects in the order the main stream reads them) up to
++    ``budget`` bytes: within a group its small tensors first (scales, biases, norms), then a 4-bit matrix's chunk
++    heads when its decode launch is one wave (``q4_heads``), else the large tensors' leading bytes; 16-byte aligned."""
++
++    out: list[tuple[int, int]] = []
++    left = budget
++    for g in groups:
++        ts = sorted(tensors(g), key=lambda x: x.numel() * x.element_size())
++        heads = []
++        if all(hasattr(g, a) for a in ("weight", "scales", "biases", "n", "k")) and isinstance(g.weight, torch.Tensor):
++            small = sum(t.numel() * t.element_size() for t in ts if t is not g.weight)
++            heads = q4_heads(g, left - small) if left > small else []
++            if heads:
++                ts = [t for t in ts if t is not g.weight]
++        for t in ts:
++            if left < ALIGN:
++                return out
++            sp = _span(t, left)
++            if sp is not None:
++                out.append(sp)
++                left -= sp[1]
++        if heads and left >= sum(n for _, n in heads):
++            out += heads
++            left -= sum(n for _, n in heads)
++    return out
++
++
++def pieces(spans: list[tuple[int, int]], piece: int = PIECE) -> list[tuple[int, int]]:
++    out = []
++    for a, n in spans:
++        for o in range(0, n, piece):
++            out.append((a + o, min(piece, n - o)))
++    return out
++
++
++class Prefetch:
++    """The sites' tables for one set of weights (one device table; (first, count) a site) and the side stream."""
++
++    def __init__(self, w, settings: Settings | None = None) -> None:
++        self.s = settings or Settings.from_env()
++        self.w = w
++        self.sites: dict[tuple[int, str], tuple[int, int]] = {}
++        self.bytes: dict[tuple[int, str], int] = {}
++        budget = int(self.s.mb * (1 << 20))
++        rows: list[tuple[int, int]] = []
++        layers = list(w.layers)
++        for i, layer in enumerate(layers):
++            nxt = layers[i + 1] if i + 1 < len(layers) else None
++            plan = {"a": self._ffn(layer), "f": self._next(nxt), "o": self._out(layer)}
++            for name, groups in plan.items():
++                if name not in self.s.sites or not groups:
++                    continue
++                spans = ranges(groups, budget)
++                p = pieces(spans, self.s.piece)
++                if p:
++                    self.sites[(layer.index, name)] = (len(rows), len(p), self._grid(len(p)))
++                    self.bytes[(layer.index, name)] = sum(n for _, n in spans)
++                    rows += p
++        dev = w.device
++        self.table = torch.tensor(rows or [(0, 0)], dtype=torch.int64, device=dev).view(-1, 2).contiguous()
++        self.sink = torch.zeros((1,), dtype=torch.int32, device=dev)
++        self.side = torch.cuda.Stream(device=dev) if torch.cuda.is_available() else None
++        if self.side is not None:
++            _ext()                                       # built / loaded now, before any graph capture
++        self.forked = False
++        self.launches = 0
++
++    def _grid(self, n: int) -> int:
++        """Blocks for a site of ``n`` pieces: TF_GLM_L2PF_BLOCKS, or a thread a piece (bulk) / a warp a piece."""
++
++        if self.s.blocks:
++            return self.s.blocks
++        per = self.s.threads if self.s.mode == 0 else self.s.threads // 32
++        return max(1, min(48, -(-n // per)))
++
++    # -- what each site prefetches ---------------------------------------------------------------------------------
++    def _ffn(self, layer) -> list:
++        g: list = [layer.ffn_hc, layer.post_norm]
++        if layer.mlp is not None:
++            g += [layer.mlp.gu, layer.mlp.down]
++        elif layer.moe is not None:
++            g += [layer.moe.router, layer.moe.bias]
++            if layer.moe.shared is not None:
++                g += [layer.moe.shared.gu, layer.moe.shared.down]
++        return g
++
++    def _next(self, nxt) -> list:
++        if nxt is None:
++            return [self.w.norm, self.w.head]
++        g: list = [nxt.attn_hc, nxt.in_norm]
++        if nxt.kda is not None:
++            k = nxt.kda
++            g += [k.fb, k.gb, k.conv, k.a_log, k.dt_bias, k.proj]
++        elif nxt.dsa is not None:
++            a = nxt.dsa
++            g += [a.q_norm, a.kv_norm, a.proj, a.q_b]
++            if a.index is not None:
++                g += [a.index.kw, a.index.gate]
++        return g
++
++    def _out(self, layer) -> list:
++        """KDA: its output projection. DSA (fired after absorb_q, before the attention core): the value half of kv_b
++        that expand_v reads, then the output projection."""
++
++        if layer.kda is not None:
++            return [layer.kda.o]
++        if layer.dsa is not None:
++            a = layer.dsa.absorb
++            value = [getattr(a, n) for n in ("wvs", "wvb", "sv", "wvw", "wv") if getattr(a, n, None) is not None]
++            return value + [layer.dsa.o]
++        return []
++
++    # -- the forward's calls ------------------------------------------------------------------------------------------
++    def site(self, index: int, name: str) -> None:
++        """Fork the side stream at this point of the main stream and prefetch the site's ranges there."""
++
++        key = self.sites.get((index, name))
++        if key is None or self.side is None:
++            return
++        first, count, grid = key
++        main = torch.cuda.current_stream()
++        self.side.wait_stream(main)
++        with torch.cuda.stream(self.side):
++            _ext().prefetch(self.table, first, count, self.s.mode, grid, self.s.threads, self.sink)
++        self.forked = True
++        self.launches += 1
++
++    def join(self) -> None:
++        """The main stream waits for the side stream (a captured graph's branches rejoin before its end)."""
++
++        if self.forked:
++            torch.cuda.current_stream().wait_stream(self.side)
++            self.forked = False
++
++    def summary(self) -> str:
++        per = {}
++        for (_, name), n in self.bytes.items():
++            per.setdefault(name, []).append(n)
++        parts = [f"{k} {len(v)} sites {sum(v) / len(v) / (1 << 20):.1f} MiB" for k, v in sorted(per.items())]
++        mode = {0: "bulk", 1: "lines", 2: "touch"}[self.s.mode]
++        return f"L2 prefetch in decode windows ({mode}, up to {self.s.mb:g} MiB a site): " + ", ".join(parts)
++
++
++ACTIVE: Prefetch | None = None         # set by forward.compute for a decode window while it runs
++
++
++def site(index: int, name: str) -> None:
++    if ACTIVE is not None:
++        ACTIVE.site(index, name)

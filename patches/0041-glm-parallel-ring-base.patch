@@ -1,0 +1,13 @@
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 9bf8b95..3858103 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -148,7 +148,7 @@ class BatchedVerify:
+         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+             g = self.graphs[R]
+             self._stage([0] * R)
+-            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+             best = float("inf")
+             for _ in range(reps + 1):

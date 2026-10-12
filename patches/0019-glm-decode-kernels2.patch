@@ -1,0 +1,269 @@
+diff --git tensorfold/cuda/kernels/qmm.cu tensorfold/cuda/kernels/qmm.cu
+index c759255..5aa20ae 100644
+--- tensorfold/cuda/kernels/qmm.cu
++++ tensorfold/cuda/kernels/qmm.cu
+@@ -56,9 +56,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
+         unsigned char* pw = p + T::X;
+         constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
+         for (int c = tid; c < T::W / 16; c += T::THREADS) {
+-            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+-            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+-            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
++            if constexpr (BN >= 64) {
++                const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++                const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
++                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
++            } else {                                      // part of a stored tile: its n8 tiles are contiguous
++                const size_t tile = static_cast<size_t>(n0 / 64) * KG + g;
++                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + (n0 % 64) * GS / 2 +
++                                  c * 16);
++            }
+         }
+         unsigned char* ps = pw + T::W;
+         for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
+@@ -310,7 +316,11 @@ void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::
+         case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
+         case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+         case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+-        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-11");
++        case 12: launch<64, 16, 32, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 13: launch<64, 16, 32, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 14: launch<64, 16, 32, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 15: launch<64, 16, 32, 1, 1, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-15");
+     }
+ }
+ 
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index c1fb8ce..adec331 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -433,7 +433,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+                 glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
+                 mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
+             with prof.timed("moe: combine"):
+-                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
++                # the shared row read from sy where it is (the copy's bits, one pass less); decode windows too unless
++                # TF_GLM_COMBINE_SY=0
++                if b.prefill or __import__("os").environ.get("TF_GLM_COMBINE_SY", "1") != "0":
+                     glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
+                 else:
+                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 620025a..ae13bb7 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -186,6 +186,23 @@ def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl
+ HC_MMA = __import__("os").environ.get("TF_GLM_HC_MMA", "1") != "0"    # prompt rows' mixing dots on the tensor cores
+ 
+ 
++def hc_dec() -> bool:
++    """TF_GLM_HC_DEC (default on): decode rows' mixing dots in hc.cu, 48 blocks a row instead of 16, _hc_partial's
++    bits; 0: _hc_partial."""
++    return __import__("os").environ.get("TF_GLM_HC_DEC", "1") != "0"
++
++
++@__import__("functools").lru_cache(maxsize=1)
++def _hc_ext():
++    from pathlib import Path
++
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_hc_v2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
+ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
+            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
+            eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
+@@ -198,6 +215,9 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+     if prompt and HC_MMA and x.is_contiguous():
+         _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
+                                                             num_warps=4, num_stages=3)
++    elif (hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16 and x.is_contiguous()
++          and fn.is_contiguous() and part.is_contiguous()):
++        _hc_ext().hc_partial(x, fn, part, rows)                  # _hc_partial's bits on 48 blocks a row
+     else:
+         _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
+diff --git tensorfold/families/glm5_next/cuda/hc.cpp tensorfold/families/glm5_next/cuda/hc.cpp
+new file mode 100644
+index 0000000..4c0cd6a
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/hc.cpp
+@@ -0,0 +1,21 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void hc_partial_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t);
++
++// PART [rows, 16, 32] fp32 = glue._hc_partial's output for x [rows, 16384] bf16 and fn [24, 16384] bf16.
++void hc_partial(const at::Tensor& x, const at::Tensor& fn, at::Tensor part, int64_t rows) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(1) == 16384,
++                "hc_partial: x [rows, 16384] bf16, contiguous");
++    TORCH_CHECK(fn.is_cuda() && fn.scalar_type() == at::kBFloat16 && fn.is_contiguous() && fn.size(0) == 24 &&
++                fn.size(1) == 16384, "hc_partial: fn [24, 16384] bf16");
++    TORCH_CHECK(part.is_cuda() && part.scalar_type() == at::kFloat && part.is_contiguous() &&
++                part.numel() >= rows * 16 * 32, "hc_partial: part [rows, 16, 32] fp32");
++    TORCH_CHECK(rows >= 1 && x.size(0) >= rows, "hc_partial: rows");
++    c10::cuda::CUDAGuard guard(x.device());
++    hc_partial_cuda(x, fn, part, rows);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("hc_partial", &hc_partial);
++}
+diff --git tensorfold/families/glm5_next/cuda/hc.cu tensorfold/families/glm5_next/cuda/hc.cu
+new file mode 100644
+index 0000000..2236475
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/hc.cu
+@@ -0,0 +1,97 @@
++// GLM-5.3-Flash's hyper-connection mixing dots for decode rows (hc_pre's first half) with more blocks than
++// glue._hc_partial, reproducing its bits: that Triton kernel (4 warps, a [32, 128] bf16 tile in the blocked layout
++// sizePerThread [1, 8], threadsPerWarp [2, 16]) sums, for each of 8 steps of 128 inputs, a row's 8 products per
++// thread in input order (products of bf16 values are exact in fp32, so fused or not), then across the 16 lanes of
++// the row with butterflies 8, 4, 2, 1, and adds the steps to a zero accumulator in order; the sum of squares keeps
++// one input per thread (4 warps x 32 lanes), adds the 8 steps' squares to zero in order, then butterflies 16 .. 1
++// within each warp and (w0 + w2) + (w1 + w3) across the warps. PART [rows, 16 blocks, 32]: the 24 dots, then the sum.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_bf16.h>
++
++namespace {
++
++constexpr int WIDE = 16384, NB = 16, KB = WIDE / NB, SUB = 128, STEPS = KB / SUB, ROWS = 24;
++
++__device__ __forceinline__ void unpack8(const uint4 v, float (&f)[8]) {
++    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        f[2 * i] = __uint_as_float(w[i] << 16);
++        f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
++    }
++}
++
++// Block (K block, part, row group): warps 0..7 the dots of mixing rows 8 part .. 8 part + 7 (their weights read once
++// for up to RPB rows), warp 8 of part 0 the squares.
++constexpr int RPB = 4;
++
++__global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __restrict__ X,
++                                                        const __nv_bfloat16* __restrict__ FN, float* __restrict__ part,
++                                                        int rows) {
++    const int b = blockIdx.x, p = blockIdx.y, r0 = blockIdx.z * RPB;
++    const int r1 = min(r0 + RPB, rows);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (warp < 8) {
++        const int m = p * 8 + warp;
++        const int h = lane >> 4, l = lane & 15;
++        const __nv_bfloat16* wr = FN + (size_t)m * WIDE + b * KB;
++        float wf[4][8];
++#pragma unroll
++        for (int i = 0; i < 4; ++i)                    // steps 2 i + h, inputs 8 l .. 8 l + 7 of the step
++            unpack8(__ldg(reinterpret_cast<const uint4*>(wr + (2 * i + h) * SUB + 8 * l)), wf[i]);
++        for (int r = r0; r < r1; ++r) {
++            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
++            uint4 xv[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) xv[i] = __ldg(reinterpret_cast<const uint4*>(xr + (2 * i + h) * SUB + 8 * l));
++            float s[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                float xf[8];
++                unpack8(xv[i], xf);
++                float a = __fmul_rn(wf[i][0], xf[0]);
++#pragma unroll
++                for (int j = 1; j < 8; ++j) a = __fmaf_rn(wf[i][j], xf[j], a);
++#pragma unroll
++                for (int o = 8; o; o >>= 1) a = __fadd_rn(a, __shfl_xor_sync(0xffffffffu, a, o));
++                s[i] = a;
++            }
++            float acc = 0.f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                acc = __fadd_rn(acc, s[i]);                                      // step 2 i (half 0)
++                acc = __fadd_rn(acc, __shfl_sync(0xffffffffu, s[i], 16));       // step 2 i + 1 (half 1)
++            }
++            if (lane == 0) part[((size_t)r * NB + b) * 32 + m] = acc;
++        }
++    } else if (p == 0) {
++        for (int r = r0; r < r1; ++r) {
++            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
++            float w[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {              // the Triton kernel's warp j: input 32 j + lane of each step
++                float ss = 0.f;
++#pragma unroll
++                for (int t = 0; t < STEPS; ++t) {
++                    const float x = __bfloat162float(xr[t * SUB + 32 * j + lane]);
++                    ss = __fmaf_rn(x, x, ss);
++                }
++#pragma unroll
++                for (int o = 16; o; o >>= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
++                w[j] = ss;
++            }
++            if (lane == 0) part[((size_t)r * NB + b) * 32 + ROWS] = __fadd_rn(__fadd_rn(w[0], w[2]), __fadd_rn(w[1], w[3]));
++        }
++    }
++}
++
++}  // namespace
++
++void hc_partial_cuda(const at::Tensor& x, const at::Tensor& fn, at::Tensor& part, int64_t rows) {
++    hc_partial_kernel<<<dim3(NB, 3, (unsigned)((rows + RPB - 1) / RPB)), 288, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(fn.data_ptr()),
++        part.data_ptr<float>(), (int)rows);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index e6d7924..cfe50b3 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -587,6 +587,12 @@ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.c
+     tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
+ 
+ 
++def chunk_stages() -> int:
++    """TF_GLM_LATENT_STAGES (default 3): Triton pipeline depth of the dense / sparse chunk programs' key tiles: the
++    loads only, the same bits (1: none, as before; 4 does not fit in shared memory)."""
++    return int(__import__("os").environ.get("TF_GLM_LATENT_STAGES", "3"))
++
++
+ class LatentScratch:
+     """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``."""
+ 
+@@ -616,7 +622,8 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"latent attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8,
++                                                num_stages=chunk_stages())
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+ 
+@@ -633,7 +640,8 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
+     hb = head_block(R)
+     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8,
++                                                 num_stages=chunk_stages())
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index a3668ae..074a507 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -350,7 +350,7 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
+ # Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
+ # output keeps its chain, so every choice gives the same bits. By per-rank shape (n, k), measured on GB10.
+ DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192, 1536): 2, (4096, 8192): 4,
+-                                         (4096, 1024): 6}
++                                         (4096, 1024): 2}
+ _dec_env: tuple[str, dict] = ("", {})
+ 
+ 

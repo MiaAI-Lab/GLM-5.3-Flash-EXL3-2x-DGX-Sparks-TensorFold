@@ -1,0 +1,2380 @@
+diff --git tensorfold/cli.py tensorfold/cli.py
+index 4ee0f43..c2e3768 100644
+--- tensorfold/cli.py
++++ tensorfold/cli.py
+@@ -232,10 +232,14 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+ 
+     from tensorfold import hub
+ 
+-    if args.tp == 2 and not args.master:
+-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+-    if args.tp == 1 and args.rank != 0:
+-        raise ValueError("--rank 1 needs --tp 2")
++    tp, rank = int(args.tp), int(args.rank)
++    if tp > 1 and not args.master:
++        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
++    if not 0 <= rank < tp:
++        raise ValueError(f"--rank {rank} needs --tp {rank + 1} or more")
++    sizes = tuple(getattr(family.package, "CUDA_TP", (1, 2)))      # tensor-parallel sizes the family's engine runs
++    if tp not in sizes:
++        raise ValueError(f"{family.title} runs on CUDA with --tp {' or '.join(map(str, sizes))}, not {tp}")
+     started = time.perf_counter()
+     drafter = "" if args.no_drafts else _drafter(family, args.drafter)
+     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
+@@ -259,7 +263,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
+         options["checkpoint_slots"] = int(args.checkpoint_slots)
+     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
+-    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
++    where = f", rank {rank} of {tp}" if tp > 1 else ""
+     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
+     from tensorfold.cuda import prompt_precision
+ 
+@@ -271,8 +275,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+         raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
+                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
+     stacks.arm()            # its warmup may have loaded a compiler that took USR1
+-    if args.tp == 2 and args.rank == 1:
+-        print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
++    if tp > 1 and rank > 0:
++        print(f"[tensorfold] rank {rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+         engine.follow()
+         return 0
+     from tensorfold.cuda.server import App, serve
+diff --git tensorfold/cli_args.py tensorfold/cli_args.py
+index a9eb51e..8b0583c 100644
+--- tensorfold/cli_args.py
++++ tensorfold/cli_args.py
+@@ -112,12 +112,13 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+     cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
+     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
+                       help="auto: MLX on macOS, CUDA elsewhere")
+-    cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,
+-                      help="GPUs (one per machine) the model is split over; run the same command on each")
+-    cuda.add_argument("--rank", type=int, choices=(0, 1), default=0,
+-                      help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
+-    cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
+-    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
++    cuda.add_argument("--tp", type=int, choices=(1, 2, 3, 4), default=1,
++                      help="GPUs (one per machine) the model is split over; run the same command on each "
++                           "(3 and 4: GLM-5.3-Flash only)")
++    cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
++                      help="with --tp N: this machine's rank, 0 to N-1; rank 0 serves HTTP, the others follow it")
++    cuda.add_argument("--master", default="", help="with --tp N: rank 0's address on the link between the machines")
++    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp N: rank 0's rendezvous port")
+     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
+                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
+                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index b94a2ce..f541a89 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -122,6 +122,30 @@ class NCCL:
+         finally:
+             self._check(self.lib.ncclGroupEnd())
+ 
++    def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
++        """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
++        ``recvs[p][i]`` from it (an all-to-all of row blocks; each peer's matching call names this rank with the
++        same sizes and dtypes in the same order)."""
++
++        if set(sends) != set(recvs) or any(p == self.rank or not 0 <= p < self.world for p in sends):
++            raise ValueError("exchange_all: sends and receives with the same other ranks")
++        for p in sends:
++            if len(sends[p]) != len(recvs[p]):
++                raise ValueError("exchange_all: one receive per send")
++            for s, r in zip(sends[p], recvs[p]):
++                if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
++                    raise ValueError("exchange_all: each send and receive must be contiguous and alike")
++        stream = torch.cuda.current_stream().cuda_stream
++        self._check(self.lib.ncclGroupStart())
++        try:
++            for p in sorted(sends):
++                for s, r in zip(sends[p], recvs[p]):
++                    if s.numel():
++                        self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, self.comm, stream))
++                        self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, self.comm, stream))
++        finally:
++            self._check(self.lib.ncclGroupEnd())
++
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index d5ee33a..8256956 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -98,7 +98,18 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
+     return transform
+ 
+ 
+-def split_weights(rule, world: int = 2):
++def split_weights(rule, world: int = 2, cut=None):
++    """GLM's per-rank weight bytes. ``cut(name, shape, kind)``: the rank's [start, stop) of a split tensor's axis
++    (``kind``, or ``"vocab"`` for lm_head's rows); None: even shares of ``world``."""
++
++    def share(name: str, shape: list[int], kind: str, axis: int) -> int:
++        if cut is not None:
++            a, b = cut(name, shape, kind)
++            return b - a
++        if shape[axis] % world:
++            raise ValueError(f"checkpoint tensor does not split evenly: {name}")
++        return shape[axis] // world
++
+     def transform(name: str, info: dict) -> tuple[int, int]:
+         kind = rule(name)
+         if kind == "drop":
+@@ -106,11 +117,9 @@ def split_weights(rule, world: int = 2):
+         shape = list(info["shape"])
+         if not info.get("split") and kind != "rep":
+             axis = {"row": 0, "col": -1, "dim1": 1}[kind]
+-            if shape[axis] % world:
+-                raise ValueError(f"checkpoint tensor does not split evenly: {name}")
+-            shape[axis] //= world
++            shape[axis] = share(name, shape, kind, axis)
+         if name.startswith("lm_head."):
+-            shape[0] //= world
++            shape[0] = share(name, shape, "vocab", 0)
+         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",
+                               ".hc_ffn_scale", ".e_score_correction_bias"))
+         total = padded(info, shape, float32=cast, name=name)
+@@ -254,19 +263,27 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, *, prompt: bo
+     return total + 2 * 4 * pairs * max(width, d) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4 + 4
+ 
+ 
++def even_share(world: int):
++    """A ``share(family, total)`` of even splits (the two-rank engine's): total // world."""
++
++    return lambda family, total: int(total) // int(world)
++
++
+ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+                  prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
+-                 exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16") -> Geometry:
++                 exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16", share=None) -> Geometry:
+     """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
+     one; GLM's TF_GLM_MTP can leave it out); ``onepass``: prompt chunks' sparse latent attention keeps no partials
+     (TF_GLM_SPARSE_ONEPASS); an EXL3 checkpoint's ``exl3_prompt``: prompt chunks run the prompt expert kernels
+     (TF_GLM_EXL3_PROMPT: no split-K sums), ``prompt_split_k``: the prompt buffers keep split-K partials for BF16 / FP8
+     projections (``forward.Buffers.sk``); ``kv``: the DSA caches' format (TF_GLM_KV: the latent rows and the
+-    indexer's pooled keys; the indexer's per-token keys and gates are bf16 rings)."""
++    indexer's pooled keys; the indexer's per-token keys and gates are bf16 rings); ``share(family, total)``: this
++    rank's share of a split dimension (GLM's ``tp.Layout``: heads, lin, dense, moe, vocab), default ``even_share``."""
++    share = even_share(world) if share is None else share
+     linear, attention = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+-    heads = int(t["num_attention_heads"]) // world
+-    lh = int(lin.get("num_heads", t.get("linear_num_heads", 64))) // world
++    heads = share("heads", int(t["num_attention_heads"]))
++    lh = share("lin", int(lin.get("num_heads", t.get("linear_num_heads", 64))))
+     ld = int(lin.get("head_dim", t.get("linear_head_dim", 128)))
+     conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+@@ -277,13 +294,14 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
+     fixed += linear * rows * lh * (12 * ld + 4)
+     slots = int(t["num_experts_per_tok"]) + 1
+-    width = int(t["moe_intermediate_size"]) // world
+-    extent = d * streams + int(t["vocab_size"]) // world + slots * (d + width) + heads * (2 * kd + vd)
++    width = share("moe", int(t["moe_intermediate_size"]))
++    vocab = share("vocab", int(t["vocab_size"]))
++    extent = d * streams + vocab + slots * (d + width) + heads * (2 * kd + vd)
+     extent += int(t.get("q_lora_rank", d)) * 2 + int(t.get("kv_lora_rank", d)) * 2
+-    extent += int(t.get("intermediate_size", width)) * 3 // world + int(t.get("index_n_heads", 32)) * index
++    extent += share("dense", int(t.get("intermediate_size", width))) * 3 + int(t.get("index_n_heads", 32)) * index
+     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
+     # prompt-chunk buffers: at most 5 row extents a row without the head
+-    fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
++    fixed += prefill_rows * 5 * (extent - vocab)
+     if (t.get("_quantization") or {}).get("quant_method") == "exl3":
+         # the routed experts' scratch of the decode windows (the MTP head's too) and of a prompt chunk, and the prompt
+         # buffers' split-K partials (8 x rows x 16,384 fp32, as forward.Buffers allocates them)
+@@ -295,7 +313,8 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     if kv != "bf16" and not latent:
+         raise ValueError("TF_GLM_KV=fp8 needs the latent cache")
+     def bytes_at(capacity: int) -> int:
+-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows, onepass=onepass)
++        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows, onepass=onepass,
++                                    share=share)
+         if latent:
+             # latent cache; a prompt chunk's latent partials (its dense pass runs MLA_PROMPT_ATT_ROWS rows at a time)
+             # and absorbed rows (the MTP absorbs through the same buffers)
+@@ -314,11 +333,12 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+ 
+ 
+ def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS,
+-                      onepass: bool = False) -> int:
++                      onepass: bool = False, share=None) -> int:
+     """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse
+     attention's partials, which the latent path's one-pass kernel (``onepass``) does not allocate."""
+ 
+-    heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
++    share = even_share(world) if share is None else share
++    heads, topk = share("heads", int(t["num_attention_heads"])), int(t.get("index_topk", 2048))
+     # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
+     select = min(prefill_rows, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + prefill_rows * 16 * (topk + 3)
+     if latent and onepass:
+@@ -351,11 +371,12 @@ def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False,
+     return Geometry(bytes_at, reserve)
+ 
+ 
+-def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geometry:
+-    """GLM's DFlash2 drafter on each rank: one context (a ring, or capacity + block rows) and a block pass."""
++def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool, kv_heads: int | None = None) -> Geometry:
++    """GLM's DFlash2 drafter on each rank: one context (a ring, or capacity + block rows) and a block pass;
++    ``kv_heads``: this rank's KV heads (default an even share)."""
+ 
+     layers = int(t["num_hidden_layers"])
+-    heads = int(t["num_key_value_heads"]) // world
++    heads = int(t["num_key_value_heads"]) // world if kv_heads is None else int(kv_heads)
+     hd = int(t["head_dim"])
+     block = int((t.get("dflash_config") or {}).get("block_size", 16))
+     window = int(t.get("sliding_window", 0))
+@@ -368,8 +389,12 @@ def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geomet
+     return Geometry(bytes_at, reserve)
+ 
+ 
+-def dflash2_weights(draft_dir, world: int) -> Weights:
+-    """GLM's DFlash2 drafter as held on each rank (4-bit copies, bf16 norms, fp32 codebooks), and its staging."""
++def dflash2_weights(draft_dir, world: int, fraction=None) -> Weights:
++    """GLM's DFlash2 drafter as held on each rank (4-bit copies, bf16 norms, fp32 codebooks), and its staging;
++    ``fraction(kind, n)``: this rank's share of n query (``q``), key/value (``kv``) or MLP (``mlp``) rows (default
++    n // world)."""
++
++    part = (lambda kind, n: n // world) if fraction is None else fraction
+ 
+     h = headers(draft_dir)
+     shape = {name: [int(x) for x in info["shape"]] for name, info in h.items()}
+@@ -385,8 +410,8 @@ def dflash2_weights(draft_dir, world: int) -> Weights:
+         o, gate, up, down = (shape[p + x] for x in ("self_attn.o_proj.weight", "mlp.gate_proj.weight",
+                                                       "mlp.up_proj.weight", "mlp.down_proj.weight"))
+         d = q[1]
+-        mats += [((q[0] + k[0] + v[0]) // world, d), ((k[0] + v[0]) // world, d), (o[0], o[1] // world),
+-                 ((gate[0] + up[0]) // world, d), (down[0], down[1] // world)]
++        mats += [(part("q", q[0]) + part("kv", k[0]) + part("kv", v[0]), d), (part("kv", k[0]) + part("kv", v[0]), d),
++                 (o[0], part("q", o[1])), (part("mlp", gate[0]) + part("mlp", up[0]), d), (down[0], part("mlp", down[1]))]
+         quantized |= {p + x for x in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+                                       "self_attn.o_proj.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                       "mlp.down_proj.weight")}
+diff --git tensorfold/cuda/roce.py tensorfold/cuda/roce.py
+index 93535a4..4ee4ac0 100644
+--- tensorfold/cuda/roce.py
++++ tensorfold/cuda/roce.py
+@@ -74,13 +74,15 @@ def proxy_library() -> ctypes.CDLL:
+     for name, res, args in (
+             ("roce_abi_version", i, []), ("roce_layout", i, [i, u64, ctypes.POINTER(u64)]),
+             ("roce_blob_bytes", u64, []),
+-            ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, i, i, p, u64, u64, ctypes.c_char_p, u64]),
++            ("roce_create", p, [i, i, ctypes.POINTER(ctypes.c_char_p), i, ctypes.POINTER(i), i, p, u64, u64,
++                                ctypes.c_char_p, u64]),
++            ("roce_set_routes", i, [p, i, i, ctypes.POINTER(i), ctypes.POINTER(i), i]),
+             ("roce_local_blob", i, [p, p, u64]), ("roce_connect", i, [p, p, u64]), ("roce_start", i, [p]),
+             ("roce_stop", None, [p]), ("roce_failed", i, [p]), ("roce_error", ctypes.c_char_p, [p]),
+             ("roce_stat", u64, [p, i]), ("roce_hca_stat", u64, [p, i, i]), ("roce_destroy", None, [p])):
+         fn = getattr(lib, name)
+         fn.restype, fn.argtypes = res, args
+-    if lib.roce_abi_version() != 4:
++    if lib.roce_abi_version() != 5:
+         raise RuntimeError("unexpected RoCE proxy ABI version")
+     return lib
+ 
+@@ -94,19 +96,96 @@ def _ext():
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+-def _hcas() -> list[str]:
++MAX_HCAS = 4                             # roce_proxy.c's ROCE_MAX_HCAS
++_SYS = Path("/sys/class/infiniband")
++
++
++def _hcas(world: int = 2) -> list[str]:
++    """The HCAs the transport uses: TF_ROCE_HCA (or NCCL_IB_HCA), else every ACTIVE one; two ranks take the first
++    two (their one cable's rails), more ranks up to four (a triangle's two rails a peer)."""
++
+     raw = os.environ.get("TF_ROCE_HCA") or os.environ.get("NCCL_IB_HCA") or ""
+     names = [x.strip().lstrip("=^").split(":")[0] for x in raw.split(",") if x.strip()]
+     if not names:
+-        root = Path("/sys/class/infiniband")
+-        names = [d.name for d in sorted(root.glob("*")) if "ACTIVE" in (d / "ports/1/state").read_text()]
+-    return names[:2]
++        names = [d.name for d in sorted(_SYS.glob("*")) if "ACTIVE" in (d / "ports/1/state").read_text()]
++    return names[:2] if world == 2 else names[:MAX_HCAS]
++
++
++def _ipv4_gid(hca: str) -> tuple[int, int, int] | None:
++    """(GID index, IPv4 as an int, prefix length) of ``hca``'s first RoCE v2 IPv4 GID (sysfs and ``ip``), or None."""
++
++    import ipaddress
++
++    port = _SYS / hca / "ports" / "1"
++    entries = []
++    for path in (port / "gids").glob("*"):
++        try:
++            gid = path.read_text().strip()
++            kind = (port / "gid_attrs" / "types" / path.name).read_text().strip()
++        except OSError:
++            continue
++        if "v2" not in kind.lower() or not gid.replace(":", "").lower().startswith("0" * 20 + "ffff"):
++            continue
++        raw = bytes.fromhex(gid.replace(":", ""))
++        if raw == bytes(16):
++            continue
++        entries.append((int(path.name), int(ipaddress.IPv4Address(raw[12:])), path))
++    if not entries:
++        return None
++    index, ip, path = min(entries)
++    prefix = 24
++    try:
++        dev = (port / "gid_attrs" / "ndevs" / path.name).read_text().strip()
++        out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", dev], capture_output=True, text=True).stdout
++        for word in out.split():
++            if "/" in word and word.split("/")[0] == str(ipaddress.IPv4Address(ip)):
++                prefix = int(word.split("/")[1])
++    except (OSError, ValueError):
++        pass
++    return index, ip, prefix
++
++
++def plan_routes(addrs: list[list[tuple[int, int] | None]]) -> tuple[dict, int]:
++    """Every rank's (IPv4, prefix) a listed HCA (None: unknown) -> ({(rank, peer): [(local HCA, peer HCA), ...]},
++    stripes a peer). HCAs pair when they share a subnet, each HCA once a peer, in name order on both sides (so the
++    two ends of a pair list the same pairs mirrored); every pair of ranks gets the fewest stripes any pair has,
++    which must be at least one."""
++
++    world = len(addrs)
++
++    def net(a):
++        return None if a is None else (a[0] >> (32 - a[1]) if a[1] else 0, a[1])
++
++    pairs: dict = {}
++    for r in range(world):
++        for p in range(world):
++            if p == r:
++                continue
++            used, got = set(), []
++            for h, a in enumerate(addrs[r]):
++                for rh, b in enumerate(addrs[p]):
++                    if rh not in used and net(a) is not None and net(a) == net(b):
++                        used.add(rh)
++                        got.append((h, rh))
++                        break
++            pairs[(r, p)] = got
++    if world < 2:
++        return pairs, 0
++    least = min(len(v) for v in pairs.values())
++    if least == 0:
++        missing = ", ".join(f"{r}-{p}" for (r, p), v in sorted(pairs.items()) if not v and r < p)
++        raise RuntimeError(f"RoCE: no HCA of rank(s) {missing} shares a subnet with the peer's: every pair of ranks "
++                           "needs a direct path (a cable or a switch); use TF_GLM_COMM=nccl on a ring")
++    return {k: v[:least] for k, v in pairs.items()}, least
+ 
+ 
+ class RoceGather:
+     """One rank's side of the exchange: the pinned region, the proxy thread and the gather launches."""
+ 
+     def __init__(self, comm, rank: int, world: int, max_bytes: int = 256 << 10) -> None:
++        """Two ranks: every listed HCA to the peer's of the same index (b12x's striping), GID index TF_ROCE_GID_INDEX
++        (or NCCL_IB_GID_INDEX, 3). More ranks: each HCA's own RoCE v2 IPv4 GID (unless TF_ROCE_GID_INDEX) and routes
++        by subnet (``plan_routes``), so a triangle of direct cables reaches each peer over that pair's rails."""
+         lib = proxy_library()
+         self.lib, self.rank, self.world, self.max_bytes = lib, rank, world, int(max_bytes)
+         self.slot_bytes = -(-self.max_bytes // SLOT_ALIGN) * SLOT_ALIGN
+@@ -121,24 +200,39 @@ class RoceGather:
+         self.classes = BLOCKS.bit_length()
+         # epoch, stage arrivals and tail arrivals by power-of-two grid, poison
+         self.counters = torch.zeros(2 + 2 * self.classes, dtype=torch.int32, device="cuda")
+-        self.hcas = _hcas()
+-        gid = int(os.environ.get("TF_ROCE_GID_INDEX") or os.environ.get("NCCL_IB_GID_INDEX") or 3)
++        self.hcas = _hcas(world)
++        fixed = os.environ.get("TF_ROCE_GID_INDEX") or os.environ.get("NCCL_IB_GID_INDEX")
++        found = [None] * len(self.hcas) if world == 2 else [_ipv4_gid(h) for h in self.hcas]
++        if world == 2 or fixed:
++            gids = [int(fixed or 3)] * len(self.hcas)
++        else:
++            gids = [f[0] if f is not None else 3 for f in found]
++        self.addrs = [None if f is None else (f[1], f[2]) for f in found]
+         tc = int(os.environ.get("NCCL_IB_TC", "0"), 0)
+         names = (ctypes.c_char_p * len(self.hcas))(*[n.encode() for n in self.hcas])
+         err = ctypes.create_string_buffer(512)
+-        self.ctx = lib.roce_create(world, rank, names, len(self.hcas), gid, tc, ctypes.c_void_p(base), total,
+-                                   self.slot_bytes, err, len(err))
++        self.ctx = lib.roce_create(world, rank, names, len(self.hcas), (ctypes.c_int * len(gids))(*gids), tc,
++                                   ctypes.c_void_p(base), total, self.slot_bytes, err, len(err))
+         failed = 0 if self.ctx else 1
+         blob_len = int(lib.roce_blob_bytes())
+         blob = ctypes.create_string_buffer(blob_len)
+         if not failed and lib.roce_local_blob(self.ctx, blob, blob_len) != 0:
+             failed = 1
+-        # both ranks' verdict, geometry and connection blob through the existing communicator
++        # every rank's verdict, geometry and connection blob through the existing communicator (more than two ranks:
++        # each HCA's IPv4 and prefix too, for the routes)
+         words = -(-blob_len // 4)
+-        mine = torch.zeros(4 + words, dtype=torch.int32)
+-        mine[:4] = torch.tensor([failed, len(self.hcas), self.slot_bytes >> 12, self.flag_stride])
++        extra = 0 if world == 2 else 2 * MAX_HCAS
++        mine = torch.zeros(4 + extra + words, dtype=torch.int32)
++        n_hca = len(self.hcas) if world == 2 else 0
++        mine[:4] = torch.tensor([failed, n_hca, self.slot_bytes >> 12, self.flag_stride])
++        if extra:                                        # (IPv4 as int32 bits, prefix) a slot; prefix -1: none
++            mine[4:4 + extra] = torch.tensor([0, -1] * MAX_HCAS, dtype=torch.int32)
++            for h, a in enumerate(self.addrs):
++                if a is not None:
++                    mine[4 + 2 * h] = a[0] - (1 << 32) if a[0] >= 1 << 31 else a[0]
++                    mine[5 + 2 * h] = a[1]
+         raw = torch.frombuffer(bytearray(blob.raw.ljust(words * 4, b"\0")), dtype=torch.int32)
+-        mine[4:] = raw
++        mine[4 + extra:] = raw
+         got = torch.empty(world * mine.numel(), dtype=torch.int32, device="cuda")
+         comm.all_gather(mine.cuda(), got)
+         rows = got.view(world, -1).cpu()
+@@ -146,7 +240,27 @@ class RoceGather:
+             why = err.value.decode(errors="replace") if not self.ctx else "the ranks' RoCE geometry differs"
+             self.close()
+             raise RuntimeError(f"RoCE all-gather setup failed on some rank: {why}")
+-        blobs = b"".join(bytes(r[4:].numpy().tobytes())[:blob_len] for r in rows)
++        self.n_flag = len(self.hcas)                     # stripes a peer: every HCA at two ranks
++        if extra:
++            addrs = [[None if int(r[5 + 2 * h]) < 0 else (int(r[4 + 2 * h]) & 0xFFFFFFFF, int(r[5 + 2 * h]))
++                      for h in range(MAX_HCAS)] for r in rows]
++            try:
++                routes, self.n_flag = plan_routes(addrs)
++            except RuntimeError:
++                self.close()
++                raise
++            for p in range(world):
++                if p == rank:
++                    continue
++                local, remote = zip(*routes[(rank, p)])
++                n = len(local)
++                if lib.roce_set_routes(self.ctx, p, n, (ctypes.c_int * n)(*local), (ctypes.c_int * n)(*remote),
++                                       self.n_flag) != 0:
++                    why = lib.roce_error(self.ctx).decode(errors="replace")
++                    self.close()
++                    raise RuntimeError(f"RoCE routes: {why}")
++            self.routes = {p: routes[(rank, p)] for p in range(world) if p != rank}
++        blobs = b"".join(bytes(r[4 + extra:].numpy().tobytes())[:blob_len] for r in rows)
+         self.spin = spin_limit()
+         _ext()                      # its first build (tens of seconds) here, before the verdict all-gather below
+         ok = lib.roce_connect(self.ctx, blobs, len(blobs)) == 0 and lib.roce_start(self.ctx) == 0
+@@ -175,7 +289,7 @@ class RoceGather:
+         c = self.counters.data_ptr()
+         _ext().gather(send, recv, packs, nbytes, packs, self.recv, self.flag, self.send, self.ctrl, self.slot_bytes,
+                       c, c + 4 * (1 + klass), c + 4 * (1 + self.classes + klass), c + 4 * (1 + 2 * self.classes),
+-                      self.spin, self.world, self.rank, self.slots, self.flag_stride, len(self.hcas), grid, THREADS)
++                      self.spin, self.world, self.rank, self.slots, self.flag_stride, self.n_flag, grid, THREADS)
+         if not torch.cuda.is_current_stream_capturing():
+             self.check()
+ 
+diff --git tensorfold/cuda/roce_proxy.c tensorfold/cuda/roce_proxy.c
+index 5e605ae..d8ba88c 100644
+--- tensorfold/cuda/roce_proxy.c
++++ tensorfold/cuda/roce_proxy.c
+@@ -1,6 +1,10 @@
+ // Adapted from b12x (https://github.com/local-inference-lab/b12x), b12x/comm/roce/_roce_proxy.c at commit
+ // 8a99d639410e39d5f39cb4037675331beceea1d4: "RoCEnante", Copyright the b12x contributors, Apache License 2.0
+-// (http://www.apache.org/licenses/LICENSE-2.0). Unchanged except this header. Used by tensorfold/cuda/roce.py.
++// (http://www.apache.org/licenses/LICENSE-2.0). Used by tensorfold/cuda/roce.py. Changes from b12x's file (TensorFold,
++// 2026-10-01, ABI 5): up to 4 HCAs, a GID index per HCA, and routes: each peer's stripes go over chosen (local HCA,
++// peer HCA) pairs (roce_set_route; default HCA h to the peer's HCA h, every HCA), so ranks cabled to each other
++// directly (a triangle of Sparks: one /24 and two rails a pair) reach each peer over its own rails only. Flags are
++// indexed by stripe (``n_flag`` stripes a peer, the same for every peer).
+ 
+ // RDMA proxy for the b12x RoCE one-shot all-reduce.
+ //
+@@ -40,12 +44,12 @@
+ #include <time.h>
+ 
+ #define ROCE_MAX_PEERS 16
+-#define ROCE_MAX_HCAS 2
++#define ROCE_MAX_HCAS 4
+ #define ROCE_SLOTS 2
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 4
++#define ROCE_ABI_VERSION 5
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+@@ -78,8 +82,13 @@ typedef struct {
+     int world;
+     int rank;
+     int n_hca;
+-    int gid_index;
++    int gid_index[ROCE_MAX_HCAS];
+     int traffic_class;
++    // routes: stripe s to peer p leaves on local HCA stripe_hca[p][s] for the peer's HCA stripe_remote[p][s]
++    int n_stripe[ROCE_MAX_PEERS];
++    int stripe_hca[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
++    int stripe_remote[ROCE_MAX_PEERS][ROCE_MAX_HCAS];
++    int n_flag;                      // stripes (flags) a peer, the same for every peer and on every rank
+     roce_hca_t hca[ROCE_MAX_HCAS];
+     uint8_t *region;
+     size_t region_bytes;
+@@ -90,7 +99,7 @@ typedef struct {
+     size_t ctrl_off;
+     int started;
+     uint64_t peer_addr[ROCE_MAX_PEERS];
+-    uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
++    uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];   // by stripe
+     pthread_t thread;
+     atomic_int running;
+     atomic_int failed;
+@@ -179,7 +188,7 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
+     }
+     hca->lid = port.lid;
+     hca->mtu = port.active_mtu;
+-    if (ibv_query_gid(hca->ctx, ROCE_PORT, c->gid_index, &hca->gid) != 0) {
++    if (ibv_query_gid(hca->ctx, ROCE_PORT, c->gid_index[h], &hca->gid) != 0) {
+         set_err(c, "ibv_query_gid", errno);
+         return -1;
+     }
+@@ -235,7 +244,7 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
+ }
+ 
+ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n_hca,
+-                        int gid_index, int traffic_class, void *region, uint64_t region_bytes,
++                        const int *gid_index, int traffic_class, void *region, uint64_t region_bytes,
+                         uint64_t slot_bytes, char *err, uint64_t err_len) {
+     uint64_t layout[7];
+     if (roce_layout(world, slot_bytes, layout) != 0 || layout[4] > region_bytes ||
+@@ -252,7 +261,17 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+     c->world = world;
+     c->rank = rank;
+     c->n_hca = n_hca;
+-    c->gid_index = gid_index;
++    for (int h = 0; h < n_hca; h++) {
++        c->gid_index[h] = gid_index[h];
++    }
++    for (int p = 0; p < world; p++) {           // default routes: HCA h to the peer's HCA h, every HCA
++        c->n_stripe[p] = p == rank ? 0 : n_hca;
++        for (int h = 0; h < n_hca; h++) {
++            c->stripe_hca[p][h] = h;
++            c->stripe_remote[p][h] = h;
++        }
++    }
++    c->n_flag = n_hca;
+     c->traffic_class = traffic_class;
+     c->region = region;
+     c->region_bytes = region_bytes;
+@@ -271,6 +290,26 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+     return c;
+ }
+ 
++int roce_set_routes(roce_ctx_t *c, int peer, int n, const int *local, const int *remote, int n_flag) {
++    // before roce_connect: peer's stripes (n of them) over (local[s], remote[s]); n_flag: the stripes every peer has
++    if (c->started || peer < 0 || peer >= c->world || peer == c->rank || n < 1 || n > ROCE_MAX_HCAS ||
++        n != n_flag || n_flag > ROCE_MAX_HCAS) {
++        snprintf(c->err, sizeof(c->err), "invalid RoCE route to rank %d (%d stripes, %d a peer)", peer, n, n_flag);
++        return -1;
++    }
++    for (int s = 0; s < n; s++) {
++        if (local[s] < 0 || local[s] >= c->n_hca || remote[s] < 0 || remote[s] >= ROCE_MAX_HCAS) {
++            snprintf(c->err, sizeof(c->err), "invalid RoCE route to rank %d: stripe %d", peer, s);
++            return -1;
++        }
++        c->stripe_hca[peer][s] = local[s];
++        c->stripe_remote[peer][s] = remote[s];
++    }
++    c->n_stripe[peer] = n;
++    c->n_flag = n_flag;
++    return 0;
++}
++
+ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     if (out_len < sizeof(roce_blob_t)) {
+         return -1;
+@@ -291,23 +330,24 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     return 0;
+ }
+ 
+-static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer) {
++static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer, int rh) {
++    // local HCA h's QP for peer p <-> the peer's HCA rh's QP for this rank
+     roce_hca_t *hca = &c->hca[h];
+     struct ibv_qp_attr rtr;
+     memset(&rtr, 0, sizeof(rtr));
+     rtr.qp_state = IBV_QPS_RTR;
+-    rtr.path_mtu = (enum ibv_mtu)(peer->mtu[h] < (uint32_t)hca->mtu ? peer->mtu[h] : (uint32_t)hca->mtu);
+-    rtr.dest_qp_num = peer->qp_num[h][c->rank];
++    rtr.path_mtu = (enum ibv_mtu)(peer->mtu[rh] < (uint32_t)hca->mtu ? peer->mtu[rh] : (uint32_t)hca->mtu);
++    rtr.dest_qp_num = peer->qp_num[rh][c->rank];
+     rtr.rq_psn = 0;
+     rtr.max_dest_rd_atomic = 1;
+     rtr.min_rnr_timer = 12;
+     rtr.ah_attr.is_global = 1;
+-    rtr.ah_attr.dlid = peer->lid[h];
++    rtr.ah_attr.dlid = peer->lid[rh];
+     rtr.ah_attr.sl = 0;
+     rtr.ah_attr.src_path_bits = 0;
+     rtr.ah_attr.port_num = ROCE_PORT;
+-    memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[h], 16);
+-    rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
++    memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[rh], 16);
++    rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index[h];
+     rtr.ah_attr.grh.hop_limit = 64;
+     rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
+     rtr.ah_attr.grh.flow_label = 0;
+@@ -347,9 +387,15 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+             continue;
+         }
+         c->peer_addr[p] = all[p].region_addr;
+-        for (int h = 0; h < c->n_hca; h++) {
+-            c->peer_rkey[h][p] = all[p].rkey[h];
+-            if (connect_qp(c, h, p, &all[p]) != 0) {
++        if (c->n_stripe[p] != c->n_flag) {
++            snprintf(c->err, sizeof(c->err), "rank %d has %d stripes, every peer needs %d", p, c->n_stripe[p],
++                     c->n_flag);
++            return -1;
++        }
++        for (int s = 0; s < c->n_stripe[p]; s++) {
++            const int h = c->stripe_hca[p][s], rh = c->stripe_remote[p][s];
++            c->peer_rkey[s][p] = all[p].rkey[rh];
++            if (connect_qp(c, h, p, &all[p], rh) != 0) {
+                 return -1;
+             }
+         }
+@@ -395,7 +441,9 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             continue;
+         }
+         uint32_t pack_offset = 0;
+-        for (int h = 0; h < c->n_hca; h++) {
++        const int n_stripe = c->n_stripe[p];
++        for (int s = 0; s < n_stripe; s++) {
++            const int h = c->stripe_hca[p][s];
+             roce_hca_t *hca = &c->hca[h];
+             // Two work requests per stripe; keep the queue at most a quarter
+             // full so a provider that needs extra entries can never fail a post.
+@@ -413,8 +461,8 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+                     return -1;
+                 }
+             }
+-            uint32_t stripe_packs = total_packs / (uint32_t)c->n_hca;
+-            if ((uint32_t)h < total_packs % (uint32_t)c->n_hca) {
++            uint32_t stripe_packs = total_packs / (uint32_t)n_stripe;
++            if ((uint32_t)s < total_packs % (uint32_t)n_stripe) {
+                 stripe_packs += 1;
+             }
+             uint32_t stripe_bytes = stripe_packs * 16;
+@@ -434,9 +482,9 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+             flag_wr.wr.rdma.remote_addr =
+                 remote + c->flag_off +
+-                (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_hca +
+-                 (uint64_t)h) * ROCE_FLAG_STRIDE;
+-            flag_wr.wr.rdma.rkey = c->peer_rkey[h][p];
++                (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_flag +
++                 (uint64_t)s) * ROCE_FLAG_STRIDE;
++            flag_wr.wr.rdma.rkey = c->peer_rkey[s][p];
+ 
+             struct ibv_send_wr data_wr;
+             struct ibv_sge data_sge;
+@@ -457,7 +505,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+                     remote + c->recv_off +
+                     ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes +
+                     byte_offset;
+-                data_wr.wr.rdma.rkey = c->peer_rkey[h][p];
++                data_wr.wr.rdma.rkey = c->peer_rkey[s][p];
+                 first_wr = &data_wr;
+             }
+             struct ibv_send_wr *bad = NULL;
+diff --git tensorfold/cuda/shares.py tensorfold/cuda/shares.py
+new file mode 100644
+index 0000000..3a836ab
+--- /dev/null
++++ tensorfold/cuda/shares.py
+@@ -0,0 +1,41 @@
++"""How a dimension splits over tensor-parallel ranks: whole units (a head, a 128-column Hadamard block, 64 vocabulary
++rows), as even as they go, the remainder to the lowest ranks. Two ranks of an even count get exact halves."""
++
++from __future__ import annotations
++
++
++def parts(total: int, world: int, unit: int = 1) -> list[int]:
++    """Each rank's share of ``total`` (a multiple of ``unit``) in rank order: e.g. 64 heads over 3 ranks 22, 21, 21;
++    2048 columns in units of 128 over 3 ranks 768, 640, 640."""
++
++    total, world, unit = int(total), int(world), int(unit)
++    if world < 1 or unit < 1:
++        raise ValueError(f"shares of {total} over {world} ranks in units of {unit}")
++    if total % unit:
++        raise ValueError(f"{total} is not a whole number of {unit}-wide units")
++    units = total // unit
++    if units < world:
++        raise ValueError(f"{total} ({units} units of {unit}) cannot give each of {world} ranks a unit")
++    base, extra = divmod(units, world)
++    return [(base + (r < extra)) * unit for r in range(world)]
++
++
++def share(total: int, world: int, rank: int, unit: int = 1) -> tuple[int, int]:
++    """Rank ``rank``'s [start, stop) of ``total`` (``parts``)."""
++
++    sizes = parts(total, world, unit)
++    if not 0 <= rank < world:
++        raise ValueError(f"rank {rank} of {world}")
++    start = sum(sizes[:rank])
++    return start, start + sizes[rank]
++
++
++def scaled(total: int, world: int, rank: int, unit: int, length: int) -> tuple[int, int]:
++    """Rank ``rank``'s [start, stop) of an axis of ``length`` elements that holds the ``total`` (e.g. a trellis's
++    128 tile columns for 2,048 expert columns, a packed row's words): the share of ``total`` scaled to the axis,
++    which must land on whole elements."""
++
++    a, b = share(total, world, rank, unit)
++    if (a * length) % total or (b * length) % total:
++        raise ValueError(f"rank {rank} of {world}: [{a}, {b}) of {total} is not whole on an axis of {length}")
++    return a * length // total, b * length // total
+diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
+index 90cb8f3..5701341 100644
+--- tensorfold/families/glm5_next/__init__.py
++++ tensorfold/families/glm5_next/__init__.py
+@@ -200,17 +200,21 @@ def memory_fraction(ram_bytes: int) -> float | None:
+ 
+ # the CUDA engine's kernels read MLX affine weights of this (bits, group size); EXL3 checkpoints are checked above
+ CUDA_QUANTIZATION = (4, 64)
++CUDA_TP = (2, 3, 4)                    # GPUs (one per machine) the CUDA engine splits over
+ 
+ 
+ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
+                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
+-    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
++    """Build the N-rank engine (N = 2, 3 or 4) with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
+ 
+-    if int(tp) != 2:
+-        raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
+-                         "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
++    tp = int(tp)
++    if tp not in CUDA_TP:
++        raise ValueError("GLM-5.3-Flash needs two GPUs or more (2, 3 or 4), one per machine: run the same "
++                         "`tensorfold serve` command with --tp N --rank R --master ADDRESS on each (rank 0 last)")
+     if not master:
+-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
++        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
++    if not 0 <= int(rank) < tp:
++        raise ValueError(f"--rank {rank}: 0 to {tp - 1} with --tp {tp}")
+     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
+ 
+     if mtp_drafts is None:
+@@ -219,7 +223,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
+     else:
+         policy = str(int(mtp_drafts))
+-    return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
++    return GlmEngine(Path(model_dir), rank=int(rank), world=tp, master=master, port=int(master_port), policy=policy,
+                      drafter=Path(drafter) if drafter and not no_drafts else None,
+                      context=options.get("context"), context_explicit=options.get("context_explicit"),
+                      serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index be872ae..d355e85 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -12,7 +12,7 @@ import torch
+ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import glue, prof, qmm
++from . import glue, prof, qmm, tp
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_forward, mtp_stage
+ from .sparse import pool_bucket
+@@ -111,7 +111,7 @@ class Engine:
+         if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
+             from . import kda as kda_mod
+ 
+-            kda_mod.reserve(max(max_rows, prefill_rows), w.cfg.lin_heads // w.world, w.device)
++            kda_mod.reserve(max(max_rows, prefill_rows), tp.of(w).lin_heads, w.device)
+         self.buf = Buffers(w, max_rows, capacity)
+         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
+         if taps:
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index b5dcd26..69d2268 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -233,9 +233,13 @@ class Drafter:
+         self.D = int(cfg["hidden_size"])
+         self.hd = int(cfg["head_dim"])
+         heads, kv_heads = int(cfg["num_attention_heads"]), int(cfg["num_key_value_heads"])
+-        if heads % self.world or kv_heads % self.world:
+-            raise ValueError("drafter heads must split evenly over the ranks")
+-        self.heads, self.kvh = heads // self.world, kv_heads // self.world
++        from .tp import draft_parts
++
++        # KV heads in whole query groups over the ranks (32 / 8 over 3: 12/12/8 query heads, 3/3/2 KV heads), the MLP
++        # in units of 128 (``tp.draft_parts``); two ranks: halves
++        qs, kvs, mlps = draft_parts(heads, kv_heads, int(cfg["intermediate_size"]), self.world)
++        self.heads, self.kvh = qs[self.rank], kvs[self.rank]
++        q0, kv0 = sum(qs[:self.rank]), sum(kvs[:self.rank])
+         self.eps = float(cfg["rms_norm_eps"])
+         theta = float(cfg["rope_parameters"]["rope_theta"])
+         self.mask_id = int(dc["mask_token_id"])
+@@ -247,11 +251,9 @@ class Drafter:
+         self.tap_layers = tuple(int(i) for i in dc["target_layer_ids"])
+         self.window = int(cfg["sliding_window"]) - 1
+         self.causal = bool(cfg.get("is_causal", True))
+-        inter = int(cfg["intermediate_size"])
+-        if inter % self.world:
+-            raise ValueError("drafter MLP must split evenly over the ranks")
+-        self.inter = inter // self.world
+-        r, H, KV, hd = self.rank, self.heads, self.kvh, self.hd
++        self.inter = mlps[self.rank]
++        m0 = sum(mlps[:self.rank])
++        H, KV, hd = self.heads, self.kvh, self.hd
+         dev = self.dev
+ 
+         def gpu(t: torch.Tensor) -> torch.Tensor:
+@@ -272,13 +274,13 @@ class Drafter:
+             self.layers: list[DraftLayer] = []
+             for i in range(int(cfg["num_hidden_layers"])):
+                 p = f"layers.{i}."
+-                q = get(p + "self_attn.q_proj.weight")[r * H * hd:(r + 1) * H * hd]
+-                k = get(p + "self_attn.k_proj.weight")[r * KV * hd:(r + 1) * KV * hd]
+-                v = get(p + "self_attn.v_proj.weight")[r * KV * hd:(r + 1) * KV * hd]
+-                o = get(p + "self_attn.o_proj.weight")[:, r * H * hd:(r + 1) * H * hd]
+-                g = get(p + "mlp.gate_proj.weight")[r * self.inter:(r + 1) * self.inter]
+-                u = get(p + "mlp.up_proj.weight")[r * self.inter:(r + 1) * self.inter]
+-                dn = get(p + "mlp.down_proj.weight")[:, r * self.inter:(r + 1) * self.inter]
++                q = get(p + "self_attn.q_proj.weight")[q0 * hd:(q0 + H) * hd]
++                k = get(p + "self_attn.k_proj.weight")[kv0 * hd:(kv0 + KV) * hd]
++                v = get(p + "self_attn.v_proj.weight")[kv0 * hd:(kv0 + KV) * hd]
++                o = get(p + "self_attn.o_proj.weight")[:, q0 * hd:(q0 + H) * hd]
++                g = get(p + "mlp.gate_proj.weight")[m0:m0 + self.inter]
++                u = get(p + "mlp.up_proj.weight")[m0:m0 + self.inter]
++                dn = get(p + "mlp.down_proj.weight")[:, m0:m0 + self.inter]
+                 for conv in ("attention_conv", "mlp_conv"):
+                     if tuple(get(p + conv + ".base_kernel").shape) != (2, 2, self.D):
+                         raise ValueError(f"unexpected {conv} base kernel shape")
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 87f265f..7aa889c 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1,4 +1,4 @@
+-"""GLM-5.3-Flash on two NCCL ranks; both sample by one keyed rule from the same gathered candidates, so no broadcast."""
++"""GLM-5.3-Flash on N NCCL ranks (2, 3 or 4); all sample by one keyed rule from the same gathered candidates, so no broadcast."""
+ 
+ from __future__ import annotations
+ 
+@@ -308,15 +308,18 @@ PARALLEL_MOST = 4                     # --parallel: concurrent requests at most
+ MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+ 
+ 
+-def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS) -> int:
+-    """What one more stream slot (``forward.Slots``) takes on each rank, from the text config: every KDA layer's
+-    recurrent states (two parities), conv window, a decode window's projections and replay scratch."""
++def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
++    """What one more stream slot (``forward.Slots``) takes on rank ``rank`` of ``world``, from the text config:
++    every KDA layer's recurrent states (two parities), conv window, a decode window's projections and replay
++    scratch."""
+ 
+     from tensorfold.cuda.geometry import layer_counts
+ 
++    from .tp import UNITS, split_sizes
++
+     linear, _ = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+-    lh = int(lin.get("num_heads", t.get("linear_num_heads", 64))) // world
++    lh = split_sizes(int(lin.get("num_heads", t.get("linear_num_heads", 64))), world, UNITS["lin"])[rank]
+     ld = int(lin.get("head_dim", t.get("linear_head_dim", 128)))
+     conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
+     width = 3 * lh * ld + 2 * ld + lh                  # the KDA input projection's rows (q, k, v, f_a, g_a, beta)
+@@ -325,14 +328,16 @@ def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS) -> int:
+ 
+ 
+ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capacity: int,
+-                      tap_rows: int = MAX_ROWS) -> int:
+-    """``dflash2_multi.MultiDrafter``'s context pool on each rank: ``streams`` rings (or flat contexts of capacity +
+-    block rows) and the padded context updates' trash rows, keys and values per draft layer."""
++                      tap_rows: int = MAX_ROWS, rank: int = 0) -> int:
++    """``dflash2_multi.MultiDrafter``'s context pool on rank ``rank``: ``streams`` rings (or flat contexts of
++    capacity + block rows) and the padded context updates' trash rows, keys and values per draft layer."""
+ 
+     from tensorfold.cuda.geometry import draft_ring_rows
+ 
++    from .tp import split_sizes
++
+     layers = int(t["num_hidden_layers"])
+-    heads = int(t["num_key_value_heads"]) // world
++    heads = split_sizes(int(t["num_key_value_heads"]), world, 1)[rank]
+     hd = int(t["head_dim"])
+     block = int((t.get("dflash_config") or {}).get("block_size", 16))
+     window = int(t.get("sliding_window", 0))
+@@ -342,6 +347,27 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
+     return 2 * layers * heads * hd * (streams * cap + trash) * 2
+ 
+ 
++def draft_fraction(draft_dir, rank: int, world: int):
++    """``geometry.dflash2_weights``'s per-rank rows of the drafter at ``draft_dir`` (``tp.draft_parts``)."""
++
++    from tensorfold.cuda.capacity import config as read_config
++
++    from .tp import draft_parts
++
++    t = read_config(draft_dir)
++    heads, kv_heads, inter = int(t["num_attention_heads"]), int(t["num_key_value_heads"]), int(t["intermediate_size"])
++    qs, kvs, mlps = draft_parts(heads, kv_heads, inter, world)
++    hd = int(t.get("head_dim") or int(t["hidden_size"]) // heads)
++    rows = {"q": qs[rank] * hd, "kv": kvs[rank] * hd, "mlp": mlps[rank]}
++    totals = {"q": heads * hd, "kv": kv_heads * hd, "mlp": inter}
++
++    def fraction(kind: str, n: int) -> int:
++        if n != totals[kind]:
++            raise ValueError(f"drafter {kind} rows {n}, config {totals[kind]}")
++        return rows[kind]
++    return fraction
++
++
+ def _f64_ints(x: float) -> list[int]:
+     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
+ 
+@@ -372,9 +398,16 @@ def without_mtp(transform, layers: int):
+     return lambda name, info: (0, 0) if name.startswith(prefix) else transform(name, info)
+ 
+ 
++def bell_key(rank: int, n: int) -> str:
++    """The store key that wakes follower ``rank`` for request ``n`` (rank 1's is the two-rank engine's name)."""
++
++    return f"tf_glm_request_{n}" if rank == 1 else f"tf_glm_request_r{rank}_{n}"
++
++
+ class GlmEngine:
+-    """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
++    """GLM-5.3-Flash on ``world`` ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
++    world = 2                   # ranks the model is split over (``tp.Layout``; set by __init__)
+     shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
+     opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
+     parallel = 1                # --parallel N: requests decoded together (``multi``); 1 serves one at a time
+@@ -382,14 +415,17 @@ class GlmEngine:
+     multi = None                # --parallel > 1: the ``multi.MultiDecoder`` (both ranks)
+     scheduler = None            # ... and rank 0's ``multi.GlmScheduler``
+ 
+-    def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
++    def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, world: int = 2,
++                 policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+                  prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
+-                 split=None, parallel: int = 1) -> None:
++                 split=None, parallel: int = 1, graphs: bool = True) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+         ``vision``: rank 0 runs the image tower (rank 1 only takes its rows); ``split``: a ``hcsplit.SplitSettings``
+         instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests); ``parallel``: requests decoded together
+-        (``multi``: their caches share one pool, each stream up to the context window; DFlash2 drafts only)."""
++        (``multi``: their caches share one pool, each stream up to the context window; DFlash2 drafts only);
++        ``world``: the ranks the model is split over (2, 3 or 4; ``tp.Layout``); ``graphs``: False runs every window
++        eagerly (tests whose communicator cannot be captured)."""
+ 
+         import torch
+ 
+@@ -414,26 +450,34 @@ class GlmEngine:
+         # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
+         # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
+         self.split = SplitSettings.from_env() if split is None else split
++        world = int(world) if comm is None else int(getattr(comm, "world", world))
++        from .tp import SIZES
++
++        if world not in SIZES:
++            raise ValueError(f"GLM-5.3-Flash's CUDA engine runs on {', '.join(map(str, SIZES))} ranks, not {world}")
+         torch.cuda.set_device(0)
+         self.torch = torch
+-        self.rank = rank
++        self.rank, self.world = rank, world
+         parallel = int(parallel)
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         self.parallel = parallel
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+-        self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
++        self.comm = comm if comm is not None else NCCL(rank, world, master, port)
+         self.comm.barrier()
+         if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
+             # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
+             from tensorfold.cuda.roce import RoceComm
+ 
+-            self.comm = RoceComm(self.comm, rank, 2)
++            self.comm = RoceComm(self.comm, rank, world)
+             if rank == 0:
+-                print(f"[tensorfold] all-gathers up to {self.comm.roce.max_bytes >> 10} KiB over RoCE "
+-                      f"({', '.join(self.comm.roce.hcas)}; b12x's RoCEnante transport), larger ones over NCCL",
+-                      flush=True)
++                roce = self.comm.roce
++                routes = getattr(roce, "routes", None)
++                via = ", ".join(roce.hcas) if routes is None else "; ".join(
++                    f"rank {p} over {'+'.join(roce.hcas[h] for h, _ in pairs)}" for p, pairs in sorted(routes.items()))
++                print(f"[tensorfold] all-gathers up to {roce.max_bytes >> 10} KiB over RoCE ({via}; b12x's RoCEnante "
++                      "transport), larger ones over NCCL", flush=True)
+         cfg = Config.read(model_dir)
+         # Without --context the window stays dense, attending every key without indexer work.
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+@@ -442,7 +486,28 @@ class GlmEngine:
+         from .qmm import KVB_KINDS, dense_kind, fp8_weights, kvb_kind, kvb_weights, q4_weights
+ 
+         # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
+-        weights_estimate = split_weights(rule)
++        from . import tp as tp_mod
++        from .split import rank_cut
++
++        lay = tp_mod.Layout.from_config(cfg, rank, world)
++        self.tp = lay
++
++        def cut(name: str, shape: list[int], kind: str) -> tuple[int, int]:
++            """This rank's share of a split tensor (``split.rank_cut``) or of lm_head's rows, for the estimate."""
++            if kind == "vocab":
++                if "vocab" not in lay.totals:
++                    return 0, shape[0] // world
++                return lay.vocab_offset, lay.vocab_offset + lay.vocab
++            got = rank_cut(lay, name, shape, kind)
++            if got is None:                          # a family the config does not size (two ranks): halves
++                n = shape[{"row": 0, "col": -1, "dim1": 1}[kind]]
++                return 0, n // world
++            return got
++
++        def share(family: str, total: int) -> int:
++            """This rank's width of a split dimension, for the estimate."""
++            return lay.size(family) if family in lay.totals else int(total) // world
++        weights_estimate = split_weights(rule, world, cut)
+         if cfg.quant == "exl3" and dense_kind() == "fp8":
+             weights_estimate = fp8_weights(weights_estimate)
+         elif cfg.quant == "exl3" and dense_kind() == "q4":
+@@ -488,13 +553,13 @@ class GlmEngine:
+         def geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+ 
+-            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
++            g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT, prefill_rows=prefill_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+                              prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv)
+             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
+             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
+             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
+-            extra = workspace + (parallel - 1) * (slot_bytes(text) + mla_ring_bytes(text, prefill_rows))
++            extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
+             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
+             if not extra and not per:
+                 return g
+@@ -503,16 +568,17 @@ class GlmEngine:
+         def draft_geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+ 
+-            g = dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING)
++            g = dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING,
++                                 kv_heads=tp_mod.split_sizes(int(text["num_key_value_heads"]), world, 1)[rank])
+             if parallel == 1:
+                 return g
+             # --parallel: the multi-stream drafter's own pool of contexts beside the solo drafter's
+-            return Geometry(lambda slots: g.bytes_at(slots) + multi_draft_bytes(text, parallel, ring=DRAFT_RING,
++            return Geometry(lambda slots: g.bytes_at(slots) + multi_draft_bytes(text, parallel, world, rank=rank, ring=DRAFT_RING,
+                                                                                  capacity=slots), g.reserve)
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+                                    geometry,
+-                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
+-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
++                                   weights_estimate, rank=rank, world=world, gather=self._gather_ints,
++                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, world, draft_fraction(d, rank, world)),
+                                    draft_geometry=draft_geometry)
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+@@ -538,7 +604,7 @@ class GlmEngine:
+             verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
+         else:
+             verify_code = [verify_code]
+-        # both ranks must run the same calls: refuse to start when they were given different settings
++        # every rank must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+@@ -549,17 +615,19 @@ class GlmEngine:
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+-        both = self._gather_ints(mine + [spare >> 20])
+-        if both[0][:-1] != both[1][:-1]:
+-            raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
++        rows = self._gather_ints(mine + [spare >> 20])
++        odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
++        if odd:
++            raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
+-                               f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+-                               "(or pass --drafter none to both) and give both the same flags")
+-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
++                               f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
++                               "; pull the draft model on every machine (or pass --drafter none to all) and give "
++                               "every rank the same flags")
++        self.cache_bytes = min(row[-1] for row in rows) << 20
+         plan["kept_bytes"] = self.cache_bytes
+         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
+             plan[key] = plan[key] + self.cache_bytes
+@@ -575,7 +643,8 @@ class GlmEngine:
+             text = read_config(model_dir)
+             g = geometry(text)
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+-            states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, rows=0) // 2 + (22 << 20))
++            states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, world, rows=0, rank=rank) // 2 +
++                                                                          (22 << 20))
+             pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+@@ -590,15 +659,20 @@ class GlmEngine:
+             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
+                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
+-        if self.split.split and self.split.exchange == "p2p" and getattr(self.comm, "world", 2) == 2 \
+-                and hasattr(self.comm, "exchange"):
+-            # both ranks: open the split's send/receive connection before the weights and the cache pool take the
++        if self.split.split and self.split.exchange == "p2p" and hasattr(self.comm, "exchange" if world == 2
++                                                                         else "exchange_all"):
++            # every rank: open the split's send/receive connections before the weights and the cache pool take the
+             # memory; opened at the split's warm-up (after the pool), NCCL's buffer registration could fail with
+-            # ENOMEM (ibv_reg_mr, issue #36). The connection stays open; nothing it sends changes
++            # ENOMEM (ibv_reg_mr, issue #36). The connections stay open; nothing they send changes. Past two ranks,
++            # one to every peer, as ``hcsplit.RowSplit.warm`` opens them
+             a = torch.zeros((1,), dtype=torch.float32, device="cuda")
+-            self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
++            if world == 2:
++                self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
++            else:
++                peers = [p for p in range(world) if p != rank]
++                self.comm.exchange_all({p: [a] for p in peers}, {p: [torch.empty_like(a)] for p in peers})
+             torch.cuda.synchronize()
+-        w = load(model_dir, rank=rank, mtp=self.mtp_on)
++        w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on)
+         w.comm = self.comm
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+         self.comm.barrier()
+@@ -612,7 +686,7 @@ class GlmEngine:
+             from .dflash2 import Drafter
+ 
+             self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
+-        self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++        self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
+                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+                         split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
+@@ -649,7 +723,8 @@ class GlmEngine:
+             print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
+                   f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX)", flush=True)
+         if self.drafter is not None:
+-            self.drafter.capture()
++            if graphs:
++                self.drafter.capture()
+         self.costs = self._calibrate()
+         if rank == 0:
+             c = self.costs
+@@ -759,9 +834,9 @@ class GlmEngine:
+                 back()
+         names = list(best)
+         mine = torch.tensor([best[n] for n in names], dtype=torch.float32, device="cuda")
+-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device="cuda")
++        got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
+         self.comm.all_gather(mine, got)
+-        both = dict(zip(names, got.view(2, -1).max(dim=0).values.tolist()))
++        both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
+         e.reset()
+         if self.drafter is not None:
+             self.drafter.reset()
+@@ -779,11 +854,12 @@ class GlmEngine:
+     def _gather_ints(self, values: list[int]) -> list[list[int]]:
+         torch = self.torch
+         mine = torch.tensor(values, dtype=torch.int32, device="cuda")
+-        got = torch.empty((2 * len(values),), dtype=torch.int32, device="cuda")
++        got = torch.empty((self.world * len(values),), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(mine, got)
+-        return [got[:len(values)].tolist(), got[len(values):].tolist()]
++        return got.view(self.world, len(values)).tolist()
+ 
+-    # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
++    # the idle doorbell: the followers wait for each request on the rendezvous store (no store: no doorbell), not in
++    # NCCL; a key a follower and request, which only that follower deletes
+     def _store(self):
+         return getattr(self.comm, "store", None)
+ 
+@@ -791,7 +867,8 @@ class GlmEngine:
+         store = self._store()
+         if store is not None:
+             self._bell = getattr(self, "_bell", 0) + 1
+-            store.set(f"tf_glm_request_{self._bell}", b"1")
++            for r in range(1, getattr(self, "world", 2)):
++                store.set(bell_key(r, self._bell), b"1")
+ 
+     def _await_bell(self) -> None:
+         store = self._store()
+@@ -799,7 +876,7 @@ class GlmEngine:
+             return
+         from datetime import timedelta
+ 
+-        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}"
++        key = bell_key(getattr(self, "rank", 1), getattr(self, "_bell", 0) + 1)
+         while True:
+             try:
+                 store.wait([key], timedelta(hours=1))
+@@ -815,12 +892,12 @@ class GlmEngine:
+ 
+         torch = self.torch
+         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
+-        got = torch.empty((2,), dtype=torch.int32, device="cuda")
++        got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(n, got)
+         count = int(got[0].item())
+         buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
+                else torch.zeros((count,), dtype=torch.int32, device="cuda"))
+-        allv = torch.empty((2 * count,), dtype=torch.int32, device="cuda")
++        allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(buf, allv)
+         return [int(v) for v in allv[:count].tolist()]
+ 
+@@ -1120,7 +1197,7 @@ class GlmEngine:
+         return stats
+ 
+     def follow(self) -> None:
+-        """Rank 1: mirror every request rank 0 serves, forever."""
++        """Ranks past 0: mirror every request rank 0 serves, forever."""
+ 
+         if self.multi is not None:
+             self.multi.follow()
+@@ -1129,7 +1206,7 @@ class GlmEngine:
+             self.follow_one()
+ 
+     def follow_one(self) -> None:
+-        """Rank 1: mirror one request rank 0 serves."""
++        """A rank past 0: mirror one request rank 0 serves."""
+ 
+         from tensorfold.engine.exact_sampling import Sampling
+ 
+@@ -1153,7 +1230,7 @@ class GlmEngine:
+         if cached:
+             hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
+             if hit is None:
+-                raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
++                raise RuntimeError(f"rank {self.rank} has no snapshot of the {cached} tokens rank 0 resumes from")
+         self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+                   constraint, feed, shared)
+         if hasattr(self.comm, "check"):
+@@ -1162,7 +1239,7 @@ class GlmEngine:
+ 
+ class VisionFeed:
+     """An image prompt's feature rows for each prefill chunk: rank 0 holds them all, and hands a chunk's rows to
+-    rank 1 through the all-gather as the chunk comes (rank 1 sends zeros), so neither rank holds a second copy."""
++    the other ranks through the all-gather as the chunk comes (they send zeros), so no rank holds a second copy."""
+ 
+     def __init__(self, engine: GlmEngine, positions: list[int], rows) -> None:
+         self.engine, self.positions, self.rows = engine, positions, rows
+@@ -1182,7 +1259,7 @@ class VisionFeed:
+         n = hi - lo
+         mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
+                 torch.zeros((n, self.width), dtype=torch.bfloat16, device="cuda"))
+-        both = torch.empty((2 * n, self.width), dtype=torch.bfloat16, device="cuda")
++        both = torch.empty((self.engine.world * n, self.width), dtype=torch.bfloat16, device="cuda")
+         self.engine.comm.all_gather(mine, both)
+         index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device="cuda")
+         return index, both[:n]
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 38824db..5ef3fa0 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -989,20 +989,19 @@ void exl3_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+-// Decode windows (items of up to 16 pairs): ``dec_kernel`` with NT 8, 4 warps and 16 k steps a warp (both of GLM's
+-// expert matmuls: gate/up K 4096 in 4 splits, down K 1024 in 1). fuse 0: Z as exl3_grouped_cuda; 1: Y (down); 2: Xd
+-// (gate/up; ``done`` holds max_items * N / 128 zeroed ints).
+-void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
+-                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+-                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+-                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+-                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
+-    constexpr int NT = 8, W = 4, STEPS = 16;
+-    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
+-    TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
+-                "decode expert kernel: 16 k steps a warp");
+-    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
+-    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
++// Decode windows (items of up to 16 pairs): ``dec_kernel`` with NT 8, 4 warps and K / 64 k steps a warp: gate/up K
++// 4096 in 4 splits (16 steps), down K = the rank's expert width in 1 (16 steps at two ranks' 1024; 8, 10 and 12 for
++// the 512 / 640 / 768 of three and four ranks: the grouped kernel's chains at that width, so the same bits as
++// TF_GLM_EXL3_DEC=0). fuse 0: Z as exl3_grouped_cuda; 1: Y (down); 2: Xd (gate/up; ``done`` holds max_items * N / 128
++// zeroed ints). The 16-byte loads run PD steps ahead where PD divides the steps (10 steps: at most 2).
++template <int STEPS>
++static void dec_launch(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                       const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
++                       int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
++                       int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
++                       const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
++    constexpr int NT = 8, W = 4;
++    constexpr int PD4 = STEPS % 4 == 0 ? 4 : 2;
+     dim3 grid((unsigned)max_items, (unsigned)(N / (16 * NT)), (unsigned)(mats * SK));
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+@@ -1016,12 +1015,39 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
+     if (ld == 0) DEC1(F_, XR_, 0, 1);                                                                             \
+     else if (ld == 1) DEC1(F_, XR_, 1, 1);                                                                        \
+     else if (ld == 2) DEC1(F_, XR_, 1, 2);                                                                        \
+-    else DEC1(F_, XR_, 1, 4)
+-    if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
+-    else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
+-    else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
++    else DEC1(F_, XR_, 1, PD4)
++    if constexpr (STEPS == 16) {                     // every matrix: gate/up (fuse 0 / 2, xrow) and two ranks' down
++        if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
++        else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
++        else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
++    } else {                                         // only the down projection of 3 or 4 ranks (one matrix)
++        TORCH_CHECK(mats == 1 && !xrow && fuse != 2, "decode expert kernel: ", STEPS,
++                    " k steps a warp only for the down projection");
++        if (fuse == 0) { DEC(0, false); } else { DEC(1, false); }
++    }
+ #undef DEC
+ #undef DEC1
++}
++
++void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
++                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
++                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
++                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
++    constexpr int NT = 8, W = 4;
++    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
++    TORCH_CHECK(K % (16 * SK * W) == 0 && N % (16 * NT) == 0, "decode expert kernel: whole k steps a warp");
++    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
++    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
++    const int64_t steps = K / (16 * SK * W);
++#define ARGS X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow, sv0, sv1, \
++             su2, out, limit, done, ld
++    if (steps == 16) dec_launch<16>(ARGS);
++    else if (steps == 12) dec_launch<12>(ARGS);
++    else if (steps == 10) dec_launch<10>(ARGS);
++    else if (steps == 8) dec_launch<8>(ARGS);
++    else TORCH_CHECK(false, "decode expert kernel: 8, 10, 12 or 16 k steps a warp, not ", steps);
++#undef ARGS
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index d79bfb2..2bc0b6b 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -11,6 +11,9 @@ import torch
+ 
+ from tensorfold.cuda import experts as grouped
+ 
++# a rank's expert widths the decode kernel (``dec``) takes: two ranks' 1024, four ranks' 512, three ranks' 768 / 640
++# (its down projection's K / 64 k steps a warp: 16, 8, 12, 10); others run the grouped kernel (the same bits)
++DEC_WIDTHS = (1024, 768, 640, 512)
+ # Gate/up and down tile counts, warps, and K splits stay fixed across row counts to preserve each row's bits.
+ GATEUP_CFG = (8, 4, 4)
+ DOWN_CFG = (8, 4, 1)
+@@ -73,7 +76,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v19", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v20", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -204,7 +207,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")
+     items = grouped.max_items(R * slots, plan.experts)
+     dec, fuse, xrow = dec_settings()
+-    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI == 1024:
++    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI in DEC_WIDTHS:
+         xrow = xrow and ex.shared_suh is not None
+         if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
+             ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index f1c4d14..1af69e5 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse
++from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -40,8 +40,8 @@ class Buffers:
+         dev = w.device
+         bf, f32 = torch.bfloat16, torch.float32
+         D, S = c.hidden, c.streams
+-        HL = c.heads // w.world
+-        LL = c.lin_heads // w.world
++        HL = tp.of(w).heads
++        LL = tp.of(w).lin_heads
+         self.rows, self.prefill = rows, prefill
+         head_rows = 1 if prefill else rows
+         self.world = w.world
+@@ -93,13 +93,13 @@ class Buffers:
+         self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
+         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
+         # dense MLP
+-        dl = c.dense_width // w.world
++        dl = tp.of(w).dense
+         self.gu = torch.empty((rows, 2 * dl), dtype=bf, device=dev)
+         self.act = torch.empty((rows, dl), dtype=bf, device=dev)
+         self.xs_act = torch.empty((rows, dl // 64), dtype=f32, device=dev)
+         # MoE
+         slots = c.top_k + 1
+-        ml = c.moe_width // w.world
++        ml = tp.of(w).moe
+         self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
+         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=dev)
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+@@ -112,7 +112,7 @@ class Buffers:
+             from .exl3_mm import Scratch, prompt_kernels, prompt_pass
+ 
+             prompt = prefill and prompt_kernels()
+-            sl = c.shared_width // w.world
++            sl = tp.of(w).shared
+             self.exl3 = Scratch(rows, slots, D, ml, dev, prompt=prompt)
+             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
+             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
+@@ -187,7 +187,7 @@ class Caches:
+ 
+         c = w.cfg
+         dev = w.device
+-        HL = c.heads // w.world
++        HL = tp.of(w).heads
+         dsa = len([l for l in w.layers if l.kind == "dsa"])
+         self.latent = latent.ENABLED
+         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
+@@ -276,7 +276,7 @@ class Slots:
+     def __init__(self, w: Weights, count: int, rows: int) -> None:
+         c = w.cfg
+         dev = w.device
+-        LL = c.lin_heads // w.world
++        LL = tp.of(w).lin_heads
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         n = len(kda_layers)
+         width = kda_layers[0].kda.proj.n if kda_layers else 0
+@@ -298,7 +298,7 @@ def slot_bytes(w: Weights, rows: int) -> int:
+     """Device bytes one more stream slot takes (``Slots``), without allocating it."""
+ 
+     c = w.cfg
+-    LL = c.lin_heads // w.world
++    LL = tp.of(w).lin_heads
+     kda_layers = [l for l in w.layers if l.kind == "kda"]
+     n = len(kda_layers)
+     width = kda_layers[0].kda.proj.n if kda_layers else 0
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index ae13bb7..993b71a 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -280,6 +280,23 @@ def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torc
+     _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
+ 
+ 
++def hc_post_ranks(x: torch.Tensor, xout: torch.Tensor, first: torch.Tensor, stride: int, world: int,
++                  post: torch.Tensor, comb: torch.Tensor) -> None:
++    """``hc_post`` of ``world`` ranks' fp32 partials [R, D] that sit ``stride`` elements apart from rank 0's
++    (``first``): rows of one all-gathered [world, R', D] buffer (stride R' x D), the sum rank 0 first and every bit
++    hc_post's (TF_GLM_HC_SPLIT past two ranks)."""
++
++    rows, d = first.shape
++    if first.dtype != torch.float32 or not first.is_contiguous():
++        raise ValueError("hc_post_ranks: contiguous fp32 partials")
++    if not rows:
++        return
++    s = x.shape[1] // d
++    block = min(1024, d)
++    _hc_post[(rows, d // block)](x, xout, first, post, comb, int(stride), D=d, S=s, WORLD=int(world), BLOCK=block,
++                                 num_warps=4)
++
++
+ @triton.jit
+ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 5426bb7..7a44e73 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -1,4 +1,4 @@
+-"""TF_GLM_HC_SPLIT=1: a prompt chunk's hyper-connection glue split by rows between the two ranks (decode untouched).
++"""TF_GLM_HC_SPLIT=1: a prompt chunk's hyper-connection glue split by rows between the ranks (decode untouched).
+ 
+ Unsplit, each exchange site (after the attention block and after the MLP/MoE block) all-gathers both ranks' fp32
+ partials [R, D], and both ranks run hc_post and the next hc_pre over all R rows. Split, rank r owns rows
+@@ -109,15 +109,29 @@ class SplitSettings:
+ 
+ 
+ class HcSplit:
+-    """One prompt buffer's row split: rows, pieces, the second stream and its events."""
++    """One prompt buffer's row split: rows, pieces, the second stream and its events.
++
++    Past two ranks (``world`` N): rank r owns rows [r H, r H + H), H = ceil(R / N) (pad rows zero, never read).
++    p2p: each rank sends every peer its partial of that peer's rows and receives each peer's partial of its own rows
++    into a [N, n, D] staging block a piece (its own partial copied into its slot), summed rank 0 first by hc_post
++    (``exchange_all``: one NCCL group, every pair a send and a receive, so it needs every pair connected); its glued
++    rows go to every peer the same way. gather (for fabrics without every pair, e.g. a ring): the unsplit all-gather
++    of every rank's whole partial, glue on own rows (``glue.hc_post_ranks``), then the in-place all-gather of the
++    rows. Either way the partial sums are hc_post's, rank 0 first: the unsplit bits."""
+ 
+     def __init__(self, w, b, settings: SplitSettings) -> None:
+-        if w.world != 2 or w.comm is None or (settings.exchange == "p2p" and not hasattr(w.comm, "exchange")):
+-            raise ValueError("TF_GLM_HC_SPLIT needs two ranks and a communicator with exchange (send/receive), "
+-                             "or TF_GLM_HC_EXCHANGE=gather")
++        world = int(getattr(w, "world", 2))
++        two = world == 2
++        p2p = settings.exchange == "p2p"
++        if world < 2 or w.comm is None or (p2p and not hasattr(w.comm, "exchange" if two else "exchange_all")):
++            raise ValueError("TF_GLM_HC_SPLIT needs two ranks or more and a communicator with exchange "
++                             "(send/receive), or TF_GLM_HC_EXCHANGE=gather")
+         self.w, self.b, self.settings = w, b, settings
+-        self.rank, self.peer = w.rank, 1 - w.rank
+-        self.gather = settings.exchange == "gather"
++        self.world = world
++        self.rank = w.rank
++        self.peer = 1 - w.rank if two else None
++        self.peers = [r for r in range(world) if r != w.rank]
++        self.gather = not p2p
+         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
+         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
+         self.active = False
+@@ -136,38 +150,52 @@ class HcSplit:
+             self.ev_glue = [torch.cuda.Event() for _ in range(n)]
+             self.ev_done = torch.cuda.Event()
+ 
++    def padded(self, R: int) -> int:
++        """R rounded up to a whole share a rank (two ranks: an odd chunk gets one pad row)."""
++        return -(-R // self.world) * self.world
++
+     def applies(self, R: int) -> bool:
+-        return R >= self.settings.min_rows and R + (R & 1) <= self.b.rows
++        return R >= self.settings.min_rows and self.padded(R) <= self.b.rows
+ 
+     def warm(self) -> None:
+-        """Open the NCCL send/receive connection to the peer at startup (both ranks call this together)."""
++        """Open the NCCL send/receive connections to the peers at startup (every rank calls this together)."""
+ 
+         if self.gather:
+             return
+         a = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         z = torch.empty_like(a)
+-        self.w.comm.exchange([a], [z], self.peer)
++        if self.world == 2:
++            self.w.comm.exchange([a], [z], self.peer)
++        else:
++            outs = {p: [torch.empty_like(a)] for p in self.peers}
++            self.w.comm.exchange_all({p: [a] for p in self.peers}, outs)
+         torch.cuda.synchronize()
+ 
+     # -- per chunk ------------------------------------------------------------------------------------------------
+     def begin(self, R: int) -> None:
+         b = self.b
+-        self.R, self.Rp = R, R + (R & 1)
+-        self.H = H = self.Rp // 2
++        self.R, self.Rp = R, self.padded(R)
++        self.H = H = self.Rp // self.world
+         n = self.settings.piece_count()
+         size = -(-H // n)
+         if size > 64:                                 # whole 64-row tiles for the glue kernels where possible
+             size = min(H, -(-size // 64) * 64)
+         self.pieces = [(off, min(size, H - off)) for off in range(0, H, size)]
+-        # where the peer's partial of each piece of this rank's rows lands: [n, D] fp32 in the all-gather buffer,
+-        # unused while split (gather: the peer's slot of the piece's [2, n, D])
++        # where the peers' partials of each piece of this rank's rows land, in the all-gather buffer (unused while
++        # split). Two ranks: [n, D] fp32 a piece (gather: the peer's slot of the piece's [2, n, D]); more: a [N, n, D]
++        # block a piece (p2p), or every rank's whole partial [N, Rp, D] (gather, one piece)
+         d = b.part.shape[1]
+-        if self.gather:
++        N = self.world
++        if N == 2 and self.gather:
+             self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
+                         for off, n in self.pieces]
+-        else:
++        elif N == 2:
+             self.got = [b.gath[off * d:(off + n) * d].view(n, d) for off, n in self.pieces]
+-        if self.Rp > R:                                # the pad row: zero streams and partials, never read
++        elif self.gather:
++            self.got = [b.gath[:N * self.Rp * d].view(N, self.Rp, d)]
++        else:
++            self.got = [b.gath[N * off * d:N * (off + n) * d].view(N, n, d) for off, n in self.pieces]
++        if self.Rp > R:                                # the pad rows: zero streams and partials, never read
+             b.x[R:self.Rp].zero_()
+             b.part[R:self.Rp].zero_()
+         if self.stream is not None:
+@@ -191,41 +219,64 @@ class HcSplit:
+             fill(lo, hi)
+ 
+     def _swap_partial(self, j: int) -> None:
+-        """Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows in."""
++        """Piece j: this rank's partial of the peers' rows out, the peers' partials of this rank's rows in."""
+ 
+         off, n = self.pieces[j]
++        b = self.b
++        if self.world > 2:
++            if self.gather:                             # every rank's whole partial (one piece)
++                self.all_gather(b.part[:self.Rp].reshape(-1), self.got[0].reshape(-1))
++                return
++            self.w.comm.exchange_all({p: [b.part[p * self.H + off:p * self.H + off + n]] for p in self.peers},
++                                     {p: [self.got[j][p]] for p in self.peers})
++            return
+         lo = self.theirs() + off
+-        send = self.b.part[lo:lo + n]
++        send = b.part[lo:lo + n]
+         if self.gather:
+             d = send.shape[1]
+-            self.all_gather(send.reshape(-1), self.b.gath[2 * off * d:2 * (off + n) * d])
++            self.all_gather(send.reshape(-1), b.gath[2 * off * d:2 * (off + n) * d])
+         else:
+             self.w.comm.exchange([send], [self.got[j]], self.peer)
+ 
+     def _swap_rows(self, j: int, outs: list[torch.Tensor]) -> None:
+-        """Piece j of bf16 row buffers: this rank's rows out, the peer's rows in (gather: in place, whole halves)."""
++        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares)."""
+ 
+         off, n = self.pieces[j]
+-        mine, theirs = self.mine() + off, self.theirs() + off
++        mine = self.mine() + off
+         if self.gather:                                 # one piece: rank order is row order
+             for t in outs:
+                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))
+             return
++        if self.world > 2:
++            self.w.comm.exchange_all({p: [t[mine:mine + n] for t in outs] for p in self.peers},
++                                     {p: [t[p * self.H + off:p * self.H + off + n] for t in outs] for p in self.peers})
++            return
++        theirs = self.theirs() + off
+         self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
+ 
+     def partial(self, fill: Callable[[int, int], None]) -> None:
+-        """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peer's rows sent to it and its
+-        partial of this rank's rows received (``got``)."""
++        """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peers' rows sent to them and
++        their partials of this rank's rows received (``got``)."""
+ 
+-        theirs, mine = self.theirs(), self.mine()
+-        if self.stream is None:
++        mine = self.mine()
++        if self.stream is None or (self.world > 2 and self.gather):
+             fill(0, self.R)
+-            for j in range(len(self.pieces)):
+-                self._swap_partial(j)
++            if self.stream is None:
++                for j in range(len(self.pieces)):
++                    self._swap_partial(j)
++                return
++            main = torch.cuda.current_stream()          # past two ranks, gather: the whole partial, then its gather
++            self.ev_fill[0].record(main)
++            with torch.cuda.stream(self.stream):
++                self.stream.wait_event(self.ev_fill[0])
++                self._swap_partial(0)
++                self.ev_part[0].record(self.stream)
+             return
+         main = torch.cuda.current_stream()
++        others = [self.theirs()] if self.world == 2 else [p * self.H for p in self.peers]
+         for j, (off, n) in enumerate(self.pieces):
+-            self._fill(fill, theirs + off, theirs + off + n)
++            for start in others:
++                self._fill(fill, start + off, start + off + n)
+             self.ev_fill[j].record(main)
+             with torch.cuda.stream(self.stream):
+                 self.stream.wait_event(self.ev_fill[j])
+@@ -234,17 +285,36 @@ class HcSplit:
+         self._fill(fill, mine, mine + self.H)
+ 
+     def own(self) -> tuple[int, int]:
+-        """This rank's rows of the chunk, [lo, hi) (the pad row left out)."""
++        """This rank's rows of the chunk, [lo, hi) (the pad rows left out)."""
+ 
+         return self.mine(), min(self.mine() + self.H, self.R)
+ 
++    def _post(self, j: int, lo: int, hi: int) -> None:
++        """hc_post of this rank's rows lo .. hi (piece j): every rank's partial of them summed rank 0 first."""
++
++        b = self.b
++        x = b.x[lo:hi]
++        own = b.part[lo:hi]
++        if self.world == 2:
++            got = self.got[j]
++            g0, g1 = (own, got) if self.rank == 0 else (got, own)
++            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
++        elif self.gather:
++            whole = self.got[0]
++            glue.hc_post_ranks(x, x, whole[0, lo:hi], self.Rp * whole.shape[2], self.world, b.post[lo:hi],
++                               b.comb[lo:hi])
++        else:
++            block = self.got[j]
++            block[self.rank].copy_(own)
++            glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi])
++
+     def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+              front: Callable[[int, int], None] | None = None) -> None:
+         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
+-        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's. ``front(lo, hi)``
++        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peers'. ``front(lo, hi)``
+         (TF_GLM_PREFILL_OVERLAP=2): the next block's row-independent start on this rank's rows of each piece, on the
+         main stream right after the piece's glue, while its swap (and the later pieces' partials) are on the wire;
+-        the caller runs it on the peer's rows (``own`` is what was done) after this returns."""
++        the caller runs it on the peers' rows (``own`` is what was done) after this returns."""
+ 
+         b, c = self.b, self.w.cfg
+         mine = self.mine()
+@@ -253,11 +323,9 @@ class HcSplit:
+         for j, (off, n) in enumerate(self.pieces):
+             lo, hi = mine + off, mine + off + n
+             if self.stream is not None:
+-                main.wait_event(self.ev_part[j])
+-            own, got = b.part[lo:hi], self.got[j]
+-            g0, g1 = (own, got) if self.rank == 0 else (got, own)
++                main.wait_event(self.ev_part[0 if self.world > 2 and self.gather else j])
++            self._post(j, lo, hi)
+             x = b.x[lo:hi]
+-            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
+             for slot in taps:
+                 glue.stream_mean(x, b.taps[slot][lo:hi])
+             if final:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 4c7f64e..bfc06e2 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -116,18 +116,19 @@ def digest(msg: Sequence[int], seq: int) -> int:
+     return int((int((a * w % SEAL_MOD).sum()) + seq * 1_000_003) % SEAL_MOD)
+ 
+ 
+-def unseal(msg: Sequence[int], seq: int) -> list[int]:
+-    """Rank 1: the message rank 0 sealed as number ``seq``, or a RuntimeError naming what differs: the ranks would
+-    otherwise apply different ops and wait on each other's collectives forever (issue #29's hangs had no error)."""
++def unseal(msg: Sequence[int], seq: int, rank: int = 1) -> list[int]:
++    """A follower (rank ``rank``, 1 or more): the message rank 0 sealed as number ``seq``, or a RuntimeError naming
++    what differs: the ranks would otherwise apply different ops and wait on each other's collectives forever (issue
++    #29's hangs had no error)."""
+ 
+     if len(msg) < 2:
+-        raise RuntimeError(f"rank 1: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
+-                           "the ranks are out of step: restart both")
++        raise RuntimeError(f"rank {rank}: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
++                           "the ranks are out of step: restart them all")
+     body, got_seq, got = list(msg[:-2]), int(msg[-2]), int(msg[-1])
+     if got_seq != seq or got != digest(body, got_seq):
+-        raise RuntimeError(f"rank 1: expected rank 0's message {seq}, received number {got_seq} "
++        raise RuntimeError(f"rank {rank}: expected rank 0's message {seq}, received number {got_seq} "
+                            f"({'checksum matches' if got == digest(body, got_seq) else 'checksum differs'}, "
+-                           f"{len(body)} values): the ranks are out of step: restart both")
++                           f"{len(body)} values): the ranks are out of step: restart them all")
+     return body
+ 
+ 
+@@ -548,9 +549,10 @@ class MultiDecoder:
+         if ready is not None:
+             ready.record()
+         comm = self.g.comm
+-        got = torch.empty((2,), dtype=torch.int32, device=dev)
++        world = self.g.world
++        got = torch.empty((world,), dtype=torch.int32, device=dev)
+         comm.all_gather(length, got)
+-        allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
++        allv = torch.empty((world * n,), dtype=torch.int32, device=dev)
+         comm.all_gather(vals[:n], allv)
+ 
+     def _time_rows(self, reps: int = 5) -> list[float]:
+@@ -562,9 +564,10 @@ class MultiDecoder:
+             raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
+                              "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
+         mine = torch.tensor(v.time_rows(reps), dtype=torch.float32, device=self.w.device)
+-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device=self.w.device)
++        world = self.g.world
++        got = torch.empty((world * mine.numel(),), dtype=torch.float32, device=self.w.device)
+         self.g.comm.all_gather(mine, got)
+-        return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
++        return [float(x) for x in got.view(world, -1).max(dim=0).values.tolist()]
+ 
+     @torch.no_grad()
+     def _time_prompt_layers(self):
+@@ -1659,8 +1662,8 @@ class MultiDecoder:
+             if self.idle:
+                 self.g._await_bell()
+                 self.idle = False
+-            _watch(self.watchdog, "rank 1 message")       # busy: rank 0's next message is due within a round
+-            self.apply(unseal(self.g._share(None), self.received))
++            _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
++            self.apply(unseal(self.g._share(None), self.received, self.rank))
+             self.received = (self.received + 1) % SEAL_MOD
+             _unwatch(self.watchdog)
+             if once:
+diff --git tensorfold/families/glm5_next/cuda/split.py tensorfold/families/glm5_next/cuda/split.py
+index 8f51c55..a973b31 100644
+--- tensorfold/families/glm5_next/cuda/split.py
++++ tensorfold/families/glm5_next/cuda/split.py
+@@ -71,54 +71,84 @@ def read_header(path: str | Path) -> tuple[dict, int]:
+     return header, 8 + n
+ 
+ 
+-def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int) -> tuple[np.ndarray, list[int]]:
+-    """A tensor's bytes -> rank's part of them and its shape."""
++AXIS = {"row": 0, "col": 1, "dim1": 1}
++
++
++def _cut(shape: list[int], kind: str, rank: int, cut: tuple[int, int] | None) -> tuple[int, int]:
++    """[start, stop) of the split axis: ``cut`` (``tp.Layout.cut``), or rank's half of an even axis (two ranks)."""
++
++    if kind == "col" and len(shape) != 2:
++        raise ValueError(f"column split needs a 2-D shape, got {shape}")
++    if kind == "dim1" and len(shape) < 2:
++        raise ValueError(f"split of the second axis needs a second dim, got {shape}")
++    n = shape[AXIS[kind]]
++    if cut is None:
++        if n % 2:
++            raise ValueError(f"{kind} split of an odd dim {shape}")
++        return rank * (n // 2), (rank + 1) * (n // 2)
++    a, b = int(cut[0]), int(cut[1])
++    if not 0 <= a < b <= n:
++        raise ValueError(f"{kind} split [{a}, {b}) outside {shape}")
++    return a, b
++
++
++def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int,
++                cut: tuple[int, int] | None = None) -> tuple[np.ndarray, list[int]]:
++    """A tensor's bytes -> rank's part of them and its shape; ``cut``: the rank's [start, stop) of the split axis
++    (``tp.Layout.cut``; default rank's half, the two-rank split)."""
+ 
+     if kind == "rep":
+         return raw, list(shape)
++    if kind not in AXIS:
++        raise ValueError(kind)
++    a, b = _cut(shape, kind, rank, cut)
+     if kind == "row":
+-        rows = shape[0]
+-        if rows % 2:
+-            raise ValueError(f"row split of odd leading dim {shape}")
+-        per = raw.size // rows
+-        half = rows // 2
+-        return raw[rank * half * per:(rank + 1) * half * per], [half] + list(shape[1:])
+-    if kind == "col":
+-        if len(shape) != 2 or shape[1] % 2:
+-            raise ValueError(f"column split needs an even 2-D shape, got {shape}")
+-        view = raw.reshape(shape[0], shape[1] * itemsize)
+-        half = shape[1] // 2
+-        part = np.ascontiguousarray(view[:, rank * half * itemsize:(rank + 1) * half * itemsize])
+-        return part.reshape(-1), [shape[0], half]
+-    if kind == "dim1":                                   # the second axis of a 2-D or higher tensor
+-        if len(shape) < 2 or shape[1] % 2:
+-            raise ValueError(f"split of the second axis needs an even second dim, got {shape}")
+-        inner = int(np.prod(shape[2:])) * itemsize
+-        view = raw.reshape(shape[0], shape[1] * inner)
+-        half = shape[1] // 2
+-        part = np.ascontiguousarray(view[:, rank * half * inner:(rank + 1) * half * inner])
+-        return part.reshape(-1), [shape[0], half] + list(shape[2:])
+-    raise ValueError(kind)
+-
+-
+-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
++        per = raw.size // shape[0]
++        return raw[a * per:b * per], [b - a] + list(shape[1:])
++    inner = int(np.prod(shape[2:])) * itemsize
++    view = raw.reshape(shape[0], shape[1] * inner)
++    part = np.ascontiguousarray(view[:, a * inner:b * inner])
++    return part.reshape(-1), [shape[0], b - a] + list(shape[2:])
++
++
++def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, cut: tuple[int, int] | None = None):
+     """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
+ 
+     if kind == "rep":
+         return raw.clone(), list(shape)
++    if kind not in AXIS:
++        raise ValueError(kind)
++    a, b = _cut(shape, kind, rank, cut)
+     if kind == "row":
+-        if shape[0] % 2:
+-            raise ValueError(f"row split of odd leading dim {shape}")
+-        per, half = raw.numel() // shape[0], shape[0] // 2
+-        return raw[rank * half * per:(rank + 1) * half * per].clone(), [half] + list(shape[1:])
+-    if kind in ("col", "dim1"):
+-        if len(shape) < 2 or shape[1] % 2 or (kind == "col" and len(shape) != 2):
+-            raise ValueError(f"{kind} split needs an even second dim, got {shape}")
+-        inner = int(np.prod(shape[2:])) * itemsize
+-        half = shape[1] // 2
+-        part = raw.view(shape[0], shape[1] * inner)[:, rank * half * inner:(rank + 1) * half * inner]
+-        return part.contiguous().reshape(-1), [shape[0], half] + list(shape[2:])
+-    raise ValueError(kind)
++        per = raw.numel() // shape[0]
++        return raw[a * per:b * per].clone(), [b - a] + list(shape[1:])
++    inner = int(np.prod(shape[2:])) * itemsize
++    part = raw.view(shape[0], shape[1] * inner)[:, a * inner:b * inner]
++    return part.contiguous().reshape(-1), [shape[0], b - a] + list(shape[2:])
++
++
++def layout_for(model_dir: str | Path, rank: int, world: int):
++    """``tp.Layout`` of rank ``rank`` of ``world`` from the checkpoint's config."""
++
++    from .tp import Layout
++
++    raw = json.loads((Path(model_dir) / "config.json").read_text())
++    return Layout.from_text(dict(raw.get("text_config") or raw), rank, world)
++
++
++def rank_cut(layout, name: str, shape: list[int], kind: str) -> tuple[int, int] | None:
++    """The rank's [start, stop) of ``name``'s split axis by ``layout`` (None for a replicated tensor)."""
++
++    if kind in ("rep", "drop"):
++        return None
++    if layout is None:                                    # two ranks without a config: halves
++        return None
++    family = layout.family(name)
++    if family is None or family not in layout.totals:
++        if layout.world == 2:                             # a family the config does not size: halves, as ever
++            return None
++        raise ValueError(f"{name}: split ({kind}) but the config sizes no tensor-parallel family for it")
++    return layout.cut(family, shape[AXIS[kind]])
+ 
+ 
+ def torch_dtype(dtype: str):
+@@ -133,19 +163,37 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
+     return sorted(Path(model_dir).glob(f"*.rank{rank}.safetensors"))
+ 
+ 
++def folder_world(files: list[Path]) -> int:
++    """The tensor-parallel size a rank folder was split for (its ``tf_tp`` metadata; none: the two-rank split)."""
++
++    worlds = set()
++    for path in files:
++        meta = read_header(path)[0].get("__metadata__") or {}
++        worlds.add(int(meta.get("tf_tp", 2)))
++    if len(worlds) > 1:
++        raise ValueError(f"rank files split for different sizes: {sorted(worlds)}")
++    return worlds.pop() if worlds else 2
++
++
+ class RankReader:
+     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
+ 
+-    def __init__(self, model_dir: str | Path, rank: int) -> None:
++    def __init__(self, model_dir: str | Path, rank: int, world: int = 2) -> None:
+         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
+ 
+-        self.dir, self.rank = Path(model_dir), rank
+-        self.io = Reader()                                # O_DIRECT reads where the file system allows them
+-        self.reads = ReadAhead(self.io, READERS, RUN, GAP)
+-        mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
++        self.dir, self.rank, self.world = Path(model_dir), rank, int(world)
++        mine = rank_files(self.dir, rank)
++        other = sorted(p for p in self.dir.glob("*.rank*.safetensors") if p not in mine)
+         if other and not mine:
+-            raise ValueError(f"{self.dir} holds rank {1 - rank}'s share: give rank {rank} its own folder or the "
++            raise ValueError(f"{self.dir} holds another rank's share ({other[0].name}): give rank {rank} its own "
++                             "folder or the full checkpoint")
++        if mine and folder_world(mine) != self.world:
++            raise ValueError(f"{self.dir} holds rank {rank}'s share for --tp {folder_world(mine)}, not --tp "
++                             f"{self.world}: split it again (python -m {__name__} --tp {self.world}) or give the "
+                              "full checkpoint")
++        self._layout = False                              # read from config.json at the first split tensor
++        self.io = Reader()                                # O_DIRECT reads where the file system allows them
++        self.reads = ReadAhead(self.io, READERS, RUN, GAP)
+         self.split = bool(mine)
+         if self.split:
+             self.folder = SafeTensors(mine, self.io)
+@@ -169,6 +217,17 @@ class RankReader:
+             items.append((name, span[0], span[1], span[2], span))
+         self.reads.queue(items, device, self._cut)
+ 
++    @property
++    def layout(self):
++        """This rank's ``tp.Layout`` (None without a config.json at two ranks: plain halves)."""
++
++        if self._layout is False:
++            if self.world == 2 and not (self.dir / "config.json").exists():
++                self._layout = None
++            else:
++                self._layout = layout_for(self.dir, self.rank, self.world)
++        return self._layout
++
+     @property
+     def ahead(self) -> dict:
+         return self.reads.ahead
+@@ -180,12 +239,13 @@ class RankReader:
+     def close(self) -> None:
+         self.reads.close()
+ 
+-    def _span(self, name: str) -> tuple[str, int, int, str, list[int], str]:
+-        """(file, first byte, end byte, split kind, shape, dtype) of the bytes this rank reads for ``name``."""
++    def _span(self, name: str) -> tuple:
++        """(file, first byte, end byte, split kind, shape, dtype, cut) of the bytes this rank reads for ``name``;
++        ``cut``: the rank's [start, stop) of the split axis."""
+ 
+         if self.split:                                    # a rank folder holds the rank's tensors as they are
+             path, begin, n, dtype, shape = self.folder.where[name]
+-            return str(path), begin, begin + n, "rep", list(shape), dtype
++            return str(path), begin, begin + n, "rep", list(shape), dtype, None
+         file = str(self.dir / self.index[name])
+         if file not in self.files:
+             self.files[file] = read_header(file)
+@@ -196,18 +256,22 @@ class RankReader:
+             raise KeyError(f"{name} is not used by the engine")
+         a, b = info["data_offsets"]
+         shape = list(info["shape"])
+-        if kind == "row" and shape and shape[0] % 2 == 0:   # the rank's rows are one run: read only those
+-            per = (b - a) // shape[0] * (shape[0] // 2)
+-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // 2] + shape[1:]
+-        return file, base + a, base + b, kind, shape, info["dtype"]
++        cut = rank_cut(self.layout, name, shape, kind)
++        if kind == "row" and cut is None and shape and shape[0] % 2 == 0:
++            cut = _cut(shape, kind, self.rank, None)
++        if kind == "row" and cut is not None:             # the rank's rows are one run: read only those
++            per = (b - a) // shape[0]
++            a, b = a + cut[0] * per, a + cut[1] * per
++            kind, shape, cut = "rep", [cut[1] - cut[0]] + shape[1:], None
++        return file, base + a, base + b, kind, shape, info["dtype"], cut
+ 
+     def _tensor(self, raw: np.ndarray, span: tuple, own: bool):
+         """The rank's tensor from the span's bytes; ``own``: never a view of ``raw`` (a shared read's buffer)."""
+ 
+         import torch
+ 
+-        _, _, _, kind, shape, dtype = span
+-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
++        _, _, _, kind, shape, dtype, cut = span
++        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, cut)
+         if own and np.may_share_memory(data, raw):
+             data = data.copy()
+         return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
+@@ -223,8 +287,8 @@ class RankReader:
+ 
+         if not raw.is_cuda:
+             return self._tensor(raw.numpy(), span, own=True)
+-        _, _, _, kind, shape, dtype = span
+-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
++        _, _, _, kind, shape, dtype, cut = span
++        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, cut)
+         return data.view(torch_dtype(dtype)).reshape(shape)
+ 
+ def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:
+@@ -246,11 +310,16 @@ def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], meta
+     os.replace(tmp, path)
+ 
+ 
+-def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+-    """One checkpoint file -> OUT/<stem>.rank<R>.safetensors with the rank's part of every tensor it keeps."""
++def split_file(src: str | Path, out: str | Path, rank: int, world: int = 2, layout=None) -> dict:
++    """One checkpoint file -> OUT/<stem>.rank<R>.safetensors with the rank's part of every tensor it keeps (of
++    ``world`` ranks by ``layout``, a ``tp.Layout``; the metadata names a size past 2 as ``tf_tp``)."""
+ 
+     header, base = read_header(src)
+     metadata = header.pop("__metadata__", None)
++    if layout is None and (int(world) != 2 or (Path(src).parent / "config.json").exists()):
++        layout = layout_for(Path(src).parent, rank, world)
++    if int(world) != 2:
++        metadata = {**(metadata or {}), "tf_tp": str(int(world))}
+     mm = np.memmap(src, dtype=np.uint8, mode="r")
+     stem = os.path.basename(str(src)).replace(".safetensors", "")
+     summary = {"rep": 0, "row": 0, "col": 0, "dim1": 0, "drop": 0}
+@@ -263,7 +332,8 @@ def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+             continue
+         a, b = info["data_offsets"]
+         itemsize = DTYPE_BYTES[info["dtype"]]
+-        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank)
++        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank,
++                                  rank_cut(layout, name, list(info["shape"]), kind))
+         if int(np.prod(shape)) * itemsize != data.size:
+             raise ValueError(f"{name}: {shape} does not match {data.size} bytes")
+         part.append((name, info["dtype"], shape, data))
+@@ -276,9 +346,13 @@ def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+ def main(argv: list[str] | None = None) -> int:
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("model_dir", type=Path, help="the checkpoint (e.g. the snapshot `tensorfold pull` downloaded)")
+-    p.add_argument("--rank", type=int, choices=(0, 1), required=True, help="the rank this machine serves")
+-    p.add_argument("out", type=Path, help="the folder to write (then: tensorfold serve OUT --tp 2 --rank R ...)")
++    p.add_argument("--tp", type=int, choices=(2, 3, 4), default=2, help="ranks the model is split over")
++    p.add_argument("--rank", type=int, choices=(0, 1, 2, 3), required=True, help="the rank this machine serves")
++    p.add_argument("out", type=Path, help="the folder to write (then: tensorfold serve OUT --tp N --rank R ...)")
+     args = p.parse_args(argv)
++    if args.rank >= args.tp:
++        p.error(f"--rank {args.rank} needs --tp {args.rank + 1} or more")
++    layout = layout_for(args.model_dir, args.rank, args.tp)
+     files = sorted(args.model_dir.glob("model-*.safetensors"))
+     if not files:
+         raise SystemExit(f"{args.model_dir}: no model-*.safetensors files")
+@@ -290,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
+         stem = src.name.replace(".safetensors", "")
+         if (args.out / f"{stem}.rank{args.rank}.safetensors").exists():
+             continue
+-        print(src.name, split_file(src, args.out, args.rank), flush=True)
++        print(src.name, split_file(src, args.out, args.rank, args.tp, layout), flush=True)
+     print(f"rank {args.rank}'s share of {len(files)} files in {args.out}", flush=True)
+     return 0
+ 
+diff --git tensorfold/families/glm5_next/cuda/tp.py tensorfold/families/glm5_next/cuda/tp.py
+new file mode 100644
+index 0000000..5eec3b1
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/tp.py
+@@ -0,0 +1,178 @@
++"""GLM-5.3-Flash's tensor-parallel layout over N ranks (N = 2, 3, 4): which share of each split dimension a rank
++holds. Every family splits in whole units (``tensorfold.cuda.shares``), the remainder to the lowest ranks, so two
++ranks hold exact halves (the two-rank engine's split) and three hold e.g. 22/21/21 heads and 6/5/5 of an expert's
++16 Hadamard blocks. Nothing is padded: no exchanged tensor is per-head or per-column (the ranks gather full-width
++fp32 partials and top-k candidates), so ranks may hold different shapes.
++
++Families (the split checkpoint tensors, ``split.ROW`` / ``COL`` / EXL3 rules):
++  heads   MLA attention heads: q_b and kv_b rows, a DSA layer's o_proj columns        unit 1 head
++  lin     KDA heads: q/k/v (and their convs), f_b, g_b, b, A_log, dt_bias rows, o_proj  unit 1 head
++  dense   the dense MLP's intermediate (layers before first_k_dense_replace)            unit 128
++  moe     a routed expert's intermediate (EXL3: whole 128-column Hadamard blocks)        unit 128
++  shared  the shared expert's intermediate                                              unit 128
++  vocab   lm_head rows                                                                  unit 64
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++
++from tensorfold.cuda.shares import parts
++
++UNITS = {"heads": 1, "lin": 1, "dense": 128, "moe": 128, "shared": 128, "vocab": 64}
++SIZES = (2, 3, 4)                     # the engine's tensor-parallel sizes
++
++_LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.")
++_FAMILIES = (
++    (re.compile(r"\.mlp\.experts\.\d+\."), "moe"),
++    (re.compile(r"\.mlp\.shared_experts\."), "shared"),
++    (re.compile(r"\.mlp\.(gate|up|down)_proj\."), "dense"),
++    (re.compile(r"\.self_attn\.(q_b|kv_b)_proj\."), "heads"),
++    (re.compile(r"\.self_attn\.((q|k|v)_proj|(q|k|v)_conv1d|f_b_proj|g_b_proj|b_proj)\."), "lin"),
++    (re.compile(r"\.self_attn\.(A_log|dt_bias)$"), "lin"),
++    (re.compile(r"^lm_head\."), "vocab"),
++)
++_O_PROJ = re.compile(r"\.self_attn\.o_proj\.")
++
++
++@dataclass(frozen=True)
++class Layout:
++    """Rank ``rank`` of ``world``: the totals of every family and this rank's [start, stop) of each."""
++
++    rank: int
++    world: int
++    totals: dict = field(hash=False)
++    kinds: tuple = ()                  # per layer "kda" / "dsa" (an o_proj's family); past them: the MTP layer (dsa)
++
++    def __post_init__(self) -> None:
++        if not 0 <= self.rank < self.world:
++            raise ValueError(f"rank {self.rank} of {self.world}")
++        for name in self.totals:
++            self.sizes(name)                                # every family must split whole
++
++    @classmethod
++    def from_config(cls, cfg, rank: int, world: int) -> "Layout":
++        """From ``weights.Config``."""
++
++        names = {"heads": "heads", "lin": "lin_heads", "dense": "dense_width", "moe": "moe_width",
++                 "shared": "shared_width", "vocab": "vocab"}
++        totals = {f: int(getattr(cfg, a)) for f, a in names.items() if getattr(cfg, a, None) is not None}
++        return cls(int(rank), int(world), totals, tuple(getattr(cfg, "kinds", ()) or ()))
++
++    @classmethod
++    def from_text(cls, t: dict, rank: int, world: int) -> "Layout":
++        """From a checkpoint's text config (``config.json``'s text_config or the whole of it)."""
++
++        lin = t.get("linear_attn_config") or {}
++        kinds = tuple("kda" if k == "linear_attention" else "dsa" for k in t.get("layer_types", ()))
++        totals = {}
++        if "num_attention_heads" in t:
++            totals["heads"] = int(t["num_attention_heads"])
++        if "num_heads" in lin or "linear_num_heads" in t:
++            totals["lin"] = int(lin.get("num_heads", t.get("linear_num_heads", 0)))
++        if "intermediate_size" in t:
++            totals["dense"] = int(t["intermediate_size"])
++        if "moe_intermediate_size" in t:
++            moe = int(t["moe_intermediate_size"])
++            totals.update(moe=moe, shared=moe * int(t.get("n_shared_experts", 1)))
++        if "vocab_size" in t:
++            totals["vocab"] = int(t["vocab_size"])
++        return cls(int(rank), int(world), totals, kinds)
++
++    def sizes(self, family: str) -> list[int]:
++        return split_sizes(self.totals[family], self.world, UNITS[family])
++
++    def size(self, family: str) -> int:
++        return self.sizes(family)[self.rank]
++
++    def start(self, family: str) -> int:
++        return sum(self.sizes(family)[:self.rank])
++
++    def largest(self, family: str) -> int:
++        """The largest share any rank holds (rank 0's): what a buffer every rank sizes alike must take."""
++        return max(self.sizes(family))
++
++    def cut(self, family: str, length: int) -> tuple[int, int]:
++        """This rank's [start, stop) of an axis of ``length`` elements holding ``family``'s total (rows of a weight,
++        packed words, trellis tiles, group scales)."""
++
++        total, a = self.totals[family], self.start(family)
++        b = a + self.size(family)
++        if (a * length) % total or (b * length) % total:
++            raise ValueError(f"rank {self.rank} of {self.world}: [{a}, {b}) of {family}'s {total} is not whole on an "
++                             f"axis of {length}")
++        return a * length // total, b * length // total
++
++    def at(self, rank: int) -> "Layout":
++        return Layout(rank, self.world, self.totals, self.kinds)
++
++    # the per-rank widths the engine sizes its weights and buffers by
++    @property
++    def heads(self) -> int:
++        return self.size("heads")
++
++    @property
++    def lin_heads(self) -> int:
++        return self.size("lin")
++
++    @property
++    def dense(self) -> int:
++        return self.size("dense")
++
++    @property
++    def moe(self) -> int:
++        return self.size("moe")
++
++    @property
++    def shared(self) -> int:
++        return self.size("shared")
++
++    @property
++    def vocab(self) -> int:
++        return self.size("vocab")
++
++    @property
++    def vocab_offset(self) -> int:
++        return self.start("vocab")
++
++    def family(self, name: str) -> str | None:
++        """The family a split checkpoint tensor belongs to (None: not one this layout splits)."""
++
++        if _O_PROJ.search(name):
++            m = _LAYER.search(name)
++            layer = int(m.group(1)) if m else -1
++            return "lin" if 0 <= layer < len(self.kinds) and self.kinds[layer] == "kda" else "heads"
++        for pattern, family in _FAMILIES:
++            if pattern.search(name):
++                return family
++        return None
++
++
++def split_sizes(total: int, world: int, unit: int) -> list[int]:
++    """Each rank's share of a family's ``total``: halves at two ranks whenever the total is even (the two-rank
++    engine's split, whatever the unit), else whole ``unit``s as even as they go (``shares.parts``)."""
++
++    if world == 2 and total % 2 == 0:
++        return [total // 2, total // 2]
++    return parts(total, world, unit)
++
++
++def of(w) -> Layout:
++    """The layout of a ``weights.Weights`` (or a stand-in with cfg, rank and world)."""
++
++    lay = getattr(w, "tp", None)
++    if lay is None:
++        lay = Layout.from_config(w.cfg, getattr(w, "rank", 0), getattr(w, "world", 1))
++    return lay
++
++
++def draft_parts(heads: int, kv_heads: int, inter: int, world: int) -> tuple[list[int], list[int], list[int]]:
++    """DFlash2's split: KV heads in whole groups (each with its heads // kv_heads query heads), the MLP in units of
++    128 -> (query heads, KV heads, MLP width) per rank. 32 / 8 over 3 ranks: KV 3/3/2, queries 12/12/8."""
++
++    if heads % kv_heads:
++        raise ValueError(f"drafter: {heads} query heads over {kv_heads} KV heads")
++    group = heads // kv_heads
++    kv = split_sizes(kv_heads, world, 1)
++    return [k * group for k in kv], kv, split_sizes(inter, world, 128 if inter % 128 == 0 else 1)
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index f359bc9..64dbc7c 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -97,7 +97,9 @@ class BatchedVerify:
+         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         n = len(kda_layers)
+-        LL = c.lin_heads // w.world
++        from .tp import of as layout_of
++
++        LL = layout_of(w).lin_heads
+         width = kda_layers[0].kda.proj.n if kda_layers else 0
+         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
+         self.dsa_index = {l.index: i for i, l in enumerate(l for l in w.layers if l.kind == "dsa")}
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 783bd39..b768c7d 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -213,10 +213,17 @@ class Weights:
+     comm: Any = None
+     meta: dict = field(default_factory=dict)
+     draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
++    tp: Any = None                    # the rank's ``tp.Layout`` (None: made from cfg, rank and world)
++
++    def __post_init__(self) -> None:
++        if self.tp is None:
++            from .tp import Layout
++
++            self.tp = Layout.from_config(self.cfg, self.rank, self.world)
+ 
+     @property
+     def vocab_offset(self) -> int:
+-        return self.rank * (self.cfg.vocab // self.world)
++        return self.tp.vocab_offset
+ 
+     def nbytes(self) -> int:
+         total = 0
+@@ -247,20 +254,22 @@ class Weights:
+         return total
+ 
+ 
+-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
+-    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
++def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True) -> Weights:
++    """Rank ``rank`` of ``world`` from a checkpoint or rank folder (``tp.Layout``'s shares), MTP included unless
++    ``mtp`` is False, with its rows of the head."""
+ 
+     from .split import RankReader
++    from .tp import Layout
+ 
+-    world = 2
+     cfg = Config.read(model_dir)
++    lay = Layout.from_config(cfg, rank, world)
+     if cfg.quant not in ("mlx", "exl3"):
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+     exl3 = cfg.quant == "exl3"
+     dev = torch.device(device)
+-    rd = RankReader(model_dir, rank)
+-    HL = cfg.heads // world
+-    LL = cfg.lin_heads // world
++    rd = RankReader(model_dir, rank, world)
++    HL = lay.heads
++    LL = lay.lin_heads
+ 
+     def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
+         x = rd.get(PREFIX + name)
+@@ -432,23 +441,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+     try:                                          # a failed load still cancels the reads queued ahead
+         which = list(range(cfg.layers))
+         built = [layer(i) for i in which]
+-        vl = cfg.vocab // world
++        v0, v1 = lay.vocab_offset, lay.vocab_offset + lay.vocab
+         draft_head = None
+         if exl3:
+-            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
++            raw = rd.get("lm_head.weight")[v0:v1].to(dev)
+             head = dense(raw)
+             # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
+             draft_head = draft_quantize4(raw)
+         else:
+             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
+-            head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
+-                           hb[rank * vl:(rank + 1) * vl].to(dev))
++            head = make_q4(as_i32(hw[v0:v1]).to(dev), hs[v0:v1].to(dev), hb[v0:v1].to(dev))
+         mtpw = None
+         if cfg.mtp_layers and mtp:
+             i = cfg.layers
+             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
+                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
+-        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
++        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
+         w.meta.update(layers=which)
+     finally:
+         rd.close()

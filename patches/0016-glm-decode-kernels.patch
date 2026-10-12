@@ -1,0 +1,605 @@
+diff --git tensorfold/cuda/kernels/qmm.cpp tensorfold/cuda/kernels/qmm.cpp
+index 81c10c7..bb6a473 100644
+--- tensorfold/cuda/kernels/qmm.cpp
++++ tensorfold/cuda/kernels/qmm.cpp
+@@ -4,6 +4,8 @@
+ bool qmm_clusters(int, bool);
+ void qmm_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+               at::Tensor&, const at::Tensor&, int, int, int, int, bool, bool);
++void qmm_cfg_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                  at::Tensor&, const at::Tensor&, int, int, bool, int);
+ void qmm_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
+                       int, bool, int);
+ void qmm_prefill8w_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
+@@ -44,6 +46,36 @@ void qmm(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const a
+              static_cast<int>(bm), f32, reduce);
+ }
+ 
++// ``qmm`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg`` (same bits, other speed).
++void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
++             const at::Tensor& biases, at::Tensor& out, const c10::optional<at::Tensor>& part, int64_t n, int64_t sk,
++             bool f32, int64_t cfg) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
++                x.size(0) <= 16 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 16, K) bf16");
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
++                "x rows must start on 16-byte boundaries");
++    const int64_t m = x.size(0), k = x.size(1), kg = k / 64, npad = (n + 127) / 128 * 128;
++    TORCH_CHECK(k % 64 == 0 && sk >= 1 && kg % sk == 0, "K splits into whole groups a slice");
++    TORCH_CHECK(xs.is_cuda() && xs.is_contiguous() && xs.scalar_type() == at::kFloat && xs.size(0) == m &&
++                xs.size(1) == kg, "xs: (M, K / 64) fp32");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt && w.numel() == npad * k / 8,
++                "packed weight does not match n and K");
++    TORCH_CHECK(scales.stride(1) == 1 && biases.stride(1) == 1 && scales.stride(0) >= npad &&
++                biases.stride(0) == scales.stride(0) && scales.scalar_type() == at::kBFloat16 &&
++                biases.scalar_type() == at::kBFloat16 && scales.size(0) == kg && scales.size(1) == npad,
++                "scales and biases: (K / 64, n padded to 128) bf16");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == m && out.size(1) == n &&
++                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
++    c10::cuda::CUDAGuard guard(x.device());
++    at::Tensor p;
++    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), true)) {
++        p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
++        TORCH_CHECK(p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n, "part");
++    }
++    qmm_cfg_cuda(x, xs, w, scales, biases, out, p, static_cast<int>(n), static_cast<int>(sk), f32,
++                 static_cast<int>(cfg));
++}
++
+ // Prefill: x (M, K) bf16 times a packed 4-bit weight with each weight rounded once to bf16, one fp32 chain over K.
+ void qmm_prefill(const at::Tensor& x, const at::Tensor& w, const at::Tensor& scales, const at::Tensor& biases,
+                  at::Tensor& out, int64_t n, int64_t gs, bool f32, int64_t tile) {
+@@ -115,6 +147,7 @@ void qmm_prefill8w(const at::Tensor& x8, const at::Tensor& a, const at::Tensor&
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("qmm", &qmm);
++    m.def("qmm_cfg", &qmm_cfg);
+     m.def("qmm_prefill", &qmm_prefill);
+     m.def("qmm_prefill8", &qmm_prefill8);
+     m.def("qmm_prefill8w", &qmm_prefill8w);
+diff --git tensorfold/cuda/kernels/qmm.cu tensorfold/cuda/kernels/qmm.cu
+index e8afd09..c759255 100644
+--- tensorfold/cuda/kernels/qmm.cu
++++ tensorfold/cuda/kernels/qmm.cu
+@@ -292,6 +292,28 @@ void dispatch(int bm, const at::Tensor& x, const at::Tensor& xs, const at::Tenso
+     }
+ }
+ 
++// Decode rows (a 16-row tile) on other column tiles, warps and stage counts: every output's chain (groups in order
++// within its K slice, slices added in order) is qmm_kernel's, so every choice gives the same bits.
++template <bool F32, bool CLUSTER>
++void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& s,
++                  const at::Tensor& b, at::Tensor& out, const at::Tensor& part, int N, int SK) {
++    switch (cfg) {
++        case 0: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 1: launch<64, 16, 128, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 2: launch<64, 16, 128, 1, 8, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 3: launch<64, 16, 64, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 4: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 5: launch<64, 16, 64, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 6: launch<64, 16, 128, 1, 8, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 7: launch<64, 16, 64, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 8: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
++        case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
++        case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
++        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-11");
++    }
++}
++
+ } // namespace
+ 
+ // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
+@@ -299,6 +321,27 @@ bool qmm_clusters(int SK, bool reduce) {
+     return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9;
+ }
+ 
++// ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
++void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
++                  const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
++    const int M = x.size(0);
++    TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
++    const bool cluster = qmm_clusters(SK, true);
++    if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
++               else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
++    else { if (cluster) dispatch_cfg<false, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
++           else dispatch_cfg<false, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
++    if (SK > 1 && !cluster) {
++        const long long total = static_cast<long long>(M) * N;
++        const int threads = 256;
++        const int blocks = static_cast<int>((total + threads - 1) / threads);
++        auto stream = at::cuda::getCurrentCUDAStream();
++        if (f32) reduce_kernel<true><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
++        else reduce_kernel<false><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++}
++
+ void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+               const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, int gs, int bm,
+               bool f32, bool reduce) {
+diff --git tensorfold/cuda/kernels/qmm.py tensorfold/cuda/kernels/qmm.py
+index 2c8fc13..83e6366 100644
+--- tensorfold/cuda/kernels/qmm.py
++++ tensorfold/cuda/kernels/qmm.py
+@@ -16,7 +16,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_qmm_v3", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
++    return load(name="tensorfold_qmm_v4", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+                                                    str(here / "qmm_prefill.cu"), str(here / "qmm_prefill8.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+@@ -138,8 +138,10 @@ def group_sums(x: torch.Tensor, gs: int = 64) -> torch.Tensor:
+ 
+ 
+ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | None = None, f32: bool = False,
+-           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True) -> torch.Tensor:
+-    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order."""
++           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True,
++           variant: int | None = None) -> torch.Tensor:
++    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order;
++    ``variant``: decode rows (up to 16, groups of 64) on another tile config (``qmm_cfg``: the same bits)."""
+ 
+     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != q.k:
+         raise ValueError(f"matmul: x must be (M, {q.k}) bf16")
+@@ -153,6 +155,9 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int |
+         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+     if sk > 1 and not reduce and part is None:
+         part = torch.empty((sk, m, q.n), dtype=torch.float32, device=x.device)
++    if variant is not None and reduce and m <= 16 and q.gs == 64:
++        _ext().qmm_cfg(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, f32, int(variant))
++        return out
+     _ext().qmm(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, q.gs, bucket(m), f32, reduce)
+     return out if sk == 1 or reduce else part.reshape(-1)[:sk * m * q.n].view(sk, m, q.n)
+ 
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 79a6427..116000f 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -96,6 +96,10 @@ class Engine:
+         self.grid = grid
+         w.meta["long_context"] = long_context
+         self.rows, self.prefill_rows = max_rows, prefill_rows
++        if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
++            from . import kda as kda_mod
++
++            kda_mod.reserve(max(max_rows, prefill_rows), w.cfg.lin_heads // w.world, w.device)
+         self.buf = Buffers(w, max_rows, capacity)
+         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
+         if taps:
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index 3a392a2..9755ea8 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -16,6 +16,10 @@ void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, c
+                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+                       double, int64_t, int64_t, bool);
+ void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
++void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                   const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
++                   int64_t, int64_t, int64_t, int64_t, bool, const at::Tensor&, const at::Tensor&,
++                   const at::Tensor&, at::Tensor&, double, at::Tensor&);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -104,6 +108,27 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+                      max_items, limit, pass, slots, shx);
+ }
+ 
++// Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd
++// (gate/up, the epilogue run by each (item, n block)'s last block; ``done`` zeroed ints, reset by the kernel).
++void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1, const at::Tensor& items,
++         const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
++         int64_t P, int64_t SK, int64_t max_items, int64_t slots, int64_t fuse, bool xrow,
++         const at::Tensor& sv0, const at::Tensor& sv1, const at::Tensor& su2, at::Tensor out, double limit,
++         at::Tensor done) {
++    const int64_t E = T0.size(0);
++    for (auto* t : {&X0, &X1, &sv0, &sv1, &su2}) check(*t, at::kHalf, "dec: fp16 input");
++    for (auto* t : {&T0, &T1, &items, &counts, &members}) check(*t, at::kInt, "dec: int32 input");
++    check(done, at::kInt, "done");
++    check(Z, at::kFloat, "Z");
++    TORCH_CHECK(fuse == 1 || Z.numel() >= mats * SK * P * N, "Z too small");
++    TORCH_CHECK(fuse != 1 || (out.scalar_type() == at::kFloat && out.numel() >= P * N), "dec: Y fp32 [P, N]");
++    TORCH_CHECK(fuse != 2 || (out.scalar_type() == at::kHalf && out.numel() >= P * N &&
++                              done.numel() >= max_items * (N / 128)), "dec: Xd fp16 [P, N] and done counts");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3_dec_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow,
++                  sv0, sv1, su2, out, limit, done);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
+     m.def("prompt", &prompt);
+@@ -111,4 +136,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("rot_rows", &rot_rows);
+     m.def("gateup_epilogue", &gateup_epilogue);
+     m.def("down_epilogue", &down_epilogue);
++    m.def("dec", &dec);
+ }
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 46cb22d..19357c7 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -306,6 +306,187 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
+     for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+ }
+ 
++// ---- decode windows: grouped_kernel's arithmetic with its epilogues fused -------------------------------------
++// Every mma chain, warp sum and split sum is grouped_kernel's (non-SEQ, register prefetch of the next k step): a
++// warp runs k tiles kt0 .. kt0 + STEPS - 1 of its split in order from zero, the warps are added in warp order, the
++// splits in split order from 0. What changes:
++// FUSE 1 (the down projection, SK = 1): the block's 128 columns are one Hadamard block, so it applies
++//   down_epilogue_kernel's arithmetic to its own sums and writes Y, no Z round trip, no epilogue launch;
++// FUSE 2 (gate and up): each block still writes its Z partial; the last of the 2 * SK blocks of an (item, n block)
++//   to finish (an atomic count, reset for the next launch) runs gateup_epilogue_kernel's arithmetic on the item's
++//   rows and 128 columns, reading the partials in split order: the same sums whichever block finishes last.
++// XROW: X holds one row a token (rot_rows, a layer whose experts share one suh), pair p reads row p / slots.
++template <int NT, int W, int STEPS, int FUSE, bool XROW>
++__global__ void __launch_bounds__(W * 32) dec_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E, int slots,
++    const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ su2, void* __restrict__ out,
++    float limit, int* __restrict__ done) {
++    static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
++    const int item = blockIdx.x, nblock = blockIdx.y;
++    if (item >= counts[0]) return;
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (e >= E) return;                                  // the shared expert (id E) is not EXL3
++    const int mat = blockIdx.z / SK, split = blockIdx.z % SK;
++    const half* X = mat ? X1 : X0;
++    const uint32_t* T = mat ? T1 : T0;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4;
++
++    __shared__ int rows_sh[16];
++    __shared__ float red[W][16][NT * 16];
++    if (threadIdx.x < 16) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++    __syncthreads();
++    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
++    const int xr0 = r0 < 0 ? 0 : (XROW ? r0 / slots : r0), xr1 = r1 < 0 ? 0 : (XROW ? r1 / slots : r1);
++    const half* x0 = X + (size_t)xr0 * K + 2 * t;
++    const half* x1 = X + (size_t)xr1 * K + 2 * t;
++    const int nt0 = nblock * NT;
++    const int kt0 = split * (KT / SK) + warp * STEPS;
++    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
++
++    float acc[NT][2][4];
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++
++    // grouped_kernel's PF loop as it is (a runtime loop: unrolling it measured slower)
++    uint32_t words[NT], a[4];
++#pragma unroll
++    for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
++    {
++        const int k = kt0 * 16;
++        a[0] = load_pair(x0 + k, r0 >= 0); a[1] = load_pair(x1 + k, r1 >= 0);
++        a[2] = load_pair(x0 + k + 8, r0 >= 0); a[3] = load_pair(x1 + k + 8, r1 >= 0);
++    }
++    for (int kt = kt0; kt < kt0 + STEPS; ++kt) {
++        uint32_t nw[NT], na[4];
++        const bool more = kt + 1 < kt0 + STEPS;
++        if (more) {
++            const uint32_t* next = tile + (size_t)NTILES * 32;
++#pragma unroll
++            for (int i = 0; i < NT; ++i) nw[i] = __ldg(next + i * 32);
++            const int k = (kt + 1) * 16;
++            na[0] = load_pair(x0 + k, r0 >= 0); na[1] = load_pair(x1 + k, r1 >= 0);
++            na[2] = load_pair(x0 + k + 8, r0 >= 0); na[3] = load_pair(x1 + k + 8, r1 >= 0);
++        }
++#pragma unroll
++        for (int i = 0; i < NT; ++i) {
++            uint32_t b0[2], b1[2];
++            decode_tile(words[i], lane, b0, b1);
++            mma16816(acc[i][0], a, b0);
++            mma16816(acc[i][1], a, b1);
++        }
++        if (more) {
++#pragma unroll
++            for (int i = 0; i < NT; ++i) words[i] = nw[i];
++#pragma unroll
++            for (int c = 0; c < 4; ++c) a[c] = na[c];
++        }
++        tile += (size_t)NTILES * 32;
++    }
++
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = i * 16 + h * 8 + 2 * t;
++            red[warp][g][col] = acc[i][h][0];
++            red[warp][g][col + 1] = acc[i][h][1];
++            red[warp][g + 8][col] = acc[i][h][2];
++            red[warp][g + 8][col + 1] = acc[i][h][3];
++        }
++    __syncthreads();
++
++    if constexpr (FUSE == 1) {
++        // down_epilogue_kernel on this block's sums: v = 0 + (the warps' sums in warp order), rotated, times svh
++        const half* svh_d = sv0;
++        float* y = reinterpret_cast<float*>(out);
++        for (int i = warp; i < cnt; i += W) {
++            const int p = rows_sh[i];
++            const int n = nt0 * 16 + 4 * lane;
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float s = red[0][i][4 * lane + j];
++#pragma unroll
++                for (int w = 1; w < W; ++w) s += red[w][i][4 * lane + j];
++                float z = 0.f;
++                z += s;
++                v[j] = z;
++            }
++            fwht128(v, lane);
++            float* o = y + (size_t)p * N + n;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * N + n + j]);
++        }
++        return;
++    } else {
++        constexpr int OUT = 16 * NT * 16 / (W * 32);
++#pragma unroll
++        for (int j = 0; j < OUT; ++j) {
++            const int idx = threadIdx.x + j * W * 32;
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[row];
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            if (r >= 0) Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++        }
++        if constexpr (FUSE == 2) {
++            __shared__ int last;
++            __threadfence();                               // this block's partials before its count
++            __syncthreads();
++            if (threadIdx.x == 0) {
++                int* c = done + (size_t)item * gridDim.y + nblock;
++                last = atomicAdd(c, 1) == 2 * SK - 1;
++                if (last) *c = 0;                          // the next launch starts from zero
++            }
++            __syncthreads();
++            if (!last) return;
++            __threadfence();                               // every block's partials are visible from here
++            const half* svh_g = sv0;
++            const half* svh_u = sv1;
++            const half* suh_d = su2;
++            half* xd = reinterpret_cast<half*>(out);
++            for (int i = warp; i < cnt; i += W) {
++                const int p = rows_sh[i];
++                const int n = nt0 * 16 + 4 * lane;
++                float gv[4], uv[4];
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    float sg = 0.f, su = 0.f;
++                    for (int s = 0; s < SK; ++s) {
++                        sg += __ldcg(Z + ((size_t)(0 * SK + s) * P + p) * N + n + j);
++                        su += __ldcg(Z + ((size_t)(1 * SK + s) * P + p) * N + n + j);
++                    }
++                    gv[j] = sg;
++                    uv[j] = su;
++                }
++                fwht128(gv, lane);
++                fwht128(uv, lane);
++                float v[4];
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
++                    float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])),
++                                           -limit), limit);
++                    float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                    v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
++                }
++                fwht128(v, lane);
++                half* o = xd + (size_t)p * N + n;
++#pragma unroll
++                for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++            }
++        }
++    }
++}
+ 
+ // ---- prompt chunks: Y^T = W^T X^T --------------------------------------------------------------------------------
+ // A decoded trellis tile is, reordered, an m16n8k16 A fragment of W^T (lane (g, t): a0 = b0[0], a1 = b1[0],
+@@ -643,6 +824,35 @@ void exl3_down_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// Decode windows (items of up to 16 pairs): ``dec_kernel`` with NT 8, 4 warps and 16 k steps a warp (both of GLM's
++// expert matmuls: gate/up K 4096 in 4 splits, down K 1024 in 1). fuse 0: Z as exl3_grouped_cuda; 1: Y (down); 2: Xd
++// (gate/up; ``done`` holds max_items * N / 128 zeroed ints).
++void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
++                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
++                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
++                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done) {
++    constexpr int NT = 8, W = 4, STEPS = 16;
++    TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
++                "decode expert kernel: 16 k steps a warp");
++    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
++    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
++    dim3 grid((unsigned)max_items, (unsigned)(N / (16 * NT)), (unsigned)(mats * SK));
++    auto stream = at::cuda::getCurrentCUDAStream();
++    auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
++    auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
++#define DEC(F_, XR_)                                                                                              \
++    dec_kernel<NT, W, STEPS, F_, XR_><<<grid, W * 32, 0, stream>>>(                                               \
++        h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
++        Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
++        out.data_ptr(), (float)limit, done.data_ptr<int>())
++    if (fuse == 0) { if (xrow) DEC(0, true); else DEC(0, false); }
++    else if (fuse == 1) { if (xrow) DEC(1, true); else DEC(1, false); }
++    else { if (xrow) DEC(2, true); else DEC(2, false); }
++#undef DEC
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ // Prompt chunks (a plan of PM-pair items, PM 64 or 128): Xd [P, N] = the gate/up epilogue of Xg/Xu's pairs;
+ // Y [P, D] = the down epilogue.
+ template <int PM, int NW>
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 5e21f90..c872731 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ from functools import lru_cache
++import os
+ from pathlib import Path
+ 
+ import torch
+@@ -31,6 +32,20 @@ def _nfirst() -> bool:
+     return os.environ.get("TF_GLM_EXL3_NFIRST", "1") != "0"
+ 
+ 
++def dec_settings() -> tuple[bool, int, bool]:
++    """Decode windows' EXL3 path. TF_GLM_EXL3_DEC (default on): ``dec``, grouped_kernel's sums with the down
++    projection's epilogue fused into it (one launch less a layer, no Z round trip); TF_GLM_EXL3_FUSE: 1 (default) the
++    down epilogue, 2 gate/up's too (the last of an item's blocks runs it: measured slower), 0 neither;
++    TF_GLM_EXL3_XROW (default on): a layer whose experts share one gate/up suh rotates each row's input once
++    (rot_rows: the same fp16 inputs). Every setting gives the same bits; TF_GLM_EXL3_DEC=0: the grouped kernel and
++    its epilogue kernels."""
++    on = os.environ.get("TF_GLM_EXL3_DEC", "1") != "0"
++    fuse = int(os.environ.get("TF_GLM_EXL3_FUSE", "1"))
++    if fuse not in (0, 1, 2, 3):
++        raise ValueError(f"TF_GLM_EXL3_FUSE is 0 to 3, not {fuse}")
++    return on, fuse, os.environ.get("TF_GLM_EXL3_XROW", "1") != "0"
++
++
+ def _seq() -> bool:
+     """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
+     import os
+@@ -43,7 +58,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v15", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v17", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -134,6 +149,9 @@ class Scratch:
+         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
+         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
+         self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
++        # decode windows' fused gate/up epilogue: a finished-block count per (item, 128 columns), reset by the kernel
++        self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
++                                dtype=torch.int32, device=device)
+         self.rows, self.slots = rows, slots
+ 
+ 
+@@ -160,6 +178,24 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+     if plan.tile != grouped.TILE:
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")
+     items = grouped.max_items(R * slots, plan.experts)
++    dec, fuse, xrow = dec_settings()
++    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI == 1024:
++        xrow = xrow and ex.shared_suh is not None
++        if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
++            ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++            xg = xu = s.xg
++        else:
++            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++            xg, xu = s.xg, s.xu
++        ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
++                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done)
++        if not fuse & 2:
++            ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
++        ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
++                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done)
++        if not fuse & 1:
++            ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
++        return
+     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+     nfirst = R >= PROMPT_ROWS and _nfirst()
+     nt, w, sk = GATEUP_CFG
+diff --git tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
+index 9975ab1..bd3a28e 100644
+--- tensorfold/families/glm5_next/cuda/kda.py
++++ tensorfold/families/glm5_next/cuda/kda.py
+@@ -56,23 +56,39 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
+                          scratch.rows * H, L, H, int(rows), state_out)
+ 
+ 
+-WIDE_ROWS = 64          # windows of this many rows or more (prefill chunks) run the chain in three kernels
++# windows of this many rows or more run the chain in three kernels (prep / step / out: 8 blocks a head instead of one;
++# chain_kernel's bits). TF_GLM_KDA_WIDE_ROWS, default 1: every window (decode windows measured 4-36% faster at 1-8
++# rows on GB10); 64: the one-block chain below 64 rows, as before.
++WIDE_ROWS = int(os.environ.get("TF_GLM_KDA_WIDE_ROWS", "1"))
+ # prompt chunks in chunked (WY) form, 64-row sub-chunks at absolute positions (kda_chunked.py): close, not the same bits
+ CHUNKED = os.environ.get("TF_GLM_KDA_CHUNKED", "0") == "1"
+ _tmp: dict = {}
++_outgrown: list = []
+ 
+ 
+ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+-    """The normalized q and the read-out of a long window, shared by every layer (they run one after another)."""
++    """The normalized q and the read-out of a long window, shared by every layer (they run one after another).
++    ``reserve`` sizes them before any CUDA graph is captured: a graph keeps the addresses it was captured with."""
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
+     key = (heads, device)
+     q, y = _tmp.get(key, (None, None))
+     if q is None or q.shape[0] < rows:
++        if q is not None:                # a captured graph may still use the smaller pair: keep it alive
++            _outgrown.append((q, y))
+         q = torch.empty((rows, heads, DK), dtype=torch.float32, device=device)
+         y = torch.empty((rows, heads, DV), dtype=torch.bfloat16, device=device)
+         _tmp[key] = (q, y)
+     return q, y
+ 
+ 
++def reserve(rows: int, heads: int, device) -> None:
++    """The wide path's scratch for windows of up to ``rows`` rows, allocated now (before graph capture)."""
++
++    _wide_scratch(rows, heads, device)
++
++
+ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
+           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index e0b06a3..a3668ae 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -343,7 +343,29 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
+         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+     if out is not None and (out.shape != (x.shape[0], q.n) or not out.is_contiguous()):
+         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({x.shape[0]}, {q.n})")
+-    return shared.matmul(x, q, group_sums(x) if xs is None else xs, sk=split_k(q.n, q.k), f32=f32, out=out)
++    return shared.matmul(x, q, group_sums(x) if xs is None else xs, sk=split_k(q.n, q.k), f32=f32, out=out,
++                         variant=dec_tile(q.n, q.k) if x.shape[0] <= 16 else None)
++
++
++# Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
++# output keeps its chain, so every choice gives the same bits. By per-rank shape (n, k), measured on GB10.
++DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192, 1536): 2, (4096, 8192): 4,
++                                         (4096, 1024): 6}
++_dec_env: tuple[str, dict] = ("", {})
++
++
++def dec_tile(n: int, k: int) -> int | None:
++    """TF_GLM_Q4_TILE: unset or "table" the table above, "stock" none, a number that config for every shape."""
++
++    import os
++
++    global _dec_env
++    value = os.environ.get("TF_GLM_Q4_TILE", "") or "table"
++    if value != _dec_env[0]:
++        table = DEC_TILES if value == "table" else {} if value == "stock" else None
++        _dec_env = (value, table if table is not None else {"all": int(value)})
++    table = _dec_env[1]
++    return table.get("all", table.get((n, k)))
+ 
+ 
+ def b16_split_k(n: int, k: int) -> int:

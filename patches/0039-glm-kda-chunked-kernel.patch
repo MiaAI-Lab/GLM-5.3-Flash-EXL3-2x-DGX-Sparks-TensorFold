@@ -1,0 +1,1552 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 2524b65..ae6a079 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -84,19 +84,34 @@ def vision_workspace() -> int:
+ GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
+ 
+ 
+-def prompt_grid(prefill_rows: int, value: str | None = None) -> int:
++def kda_chunked_on() -> bool:
++    from .kda import CHUNKED
++
++    return CHUNKED
++
++
++def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | None = None) -> int:
+     """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
+ 
+     With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
+-    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly."""
++    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly.
++    ``chunked`` (default: TF_GLM_KDA_CHUNKED): the chunked KDA prompt path, whose rows depend on the alignment of its
++    32-row sub-chunks, needs G a multiple of 32; unset or 0 then means 64."""
+ 
++    if chunked is None:
++        chunked = kda_chunked_on()
+     value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
+     value = value.strip()
+     if value in ("", "0"):
+-        return 0
++        if not chunked:
++            return 0
++        value = "64"
+     if not value.isdecimal() or int(value) not in GRIDS:
+         raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
+     grid = int(value)
++    if chunked and grid % 32:
++        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: TF_GLM_KDA_CHUNKED=1 runs prompt chunks in 32-row sub-chunks at "
++                         f"absolute positions, so prompt chunks must start on a grid of 32, 64 or 128 (0: 64)")
+     if prefill_rows % grid:
+         raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
+                          f"must be a multiple of it")
+@@ -615,6 +630,9 @@ class GlmEngine:
+         if rank == 0 and self.grid:
+             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                   f"(TF_GLM_PROMPT_GRID)", flush=True)
++        if rank == 0 and kda_chunked_on():
++            print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
++                  "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
+         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
+         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
+         if rank == 0 and self.shared:
+diff --git tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
+index 394dcd0..a1ea49e 100644
+--- tensorfold/families/glm5_next/cuda/kda.py
++++ tensorfold/families/glm5_next/cuda/kda.py
+@@ -60,7 +60,8 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
+ # chain_kernel's bits). TF_GLM_KDA_WIDE_ROWS, default 1: every window (decode windows measured 4-36% faster at 1-8
+ # rows on GB10); 64: the one-block chain below 64 rows, as before.
+ WIDE_ROWS = int(os.environ.get("TF_GLM_KDA_WIDE_ROWS", "1"))
+-# prompt chunks in chunked (WY) form, 64-row sub-chunks at absolute positions (kda_chunked.py): close, not the same bits
++# prompt chunks in chunked (WY) form, 32-row sub-chunks at absolute positions (kda_chunked.py, kda_chunk.cu): close to
++# the serial kernels, not their bits; the engine then puts prompt chunks on a 64-token grid (TF_GLM_PROMPT_GRID)
+ CHUNKED = os.environ.get("TF_GLM_KDA_CHUNKED", "0") == "1"
+ _tmp: dict = {}
+ _outgrown: list = []
+diff --git tensorfold/families/glm5_next/cuda/kda_chunk.cpp tensorfold/families/glm5_next/cuda/kda_chunk.cpp
+new file mode 100644
+index 0000000..fcc7da7
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kda_chunk.cpp
+@@ -0,0 +1,56 @@
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void kda_chunk_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t,
++                    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                    const at::Tensor&, double, double, int64_t, int64_t, at::Tensor&, at::Tensor&);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
++}
++
++// A prompt chunk of ``rows`` rows whose first row sits ``off`` rows into its 32-row sub-chunk (kda_chunk.cu).
++void chain(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++           const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++           const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
++           double eps, double lower, int64_t rows, int64_t off, at::Tensor out, at::Tensor state_out) {
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(G, at::kBFloat16, "G");
++    check(cs, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(state_in, at::kFloat, "state");
++    check(state_out, at::kFloat, "state out");
++    check(a_log, at::kFloat, "A_log");
++    check(dt_bias, at::kFloat, "dt_bias");
++    check(norm_w, at::kBFloat16, "norm");
++    check(out, at::kBFloat16, "out");
++    TORCH_CHECK(cs.is_contiguous() && cw.is_contiguous() && state_in.is_contiguous() && state_out.is_contiguous() &&
++                out.is_contiguous() && a_log.is_contiguous() && dt_bias.is_contiguous() && norm_w.is_contiguous(),
++                "conv state, conv weight, states, out and the per-head weights must be contiguous");
++    TORCH_CHECK(P.stride(1) == 1 && A.stride(1) == 1 && G.stride(1) == 1, "rows must be contiguous along channels");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(dt_bias.numel() == H * 128 && norm_w.numel() == 128, "dt_bias [H*128], norm [128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4 && cs.size(0) == 3 && cs.size(1) == 3 * H * 128,
++                "4-tap convolutions of 3 x H x 128 channels");
++    TORCH_CHECK(state_in.numel() == H * 128 * 128 && state_out.numel() == H * 128 * 128, "states [H, 128, 128]");
++    TORCH_CHECK(state_in.data_ptr() != state_out.data_ptr(), "state_out must not alias state_in");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows && A.size(0) >= rows && G.size(0) >= rows && out.size(0) >= rows,
++                "rows");
++    TORCH_CHECK(off >= 0 && off < 32, "off");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_chunk_cuda(P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps, lower,
++                   rows, off, out, state_out);
++}
++
++#ifdef KDA_PROF
++void kda_chunk_prof(at::Tensor&);
++void prof(at::Tensor out) { kda_chunk_prof(out); }
++#endif
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("chain", &chain);
++#ifdef KDA_PROF
++    m.def("prof", &prof);
++#endif
++}
+diff --git tensorfold/families/glm5_next/cuda/kda_chunk.cu tensorfold/families/glm5_next/cuda/kda_chunk.cu
+new file mode 100644
+index 0000000..6bd6d93
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/kda_chunk.cu
+@@ -0,0 +1,745 @@
++// GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form: one block of 256 threads per head runs the prompt
++// chunk's 32-row sub-chunks in order (sub-chunks at absolute positions), the 128 x 128 state in registers.
++//
++// Per row the inputs are kda.cu's (this file is built like kda.cu, without FMA contraction, with CUDA's expf and
++// IEEE division): conv + SiLU rounded to bf16, fp32 L2 norms (q times 128^-0.5), beta = bf16(sigmoid(b)), the
++// per-channel decay g = expf(lower * sigmoid(exp(A_log) * (a + dt_bias))). A sub-chunk of rows 0..31 entering state
++// S0 [value, key]:
++//
++//     E(t -> s)  = g_{t+1} ... g_s per key channel: a running product multiplied in row order, as the serial chain
++//                  decays its state (empty: 1); E(s) = g_0 ... g_s from the sub-chunk's start;
++//                  E(s ->) = g_{s+1} ... g_31
++//     L[s, t]    = beta_s sum_c k_s k_t E(t -> s)                  t < s
++//     M[s, t]    =        sum_c q_s k_t E(t -> s)                  t <= s
++//     T          = (I + L)^-1                                     forward substitution (16-row blocks)
++//     Y          = beta (v - (k E(s)) S0^T),   V' = T Y             the delta rule's corrections ("v_new")
++//     O          = (q E(s)) S0^T + M V'                            read-outs, rounded to bf16, then the gated RMSNorm
++//     S_end      = S0 diag(E(31)) + V'^T (k E(s ->))
++//
++// Every factor is a product of decays <= 1 (no e^(+x), no difference of cumulative log-decays), so a decay carries
++// the serial chain's rounding; all sums run in fp32 with explicit FMAs and shuffle trees in a fixed order: the kernel
++// is deterministic, and a row's bits depend only on its sub-chunk's rows and the state entering it, so they are the
++// same whichever prefill chunk the row came in, as long as prompt chunks start on multiples of 32
++// (TF_GLM_PROMPT_GRID). Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no
++// key, no value, beta 0.
++//
++// Layout. The state: thread (vg, kp) = (tid / 8, tid % 8) holds value rows 4 vg .. 4 vg + 3 and key quads kp + 8 i
++// (i < 4): an 8-lane group reads 128 contiguous bytes of a key row per load, and products with S reduce over the 8
++// lanes by a transposing shuffle tree (7 shuffles for 8 sums). Read-outs and corrections: thread (vg, kp) finishes
++// value column 4 vg + kp % 4 of the rows of one parity (odd for kp < 4, even otherwise), 16 rows. The next
++// sub-chunk's projection, decay and beta rows are loaded into registers while this one computes, and staged into
++// shared memory that is free at the sub-chunk's start.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++
++namespace {
++
++constexpr int DK = 128, DV = 128, TAPS = 4;
++constexpr int BT = 32;                  // rows of a sub-chunk
++constexpr int HALO = TAPS - 1;          // conv rows before a sub-chunk
++constexpr int NT = 256, NW = NT / 32;   // threads, warps
++constexpr int VPT = 4;                  // value rows of the state a thread holds
++constexpr int KP = NT * VPT / DV;       // threads sharing those value rows (8), each 16 keys
++constexpr int NQ = DK / 4 / KP;         // key quads a thread holds (4)
++constexpr int OWN = BT / 2;             // rows a thread finishes (16, one parity)
++constexpr int LS = BT + 4;              // row stride of L
++constexpr int PCH = 3 * DK;             // projection channels of a head (q | k | v)
++constexpr int PF_P = ((BT + HALO) * PCH / 8 + NT - 1) / NT;   // 16-byte loads a thread prefetches (7)
++constexpr int PF_A = BT * DK / 8 / NT;                         // (2)
++static_assert(KP == 8 && NQ == 4 && PF_A * NT * 8 == BT * DK, "layout");
++
++struct Smem {
++    float q[BT][DK];          // q -> q E(s) -> V'
++    float k[BT][DK];          // k -> k E(s) -> (q E) S0^T
++    float g[BT][DK];          // decays -> Y
++    union {                   // staged projection rows (conv input) -> k E(s ->), L, T, M
++        __nv_bfloat16 raw_p[BT + HALO][PCH];
++        struct {
++            float ke[BT][DK];         // k E(s ->)
++            float L[BT][LS];          // L[s][t]
++            float tt[BT][BT];         // T transposed: tt[t][s] = T[s][t]
++            float mt[BT][BT];         // M transposed: mt[t][s] = M[s][t]
++        } x;
++    } u;
++    __nv_bfloat16 v[BT][DV];
++    __nv_bfloat16 raw_a[BT][DK];      // staged decay rows
++    __nv_bfloat16 cw[PCH][TAPS];      // this head's conv weights
++    float raw_b[BT];
++    float beta[BT];
++    float egl[DK];            // E(31)
++};
++
++__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++__device__ __forceinline__ float ldb(const __nv_bfloat16* p) { return __bfloat162float(*p); }
++__device__ __forceinline__ float fma_(float a, float b, float c) { return __fmaf_rn(a, b, c); }
++__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++// a / b with IEEE rounding, branch-free: the fast path of CUDA's division (a refined reciprocal, then one
++// correction), which is the correctly rounded quotient whenever ``div_ok`` holds (checked on 742 M operand pairs
++// against a / b); callers take a / b for the rare operands outside (a huge denominator, a tiny numerator).
++__device__ __forceinline__ float div_rn(float a, float b) {
++    float r;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(b));
++    const float e = __fmaf_rn(-b, r, 1.0f);
++    r = __fmaf_rn(e, r, r);
++    const float q = a * r;
++    const float rem = __fmaf_rn(-b, q, a);
++    return __fmaf_rn(rem, r, q);
++}
++
++__device__ __forceinline__ bool div_ok(float a, float b) {
++    return (a == 0.0f || fabsf(a) > 1e-36f) && b >= 1.0f && b < 8e37f;
++}
++
++__device__ __forceinline__ float warp_sum(float x) {
++    for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
++    return x;
++}
++
++// 8 bf16 from p: one 16-byte load when aligned, else 8 loads.
++__device__ __forceinline__ uint4 ld8(const __nv_bfloat16* p, bool vec) {
++    if (vec) return *reinterpret_cast<const uint4*>(p);
++    const unsigned short* s = reinterpret_cast<const unsigned short*>(p);
++    uint4 r;
++    r.x = s[0] | ((unsigned)s[1] << 16); r.y = s[2] | ((unsigned)s[3] << 16);
++    r.z = s[4] | ((unsigned)s[5] << 16); r.w = s[6] | ((unsigned)s[7] << 16);
++    return r;
++}
++
++// One level of a transposing shuffle tree: this lane keeps the half of a[0..N) its ``hi`` bit selects, adds the
++// partner's (lane ^ mask) copy of that half, and sends the other half.
++template <int N>
++__device__ __forceinline__ void tree_level(float (&a)[N], int mask, bool hi) {
++#pragma unroll
++    for (int j = 0; j < N / 2; ++j) {
++        const float send = hi ? a[j] : a[j + N / 2];
++        const float keep = hi ? a[j + N / 2] : a[j];
++        a[j] = keep + __shfl_xor_sync(0xffffffffu, send, mask);
++    }
++}
++
++// Sums of a[0..8) over the lanes xor 4, 2, 1: lane bits (2, 1, 0) = i gets the sum of a[i].
++__device__ __forceinline__ float tree8(float (&a)[8], int lane) {
++    tree_level<8>(a, 4, lane & 4);
++    float b[4] = {a[0], a[1], a[2], a[3]};
++    tree_level<4>(b, 2, lane & 2);
++    float c[2] = {b[0], b[1]};
++    tree_level<2>(c, 1, lane & 1);
++    return c[0];
++}
++
++// Sums of a[0..16) over the lanes xor m0 > m1 > m2 > m3: the lane whose bits (m0, m1, m2, m3) spell i gets a[i]'s.
++__device__ __forceinline__ float tree16(float (&a)[16], int lane, int m0, int m1, int m2, int m3) {
++    tree_level<16>(a, m0, lane & m0);
++    float b[8];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) b[j] = a[j];
++    tree_level<8>(b, m1, lane & m1);
++    float c[4] = {b[0], b[1], b[2], b[3]};
++    tree_level<4>(c, m2, lane & m2);
++    float d[2] = {c[0], c[1]};
++    tree_level<2>(d, m3, lane & m3);
++    return d[0];
++}
++
++#ifdef KDA_PROF
++__device__ unsigned long long g_prof[16];
++#define MARK(i) \
++    do { if (tid == 0 && h == 0) { const long long t1 = clock64(); g_prof[i] += t1 - t0_; t0_ = t1; } } while (0)
++#else
++#define MARK(i) do {} while (0)
++#endif
++
++__device__ __forceinline__ void prefetch_l2(const void* p) {
++    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
++}
++
++__device__ __forceinline__ void cp16(void* dst, const void* src) {
++    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src));
++}
++
++// Warm L2 with the rows of the sub-chunk whose row 0 is prompt-chunk row r0 (projection rows r0 - 3 .. r0 + 31 of
++// this head's q | k | v channels, its decay rows and beta logits; not when ``next`` is false) and the output gate
++// rows from gate_r0.
++__device__ __forceinline__ void warm(int tid, int h, int H, int r0, bool next, int rows, int gate_r0,
++                                     const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++                                     const __nv_bfloat16* __restrict__ A, int a_stride,
++                                     const __nv_bfloat16* __restrict__ G, int g_stride) {
++    constexpr int LP = (BT + HALO) * 3 * 2, LA = BT * 2, LB = BT, LG = BT * 2;   // 128-byte lines
++    for (int x = next ? tid : tid + LP + LA + LB; x < LP + LA + LB + LG; x += NT) {
++        if (x < LP) {
++            const int row = x / 6, part = (x % 6) / 2, half = x % 2, r = r0 - HALO + row;
++            if (r >= 0 && r < rows) prefetch_l2(P + (size_t)r * p_stride + part * H * DK + h * DK + 64 * half);
++        } else if (x < LP + LA) {
++            const int y = x - LP, r = r0 + y / 2;
++            if (r >= 0 && r < rows) prefetch_l2(A + (size_t)r * a_stride + h * DK + 64 * (y % 2));
++        } else if (x < LP + LA + LB) {
++            const int r = r0 + (x - LP - LA);
++            if (r >= 0 && r < rows) prefetch_l2(P + (size_t)r * p_stride + b_off + h);
++        } else {
++            const int y = x - LP - LA - LB, r = gate_r0 + y / 2;
++            if (r >= 0 && r < rows) prefetch_l2(G + (size_t)r * g_stride + h * DV + 64 * (y % 2));
++        }
++    }
++}
++
++// Stage the rows of the sub-chunk whose row 0 is prompt-chunk row r0 into shared memory: projection rows r0 - 3 ..
++// r0 + 31 (the conv state before row 0, zero rows outside), decay rows and the beta logits. Global to shared
++// directly (cp.async) when the rows are 16-byte aligned; the caller waits (cp.async.wait_all) and syncs.
++__device__ __forceinline__ void stage(Smem& sm, int tid, int h, int H, int r0, int rows,
++                                      const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++                                      const __nv_bfloat16* __restrict__ A, int a_stride,
++                                      const __nv_bfloat16* __restrict__ cs, bool vec_p, bool vec_a) {
++    const int C = 3 * H * DK;
++    for (int item = tid; item < (BT + HALO) * PCH / 8; item += NT) {
++        const int row = item / (PCH / 8), q8 = item % (PCH / 8);
++        const int ch = (q8 / (DK / 8)) * H * DK + h * DK + 8 * (q8 % (DK / 8));
++        const int r = r0 - HALO + row;
++        uint4* dst = reinterpret_cast<uint4*>(&sm.u.raw_p[row][0]) + q8;
++        const __nv_bfloat16* src = nullptr;
++        if (r >= 0 && r < rows) src = P + (size_t)r * p_stride + ch;
++        else if (r < 0 && r >= -HALO) src = cs + (size_t)(r + HALO) * C + ch;
++        if (src == nullptr) *dst = make_uint4(0, 0, 0, 0);
++        else if (vec_p) cp16(dst, src);
++        else *dst = ld8(src, false);
++    }
++    for (int item = tid; item < BT * DK / 8; item += NT) {
++        const int row = item / (DK / 8), c8 = item % (DK / 8);
++        const int r = r0 + row;
++        uint4* dst = reinterpret_cast<uint4*>(&sm.raw_a[row][0]) + c8;
++        const __nv_bfloat16* src = A + (size_t)r * a_stride + h * DK + 8 * c8;
++        if (r < 0 || r >= rows) *dst = make_uint4(0, 0, 0, 0);
++        else if (vec_a) cp16(dst, src);
++        else *dst = ld8(src, false);
++    }
++    if (tid < BT) {
++        const int r = r0 + tid;
++        sm.raw_b[tid] = (r >= 0 && r < rows) ? ldb(P + (size_t)r * p_stride + b_off + h) : 0.0f;
++    }
++}
++
++__global__ void __launch_bounds__(NT, 1) chunk_kernel(
++        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++        const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride,
++        const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
++        const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
++        const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows, int off,
++        __nv_bfloat16* __restrict__ out, float* __restrict__ state_out) {
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
++    const int h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int vg = tid / KP, kp = tid % KP;
++    const int par = kp < 4 ? 1 : 0;                   // parity of the rows this thread finishes
++    const int ov = VPT * vg + (kp & 3);               // their value column
++    const size_t sbase = (size_t)h * DV * DK;
++    const bool vec_p = (p_stride % 8 == 0) && ((uintptr_t)P % 16 == 0) && ((uintptr_t)cs % 16 == 0);
++    const bool vec_a = (a_stride % 8 == 0) && ((uintptr_t)A % 16 == 0);
++
++    float s[VPT][NQ][4];
++#pragma unroll
++    for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            const float4 x =
++                reinterpret_cast<const float4*>(state_in + sbase + (size_t)(VPT * vg + vv) * DK)[kp + KP * i];
++            s[vv][i][0] = x.x; s[vv][i][1] = x.y; s[vv][i][2] = x.z; s[vv][i][3] = x.w;
++        }
++    const float rate = expf(a_log[h]);
++    const float dtb = dt_bias[h * DK + (tid & (DK - 1))];     // the decay channel this thread computes (tid % 128)
++    float nw[4];                                      // the norm weights of value columns 4 lane .. 4 lane + 3
++#pragma unroll
++    for (int x = 0; x < 4; ++x) nw[x] = ldb(norm_w + 4 * lane + x);
++    const bool vec_g = (g_stride % 4 == 0) && ((uintptr_t)G % 8 == 0);
++    const bool vec_o = ((H * DV) % 4 == 0) && ((uintptr_t)out % 8 == 0);
++    const int nsub = (rows + off + BT - 1) / BT;
++    for (int x = tid; x < PCH * TAPS; x += NT) {
++        const int ch = x / TAPS;
++        sm.cw[ch][x % TAPS] = cw[(size_t)((ch / DK) * H * DK + h * DK + ch % DK) * TAPS + x % TAPS];
++    }
++#ifdef KDA_PROF
++    long long t0_ = clock64();
++#endif
++
++    for (int c = 0; c < nsub; ++c) {
++        const int r0 = c * BT - off;                  // the prompt chunk's row at the sub-chunk's row 0
++
++        // 0. stage this sub-chunk's rows (warmed in L2 during the previous one), warm the next one's and this
++        // one's output gates
++        stage(sm, tid, h, H, r0, rows, P, p_stride, b_off, A, a_stride, cs, vec_p, vec_a);
++        asm volatile("cp.async.wait_all;" ::: "memory");
++        __syncthreads(); MARK(0);
++        warm(tid, h, H, r0 + BT, c + 1 < nsub, rows, r0, P, p_stride, b_off, A, a_stride, G, g_stride);
++
++        // 1. conv + SiLU (kda.cu's arithmetic) in 4-row blocks: warp w takes rows 4 w .. 4 w + 3 of q, then of k,
++        // then of v, lane l the channels 4 l .. 4 l + 3 (kda.cu's norm lanes), and the L2 norms of its q and k rows
++        // (kda.cu's sums); then the decays and beta.
++#pragma unroll 1
++        for (int part = 0; part < 3; ++part) {
++            const int rb = 4 * warp, ch = part * DK + 4 * lane;
++            float wt[4][TAPS];
++#pragma unroll
++            for (int x = 0; x < 4; ++x)
++#pragma unroll
++                for (int tap = 0; tap < TAPS; ++tap) wt[x][tap] = __bfloat162float(sm.cw[ch + x][tap]);
++            float xs[4 + HALO][4];
++#pragma unroll
++            for (int j = 0; j < 4 + HALO; ++j) {
++                const uint2 raw = *reinterpret_cast<const uint2*>(&sm.u.raw_p[rb + j][ch]);
++                const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
++                const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
++                xs[j][0] = __low2float(lo); xs[j][1] = __high2float(lo);
++                xs[j][2] = __low2float(hi); xs[j][3] = __high2float(hi);
++            }
++            float acc[4][4], act[4][4];
++            bool slow = false;
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int x = 0; x < 4; ++x) {
++                    acc[i][x] = 0.0f;
++#pragma unroll
++                    for (int tap = 0; tap < TAPS; ++tap) acc[i][x] = acc[i][x] + wt[x][tap] * xs[i + tap][x];
++                    const float den = 1.0f + expf(-acc[i][x]);
++                    act[i][x] = div_rn(acc[i][x], den);
++                    slow |= !div_ok(acc[i][x], den);
++                }
++            if (slow) {                                       // kda.cu's IEEE division for the rare operands
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) act[i][x] = acc[i][x] / (1.0f + expf(-acc[i][x]));
++            }
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int r = r0 + rb + i;
++#pragma unroll
++                for (int x = 0; x < 4; ++x) act[i][x] = (r >= 0 && r < rows) ? bf(act[i][x]) : 0.0f;
++            }
++            if (part < 2) {                                   // warp-uniform
++                float ss[4];
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    ss[i] = 0.0f;
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) ss[i] = ss[i] + act[i][x] * act[i][x];
++                }
++#pragma unroll
++                for (int o = 16; o; o >>= 1)                  // warp_sum's tree, the rows interleaved
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) ss[i] += __shfl_xor_sync(0xffffffffu, ss[i], o);
++                float (*dst)[DK] = part ? sm.k : sm.q;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const float inv = 1.0f / sqrtf(ss[i] + 1e-6f);
++                    float y[4];
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) {
++                        y[x] = act[i][x] * inv;
++                        if (part == 0) y[x] = y[x] * (1.0f / sqrtf((float)DK));
++                    }
++                    *reinterpret_cast<float4*>(&dst[rb + i][4 * lane]) = make_float4(y[0], y[1], y[2], y[3]);
++                }
++            } else {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    __nv_bfloat162 lo = __floats2bfloat162_rn(act[i][0], act[i][1]);
++                    __nv_bfloat162 hi = __floats2bfloat162_rn(act[i][2], act[i][3]);
++                    uint2 o;
++                    o.x = *reinterpret_cast<unsigned*>(&lo); o.y = *reinterpret_cast<unsigned*>(&hi);
++                    *reinterpret_cast<uint2*>(&sm.v[rb + i][4 * lane]) = o;
++                }
++            }
++        }
++        {
++            const int cc = tid & (DK - 1);
++#pragma unroll
++            for (int j = tid >> 7; j < BT; j += NT / DK) {
++                const int r = r0 + j;
++                float gv = 1.0f;
++                if (r >= 0 && r < rows) {
++                    const float a = __bfloat162float(sm.raw_a[j][cc]) + dtb;
++                    const float den = 1.0f + expf(-(rate * a));
++                    const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++                    gv = expf(lower * sg);
++                }
++                sm.g[j][cc] = gv;
++            }
++            if (tid < BT) {
++                const int r = r0 + tid;
++                sm.beta[tid] = (r >= 0 && r < rows) ? bf(sigmoidf_(sm.raw_b[tid])) : 0.0f;
++            }
++        }
++        __syncthreads(); MARK(1);
++
++        // 3. L and M. Group pr = tid / 16 takes column t = pr (rows s > pr), then t = 31 - pr (31 entries in all,
++        // every group alike), in batches of 8; lane cg holds the key quads cg and cg + 16, k_t E(t -> s) multiplied
++        // row after row; a batch's 16 sums reduce over the 16 lanes by a transposing tree.
++        {
++            const int pr = tid >> 4, cg = tid & 15;
++            const int n1 = BT - 1 - pr;               // entries of column pr
++            float kt[8], e[8];
++            auto load_t = [&](int tt) {
++#pragma unroll
++                for (int u = 0; u < 2; ++u) {
++                    const float4 x = reinterpret_cast<const float4*>(sm.k[tt])[cg + 16 * u];
++                    kt[4 * u] = x.x; kt[4 * u + 1] = x.y; kt[4 * u + 2] = x.z; kt[4 * u + 3] = x.w;
++                }
++#pragma unroll
++                for (int i = 0; i < 8; ++i) e[i] = kt[i];     // k_t E(t -> s), multiplied row after row
++            };
++            {   // the diagonal of M for both columns
++                float dg[2];
++#pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {
++                    const int tt = hh ? BT - 1 - pr : pr;
++                    load_t(tt);
++                    float a = 0.0f;
++#pragma unroll
++                    for (int u = 0; u < 2; ++u) {
++                        const float4 x = reinterpret_cast<const float4*>(sm.q[tt])[cg + 16 * u];
++                        a = fma_(x.x, kt[4 * u], a); a = fma_(x.y, kt[4 * u + 1], a);
++                        a = fma_(x.z, kt[4 * u + 2], a); a = fma_(x.w, kt[4 * u + 3], a);
++                    }
++                    dg[hh] = a;
++                }
++#pragma unroll
++                for (int o = 8; o; o >>= 1) {
++                    dg[0] += __shfl_xor_sync(0xffffffffu, dg[0], o);
++                    dg[1] += __shfl_xor_sync(0xffffffffu, dg[1], o);
++                }
++                if (cg == 0) {
++                    sm.u.x.mt[pr][pr] = dg[0];
++                    sm.u.x.mt[BT - 1 - pr][BT - 1 - pr] = dg[1];
++                }
++            }
++            load_t(pr);
++#pragma unroll
++            for (int b = 0; b < 4; ++b) {
++                float val[16];
++#pragma unroll
++                for (int ii = 0; ii < 8; ++ii) {
++                    const int i = 8 * b + ii;
++                    if (i == n1 && n1 < BT - 1) load_t(BT - 1 - pr);
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    float ak = 0.0f, aq = 0.0f;
++                    if (i < BT - 1) {
++#pragma unroll
++                        for (int u = 0; u < 2; ++u) {
++                            const float4 gx = reinterpret_cast<const float4*>(sm.g[s2])[cg + 16 * u];
++                            const float4 kx = reinterpret_cast<const float4*>(sm.k[s2])[cg + 16 * u];
++                            const float4 qx = reinterpret_cast<const float4*>(sm.q[s2])[cg + 16 * u];
++                            const float gg[4] = {gx.x, gx.y, gx.z, gx.w}, kk[4] = {kx.x, kx.y, kx.z, kx.w};
++                            const float qq[4] = {qx.x, qx.y, qx.z, qx.w};
++#pragma unroll
++                            for (int x = 0; x < 4; ++x) {
++                                e[4 * u + x] = e[4 * u + x] * gg[x];
++                                ak = fma_(kk[x], e[4 * u + x], ak);
++                                aq = fma_(qq[x], e[4 * u + x], aq);
++                            }
++                        }
++                    }
++                    val[2 * ii] = ak;
++                    val[2 * ii + 1] = aq;
++                }
++                const float sum = tree16(val, lane, 8, 4, 2, 1);        // entry cg / 2 of the batch, L (even) or M
++                const int i = 8 * b + (cg >> 1);
++                if (i < BT - 1) {
++                    const int tt = i < n1 ? pr : BT - 1 - pr;
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    if (cg & 1) {
++                        sm.u.x.mt[tt][s2] = sum;
++                        sm.u.x.mt[s2][tt] = 0.0f;                        // M[tt][s2], above the diagonal
++                    } else {
++                        sm.u.x.L[s2][tt] = sm.beta[s2] * sum;
++                    }
++                }
++            }
++        }
++        __syncthreads(); MARK(3);
++
++        // 4. T = (I + L)^-1 by warp 0: lane l inverts column l % 16 of diagonal block l / 16 by forward
++        // substitution, then block (1, 0) = -T11 (L10 T00). Warps 1-7 per key channel: k E(s ->), then k E(s) in
++        // place, and E(31) (threads 32-159); q E(s) in place (threads 160-255, then 160-191 for the last 32 channels)
++        if (warp == 0) {
++            const int blk = lane >> 4, j = lane & 15, base = 16 * blk;
++            float col[16];
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) {
++                float acc = 0.0f;
++#pragma unroll
++                for (int m = 0; m < s2; ++m) acc = fma_(sm.u.x.L[base + s2][base + m], col[m], acc);
++                col[s2] = s2 == j ? 1.0f : (s2 > j ? -acc : 0.0f);
++            }
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[base + j][base + s2] = col[s2];
++            if (blk == 1) {                                    // block (0, 1), above the diagonal: zeros
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[16 + j][s2] = 0.0f;
++            }
++            __syncwarp();
++            if (blk == 0) {
++                float xr[16];                                  // (L10 T00)[:, j]
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m < 16; ++m) acc = fma_(sm.u.x.L[16 + s2][m], col[m], acc);
++                    xr[s2] = acc;
++                }
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m <= s2; ++m)              // T11[s2][m]
++                        acc = fma_(sm.u.x.tt[16 + m][16 + s2], xr[m], acc);
++                    sm.u.x.tt[j][16 + s2] = -acc;
++                }
++            }
++        } else {
++            const int t2 = tid - 32;
++            if (t2 < DK) {
++                const int cc = t2;
++                float rr = 1.0f;
++#pragma unroll 8
++                for (int j = BT - 1; j >= 0; --j) { sm.u.x.ke[j][cc] = sm.k[j][cc] * rr; rr = rr * sm.g[j][cc]; }
++                float pp = 1.0f;
++#pragma unroll 8
++                for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.k[j][cc] = sm.k[j][cc] * pp; }
++                sm.egl[cc] = pp;
++            } else {
++                for (int cc = t2 - DK; cc < DK; cc += NT - 32 - DK) {
++                    float pp = 1.0f;
++#pragma unroll 8
++                    for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.q[j][cc] = sm.q[j][cc] * pp; }
++                }
++            }
++        }
++        __syncthreads(); MARK(4);
++
++        // 5. Every thread: its sums of (k E) S0^T and (q E) S0^T; Y = beta (v - (k E) S0^T) into g, the (q E) S0^T
++        // of the rows it finishes kept in o1.
++        float o1[OWN];
++        {
++            float4 ck[NQ], cq[NQ], nk[NQ], nq[NQ];
++            auto load_row = [&](float4 (&kx)[NQ], float4 (&qx)[NQ], int r) {
++#pragma unroll
++                for (int i = 0; i < NQ; ++i) {
++                    kx[i] = reinterpret_cast<const float4*>(sm.k[r])[kp + KP * i];
++                    qx[i] = reinterpret_cast<const float4*>(sm.q[r])[kp + KP * i];
++                }
++            };
++            // row r's 8 sums (k sums at ok, q sums at 4 - ok), reduced: entry kp, value column 4 vg + kp % 4
++            auto row_sums = [&](const float4 (&kx)[NQ], const float4 (&qx)[NQ], int ok) {
++                float a[8];
++#pragma unroll
++                for (int x = 0; x < 8; ++x) a[x] = 0.0f;
++                const int oq = 4 - ok;
++#pragma unroll
++                for (int i = 0; i < NQ; ++i)
++#pragma unroll
++                    for (int vv = 0; vv < VPT; ++vv) {
++                        a[ok + vv] = fma_(kx[i].x, s[vv][i][0], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].y, s[vv][i][1], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].z, s[vv][i][2], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].w, s[vv][i][3], a[ok + vv]);
++                        a[oq + vv] = fma_(qx[i].x, s[vv][i][0], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].y, s[vv][i][1], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].z, s[vv][i][2], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].w, s[vv][i][3], a[oq + vv]);
++                    }
++                return tree8(a, lane);
++            };
++            load_row(ck, cq, 0);
++#pragma unroll 1
++            for (int rg = 0; rg < BT / 8; ++rg) {             // 8 rows: pairs 2 rp (even: k sums first), 2 rp + 1
++#pragma unroll
++                for (int u = 0; u < 4; ++u) {
++                    const int r = 8 * rg + 2 * u;
++                    load_row(nk, nq, r + 1);
++                    const float se = row_sums(ck, cq, 0);
++                    load_row(ck, cq, r + 2 < BT ? r + 2 : r);        // (the last pair reloads a row: no predicate)
++                    const float so = row_sums(nk, nq, 4);
++                    // this thread keeps the q sum of its parity's row and writes Y of the other
++                    const float qs = par ? so : se, ks = par ? se : so;
++                    const int ry = par ? r : r + 1;
++                    sm.g[ry][ov] = (__bfloat162float(sm.v[ry][ov]) - ks) * sm.beta[ry];
++                    o1[OWN - 4 + u] = qs;
++                }
++                if (rg + 1 < BT / 8) {                        // after the loop o1[j] is row 2 j + par's
++#pragma unroll
++                    for (int j = 0; j + 4 < OWN; ++j) o1[j] = o1[j + 4];
++                }
++            }
++        }
++        __syncthreads(); MARK(5);
++
++        // 6. load this sub-chunk's output gates (warm in L2); (q E) S0^T into k (free now); V' = T Y into q. Tiles:
++        // warp w the rows 4 w' .. 4 w' + 3 with w' = w (w < 4) or 11 - w (the two warps of a scheduler, w and w + 4,
++        // then run 36 steps of t together), lane l the value columns 4 l .. 4 l + 3 (T is zero above its diagonal:
++        // t runs to the tile's last row)
++        const int rq = 4 * (warp < 4 ? warp : 11 - warp), vq = 4 * lane;
++        float gate[4][4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int r = r0 + rq + i;
++            const bool ok = r >= 0 && r < rows;
++            const __nv_bfloat16* gp = G + (size_t)(ok ? r : 0) * g_stride + h * DV + vq;
++            if (vec_g) {
++                const uint2 x = ok ? *reinterpret_cast<const uint2*>(gp) : make_uint2(0, 0);
++                const __nv_bfloat162 g0 = *reinterpret_cast<const __nv_bfloat162*>(&x.x);
++                const __nv_bfloat162 g1 = *reinterpret_cast<const __nv_bfloat162*>(&x.y);
++                gate[i][0] = __low2float(g0); gate[i][1] = __high2float(g0);
++                gate[i][2] = __low2float(g1); gate[i][3] = __high2float(g1);
++            } else {
++#pragma unroll
++                for (int x = 0; x < 4; ++x) gate[i][x] = ok ? ldb(gp + x) : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < OWN; ++j) sm.k[2 * j + par][ov] = o1[j];
++        {
++            float acc[4][4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int x = 0; x < 4; ++x) acc[i][x] = 0.0f;
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float4 tq = *reinterpret_cast<const float4*>(&sm.u.x.tt[t][rq]);
++                const float4 y = *reinterpret_cast<const float4*>(&sm.g[t][vq]);
++                const float tv[4] = {tq.x, tq.y, tq.z, tq.w}, yv[4] = {y.x, y.y, y.z, y.w};
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) acc[i][x] = fma_(tv[i], yv[x], acc[i][x]);
++            }
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++                *reinterpret_cast<float4*>(&sm.q[rq + i][vq]) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
++        }
++        __syncthreads(); MARK(6);
++
++        // 7. read-outs O = (q E) S0^T + M V' of the same tile, bf16, the gated RMSNorm (kda.cu's formula; a warp
++        // holds its rows' 128 values); the state update
++        {
++            float o[4][4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const float4 x = *reinterpret_cast<const float4*>(&sm.k[rq + i][vq]);
++                o[i][0] = x.x; o[i][1] = x.y; o[i][2] = x.z; o[i][3] = x.w;
++            }
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float4 mq = *reinterpret_cast<const float4*>(&sm.u.x.mt[t][rq]);
++                const float4 vn = *reinterpret_cast<const float4*>(&sm.q[t][vq]);
++                const float mv[4] = {mq.x, mq.y, mq.z, mq.w}, vv4[4] = {vn.x, vn.y, vn.z, vn.w};
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) o[i][x] = fma_(mv[i], vv4[x], o[i][x]);
++            }
++            float ss[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                ss[i] = 0.0f;
++#pragma unroll
++                for (int x = 0; x < 4; ++x) { o[i][x] = bf(o[i][x]); ss[i] = ss[i] + o[i][x] * o[i][x]; }
++            }
++#pragma unroll
++            for (int m = 16; m; m >>= 1)
++#pragma unroll
++                for (int i = 0; i < 4; ++i) ss[i] += __shfl_xor_sync(0xffffffffu, ss[i], m);
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int r = r0 + rq + i;
++                if (r < 0 || r >= rows) continue;
++                const float rinv = 1.0f / sqrtf(ss[i] / (float)DV + eps);
++                __nv_bfloat16 ob[4];
++#pragma unroll
++                for (int x = 0; x < 4; ++x) {
++                    const float yn = o[i][x] * rinv;
++                    const float yw = nw[x] * yn;
++                    const float den = 1.0f + expf(-gate[i][x]);
++                    const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++                    ob[x] = __float2bfloat16_rn(yw * sg);
++                }
++                __nv_bfloat16* op = out + (size_t)r * H * DV + h * DV + vq;
++                if (vec_o) *reinterpret_cast<uint2*>(op) = *reinterpret_cast<const uint2*>(ob);
++                else {
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) op[x] = ob[x];
++                }
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            const float4 ge = reinterpret_cast<const float4*>(sm.egl)[kp + KP * i];
++#pragma unroll
++            for (int vv = 0; vv < VPT; ++vv) {
++                s[vv][i][0] = s[vv][i][0] * ge.x; s[vv][i][1] = s[vv][i][1] * ge.y;
++                s[vv][i][2] = s[vv][i][2] * ge.z; s[vv][i][3] = s[vv][i][3] * ge.w;
++            }
++        }
++#pragma unroll 4
++        for (int t = 0; t < BT; ++t) {
++            const float4 vn = *reinterpret_cast<const float4*>(&sm.q[t][VPT * vg]);
++            const float vs[4] = {vn.x, vn.y, vn.z, vn.w};
++#pragma unroll
++            for (int i = 0; i < NQ; ++i) {
++                const float4 kx = reinterpret_cast<const float4*>(sm.u.x.ke[t])[kp + KP * i];
++#pragma unroll
++                for (int vv = 0; vv < VPT; ++vv) {
++                    s[vv][i][0] = fma_(vs[vv], kx.x, s[vv][i][0]); s[vv][i][1] = fma_(vs[vv], kx.y, s[vv][i][1]);
++                    s[vv][i][2] = fma_(vs[vv], kx.z, s[vv][i][2]); s[vv][i][3] = fma_(vs[vv], kx.w, s[vv][i][3]);
++                }
++            }
++        }
++        __syncthreads(); MARK(7);
++    }
++#pragma unroll
++    for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++        for (int i = 0; i < NQ; ++i)
++            reinterpret_cast<float4*>(state_out + sbase + (size_t)(VPT * vg + vv) * DK)[kp + KP * i] =
++                make_float4(s[vv][i][0], s[vv][i][1], s[vv][i][2], s[vv][i][3]);
++}
++
++}  // namespace
++
++#ifdef KDA_PROF
++void kda_chunk_prof(at::Tensor& outp) {
++    cudaMemcpyFromSymbol(outp.data_ptr(), g_prof, sizeof(unsigned long long) * 16);
++    unsigned long long z[16] = {};
++    cudaMemcpyToSymbol(g_prof, z, sizeof(z));
++}
++#endif
++
++template <typename T>
++static T* ptr(const at::Tensor& x) { return x.defined() && x.numel() ? (T*)x.data_ptr() : nullptr; }
++
++void kda_chunk_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++                    const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++                    const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
++                    const at::Tensor& norm_w, double eps, double lower, int64_t rows, int64_t off, at::Tensor& out,
++                    at::Tensor& state_out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const int smem = (int)sizeof(Smem);
++    static int attr_device = -1;
++    const int device = P.get_device();
++    if (attr_device != device) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++        attr_device = device;
++    }
++    chunk_kernel<<<H, NT, smem, stream>>>(
++        H, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A), (int)a_stride,
++        ptr<__nv_bfloat16>(G), (int)g_stride, ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(state_in),
++        ptr<float>(a_log), ptr<float>(dt_bias), ptr<__nv_bfloat16>(norm_w), (float)eps, (float)lower, (int)rows,
++        (int)off, ptr<__nv_bfloat16>(out), ptr<float>(state_out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git tensorfold/families/glm5_next/cuda/kda_chunked.py tensorfold/families/glm5_next/cuda/kda_chunked.py
+index 09cb28b..6b5e1b9 100644
+--- tensorfold/families/glm5_next/cuda/kda_chunked.py
++++ tensorfold/families/glm5_next/cuda/kda_chunked.py
+@@ -1,64 +1,39 @@
+-"""GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form: sub-chunks of 64 rows at absolute positions, the
+-intra-chunk part as matmuls, the 128 x 128 state carried from sub-chunk to sub-chunk.
+-
+-Per row the definition is kda.cu's (conv + SiLU rounded to bf16, fp32 L2 norms, q times 128^-0.5, beta =
+-bf16(sigmoid(b)), log-decay l = lower * sigmoid(exp(A_log) * (a + dt_bias)) per key channel, the delta rule
+-S <- S diag(e^l); S <- S + beta (v - S k) k^T; o = S q, o rounded to bf16, then the gated RMSNorm). The state S is
+-[value, key] as in kda.cu.
+-
+-Sub-chunk of rows 0..63 (T = 64), entering state S0, G = cumsum(l) within the sub-chunk (per key channel, <= 0 and
+-decreasing: every l is in (lower, 0) = (-5, 0)):
+-
+-    L[s, j]  = beta_s sum_c k_s[c] k_j[c] e^(G_s[c] - G_j[c])      j < s          (strictly lower)
+-    M[s, j]  =        sum_c q_s[c] k_j[c] e^(G_s[c] - G_j[c])      j <= s
+-    T        = (I + L)^-1                                           (unit lower triangular)
+-    W        = T (beta * k * e^G),   U = T (beta * v)               the WY / UT transform
+-    V'       = U - W S0^T                                           the corrected values ("v_new")
+-    O        = (q * e^G) S0^T + M V'
+-    S_end    = S0 diag(e^G_63) + V'^T (k * e^(G_63 - G))
+-
+-Every exponent above is <= 0 except inside L and M, which are formed as matmuls of row and column factors about a
+-reference row p: e^(G_s - G_j) = e^(G_s - G_p) e^(G_p - G_j). Each exponent is summed outward from its reference
+-(forward from p, backward from p, backward from the sub-chunk's end for k e^(G_63 - G)), never taken as a difference
+-of G's: all l have one sign, so a partial sum's rounding error is a few ulps of the partial sum itself, while G
+-reaches -320 in a sub-chunk and a difference of two G's would carry ulp(320) = 3e-5 into decays near 1 (the first
+-version did: 10x the error of kda.cu's chain). For the rows of 16-row block b against earlier blocks p = the
+-block's first row (both factors <= 1: errors a few ulps of the decay's own exponent); inside the diagonal tile p =
+-the first row of the row's 4-row group (column factors <= e^15 for the rows after p: errors a few ulps of 30). Only
+-blocks j <= b are formed. T is inverted per 16-row diagonal block by forward substitution, then block rows are
+-joined with matmuls (T_bj = -T_bb sum L_bm T_mj). Everything is fp32; the matmuls take tl.dot's
+-``input_precision`` (TF_GLM_KDA_PREC, default tf32x3, about fp32: read-outs ~3e-7 relative against float64 on the
+-tests' inputs, kda.cu's chain ~1e-7; "tf32" is faster and ~5e-4, half a bf16 step).
+-
+-Kernels (``chain``): _kda_lm (sub-chunk, head, block): the conv, norms, beta and decays of its rows, L and M rows,
+-q e^G; _kda_solve (sub-chunk, head): T and the sub-chunk's total log-decay; _kda_wu (sub-chunk, head, block): W, U
+-and the keys decayed to the sub-chunk's end; _kda_state (head, 16 value rows): the only sequential part, sub-chunk
+-after sub-chunk, V' and the state entering each sub-chunk; _kda_out (sub-chunk, head): O, bf16, the gated RMSNorm.
+-q, k, v, G are recomputed from the projection rows where needed rather than kept (registers) or stored (traffic).
+-
+-Sub-chunks start at absolute positions that are multiples of 64 (``pos`` gives the first row's position); a
+-prompt chunk that starts mid-sub-chunk takes a short first sub-chunk (padded rows are zero rows: no decay, no
+-key). A row's output depends only on its sub-chunk's rows and the state entering it, so it is the same whichever
+-prefill chunk it came in, as long as chunk boundaries are multiples of 64 (a short last sub-chunk included).
+-
+-The torch functions (``*_reference``) are the CPU references of the tests; ``chain`` runs the Triton kernels.
++"""GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form (kda_chunk.cu): 32-row sub-chunks at absolute positions,
++one CUDA block per head carrying the 128 x 128 state from sub-chunk to sub-chunk in registers.
++
++Per row the inputs are kda.cu's (conv + SiLU rounded to bf16, fp32 L2 norms, q times 128^-0.5, beta =
++bf16(sigmoid(b)), the per-channel decay g = e^l, l = lower * sigmoid(exp(A_log) * (a + dt_bias))); the delta rule
++S <- S diag(g); S <- S + beta (v - S k) k^T; o = S q, o rounded to bf16, then the gated RMSNorm. S is [value, key].
++
++A sub-chunk of rows 0..31 entering state S0, E(t -> s) = g_{t+1} ... g_s per key channel (empty: 1):
++
++    L[s, t]  = beta_s sum_c k_s k_t E(t -> s)      t < s          M[s, t] = sum_c q_s k_t E(t -> s)     t <= s
++    T        = (I + L)^-1                           Y = beta (v - (k E(0 -> row)) S0^T),   V' = T Y
++    O        = (q E(0 -> row)) S0^T + M V'           S_end = S0 diag(E(0 -> 31)) + V'^T (k E(row -> 31))
++
++Every decay is a running product of per-row decays <= 1, multiplied in row order as the serial chain decays its state
++(no exponent of a difference of cumulative sums: G reaches -160 in a sub-chunk, and ulp(160) = 1.5e-5 would land on
++decays near 1). All products run in fp32 FMAs in a fixed order, so the kernel is deterministic, and a row's bits
++depend only on its sub-chunk's rows and the entering state: the same whichever prefill chunk the row came in, as long
++as prompt chunks start on multiples of the sub-chunk (TF_GLM_PROMPT_GRID, which TF_GLM_KDA_CHUNKED=1 sets to 64).
++Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no key, no value, beta 0.
++It is not kda.cu's arithmetic (different sums, so bf16 outputs may round the other way and states differ at fp32
++rounding); its error against the float64 delta rule is the serial kernel's order (tests/cuda/test_glm_kda_chunked.py).
++
++The torch functions (``*_reference``) are the CPU references of the tests; ``chain`` runs the CUDA kernel.
+ """
+ 
+ from __future__ import annotations
+ 
+ import math
+-import os
++from functools import lru_cache
++from pathlib import Path
+ 
+ import torch
+-import triton
+-import triton.language as tl
+-from triton.language.extra import libdevice
+ 
+ DK = DV = 128
+ TAPS = 4
+-CHUNK = 64              # rows of a sub-chunk (the state is carried between sub-chunks)
+-BLOCK = 16              # rows of a block inside a sub-chunk (the tiles of L, M and T)
+-GROUP = 4               # rows about one reference row inside a diagonal tile
++CHUNK = 32              # rows of a sub-chunk (the state is carried between sub-chunks); kda_chunk.cu's BT
+ SCALE = 1.0 / math.sqrt(DK)
+ 
+ 
+@@ -114,28 +89,9 @@ def recurrent_reference(q, k, v, lg, beta, state, dtype=torch.float64):
+     return out, S
+ 
+ 
+-def tf32(x: torch.Tensor) -> torch.Tensor:
+-    """fp32 -> TF32 (10 mantissa bits, round to nearest, ties away: cvt.rna.tf32.f32), as fp32."""
+-
+-    i = x.float().contiguous().view(torch.int32)
+-    return ((i + 0x1000) & ~0x1FFF).view(torch.float32)
+-
+-
+-def _tri_inverse(Ld: torch.Tensor) -> torch.Tensor:
+-    """(I + Ld)^-1 for strictly lower Ld [..., n, n], by forward substitution a row at a time."""
+-
+-    n = Ld.shape[-1]
+-    T = torch.eye(n, dtype=Ld.dtype, device=Ld.device).expand(Ld.shape).clone()
+-    for s in range(1, n):
+-        T[..., s, :] = -(Ld[..., s, :, None] * T).sum(-2)
+-        T[..., s, s] = 1.0
+-    return T
+-
+-
+-def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float64, mm_round=None, state_round=...):
+-    """The chunked algorithm as the kernels run it (sub-chunks at absolute positions, reference blocks, the block
+-    triangular inverse): read-outs [rows, H, 128] and the final state. ``mm_round`` rounds matmul inputs (``tf32``
+-    emulates tl.dot's TF32 path), ``state_round`` those of the products with the state (default: ``mm_round``)."""
++def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float64):
++    """The chunked algorithm as the kernel runs it (sub-chunks of CHUNK rows at absolute positions, decays as running
++    products, T by forward substitution): read-outs [rows, H, 128] and the final state [H, 128, 128]."""
+ 
+     rows, H, _ = q.shape
+     dev = q.device
+@@ -143,78 +99,42 @@ def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float6
+     nc = -(-(rows + off) // CHUNK)
+     total = nc * CHUNK
+ 
+-    def pad(t):
++    def pad(t, fill=0.0):
+         t = t.to(dtype)
+-        z = torch.zeros((total,) + tuple(t.shape[1:]), dtype=dtype, device=dev)
++        z = torch.full((total,) + tuple(t.shape[1:]), fill, dtype=dtype, device=dev)
+         z[off:off + rows] = t
+-        return z.view((nc, CHUNK) + tuple(t.shape[1:])).transpose(1, 2)     # [nc, H, 64, ...]
+-
+-    qc, kc, vc, lc, bc = pad(q), pad(k), pad(v), pad(lg), pad(beta)
+-    rnd = mm_round or (lambda x: x)
+-    srnd = rnd if state_round is ... else (state_round or (lambda x: x))
+-
+-    def mm(x, y):
+-        return rnd(x) @ rnd(y)
++        return z.view((nc, CHUNK) + tuple(t.shape[1:])).transpose(1, 2)     # [nc, H, CHUNK, ...]
+ 
+-    def mms(x, y):
+-        return srnd(x) @ srnd(y)
+-
+-    t = torch.arange(CHUNK, device=dev)
+-    lower_strict = t[:, None] > t[None, :]
+-    lower_incl = t[:, None] >= t[None, :]
+-    nb = CHUNK // BLOCK
+-    i = torch.arange(BLOCK, device=dev)[None, :, None]
++    qc, kc, vc, bc = pad(q), pad(k), pad(v), pad(beta)
++    gc = pad(torch.exp(lg.to(dtype)), 1.0)
+     S = state.to(dtype).clone()                     # [H, V, K]
+     out = torch.empty((total, H, DV), dtype=dtype, device=dev)
+-
+-    def rcumsum(x):
+-        return torch.flip(torch.cumsum(torch.flip(x, [1]), 1), [1])
+-
+     for c in range(nc):
+-        qx, kx, vx, lx, bx = qc[c], kc[c], vc[c], lc[c], bc[c]     # [H, 64, 128] (beta [H, 64])
+-        G = torch.cumsum(lx, dim=1)
+-        Akk = torch.zeros((H, CHUNK, CHUNK), dtype=dtype, device=dev)
+-        Aqk = torch.zeros_like(Akk)
+-        for b in range(nb):
+-            rs = slice(b * BLOCK, (b + 1) * BLOCK)
+-            lb = lx[:, rs]
+-            for g in range(BLOCK // GROUP):                           # the diagonal tile, about each group's row
+-                p = g * GROUP
+-                fwd = torch.cumsum(torch.where(i > p, lb, 0.0), 1)
+-                back = rcumsum(torch.where(i <= p, lb, 0.0)) - lb
+-                rf = torch.where((i >= p) & (i < p + GROUP), torch.exp(fwd), 0.0)
+-                cf = torch.where(i < p, torch.exp(back), torch.where(i < p + GROUP, torch.exp(-fwd), 0.0))
+-                kt = (kx[:, rs] * cf).transpose(1, 2)
+-                Akk[:, rs, rs] += mm(kx[:, rs] * rf, kt)
+-                Aqk[:, rs, rs] += mm(qx[:, rs] * rf, kt)
+-            rf = torch.exp(torch.cumsum(torch.where(i > 0, lb, 0.0), 1))   # earlier blocks, about the block's row 0
+-            carry = lb[:, :1]
+-            for j in range(b - 1, -1, -1):
+-                cs = slice(j * BLOCK, (j + 1) * BLOCK)
+-                rev = rcumsum(lx[:, cs])
+-                kt = (kx[:, cs] * torch.exp(carry + (rev - lx[:, cs]))).transpose(1, 2)
+-                Akk[:, rs, cs] = mm(kx[:, rs] * rf, kt)
+-                Aqk[:, rs, cs] = mm(qx[:, rs] * rf, kt)
+-                carry = carry + rev[:, :1]
+-        L = torch.where(lower_strict, bx[:, :, None] * Akk, torch.zeros_like(Akk))
+-        M = torch.where(lower_incl, Aqk, torch.zeros_like(Aqk))
+-        T = torch.zeros_like(L)
+-        for b in range(nb):
+-            rs = slice(b * BLOCK, (b + 1) * BLOCK)
+-            Tbb = _tri_inverse(L[:, rs, rs])
+-            X = mm(L[:, rs, :b * BLOCK], T[:, :b * BLOCK, :]) if b else torch.zeros_like(T[:, rs])
+-            T[:, rs] = -mm(Tbb, X)
+-            T[:, rs, rs] = Tbb
+-        eG = torch.exp(G)
+-        W = mm(T, bx[:, :, None] * kx * eG)
+-        U = mm(T, bx[:, :, None] * vx)
+-        gl = G[:, -1:, :]
+-        Ke = kx * torch.exp(rcumsum(lx) - lx)                      # GL - G, summed backward from the end
+-        Qt = qx * eG
++        qx, kx, vx, gx, bx = qc[c], kc[c], vc[c], gc[c], bc[c]     # [H, T, 128] (beta [H, T])
++        E = torch.zeros((H, CHUNK, CHUNK, DK), dtype=dtype, device=dev)   # E[:, s, t] = E(t -> s), t <= s
++        for t in range(CHUNK):
++            e = torch.ones((H, DK), dtype=dtype, device=dev)
++            E[:, t, t] = e
++            for s in range(t + 1, CHUNK):
++                e = e * gx[:, s]
++                E[:, s, t] = e
++        Akk = torch.einsum("hsc,htc,hstc->hst", kx, kx, E)
++        Aqk = torch.einsum("hsc,htc,hstc->hst", qx, kx, E)
++        tri = torch.ones((CHUNK, CHUNK), dtype=torch.bool, device=dev)
++        L = torch.where(torch.tril(tri, -1), bx[:, :, None] * Akk, torch.zeros_like(Akk))
++        M = torch.where(torch.tril(tri), Aqk, torch.zeros_like(Aqk))
++        T = torch.eye(CHUNK, dtype=dtype, device=dev).expand(L.shape).clone()
++        for s in range(1, CHUNK):
++            T[:, s, :] = -(L[:, s, :, None] * T).sum(-2)
++            T[:, s, s] = 1.0
++        fwd = torch.cumprod(gx, dim=1)                              # E(0 -> row)
++        back = torch.cat([torch.flip(torch.cumprod(torch.flip(gx[:, 1:], [1]), 1), [1]),
++                          torch.ones_like(gx[:, :1])], 1)
+         ST = S.transpose(1, 2)                                      # [H, K, V]
+-        Vn = U - mms(W, ST)
+-        out[c * CHUNK:(c + 1) * CHUNK] = (mms(Qt, ST) + mm(M, Vn)).transpose(0, 1)
+-        S = S * torch.exp(gl) + mms(Vn.transpose(1, 2), Ke)
++        Y = bx[:, :, None] * (vx - (kx * fwd) @ ST)
++        Vn = T @ Y
++        out[c * CHUNK:(c + 1) * CHUNK] = ((qx * fwd) @ ST + M @ Vn).transpose(0, 1)
++        S = S * fwd[:, -1:, :] + Vn.transpose(1, 2) @ (kx * back)
+     return out[off:off + rows], S
+ 
+ 
+@@ -240,418 +160,37 @@ def chain_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias
+     return gate_norm_reference(y, g, norm_w, eps), S.float(), y
+ 
+ 
+-# -- Triton kernels ---------------------------------------------------------------------------------------------
+-# The per-row values rounded to bf16 (conv + SiLU, beta) must be kda.cu's bits: a value rounded the other way at a
+-# bf16 tie moves a key by 2^-8 in one channel, a beta by 2^-8 of the whole update, far above fp32 noise (and the
+-# read-out of a row whose RMSNorm is eps-dominated carries it into the output). kda.cu is built with --fmad=false and
+-# uses CUDA's expf and IEEE division: the kernels that compute these values launch with enable_fp_fusion=False and
+-# take libdevice's expf (the same algorithm) and div_rn. Triton's interpreter has no libdevice: it takes tl.exp.
+-_PRECISE = tl.constexpr(os.environ.get("TRITON_INTERPRET", "0") != "1")
+-
++def chain_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows, *,
++                    pos: int = 0, chunked: bool = True, dtype=torch.float32):
++    """A whole prompt chunk: (out bf16 [rows, H * 128], final state fp32 [H, 128, 128], read-outs y [rows, H, 128])."""
+ 
+-@triton.jit
+-def _expf(x):
+-    """CUDA's expf (libdevice) on the GPU, tl.exp under the interpreter."""
+-    if _PRECISE:
+-        return libdevice.exp(x)
++    q, k, v, lg, beta = prep_reference(p, b_off, a, conv_state, conv_w, a_log, dt_bias, lower, rows)
++    if chunked:
++        y, S = chunked_reference(q, k, v, lg, beta, state_in, pos, dtype=dtype)
+     else:
+-        return tl.exp(x)
++        y, S = recurrent_reference(q, k, v, lg, beta, state_in, dtype=dtype)
++    return gate_norm_reference(y, g, norm_w, eps), S.float(), y
+ 
+ 
+-@triton.jit
+-def _sigmoid_f(x):
+-    """kda.cu's sigmoidf_: 1 / (1 + expf(-x)), IEEE division."""
+-    return tl.math.div_rn(1.0, 1.0 + _expf(-x))
+-
+-
+-@triton.jit
+-def _bf16(x):
+-    """fp32 rounded to bf16 (to nearest even), as fp32: bit arithmetic, so Triton's CPU interpreter (which truncates
+-    in casts) rounds as the GPU does."""
+-    b = x.to(tl.uint32, bitcast=True)
+-    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
+-    return b.to(tl.float32, bitcast=True)
+-
+-
+-@triton.jit
+-def _conv_act(P, p_stride, CS, CW, r, valid, ch, C3, BT: tl.constexpr, DK_: tl.constexpr, TAPS_: tl.constexpr):
+-    """Depthwise conv over [conv state; P rows] of channels ch for rows r, SiLU, rounded to bf16: [BT, DK] fp32."""
+-
+-    acc = tl.zeros((BT, DK_), dtype=tl.float32)
+-    for tap in tl.static_range(TAPS_):
+-        at = r + (tap - (TAPS_ - 1))                        # P row (negative: conv state row at + TAPS - 1)
+-        from_p = valid & (at >= 0)
+-        from_s = valid & (at < 0)
+-        xp = tl.load(P + at.to(tl.int64)[:, None] * p_stride + ch[None, :], mask=from_p[:, None], other=0.0)
+-        xs = tl.load(CS + (at + (TAPS_ - 1)).to(tl.int64)[:, None] * C3 + ch[None, :], mask=from_s[:, None],
+-                     other=0.0)
+-        x = tl.where(from_s[:, None], xs.to(tl.float32), xp.to(tl.float32))
+-        wt = tl.load(CW + ch * TAPS_ + tap).to(tl.float32)
+-        acc = acc + wt[None, :] * x
+-    act = tl.math.div_rn(acc, 1.0 + _expf(-acc))
+-    return _bf16(act)
+-
+-
+-@triton.jit
+-def _l2(x):
+-    ss = tl.sum(x * x, axis=1)
+-    return x * tl.math.div_rn(1.0, tl.sqrt_rn(ss + 1e-6))[:, None]
+-
+-
+-@triton.jit
+-def _row(x, t, s):
+-    """Row s of x [n, N] as [N] (a sum with zeros: exact)."""
+-    return tl.sum(tl.where((t == s)[:, None], x, 0.0), axis=0)
+-
+-
+-@triton.jit
+-def _tri_inv(Ld, BC: tl.constexpr):
+-    """(I + Ld)^-1 of a strictly lower [BC, BC] block by forward substitution."""
+-
+-    i = tl.arange(0, BC)
+-    T = tl.where(i[:, None] == i[None, :], 1.0, 0.0)
+-    for s in range(1, BC):
+-        lrow = tl.sum(tl.where((i == s)[:, None], Ld, 0.0), axis=0)          # Ld[s, :]
+-        trow = -tl.sum(lrow[:, None] * T, axis=0)                           # -sum_m Ld[s, m] T[m, :]
+-        T = tl.where((i == s)[:, None], trow[None, :] + tl.where(i == s, 1.0, 0.0)[None, :], T)
+-    return T
+-
+-
+-@triton.jit
+-def _dot_k(a, b, NS: tl.constexpr, PREC: tl.constexpr):
+-    """a [M, K] @ b [K, N] as a batched dot over NS slices of K, summed: with M = N = 16 a warp then holds a slice of
+-    the operands instead of all of K."""
+-    M: tl.constexpr = a.shape[0]
+-    K: tl.constexpr = a.shape[1]
+-    N: tl.constexpr = b.shape[1]
+-    a3 = tl.permute(tl.reshape(a, (M, NS, K // NS)), (1, 0, 2))
+-    b3 = tl.reshape(b, (NS, K // NS, N))
+-    return tl.sum(tl.dot(a3, b3, input_precision=PREC), axis=0)
+-
+-
+-@triton.jit
+-def _logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower):
+-    """The log-decays l of rows r [BC, DK] (in (lower, 0)); zero rows outside the chunk."""
+-    av = tl.load(A + r.to(tl.int64)[:, None] * a_stride + hd + ch[None, :], mask=valid[:, None], other=0.0)
+-    lg = lower * _sigmoid_f(rate * (av.to(tl.float32) + dtb[None, :]))
+-    return tl.where(valid[:, None], lg, 0.0)
+-
+-
+-@triton.jit
+-def _gates(A, a_stride, r, valid, hd, ch, rate, dtb, lower, carry):
+-    """G for rows r: carry (the running log-decay before them) + their running sum; zero rows outside the chunk."""
+-    return carry[None, :] + tl.cumsum(_logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower), axis=0)
+-
+-
+-@triton.jit
+-def _beta(P, p_stride, b_off, h, r, valid):
+-    braw = tl.load(P + r.to(tl.int64) * p_stride + b_off + h, mask=valid, other=0.0).to(tl.float32)
+-    return tl.where(valid, _bf16(_sigmoid_f(braw)), 0.0)
+-
+-
+-@triton.jit
+-def _kda_lm(P, p_stride, b_off, A, a_stride, CS, CW, ALOG, DTB, lower, rows, off, H, QT, L, M,
+-            DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, GR: tl.constexpr, TAPS_: tl.constexpr,
+-            KSPLIT: tl.constexpr, PREC: tl.constexpr):
+-    """Program (sub-chunk, head, 16-row block b): block b's rows of L (beta k k decays, strictly lower) and M (q k
+-    decays, with the diagonal) against blocks j <= b, and its decayed q (QT = q e^G). Rows outside the prompt chunk
+-    are zero rows (no decay, no key).
+-
+-    A decay e^(G_s - G_j) is formed as e^(G_s - G_p) e^(G_p - G_j) about a reference row p, each exponent summed
+-    outward from p (its rounding error a few ulps of its own size, never of G's): p = the block's first row for
+-    earlier blocks (both factors <= 1: the error is a few ulps of the decay's own exponent), p = the first row of s's
+-    GR-row group inside the diagonal tile (column factors <= e^(5 (GR - 1)), errors a few ulps of 10 (GR - 1))."""
+-
+-    c = tl.program_id(0)
+-    h = tl.program_id(1)
+-    b = tl.program_id(2)
+-    i = tl.arange(0, BC)
+-    ch = tl.arange(0, DK_)
+-    C3 = 3 * H * DK_
+-    hd = h * DK_
+-    rate = _expf(tl.load(ALOG + h))
+-    dtb = tl.load(DTB + hd + ch)
+-    r0 = c * BT - off
+-    tile = (c.to(tl.int64) * H + h) * BT * BT + (b * BC + i)[:, None] * BT + i[None, :]    # + j * BC: tile (b, j)
+-
+-    r = r0 + b * BC + i
+-    valid = (r >= 0) & (r < rows)
+-    lb = _logdecay(A, a_stride, r, valid, hd, ch, rate, dtb, lower)
+-    k = _l2(_conv_act(P, p_stride, CS, CW, r, valid, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
+-    q = _l2(_conv_act(P, p_stride, CS, CW, r, valid, hd + ch, C3, BC, DK_, TAPS_)) * 0.08838834764831845
+-    beta = _beta(P, p_stride, b_off, h, r, valid)
+-
+-    # the diagonal tile in GR-row groups: rows s of group g about p = the group's first row
+-    akk = tl.zeros((BC, BC), dtype=tl.float32)
+-    aqk = tl.zeros((BC, BC), dtype=tl.float32)
+-    for g in tl.static_range(BC // GR):
+-        fwd = tl.cumsum(tl.where(i[:, None] > g * GR, lb, 0.0), axis=0)                          # G_t - G_p, t >= p
+-        back = tl.cumsum(tl.where(i[:, None] <= g * GR, lb, 0.0), axis=0, reverse=True) - lb     # G_p - G_t, t < p
+-        rf = tl.where(((i >= g * GR) & (i < g * GR + GR))[:, None], tl.exp(fwd), 0.0)
+-        cf = tl.where((i < g * GR)[:, None], tl.exp(back), tl.where((i < g * GR + GR)[:, None], tl.exp(-fwd), 0.0))
+-        col = tl.trans(k * cf)
+-        akk += _dot_k(k * rf, col, KSPLIT, PREC)
+-        aqk += _dot_k(q * rf, col, KSPLIT, PREC)
+-    tl.store(L + tile + b * BC, tl.where(i[:, None] > i[None, :], beta[:, None] * akk, 0.0))
+-    tl.store(M + tile + b * BC, tl.where(i[:, None] >= i[None, :], aqk, 0.0))
+-
+-    # earlier blocks, nearest first, about p = the block's first row
+-    fwd = tl.cumsum(tl.where(i[:, None] > 0, lb, 0.0), axis=0)                                   # G_s - G_p
+-    rf = tl.exp(fwd)
+-    rk = k * rf
+-    rq = q * rf
+-    carry = _row(lb, i, 0)                                    # G_p - G_t for t = the previous block's last row
+-    for jj in range(0, b):
+-        j = b - 1 - jj
+-        rj = r0 + j * BC + i
+-        vj = (rj >= 0) & (rj < rows)
+-        lj = _logdecay(A, a_stride, rj, vj, hd, ch, rate, dtb, lower)
+-        rev = tl.cumsum(lj, axis=0, reverse=True)
+-        kj = _l2(_conv_act(P, p_stride, CS, CW, rj, vj, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
+-        col = tl.trans(kj * tl.exp(carry[None, :] + (rev - lj)))                  # e^(G_p - G_t) <= 1, [DK, BC]
+-        tl.store(L + tile + j * BC, beta[:, None] * _dot_k(rk, col, KSPLIT, PREC))
+-        tl.store(M + tile + j * BC, _dot_k(rq, col, KSPLIT, PREC))
+-        carry += _row(rev, i, 0)
+-    # carry = G_p, the running log-decay through the block's first row
+-    rowbase = (r.to(tl.int64) * H + h) * DK_
+-    tl.store(QT + rowbase[:, None] + ch[None, :], q * tl.exp(carry[None, :] + fwd), mask=valid[:, None])
+-
+-
+-@triton.jit
+-def _kda_solve(A, a_stride, ALOG, DTB, lower, rows, off, H, L, T, GL,
+-               DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, PREC: tl.constexpr):
+-    """Program (sub-chunk, head): T = (I + L)^-1 in 16-row blocks (T_bb by forward substitution, T_bj = -T_bb
+-    sum_{j<=m<b} L_bm T_mj), and the sub-chunk's total log-decay GL."""
+-
+-    NB: tl.constexpr = BT // BC
+-    c = tl.program_id(0)
+-    h = tl.program_id(1)
+-    i = tl.arange(0, BC)
+-    ch = tl.arange(0, DK_)
+-    hd = h * DK_
+-    base = (c.to(tl.int64) * H + h) * BT * BT
+-    Ts = ()
+-    for b in tl.static_range(NB):
+-        Lrow = ()
+-        for j in tl.static_range(b + 1):
+-            Lrow = Lrow + (tl.load(L + base + (b * BC + i)[:, None] * BT + j * BC + i[None, :]),)
+-        Tbb = _tri_inv(Lrow[b], BC)
+-        Trow = ()
+-        for j in tl.static_range(b):
+-            X = tl.zeros((BC, BC), dtype=tl.float32)
+-            for m in tl.static_range(j, b):
+-                X += tl.dot(Lrow[m], Ts[m][j], input_precision=PREC)
+-            Trow = Trow + (-tl.dot(Tbb, X, input_precision=PREC),)
+-        Trow = Trow + (Tbb,)
+-        Ts = Ts + (Trow,)
+-        for j in tl.static_range(b + 1):
+-            tl.store(T + base + (b * BC + i)[:, None] * BT + j * BC + i[None, :], Trow[j])
+-    rate = _expf(tl.load(ALOG + h))
+-    dtb = tl.load(DTB + hd + ch)
+-    carry = tl.zeros((DK_,), dtype=tl.float32)
+-    for b in range(0, NB):
+-        r = c * BT - off + b * BC + i
+-        carry = _row(_gates(A, a_stride, r, (r >= 0) & (r < rows), hd, ch, rate, dtb, lower, carry), i, BC - 1)
+-    tl.store(GL + (c.to(tl.int64) * H + h) * DK_ + ch, carry)
+-
+-
+-@triton.jit
+-def _kda_wu(P, p_stride, b_off, A, a_stride, CS, CW, ALOG, DTB, lower, rows, off, H, T, W, U, KE,
+-            DK_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, TAPS_: tl.constexpr, PREC: tl.constexpr):
+-    """Program (sub-chunk, head, 16-row block b): W_b = sum_{j<=b} T_bj (beta k e^G)_j, U_b = sum_{j<=b} T_bj
+-    (beta v)_j (the WY / UT transform), and block b's keys decayed to the sub-chunk's end (KE = k e^(GL - G), the
+-    exponent summed backward from the end: a few ulps of its own size)."""
+-
+-    NB: tl.constexpr = BT // BC
+-    c = tl.program_id(0)
+-    h = tl.program_id(1)
+-    b = tl.program_id(2)
+-    i = tl.arange(0, BC)
+-    ch = tl.arange(0, DK_)
+-    C3 = 3 * H * DK_
+-    hd = h * DK_
+-    rate = _expf(tl.load(ALOG + h))
+-    dtb = tl.load(DTB + hd + ch)
+-    r0 = c * BT - off
+-    tbase = (c.to(tl.int64) * H + h) * BT * BT + (b * BC + i)[:, None] * BT + i[None, :]
+-    rb = r0 + b * BC + i
+-    vb = (rb >= 0) & (rb < rows)
+-    rowbase = (rb.to(tl.int64) * H + h) * DK_
+-    later = tl.zeros((DK_,), dtype=tl.float32)                   # log-decay of the blocks after b, last first
+-    for jj in range(0, NB - 1 - b):
+-        rj = r0 + (NB - 1 - jj) * BC + i
+-        later += tl.sum(_logdecay(A, a_stride, rj, (rj >= 0) & (rj < rows), hd, ch, rate, dtb, lower), axis=0)
+-    wv = tl.zeros((BC, DK_), dtype=tl.float32)
+-    uv = tl.zeros((BC, DK_), dtype=tl.float32)
+-    carry = tl.zeros((DK_,), dtype=tl.float32)
+-    for j in range(0, b + 1):
+-        rj = r0 + j * BC + i
+-        vj = (rj >= 0) & (rj < rows)
+-        lj = _logdecay(A, a_stride, rj, vj, hd, ch, rate, dtb, lower)
+-        Gj = carry[None, :] + tl.cumsum(lj, axis=0)
+-        carry = _row(Gj, i, BC - 1)
+-        kj = _l2(_conv_act(P, p_stride, CS, CW, rj, vj, H * DK_ + hd + ch, C3, BC, DK_, TAPS_))
+-        if j == b:
+-            ke = kj * tl.exp(later[None, :] + (tl.cumsum(lj, axis=0, reverse=True) - lj))     # GL - G
+-            tl.store(KE + rowbase[:, None] + ch[None, :], ke, mask=vb[:, None])
+-        bj = _beta(P, p_stride, b_off, h, rj, vj)
+-        vv = _conv_act(P, p_stride, CS, CW, rj, vj, 2 * H * DK_ + hd + ch, C3, BC, DK_, TAPS_)
+-        tbj = tl.load(T + tbase + j * BC)
+-        wv += tl.dot(tbj, bj[:, None] * kj * tl.exp(Gj), input_precision=PREC)
+-        uv += tl.dot(tbj, bj[:, None] * vv, input_precision=PREC)
+-    tl.store(W + rowbase[:, None] + ch[None, :], wv, mask=vb[:, None])
+-    tl.store(U + rowbase[:, None] + ch[None, :], uv, mask=vb[:, None])
+-
+-
+-@triton.jit
+-def _kda_state(S_IN, S_OUT, W, U, KE, GL, HB, rows, off, NC, H,
+-               DK_: tl.constexpr, DV_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BV: tl.constexpr,
+-               PREC: tl.constexpr):
+-    """Program (head, value tile): the state S [BV value rows, K] from sub-chunk to sub-chunk (the only sequential
+-    part), BC rows at a time: V'^T = U^T - S W^T (written over U), S <- S diag(e^GL) + V'^T KE. Saves each
+-    sub-chunk's entering state (HB [NC, H, V, K], the state's layout)."""
+-
+-    h = tl.program_id(0)
+-    v0 = tl.program_id(1) * BV
+-    ki = tl.arange(0, DK_)
+-    vi = v0 + tl.arange(0, BV)
+-    i = tl.arange(0, BC)
+-    sbase = h.to(tl.int64) * DV_ * DK_
+-    S = tl.load(S_IN + sbase + vi[:, None] * DK_ + ki[None, :])               # [BV, K]
+-    for c in range(NC):
+-        cb = (c * H + h).to(tl.int64)
+-        tl.store(HB + cb * DV_ * DK_ + vi[:, None] * DK_ + ki[None, :], S)
+-        nxt = S * tl.exp(tl.load(GL + cb * DK_ + ki))[None, :]
+-        for b in tl.static_range(BT // BC):
+-            r = c * BT - off + b * BC + i
+-            valid = (r >= 0) & (r < rows)
+-            rowbase = (r.to(tl.int64) * H + h) * DK_
+-            wb = tl.load(W + rowbase[:, None] + ki[None, :], mask=valid[:, None], other=0.0)     # [BC, K]
+-            ub = tl.load(U + rowbase[:, None] + vi[None, :], mask=valid[:, None], other=0.0)     # [BC, BV]
+-            vnt = tl.trans(ub) - tl.dot(S, tl.trans(wb), input_precision=PREC)                 # [BV, BC]
+-            tl.store(U + rowbase[:, None] + vi[None, :], tl.trans(vnt), mask=valid[:, None])
+-            kb = tl.load(KE + rowbase[:, None] + ki[None, :], mask=valid[:, None], other=0.0)     # [BC, K]
+-            nxt += tl.dot(vnt, kb, input_precision=PREC)
+-        S = nxt
+-    tl.store(S_OUT + sbase + vi[:, None] * DK_ + ki[None, :], S)
+-
+-
+-@triton.jit
+-def _kda_out(QT, U, M, HB, G, g_stride, NW, eps, OUT, rows, off, H,
+-             DK_: tl.constexpr, DV_: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, KS: tl.constexpr,
+-             PREC: tl.constexpr):
+-    """Program (sub-chunk, head): read-outs O = QT S0^T + M V' rounded to bf16, then the gated RMSNorm."""
+-
+-    c = tl.program_id(0)
+-    h = tl.program_id(1)
+-    t = tl.arange(0, BT)
+-    i = tl.arange(0, BC)
+-    ks = tl.arange(0, KS)
+-    vi = tl.arange(0, DV_)
+-    r = c * BT - off + t
+-    valid = (r >= 0) & (r < rows)
+-    rowbase = (r.to(tl.int64) * H + h) * DK_
+-    cb = (c * H + h).to(tl.int64)
+-    o = tl.zeros((BT, DV_), dtype=tl.float32)
+-    for k0 in tl.static_range(0, DK_, KS):
+-        qt = tl.load(QT + rowbase[:, None] + k0 + ks[None, :], mask=valid[:, None], other=0.0)     # [BT, KS]
+-        hs = tl.load(HB + cb * DV_ * DK_ + vi[:, None] * DK_ + k0 + ks[None, :])                   # [DV, KS]
+-        o += tl.dot(qt, tl.trans(hs), input_precision=PREC)
+-    for j in tl.static_range(BT // BC):
+-        mq = tl.load(M + cb * BT * BT + t[:, None] * BT + (j * BC + i)[None, :], mask=(t >= j * BC)[:, None],
+-                     other=0.0)                                                   # tiles above the diagonal: 0
+-        rj = c * BT - off + j * BC + i
+-        vn = tl.load(U + ((rj.to(tl.int64) * H + h) * DK_)[:, None] + vi[None, :],
+-                     mask=((rj >= 0) & (rj < rows))[:, None], other=0.0)
+-        o += tl.dot(mq, vn, input_precision=PREC)
+-    y = _bf16(o)
+-    rinv = tl.math.div_rn(1.0, tl.sqrt_rn(tl.sum(y * y, axis=1) * (1.0 / DV_) + eps))
+-    yw = tl.load(NW + vi).to(tl.float32)[None, :] * (y * rinv[:, None])
+-    gate = tl.load(G + r.to(tl.int64)[:, None] * g_stride + h * DV_ + vi[None, :], mask=valid[:, None], other=0.0)
+-    res = yw * _sigmoid_f(gate.to(tl.float32))
+-    tl.store(OUT + r.to(tl.int64)[:, None] * (H * DV_) + h * DV_ + vi[None, :], _bf16(res).to(tl.bfloat16),
+-             mask=valid[:, None])
+-
+-
+-# -- launcher ---------------------------------------------------------------------------------------------------
+-PREC = os.environ.get("TF_GLM_KDA_PREC", "tf32x3")      # tl.dot input precision: tf32x3 (~fp32), tf32, ieee
+-BV = int(os.environ.get("TF_GLM_KDA_BV", "16"))          # value rows of the state per sequential program
+-STATE_ROWS = int(os.environ.get("TF_GLM_KDA_STATE_ROWS", "32"))   # rows per step of the sequential kernel
+-KSPLIT = int(os.environ.get("TF_GLM_KDA_KSPLIT", "4"))   # K slices of the 16 x 16 x 128 products (1: one dot)
+-# (num_warps, num_stages) per kernel. One stage everywhere: GB10 (sm_121) gives a block 99 KiB of shared memory
+-# (101,376 B), and pipelined loads of the per-block loops need up to 154 KiB.
+-LAUNCH = {"lm": (8, 1), "solve": (4, 1), "wu": (8, 1), "state": (8, 1), "out": (8, 1)}
+-_EXACT = dict(enable_fp_fusion=False, enable_reflect_ftz=False)   # kda.cu's arithmetic (see _PRECISE)
+-_scratch: dict = {}
+-
+-
+-class ChunkScratch:
+-    """Intermediates of a prompt chunk of up to ``rows`` rows (one set per head count and device, shared by layers)."""
+-
+-    def __init__(self, rows: int, heads: int, device) -> None:
+-        f32 = torch.float32
+-        nc = -(-(rows + CHUNK - 1) // CHUNK)          # room for a short first sub-chunk
+-        self.rows, self.nc = rows, nc
+-        self.qt = torch.empty((rows, heads, DK), dtype=f32, device=device)
+-        self.w = torch.empty((rows, heads, DK), dtype=f32, device=device)
+-        self.u = torch.empty((rows, heads, DV), dtype=f32, device=device)
+-        self.ke = torch.empty((rows, heads, DK), dtype=f32, device=device)
+-        self.m = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
+-        self.l = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
+-        self.t = torch.empty((nc, heads, CHUNK, CHUNK), dtype=f32, device=device)
+-        self.gl = torch.empty((nc, heads, DK), dtype=f32, device=device)
+-        self.hb = torch.empty((nc, heads, DV, DK), dtype=f32, device=device)
+-
+-
+-def scratch_for(rows: int, heads: int, device) -> ChunkScratch:
+-    key = (heads, str(device))
+-    s = _scratch.get(key)
+-    if s is None or s.rows < rows:
+-        s = ChunkScratch(max(rows, CHUNK), heads, device)
+-        _scratch[key] = s
+-    return s
++# -- the CUDA kernel --------------------------------------------------------------------------------------------
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_kda_chunk", sources=[str(here / "kda_chunk.cpp"), str(here / "kda_chunk.cu")],
++                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+ 
+ 
+ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
+           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+           norm_w: torch.Tensor, eps: float, lower: float, rows: int, out: torch.Tensor, state_out: torch.Tensor,
+-          pos: int = 0, *, prec: str | None = None, bv: int | None = None) -> torch.Tensor:
++          pos: int = 0) -> torch.Tensor:
+     """kda.chain for a prompt chunk in chunked form: projection rows p [q | k | v | ... | b at b_off ...], bf16 gate
+     rows a (decay) and g (output gate), conv state [3, 3 H 128] (read, not shifted), state_in -> state_out
+     [H, 128, 128]; ``pos`` is the first row's absolute position. Writes out[:rows] (bf16 [rows, H * 128])."""
+ 
+-    H = a_log.numel()
+     rows = int(rows)
+-    if rows < 1 or p.shape[0] < rows or out.shape[0] < rows:
+-        raise ValueError("rows")
+-    if conv_w.shape != (3 * H * DK, TAPS) or conv_state.shape[0] != TAPS - 1:
+-        raise ValueError("the chunked KDA path is written for 4-tap convolutions of 3 x H x 128 channels")
+-    for x in (conv_state, conv_w, state_in, state_out, out, dt_bias, a_log, norm_w):
+-        if not x.is_contiguous():
+-            raise ValueError("conv state, conv weight, states, out and the per-head weights must be contiguous")
+-    if p.stride(1) != 1 or a.stride(1) != 1 or g.stride(1) != 1:
+-        raise ValueError("projection and gate rows must be contiguous along the channels")
+-    prec = prec or PREC
+-    bv = bv or BV
+-    off = int(pos) % CHUNK
+-    nc = -(-(rows + off) // CHUNK)
+-    s = scratch_for(rows, H, p.device)
+-    nb = CHUNK // BLOCK
+-    _kda_lm[(nc, H, nb)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, float(lower),
+-                         rows, off, H, s.qt, s.l, s.m,
+-                         DK_=DK, BT=CHUNK, BC=BLOCK, GR=GROUP, TAPS_=TAPS, KSPLIT=KSPLIT, PREC=prec,
+-                         num_warps=LAUNCH["lm"][0], num_stages=LAUNCH["lm"][1], **_EXACT)
+-    _kda_solve[(nc, H)](a, a.stride(0), a_log, dt_bias, float(lower), rows, off, H, s.l, s.t, s.gl,
+-                        DK_=DK, BT=CHUNK, BC=BLOCK, PREC=prec, num_warps=LAUNCH["solve"][0],
+-                        num_stages=LAUNCH["solve"][1], **_EXACT)
+-    _kda_wu[(nc, H, nb)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, float(lower),
+-                         rows, off, H, s.t, s.w, s.u, s.ke,
+-                         DK_=DK, BT=CHUNK, BC=BLOCK, TAPS_=TAPS, PREC=prec, num_warps=LAUNCH["wu"][0],
+-                         num_stages=LAUNCH["wu"][1], **_EXACT)
+-    _kda_state[(H, DV // bv)](state_in, state_out, s.w, s.u, s.ke, s.gl, s.hb, rows, off, nc, H,
+-                              DK_=DK, DV_=DV, BT=CHUNK, BC=STATE_ROWS, BV=bv, PREC=prec,
+-                              num_warps=LAUNCH["state"][0], num_stages=LAUNCH["state"][1])
+-    _kda_out[(nc, H)](s.qt, s.u, s.m, s.hb, g, g.stride(0), norm_w, float(eps), out, rows, off, H,
+-                      DK_=DK, DV_=DV, BT=CHUNK, BC=BLOCK, KS=32, PREC=prec, num_warps=LAUNCH["out"][0],
+-                      num_stages=LAUNCH["out"][1], **_EXACT)
++    _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
++                 dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out)
+     return out[:rows]

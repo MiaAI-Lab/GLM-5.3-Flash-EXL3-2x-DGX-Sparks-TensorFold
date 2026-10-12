@@ -1,0 +1,745 @@
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index 79210dd..3a392a2 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -14,7 +14,8 @@ void exl3_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
+ void exl3_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+-                      double, int64_t);
++                      double, int64_t, int64_t, bool);
++void exl3_rot_rows_cuda(const at::Tensor&, int64_t, const at::Tensor&, at::Tensor&, int64_t, int64_t);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -52,6 +53,16 @@ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const
+     exl3_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots);
+ }
+ 
++// Xh [rows, K] = rot_in's input rotation once a row, for a layer whose experts all share one suh for gate and up.
++void rot_rows(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor out, int64_t rows, int64_t K) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "x: bf16 CUDA");
++    check(suh, at::kHalf, "suh");
++    check(out, at::kHalf, "out");
++    TORCH_CHECK(K % 128 == 0 && suh.numel() == K && out.numel() >= rows * K, "rot_rows: shapes");
++    c10::cuda::CUDAGuard guard(x.device());
++    exl3_rot_rows_cuda(x, x_stride, suh, out, rows, K);
++}
++
+ void gateup_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                      const at::Tensor& suh_d, at::Tensor xd, int64_t rows, int64_t P, int64_t N, int64_t SK,
+                      int64_t slots, double limit) {
+@@ -81,20 +92,23 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+             const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
+             const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d,
+             at::Tensor xd, at::Tensor y, int64_t D, int64_t N, int64_t E, int64_t max_items, double limit,
+-            int64_t pass) {
++            int64_t pass, int64_t slots, bool shx) {
+     const at::cuda::CUDAGuard guard(Xg.device());
+     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
+     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
+     check(xd, at::kHalf, "prompt: xd");
+     check(y, at::kFloat, "prompt: y");
++    TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
++    TORCH_CHECK(slots > 0, "prompt: slots");
+     exl3_prompt_cuda(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                     max_items, limit, pass);
++                     max_items, limit, pass, slots, shx);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
+     m.def("prompt", &prompt);
+     m.def("rot_in", &rot_in);
++    m.def("rot_rows", &rot_rows);
+     m.def("gateup_epilogue", &gateup_epilogue);
+     m.def("down_epilogue", &down_epilogue);
+ }
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 7a27c46..46cb22d 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -210,15 +210,25 @@ __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
+ 
+ // Program (member row, 128-block of K, matrix): Xh[mat][row][block] = fp16((x[row] * suh[mat][e]) @ H) for the
+ // gate and up projections of every routed slot (row, slot) with slot < slots - 1 (the last slot is the shared
+-// expert). One warp per program.
++// expert). One warp per program. ROWS (prompt chunks of a layer whose experts all share one suh for gate and up):
++// program (row, block) writes Xh[row][block] from suh0 = that vector, the same arithmetic as every pair's input of
++// that row, so each pair's fp16 input has the same bits, computed once a row instead of 2 x top_k times.
++template <bool ROWS>
+ __global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, const int* __restrict__ pick,
+                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
+                               half* __restrict__ out1, int K, int slots) {
+     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+-    const int row = p / slots, slot = p % slots;
+-    if (slot == slots - 1) return;
++    int row, e;
++    if (ROWS) {
++        row = p;
++        e = 0;
++    } else {
++        row = p / slots;
++        const int slot = p % slots;
++        if (slot == slots - 1) return;
++        e = pick[row * slots + slot];
++    }
+     const int lane = threadIdx.x;
+-    const int e = pick[row * slots + slot];
+     const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
+     const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+     float v[4];
+@@ -327,13 +337,15 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
+ // pass of PM members with NW warps: each warp holds MT = 16 / NW m tiles for all PM members (PM / 8 n blocks), so a
+ // decoded tile feeds PM / 8 mma. PM 64 / 8 warps (two blocks an SM) or PM 128 / 16 warps (one): the same per-element
+ // chains, so the same bits. Every stage brings the members' next PBK k values and the 16 tiles' trellis words into
+-// shared memory (cp.async, PSTAGES deep).
++// shared memory (cp.async, PSTAGES deep). SHX (gate/up of a layer whose experts share one suh for both): gate and up
++// read the same member rows (X0 = X1 = the per-row Xh, the members' rows from xrows), so a stage holds them once.
+ constexpr int PWORDS = 16 * PKT * 32;          // a stage's trellis words (16 m tiles x PKT k tiles x 32)
+ 
+-template <int MATS, int PM, int NW>
++template <int MATS, int PM, int NW, bool SHX = false>
+ struct PromptCfg {
+     static constexpr int MT = 16 / NW, NB = PM / 8, T = NW * 32;
+-    static constexpr size_t STAGE_HALVES = (size_t)MATS * PM * PXS + 2 * PWORDS;
++    static constexpr int XM = SHX ? 1 : MATS;               // member-row copies a stage holds
++    static constexpr size_t STAGE_HALVES = (size_t)XM * PM * PXS + 2 * PWORDS;
+ };
+ 
+ // Which (matrix, m tile) warp-tile q (0..15) of block cb is.
+@@ -343,12 +355,12 @@ __device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
+     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
+ }
+ 
+-template <int MATS, int PM, int NW>
++template <int MATS, int PM, int NW, bool SHX = false>
+ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
+                                                 const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
+                                                 const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
+                                                 half* stage, float (&acc)[16 / NW][PM / 8][4]) {
+-    using C = PromptCfg<MATS, PM, NW>;
++    using C = PromptCfg<MATS, PM, NW, SHX>;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     int mat, nt_unused;
+     prompt_tile<MATS>(warp * C::MT, cb, mat, nt_unused);
+@@ -365,14 +377,14 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+     auto load = [&](int chunk) {
+         half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
+         const int k0 = chunk * PBK;
+-        for (int idx = threadIdx.x; idx < MATS * PM * (PBK / 8); idx += C::T) {
++        for (int idx = threadIdx.x; idx < C::XM * PM * (PBK / 8); idx += C::T) {
+             const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
+                       j = rem % (PBK / 8);
+             const int r = rows_sh[i];
+             const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : r) * K + k0 + j * 8;
+             cp_async16(dst + ((size_t)m * PM + i) * PXS + j * 8, src, r >= 0);
+         }
+-        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)MATS * PM * PXS);
++        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)C::XM * PM * PXS);
+         for (int idx = threadIdx.x; idx < 16 * PKT * 8; idx += C::T) {       // 16 B pieces of 128-B tile words
+             const int q = idx / (PKT * 8), kk = (idx / 8) % PKT, part = idx % 8;
+             int wm, nt;
+@@ -392,8 +404,8 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
+         if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
+         cp_async_commit();
+         const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
+-        const half* xs = base + (size_t)mat * PM * PXS;
+-        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)MATS * PM * PXS);
++        const half* xs = base + (size_t)(SHX ? 0 : mat) * PM * PXS;
++        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)C::XM * PM * PXS);
+ #pragma unroll
+         for (int kk = 0; kk < PKT; ++kk) {
+             uint32_t a[C::MT][4];
+@@ -442,34 +454,41 @@ __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const f
+ }
+ 
+ constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
+-template <int PM>
++template <int PM, int XM = 2>
+ constexpr size_t prompt_smem() {
+-    // max of: gate/up stages, down stages, gate/up epilogue half (2 x PM/2 x GU_ES), down half (PM/2 x DN_ES)
+-    const size_t gu = (size_t)PSTAGES * (2 * PM * PXS + 2 * PWORDS) * 2;
++    // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
++    // down half (PM/2 x DN_ES)
++    const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
+     const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
+     const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
+     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
+ }
+ 
+-template <int PM, int NW>
++// SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
++template <int PM, int NW, bool SHX>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
+     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
+     const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+-    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit) {
++    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit, int slots) {
+     constexpr int MT = 16 / NW, PH = PM / 2;
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+     __shared__ int rows_sh[PM];
++    __shared__ int xrows_sh[SHX ? PM : 1];              // SHX: the members' token rows
+     const int cb = blockIdx.x, item = blockIdx.y;
+     if (item >= counts[0]) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+     if (e >= E) return;                                  // the shared expert
+-    if (threadIdx.x < PM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++    if (threadIdx.x < PM) {
++        const int p = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++        rows_sh[threadIdx.x] = p;
++        if (SHX) xrows_sh[threadIdx.x] = p < 0 ? -1 : p / slots;
++    }
+     __syncthreads();
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     float acc[MT][PM / 8][4];
+-    prompt_mainloop<2, PM, NW>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, reinterpret_cast<half*>(smem_raw),
+-                               acc);
++    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
++                                    reinterpret_cast<half*>(smem_raw), acc);
+     float* Eg = reinterpret_cast<float*>(smem_raw);
+     int mat, nt;
+     prompt_tile<2>(warp * MT, cb, mat, nt);
+@@ -586,13 +605,24 @@ void exl3_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& p
+                       const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
+                       int64_t slots) {
+     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
+-    rot_in_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++    rot_in_kernel<false><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(),
+         reinterpret_cast<const half*>(suh0.data_ptr()), reinterpret_cast<const half*>(suh1.data_ptr()),
+         reinterpret_cast<half*>(out0.data_ptr()), reinterpret_cast<half*>(out1.data_ptr()), (int)K, (int)slots);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// Xh [rows, K] fp16 = fp16((x[row] * suh) @ H) block by block, suh [K] fp16: rot_in's arithmetic once a row.
++void exl3_rot_rows_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor& out, int64_t rows,
++                        int64_t K) {
++    dim3 grid((unsigned)rows, (unsigned)(K / 128), 1);
++    auto s = reinterpret_cast<const half*>(suh.data_ptr());
++    auto o = reinterpret_cast<half*>(out.data_ptr());
++    rot_in_kernel<true><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, nullptr, s, s, o, o, (int)K, 1);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g,
+                                const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t rows,
+                                int64_t P, int64_t N, int64_t SK, int64_t slots, double limit) {
+@@ -620,10 +650,13 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                           const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                           const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+-                          int64_t N, int64_t E, int64_t max_items, double limit) {
+-    constexpr size_t SMEM = prompt_smem<PM>();
++                          int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx) {
++    constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
+     static bool once = [] {
+-        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int)SMEM);
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int)SMEM_SHX);
+         cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+         return true;
+     }();
+@@ -631,9 +664,17 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
+-    prompt_gateup_kernel<PM, NW><<<dim3((unsigned)(N / 128), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+-        h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
+-        h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E, (float)limit);
++    const dim3 gu_grid((unsigned)(N / 128), (unsigned)max_items);
++    if (shx)
++        prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
++            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
++            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
++            (float)limit, (int)slots);
++    else
++        prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
++            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
++            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
++            (float)limit, (int)slots);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+     prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+         reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
+@@ -645,14 +686,14 @@ void exl3_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tens
+                       const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
+                       const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
+-                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass) {
++                      int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx) {
+     TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
+     if (pass == 128)
+         prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
+-                               E, max_items, limit);
++                               E, max_items, limit, slots, shx);
+     else if (pass == 64)
+         prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
+-                             max_items, limit);
++                             max_items, limit, slots, shx);
+     else
+         TORCH_CHECK(false, "prompt experts: passes of 64 or 128 members");
+ }
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 71cd600..5e21f90 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from functools import lru_cache
+ from pathlib import Path
+ 
+@@ -43,7 +43,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v14", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v15", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -63,10 +63,29 @@ class Exl3Experts:
+     count: int
+     width: int                # NI: this rank's share of the expert width
+     dims: int                 # D
++    # [D] fp16 when every expert's gate and up share one suh bitwise (found at construction; GLM-5.3-Flash's
++    # EXL3 checkpoint, every MoE layer): prompt chunks then rotate each row's input once (``rot_rows``)
++    shared_suh: torch.Tensor | None = field(default=None, init=False)
++
++    def __post_init__(self) -> None:
++        self.shared_suh = shared_suh(self.suh_g, self.suh_u)
+ 
+     def nbytes(self) -> int:
++        extra = () if self.shared_suh is None else (self.shared_suh,)
+         return sum(t.numel() * t.element_size() for t in (self.gt, self.ut, self.dt, self.suh_g, self.suh_u,
+-                                                         self.svh_g, self.svh_u, self.suh_d, self.svh_d))
++                                                         self.svh_g, self.svh_u, self.suh_d, self.svh_d, *extra))
++
++
++def shared_suh(suh_g: torch.Tensor, suh_u: torch.Tensor) -> torch.Tensor | None:
++    """The one input scale vector [D] if every expert's gate and up suh equal it bit for bit (-0 is not +0), else
++    None. Every pair's rotated input x_row * suh @ H is then the row's alone, whatever expert or matrix it feeds."""
++
++    if suh_g.dim() != 2 or suh_g.shape != suh_u.shape or suh_g.dtype != torch.float16 or suh_u.dtype != suh_g.dtype:
++        return None
++    g, u = suh_g.view(torch.int16), suh_u.view(torch.int16)
++    if not (bool(torch.equal(g, g[:1].expand_as(g))) and bool(torch.equal(u, g))):
++        return None
++    return suh_g[0].clone().contiguous()
+ 
+ 
+ def words(trellis: torch.Tensor) -> torch.Tensor:
+@@ -96,6 +115,14 @@ def prompt_kernels() -> bool:
+     return os.environ.get("TF_GLM_EXL3_PROMPT", "1") != "0"
+ 
+ 
++def row_rotation() -> bool:
++    """TF_GLM_EXL3_ROWROT (default on): prompt chunks of layers whose experts share one gate/up suh rotate each row's
++    input once and load it once for gate and up (the same fp16 inputs, so the same bits); 0: per pair, as decode."""
++    import os
++
++    return os.environ.get("TF_GLM_EXL3_ROWROT", "1") != "0"
++
++
+ class Scratch:
+     """Per-window buffers for up to ``rows`` rows of ``slots`` slots (the last slot is the shared expert's); a
+     prompt window's (``prompt``) kernels keep no split partials."""
+@@ -118,11 +145,17 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
+     if plan.tile in (64, 128):                       # a prompt window: the Y^T kernels, an item a pass
+-        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+-        ext.prompt(s.xg, s.xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
++        shx = ex.shared_suh is not None and row_rotation()
++        if shx:                                      # one rotated input a row, read by all its pairs' gate and up
++            ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++            xg = xu = s.xg
++        else:
++            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++            xg, xu = s.xg, s.xu
++        ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
+                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
+                                                                                    plan.tile), float(limit),
+-                   plan.tile)
++                   plan.tile, slots, shx)
+         return
+     if plan.tile != grouped.TILE:
+         raise ValueError("the EXL3 kernel takes items of 16 pairs")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index a5a4180..a961a94 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -314,12 +314,23 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
+ 
+ 
++def dense_rows(c, R: int, host_pos: int | None) -> int:
++    """Rows of a window from ``host_pos`` that keep dense attention: those before the first position select_tokens
++    gives a sparse count (sparse_attention overwrites every row from there). All R when the position is not known
++    on the host or the config's dense limit is not the selection's."""
++
++    if host_pos is None or c.dense_limit != sparse.SPARSE_FROM:
++        return R
++    return min(R, max(0, sparse.SPARSE_FROM - host_pos))
++
++
+ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
+-                    scale: float, nch: int, out: torch.Tensor) -> torch.Tensor:
+-    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row."""
++                    scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
++    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row
++    (``hb``: the window's ``head_block``, which a window's first rows computed alone keep)."""
+ 
+     R, step = qa.shape[0], s.part_rows
+-    hb = latent.head_block(R)
++    hb = latent.head_block(R) if hb is None else hb
+     if R <= step:
+         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
+     for r0 in range(0, R, step):
+@@ -353,16 +364,22 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+     ol = s.ol[:R]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+-        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
++        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
++        # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
++        dense = dense_rows(c, R, host_pos) if sparse_rows else R
+         with prof.timed("dsa: dense attention"):
+-            dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
++            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
++                            hb=latent.head_block(R))
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+             tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
++            if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
++                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
++            else:
++                latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+@@ -394,8 +411,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+             glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+             mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+         with prof.timed("moe: combine"):
+-            b.ey[:R, c.top_k].copy_(b.sy[:R])
+-            glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
++            if b.prefill:                # the shared row read from sy where it is (the copy's bits, one pass less)
++                glue.combine_shared(b.ey[:R], b.sy[:R], b.wts[:R], b.part[:R])
++            else:
++                b.ey[:R, c.top_k].copy_(b.sy[:R])
++                glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+         with prof.timed("moe: all-gather"):
+             return gather(w, b, R)
+     with prof.timed("moe: gate/up"):
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 84f0dbe..dbde3f1 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -439,3 +439,28 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
+     rows, d = out.shape
+     block = min(1024, d)
+     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
++
++
++@triton.jit
++def _combine_sy(Y, SY, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
++    """``_combine`` with the shared expert's row read from SY [R, D] fp32 instead of Y's last slot: the same terms
++    (w_k y_k, the shared one times its weight 1) added in the same slot order, so the same bits."""
++
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    d = c * BLOCK + tl.arange(0, BLOCK)
++    acc = tl.zeros((BLOCK,), dtype=tl.float32)
++    for k in tl.static_range(SLOTS - 1):
++        acc = acc + tl.load(Y + (r * SLOTS + k) * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + k)
++    acc = acc + tl.load(SY + r * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + SLOTS - 1)
++    tl.store(OUT + r * D + d, acc)
++
++
++def combine_shared(y: torch.Tensor, sy: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
++    """combine(y with its last slot replaced by sy): y [R, slots, D] (the last slot not read), sy [R, D] fp32."""
++
++    rows, d = out.shape
++    if y.dtype != torch.float32 or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
++        raise ValueError("combine_shared: contiguous fp32 expert rows")
++    block = min(1024, d)
++    _combine_sy[(rows, d // block)](y, sy, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 1fac95e..55e7e77 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -273,6 +273,21 @@ def _tile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
+     return next_m, l, o
+ 
+ 
++@triton.jit
++def _tile_v(q, kv, vv, m, l, o, valid, SCALE: tl.constexpr):
++    """_tile with the values a column slice vv [KT, VB] of the keys kv [KT, 512]."""
++    scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * SCALE
++    scores = tl.where(valid[None, :], scores, float("-inf"))
++    tile_m = tl.max(scores, 1)
++    active = tile_m != float("-inf")
++    next_m = tl.where(active, tl.maximum(m, tile_m), m)
++    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++    p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
++    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), vv)
++    l = l * alpha + tl.sum(p, 1)
++    return next_m, l, o
++
++
+ @triton.jit
+ def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+                   SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
+@@ -330,6 +345,78 @@ def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.const
+     tl.store(PL + base, l, mask=hok)
+ 
+ 
++@triton.jit
++def _onepass_ids(row, t0, n, KTT: tl.constexpr):
++    """Tile t0's token ids (0 past n, where their rows are masked)."""
++    idx = t0 + tl.arange(0, KTT)
++    return tl.load(row + idx, mask=idx < n, other=0).to(tl.int64)
++
++
++@triton.jit
++def _onepass_rows(LC, tok, t0, n, k, LW: tl.constexpr, KTT: tl.constexpr):
++    """Tile t0's latent rows [KTT, LW]; rows past n are not read (zeros)."""
++    ok = t0 + tl.arange(0, KTT) < n
++    return tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0)
++
++
++@triton.jit
++def _sparse_onepass(QA, LC, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr, SCALE: tl.constexpr,
++                    HBT: tl.constexpr, KTT: tl.constexpr, SPLIT: tl.constexpr, STAGES: tl.constexpr,
++                    PREFETCH: tl.constexpr):
++    """Prompt rows, program (row, head group, latent slice): HBT heads of row r over all its selected tokens in one
++    online softmax, KTT-key tiles in list order (_tile's math), straight to OUT[r, h] bf16: no partials, no merge.
++    PREFETCH: tile t + 1's gather is issued into registers before tile t's dots (a load blocks only at first use),
++    with Triton's pipeliner off; else the loop is left to Triton's pipeliner at STAGES. SPLIT > 1: the program keeps
++    LW / SPLIT output columns and recomputes the full-width scores. PREFETCH never changes the arithmetic; the tile
++    (HBT, KTT, SPLIT) is fixed (ONEPASS_TILE), so a row's bits depend on its q, its token list and the cache only,
++    never on the other rows or R. Rows with CNT 0 are left alone."""
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    vs = tl.program_id(2)
++    n = tl.load(CNT + r)
++    if n == 0:
++        return
++    VB: tl.constexpr = LW // SPLIT
++    hh = hb * HBT + tl.arange(0, HBT)
++    hok = hh < H
++    k = tl.arange(0, LW)
++    v = vs * VB + tl.arange(0, VB)
++    q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++    m = tl.full((HBT,), float("-inf"), tl.float32)
++    l = tl.zeros((HBT,), tl.float32)
++    o = tl.zeros((HBT, VB), tl.float32)
++    row = TOK + r * W
++    if PREFETCH:
++        # ids run two tiles ahead and rows one: tile t + 1's gather is issued (its ids already there) before tile t's
++        # dots, so neither load's latency stalls the in-order warp in front of the tensor-core work
++        tok = _onepass_ids(row, 0, n, KTT)
++        kv = _onepass_rows(LC, tok, 0, n, k, LW, KTT)
++        tok_next = _onepass_ids(row, KTT, n, KTT)
++        for t0 in range(0, n, KTT):
++            ok = t0 + tl.arange(0, KTT) < n
++            kv_next = _onepass_rows(LC, tok_next, t0 + KTT, n, k, LW, KTT)
++            tok_after = _onepass_ids(row, t0 + 2 * KTT, n, KTT)
++            if SPLIT == 1:
++                m, l, o = _tile(q, kv.to(tl.bfloat16), m, l, o, ok, SCALE)
++            else:
++                vv = tl.load(LC + tok[:, None] * LW + v[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, m, l, o, ok, SCALE)
++            tok = tok_next
++            kv = kv_next
++            tok_next = tok_after
++    else:
++        for t0 in tl.range(0, n, KTT, num_stages=STAGES):
++            ok = t0 + tl.arange(0, KTT) < n
++            tok = _onepass_ids(row, t0, n, KTT)
++            kv = _onepass_rows(LC, tok, t0, n, k, LW, KTT)
++            if SPLIT == 1:
++                m, l, o = _tile(q, kv.to(tl.bfloat16), m, l, o, ok, SCALE)
++            else:
++                vv = tl.load(LC + tok[:, None] * LW + v[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, m, l, o, ok, SCALE)
++    tl.store(OUT + (r * H + hh[:, None]) * LW + v[None, :], (o / l[:, None]).to(tl.bfloat16), mask=hok[:, None])
++
++
+ @triton.jit
+ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.constexpr, SPARSE: tl.constexpr):
+     """Program (row, head): the row's chunk partials in chunk order -> OUT[r, h] bf16. Sparse: rows with CNT 0 skip."""
+@@ -373,7 +460,10 @@ class LatentScratch:
+ 
+ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: LatentScratch, *, scale: float,
+               nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
+-    """Dense causal attention of qa [R, H, 512] through pos + R - 1 in nch 512-key chunks; a row ignores the others."""
++    """Dense causal attention of qa [R, H, 512] over the cache through pos + R - 1, visiting nch 512-key chunks (empty ones skipped) -> out [R, H, 512].
++
++    Row r's programs read only its query, keys 0 .. pos + r and its own partials, so the first rows of a window
++    computed alone (``qa[:n]``, the same nch and ``hb``: the window's ``head_block``) get the window's bits."""
+     R, H, LW = qa.shape
+     if nch > s.nch or R > s.part_rows or LW != s.lw:
+         raise ValueError(f"latent attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
+@@ -381,7 +471,7 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     n = nch * R * H
+     hb = head_block(R) if hb is None else hb
+     if hb not in (HB, HB_WIDE):
+-        raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
++        raise ValueError(f"latent attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+@@ -404,5 +494,32 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
++# prompt chunks' sparse attention in one pass (TF_GLM_SPARSE_ONEPASS=0: the chunk programs and their merge). Fixed
++# tile (heads, keys, latent slices) and pipeline depth, so a row's bits never depend on the chunk it sits in.
++SPARSE_ONEPASS = __import__("os").environ.get("TF_GLM_SPARSE_ONEPASS", "1") != "0"
++ONEPASS_TILE = (32, 32, 1)          # heads per program (a rank's 32), keys per tile, latent slices: sets the bits
++ONEPASS_LAUNCH = (8, 1, True)       # warps, Triton pipeline stages, register prefetch of the next tile: speed only
++
++
++def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
++                   out: torch.Tensor, scale: float, *, tile: tuple | None = None, launch: tuple | None = None) -> None:
++    """sparse_attention for a prompt chunk's rows: one program a row (and head group) walks every selected token in
++    one online softmax and writes out[r] directly, no fp32 partials; rows with counts 0 are left alone. Other bits
++    than sparse_attention's (one chain instead of merged 512-token chunks), the same for any chunking of the rows.
++    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks)."""
++    R, H, LW = qa.shape
++    if not (qa.is_contiguous() and out.is_contiguous() and tokens.is_contiguous() and cache.stride() == (LW, 1)):
++        raise ValueError("sparse_onepass: expected contiguous queries, output and token lists, cache rows of the width")
++    if R == 0:
++        return
++    hbt, kt, split = tile or ONEPASS_TILE
++    warps, stages, prefetch = launch or ONEPASS_LAUNCH
++    hbt = max(16, min(hbt, triton.next_power_of_2(H)))            # tensor-core tiles need 16 rows
++    _sparse_onepass[(R, triton.cdiv(H, hbt), split)](qa, cache, tokens, counts, out, W=tokens.shape[1], H=H, LW=LW,
++                                                     SCALE=scale, HBT=hbt, KTT=kt, SPLIT=split, STAGES=stages,
++                                                     PREFETCH=bool(prefetch), num_warps=warps,
++                                                     num_stages=1 if prefetch else stages)
++
++
+ def chunks_for(length: int) -> int:
+     return triton.cdiv(length, CHUNK)
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index a7930dd..a7a252d 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -11,6 +11,8 @@ from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt
+ POOL = 4
+ TOPK_POOLS = 512
+ BR = 16
++# the first position whose row select_tokens counts (npool > TOPK_POOLS): rows before it keep dense attention
++SPARSE_FROM = (TOPK_POOLS + 1) * POOL - 1
+ 
+ 
+ @triton.jit
+@@ -177,12 +179,55 @@ def pool_bucket(pos: int, R: int, np_max: int) -> int:
+     return min(np_max, max(1024, 1 << (visible - 1).bit_length()))
+ 
+ 
++PROMPT_ROWS = 64          # windows from this many rows (prompt chunks, eager) take the prompt selection below
++
++
++def pool_count(pos: int, R: int, np_max: int) -> int:
++    """Pools a prompt chunk scores: the visible ones rounded up to a multiple of 1,024 (at most ``pool_bucket``)."""
++    visible = (pos + R) // POOL + 1
++    return min(np_max, -(-visible // 1024) * 1024)
++
++
++def score_rows() -> int:
++    """TF_GLM_SCORE_RB: rows a prompt chunk's _scores program takes (1, 2, 4 or 8; each pool tile loaded once for
++    them, the same bits: row r's pool keys are masked to its own pools before the dot). At most 8: a block's key load
++    then stays within the pool cache's rows (capacity // 4 + 2)."""
++    import os
++
++    value = int(os.environ.get("TF_GLM_SCORE_RB", "4"))
++    if value not in (1, 2, 4, 8):
++        raise ValueError(f"TF_GLM_SCORE_RB is 1, 2, 4 or 8, not {value}")
++    return value
++
++
++@triton.jit
++def _tokens(POOLS, POS, TOK, CNT, W: tl.constexpr, K: tl.constexpr, PL: tl.constexpr, BLOCK: tl.constexpr):
++    """Program r: TOK[r] = the K pools' tokens ascending (pool * PL + j), then the incomplete last pool's visible
++    tokens (-1 past row r's position); CNT[r] = their count when the row has more than K complete pools, else 0."""
++    r = tl.program_id(0).to(tl.int64)
++    q = tl.load(POS).to(tl.int64) + r
++    npool = (q + 1) // PL
++    for c in tl.static_range(0, K * PL, BLOCK):
++        i = c + tl.arange(0, BLOCK)
++        p = tl.load(POOLS + r * K + i // PL)
++        tl.store(TOK + r * W + i, (p * PL + i % PL).to(tl.int32))
++    j = tl.arange(0, 4)
++    jok = j < PL - 1
++    tail = npool * PL + j
++    ok = jok & (tail <= q)
++    tl.store(TOK + r * W + K * PL + j, tl.where(ok, tail, -1).to(tl.int32), mask=jok)
++    n = K * PL + tl.sum(ok.to(tl.int64), 0)
++    tl.store(CNT + r, tl.where(npool > K, n, 0).to(tl.int32))
++
++
+ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int | None, R: int, np_max: int,
+                   pos_dev: torch.Tensor, *, bucket: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+     """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs."""
+ 
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
++    if bucket is None and pos is not None and R >= PROMPT_ROWS:
++        return _select_prompt(qi, wts, pk, pos, R, np_max, pos_dev)
+     # score only visible pools, rounded up to a power of two so the allocator reuses a few sizes (exact sizes fragmented memory at 128k)
+     np_max = bucket if bucket is not None else pool_bucket(pos, R, np_max)
+     # rows scored SELECT_ROWS at a time over the window's np_max pools (the same columns, so the same bits a row)
+@@ -216,6 +261,38 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     return tokens, counts
+ 
+ 
++def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                   pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """select_tokens for a prompt chunk, with select_tokens' counts and, for every counted row, its tokens:
++
++    - it scores NP = pool_count pools, not pool_bucket's power of two: the columns left out lie past every row's
++      visible pools, where _scores writes -inf, and they have the highest indices, so they rank below every column
++      kept (-inf ties go to the lower pool; a negative NaN, the one key below -inf's, is never an arithmetic result
++      on the GPU). A counted row has more than 512 visible pools and NP >= 1024 >= 512, so its best 512 pools, the
++      radix select's threshold and ties are the same. (Rows with count 0, whose tokens nothing reads, may differ.)
++      The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
++    - _scores takes score_rows() rows a program: a row's keys are masked to its own pools before its dot, as with 1;
++    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
++
++    dev = qi.device
++    NP = pool_count(pos, R, np_max)
++    scores = torch.empty((R * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)[:R * NP].view(R, NP)
++    H = wts.shape[1]
++    D = qi.shape[1] // H
++    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
++    rb = score_rows()
++    _scores[(triton.cdiv(R, rb), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, NP, D ** -0.5,
++                                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
++                                                       RB=rb, num_warps=4)
++    pools = top_pools(scores, TOPK_POOLS)                                               # ascending pool index
++    del scores
++    width = TOPK_POOLS * POOL + POOL - 1
++    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
++    counts = torch.empty((R,), dtype=torch.int32, device=dev)
++    _tokens[(R,)](pools, pos_dev, tokens, counts, W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024, num_warps=4)
++    return tokens, counts
++
++
+ @triton.jit
+ def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
+     scores = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE

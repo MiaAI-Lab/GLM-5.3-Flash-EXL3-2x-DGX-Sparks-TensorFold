@@ -1,0 +1,40 @@
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index a7a252d..73cc902 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -276,20 +276,28 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+ 
+     dev = qi.device
+     NP = pool_count(pos, R, np_max)
+-    scores = torch.empty((R * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)[:R * NP].view(R, NP)
++    # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
++    # bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
++    B = min(R, SELECT_ROWS)
++    buf = torch.empty((B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)
+     H = wts.shape[1]
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+     rb = score_rows()
+-    _scores[(triton.cdiv(R, rb), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, NP, D ** -0.5,
+-                                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
+-                                                       RB=rb, num_warps=4)
+-    pools = top_pools(scores, TOPK_POOLS)                                               # ascending pool index
+-    del scores
+     width = TOPK_POOLS * POOL + POOL - 1
+     tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
+     counts = torch.empty((R,), dtype=torch.int32, device=dev)
+-    _tokens[(R,)](pools, pos_dev, tokens, counts, W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024, num_warps=4)
++    for a in range(0, R, B):
++        n = min(B, R - a)
++        at = pos_dev if a == 0 else pos_dev + a
++        scores = buf[:n * NP].view(n, NP)
++        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pk, scores, at, n,
++                                                           NP, D ** -0.5, wscale, H=H,
++                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=rb,
++                                                           num_warps=4)
++        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
++        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
++                      num_warps=4)
+     return tokens, counts
+ 
+ 

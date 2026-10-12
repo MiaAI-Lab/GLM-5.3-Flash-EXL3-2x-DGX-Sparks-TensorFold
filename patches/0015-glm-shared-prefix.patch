@@ -1,0 +1,421 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index cd9a9f1..79a6427 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -308,18 +308,37 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+     return views
+ 
+ 
+-def save_rows(e: Engine, snap: Snapshot) -> None:
+-    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2 caches are not kept."""
+-    views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
++def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
++    """DFlash2's context rows a snapshot of n tokens depends on: its sliding window's keys and values before n (every
++    later query sits at n or past it, and masks older rows), per draft layer."""
++    lo = max(0, n - drafter.window - 1)
++    return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
++
++
++def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
++    """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
++    DFlash2's window rows."""
++    n = len(snap.ids)
++    views = _row_views(e.st, n, max(snap.mtp_len, 0))
++    if drafter is not None and snap.drafter_end == n:
++        views += _drafter_views(drafter, n)
++    return views
++
++
++def save_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
++    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2's
++    context goes with them only given ``drafter`` (TF_GLM_SHARED_PREFIX), otherwise the snapshot no longer fits it."""
++    views = _saved_views(e, snap, drafter)
+     snap.rows = [v.clone() for v in views]
+     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
+-    snap.drafter_end = -1
+-    snap.drafter_rows = None
++    if drafter is None or snap.drafter_end != len(snap.ids):
++        snap.drafter_end = -1
++        snap.drafter_rows = None
+ 
+ 
+-def row_bytes(e: Engine, snap: Snapshot) -> int:
++def row_bytes(e: Engine, snap: Snapshot, drafter=None) -> int:
+     """What ``save_rows`` would copy for this snapshot."""
+-    return sum(v.numel() * v.element_size() for v in _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)))
++    return sum(v.numel() * v.element_size() for v in _saved_views(e, snap, drafter))
+ 
+ 
+ def snapshot_bytes(snap: Snapshot) -> int:
+@@ -328,9 +347,12 @@ def snapshot_bytes(snap: Snapshot) -> int:
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+ 
+-def load_rows(e: Engine, snap: Snapshot) -> None:
+-    """Put a saved snapshot's attention rows back into the live caches."""
+-    for dst, src in zip(_row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)), snap.rows):
++def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
++    """Put a saved snapshot's attention rows (and DFlash2's, when it saved them: the same ``drafter``) back."""
++    views = _saved_views(e, snap, drafter)
++    if len(views) != len(snap.rows):
++        raise ValueError("a saved snapshot's rows do not match the caches they go back to")
++    for dst, src in zip(views, snap.rows):
+         dst.copy_(src)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 76602c5..c4b826e 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -72,6 +72,84 @@ def grid_point(n: int, cut: int, grid: int) -> int | None:
+     return point if point > cut else None
+ 
+ 
++SHARED_DEFAULT = 256                  # TF_GLM_SHARED_PREFIX=1: the fewest tokens a shared-prefix state adds
++SHARED_MIN = 16
++SHARED_MOST = 2                       # shared-prefix states a request keeps at most (the header's two slots)
++
++
++def shared_prefix(value: str | None = None) -> int:
++    """TF_GLM_SHARED_PREFIX: 0 (off, the default), or the fewest tokens past a request's resume point a shared-prefix
++    state must add (1 or on: 256; else 16 or more).
++
++    On, a drafted text request also keeps its state where its prompt stops sharing a kept one and at the end of its
++    system block (its first user message), each on the prompt grid, so a later prompt sharing only that prefix resumes
++    from it; saved states keep DFlash2's context window too."""
++
++    value = os.environ.get("TF_GLM_SHARED_PREFIX", "") if value is None else value
++    value = value.strip().lower()
++    if value in ("", "0", "off"):
++        return 0
++    if value in ("1", "on"):
++        return SHARED_DEFAULT
++    if not value.isdecimal() or int(value) < SHARED_MIN:
++        raise ValueError(f"TF_GLM_SHARED_PREFIX: 0 (off), 1 (on: {SHARED_DEFAULT} tokens) or the fewest tokens a "
++                         f"shared-prefix state adds past a request's resume point, {SHARED_MIN} or more; not {value!r}")
++    return int(value)
++
++
++def common_prefix(a, b) -> int:
++    """How many leading tokens two id sequences (lists or int64 arrays) share."""
++
++    import numpy as np
++
++    n = min(len(a), len(b))
++    if n == 0:
++        return 0
++    x = np.asarray(a[:n], dtype=np.int64)
++    y = np.asarray(b[:n], dtype=np.int64)
++    diff = np.flatnonzero(x != y)
++    return int(diff[0]) if len(diff) else n
++
++
++def shared_points(prompt: list[int], cut: int, point: int | None, grid: int, least: int, known,
++                  opener: int | None = None) -> list[int]:
++    """Where a request resumed at ``cut``, keeping its own state at ``point`` (``grid_point``), also keeps shared-prefix
++    states: at the longest prefix it shares with any of ``known`` (id sequences: the kept prompts; not the live reply,
++    which a conversation's next prompt extends anyway) and at its first ``opener`` token (the end of the system block),
++    each rounded down to the grid, kept when it adds at least ``least`` tokens past ``cut`` (and past the other point)
++    and lies short of ``point``. Sorted, at most SHARED_MOST."""
++
++    if not least or point is None:
++        return []
++    import numpy as np
++
++    arr = np.asarray(prompt, dtype=np.int64)
++    # only a sequence longer than cut + least can share enough (known may hold int64 arrays of the ids)
++    wanted = [max((common_prefix(arr, ids) for ids in known if len(ids) >= cut + least), default=0)]
++    if opener is not None:
++        at = np.flatnonzero(arr == opener)
++        if len(at):
++            wanted.append(int(at[0]))
++    out: list[int] = []
++    for p in sorted(p // grid * grid if grid else p for p in wanted):
++        if p - (out[-1] if out else cut) >= least and p < point:
++            out.append(p)
++    return out[-SHARED_MOST:]
++
++
++def user_opener(model_dir: Path) -> int | None:
++    """The id of GLM's ``<|user|>`` role token (the first one ends the system block), or None without a tokenizer."""
++
++    path = Path(model_dir) / "tokenizer.json"
++    if not path.is_file():
++        return None
++    try:
++        added = json.loads(path.read_text()).get("added_tokens", [])
++    except (OSError, ValueError):
++        return None
++    return next((int(t["id"]) for t in added if t.get("content") == "<|user|>"), None)
++
++
+ def encode_policy(spec: str) -> list[int]:
+     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
+ 
+@@ -159,6 +237,9 @@ def without_mtp(transform, layers: int):
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
++    shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
++    opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
++
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+                  prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
+@@ -233,6 +314,9 @@ class GlmEngine:
+             raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
+         # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
+         self.grid = prompt_grid(prefill_rows)
++        # TF_GLM_SHARED_PREFIX: kept states where prompts stop sharing, and saved states keep DFlash2's window; rank 0
++        # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
++        self.shared = shared_prefix()
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+         if vision:                           # the tower's bf16 weights, which the split rule drops
+@@ -266,7 +350,7 @@ class GlmEngine:
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
+-            self.split.code() + [int(self.dump is not None), quant_code, int(self.mtp_on), int(DRAFT_RING)]
++            self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -276,7 +360,7 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+-                               "TF_GLM_DRAFT_QUANT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -321,6 +405,11 @@ class GlmEngine:
+         if rank == 0 and self.grid:
+             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                   f"(TF_GLM_PROMPT_GRID)", flush=True)
++        # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
++        self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
++        if rank == 0 and self.shared:
++            print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
++                  f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX)", flush=True)
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+@@ -529,6 +618,7 @@ class GlmEngine:
+         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
+         from .decode import row_bytes, save_rows
+ 
++        drafter = self._kept_drafter()
+         live = self.live
+         dropped = False
+ 
+@@ -542,7 +632,7 @@ class GlmEngine:
+             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
+                 self._drop(snap)
+                 continue
+-            need = row_bytes(self.e, snap)
++            need = row_bytes(self.e, snap, drafter=drafter)
+             while self._held_bytes() + need > self.cache_bytes:
+                 old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
+                 if old is None:
+@@ -553,28 +643,51 @@ class GlmEngine:
+                 self._drop(snap)
+                 dropped = True
+                 continue
+-            save_rows(self.e, snap)
++            save_rows(self.e, snap, drafter=drafter)
+         if dropped:
+             import torch
+ 
+             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+ 
++    def _kept_drafter(self):
++        """The drafter whose context window saved snapshots keep (TF_GLM_SHARED_PREFIX), or None: they drop it."""
++
++        return getattr(self, "drafter", None) if self.shared else None
++
++    def _shared(self, prompt: list[int], hit) -> list[int]:
++        """Rank 0: the shared-prefix points a drafted text request keeps (``shared_points``), sent to rank 1."""
++
++        if not self.shared:
++            return []
++        import numpy as np
++
++        cut = len(hit.ids) if hit is not None else 0
++        known = []
++        for c in self.cache:                  # a kept prompt's ids as an array, made once (ids never change)
++            if getattr(c, "ids_array", None) is None:
++                c.ids_array = np.asarray(c.ids, dtype=np.int64)
++            known.append(c.ids_array)
++        return shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, self.shared, known,
++                             self.opener)
++
+     def _held_bytes(self) -> int:
+         from .decode import snapshot_bytes
+ 
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None, feed=None) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=()) -> dict[str, Any]:
++        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
++
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed)
++            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
+         finally:
+             self.e.constraint = self.e.window = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+-                  feed=None) -> dict[str, Any]:
++                  feed=None, shared=()) -> dict[str, Any]:
+         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+@@ -587,7 +700,7 @@ class GlmEngine:
+         cut = len(hit.ids) if hit is not None else 0
+         self._take_over(list(hit.ids) if hit is not None else [])
+         if hit is not None and hit.rows is not None:
+-            load_rows(self.e, hit)
++            load_rows(self.e, hit, drafter=self._kept_drafter())
+             hit.rows, hit.nbytes = None, 0            # live again
+         # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
+         self.live = list(prompt) if feed is None else []
+@@ -596,22 +709,32 @@ class GlmEngine:
+         # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
+         # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
+         point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
+-        resume, kept = hit, None
++        # TF_GLM_SHARED_PREFIX: rank 0's shared-prefix points (past the resume point, short of ``point``) are kept the
++        # same way, each prefilled to as a prompt of its length and resumed from, so fresh and resumed prompts pass
++        # through the same states there too
++        stops = sorted(p for p in set(shared) if point is not None and cut < p < point)
++        stats: dict[str, Any] = {"shared": list(stops)} if stops else {}
+         if point is not None and point < len(prompt):
+-            head = list(prompt[:point])
+-            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=hit, sample=False)
+-            kept = resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                          drafter=drafter)
++            stops.append(point)
++        resume, kept = hit, []
++        for stop in stops:
++            head = list(prompt[:stop])
++            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=resume, sample=False)
++            resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                   drafter=drafter)
++            kept.append(resume)
+         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
+         prefill_s = time.perf_counter() - t0
+         if point == len(prompt):
+-            kept = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                 drafter=drafter)
+-        if kept is not None:
+-            self._remember(kept)
+-        elif draft and feed is None and hit is not None:     # the resume point is the grid point: keep it newest
++            kept.append(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                      drafter=drafter))
++        if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
++            self.cache = [c for c in self.cache if c is not hit] + [hit]
++        for snap in kept:
++            self._remember(snap)
++        if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+-        stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        stats.update(prefill_s=prefill_s, cached=cut)
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+@@ -698,12 +821,14 @@ class GlmEngine:
+             feed = VisionFeed(self, positions, rows)
+             feed.encode_s = time.perf_counter() - t
+         hit = self._resume(list(prompt), code) if draft and feed is None else None
++        shared = self._shared(list(prompt), hit) if draft and feed is None else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+-                  int(constraint is not None), len(positions)] + code
++                  int(constraint is not None), len(positions),
++                  *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code
+         from tensorfold.engine.grammar import pack
+ 
+         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
+@@ -713,7 +838,8 @@ class GlmEngine:
+             self._share(pack(constraint))
+         if positions:
+             self._share(positions)
+-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed)
++        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
++                          shared)
+         stats.update(policy=spec, drafts=draft)
+         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+             self.comm.check()
+@@ -724,33 +850,39 @@ class GlmEngine:
+     def follow(self) -> None:
+         """Rank 1: mirror every request rank 0 serves, forever."""
+ 
++        while True:
++            self.follow_one()
++
++    def follow_one(self) -> None:
++        """Rank 1: mirror one request rank 0 serves."""
++
+         from tensorfold.engine.exact_sampling import Sampling
+ 
+-        while True:
+-            self._await_bell()
+-            (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-             images, *code) = self._share(None)
+-            prompt = self._share(None)
+-            packed = self._share(None) if shaped else []
+-            constraint = None
+-            if packed:                                  # compiled here as on rank 0
+-                from tensorfold.engine import grammar
+-
+-                constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
+-            feed = VisionFeed(self, self._share(None), None) if images else None
+-            temperature = _ints_f64(t_lo, t_hi)
+-            seed = (s_top << 62) | (s_hi << 31) | s_lo
+-            sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
+-                        if temperature > 0 else None)
+-            hit = None
+-            if cached:
+-                hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
+-                if hit is None:
+-                    raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+-            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                      constraint, feed)
+-            if hasattr(self.comm, "check"):
+-                self.comm.check()
++        self._await_bell()
++        (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
++         images, *rest) = self._share(None)
++        shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
++        prompt = self._share(None)
++        packed = self._share(None) if shaped else []
++        constraint = None
++        if packed:                                  # compiled here as on rank 0
++            from tensorfold.engine import grammar
++
++            constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
++        feed = VisionFeed(self, self._share(None), None) if images else None
++        temperature = _ints_f64(t_lo, t_hi)
++        seed = (s_top << 62) | (s_hi << 31) | s_lo
++        sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
++                    if temperature > 0 else None)
++        hit = None
++        if cached:
++            hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
++            if hit is None:
++                raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
++        self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
++                  constraint, feed, shared)
++        if hasattr(self.comm, "check"):
++            self.comm.check()
+ 
+ 
+ class VisionFeed:

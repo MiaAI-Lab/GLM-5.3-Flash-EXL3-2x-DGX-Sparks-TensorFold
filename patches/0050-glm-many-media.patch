@@ -1,0 +1,274 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index dabd045..bebd06f 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -93,9 +93,9 @@ def make_handler(app: App):
+                 return self._json(404, {"error": "not found"})
+             try:
+                 length = int(self.headers.get("Content-Length", 0))
+-                if not 0 <= length <= 32 * 1024**2:
++                if not 0 <= length <= 96 * 1024**2:          # up to 50 pictures or 4 clips as data URLs
+                     self.close_connection = True             # the unread body must not reach the next request
+-                    return self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
++                    return self._json(400, {"error": {"message": "request body exceeds the 96 MiB limit",
+                                                       "type": "invalid_request_error"}})
+                 body = json.loads(self.rfile.read(length) or b"{}")
+             except (json.JSONDecodeError, UnicodeDecodeError):
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index 2b9c05b..9c636df 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -40,21 +40,28 @@ def image_slot():
+ 
+ 
+ def prepare_images(frontend, messages, render, *, context_limit=None):
+-    from tensorfold.vision.images import ImageInputError, load_images, split_images
++    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
+ 
+     if frontend is None:
+         raise RequestError('image input requires a supported vision checkpoint served with --vision')
+     allow_urls = bool(getattr(frontend, 'allow_urls', False))
+     videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
++    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
++    limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
+     try:
+-        template, sources = split_images(messages, allow_urls=allow_urls, allow_videos=videos)
++        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
++                                         max_videos=getattr(frontend, 'max_videos', None))
+     except (ImageInputError, ValueError) as exc:
+         raise RequestError(str(exc)) from exc
+     slot = image_slot()
+     try:
+         from tensorfold.vision.images import ImageSource
+ 
+-        images = load_images([s for s in sources if isinstance(s, ImageSource)], allow_urls=allow_urls)
++        pictures = [s for s in sources if isinstance(s, ImageSource)]
++        if hasattr(frontend, 'load_images'):              # a frontend that fits each picture as it decodes it
++            images = frontend.load_images(pictures)
++        else:
++            images = load_images(pictures, limits=limits, allow_urls=allow_urls)
+         clips = [s for s in sources if not isinstance(s, ImageSource)]
+         if clips:
+             if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 0cda666..08b7bac 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -16,7 +16,7 @@ import json
+ import math
+ import os
+ import time
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -47,20 +47,44 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
+ @dataclass(frozen=True, slots=True)
+ class GlmVisionLimits:
+     """Token caps: the checkpoint allows 8,000 tokens a picture and 240,000 a clip; these keep a request's
+-    encode within the tower's reserved workspace and the prompt within a sensible share of the window."""
++    encode within the tower's reserved workspace and the prompt within a sensible share of the window.
++
++    A request takes up to ``max_images`` pictures and ``max_videos`` clips. Its pictures share
++    ``request_image_tokens`` and its clips ``request_video_tokens`` in equal parts, each still within its own cap:
++    up to 8 pictures and 2 clips (the defaults) keep their full caps, so their canvases and bits are as before."""
+ 
+     image_tokens: int = 2048         # a picture's tokens at most (a 1080p frame is 2,040 at 2,048)
+     video_tokens: int = 16384        # a clip's tokens at most, over all its frame pairs
+     video_frames: int = 128          # frames sampled from a clip at most (2 a second, spread wider past this)
+     fps: float = 2.0                 # the processor's rate
+     min_tokens: int = 16
++    max_images: int = 50             # pictures a request
++    max_videos: int = 4              # clips a request
++    request_image_tokens: int = 16384    # a request's pictures' tokens, shared
++    request_video_tokens: int = 32768    # a request's clips' tokens, shared
+ 
+     @classmethod
+     def from_env(cls) -> "GlmVisionLimits":
+         d = cls()                            # a slots class keeps its defaults on instances, not the class
+         return cls(image_tokens=_env_int("TENSORFOLD_GLM_IMAGE_TOKENS", d.image_tokens, 16, 8000),
+                    video_tokens=_env_int("TENSORFOLD_GLM_VIDEO_TOKENS", d.video_tokens, 64, 240000),
+-                   video_frames=_env_int("TENSORFOLD_GLM_VIDEO_FRAMES", d.video_frames, 2, 2048))
++                   video_frames=_env_int("TENSORFOLD_GLM_VIDEO_FRAMES", d.video_frames, 2, 2048),
++                   max_images=_env_int("TENSORFOLD_GLM_MAX_IMAGES", d.max_images, 1, 256),
++                   max_videos=_env_int("TENSORFOLD_GLM_MAX_VIDEOS", d.max_videos, 1, 16),
++                   request_image_tokens=_env_int("TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS", d.request_image_tokens,
++                                                 16, 262144),
++                   request_video_tokens=_env_int("TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS", d.request_video_tokens,
++                                                 64, 1048576))
++
++    def picture_tokens(self, pictures: int) -> int:
++        """Each picture's token cap in a request with ``pictures`` of them."""
++
++        return max(self.min_tokens, min(self.image_tokens, self.request_image_tokens // max(1, pictures)))
++
++    def clip_tokens(self, clips: int) -> int:
++        """Each clip's token cap in a request with ``clips`` of them."""
++
++        return max(64, min(self.video_tokens, self.request_video_tokens // max(1, clips)))
+ 
+ 
+ # -- the processors' geometry ---------------------------------------------------------------------------------
+@@ -364,7 +388,10 @@ class GlmVisionTower:
+ 
+         import torch
+ 
+-        out = []
++        # each pass writes its rows into the request's output at once: the rows are held once, not twice over a cat
++        rows = sum(GlmVision._rows(kind, frames) for kind, frames in items)
++        out = torch.empty((rows, self.out), dtype=torch.bfloat16, device=self.device)
++        at = 0
+         for _, frames in items:
+             frames = frames if frames.dim() == 4 else frames.unsqueeze(0).expand(2, -1, -1, -1)
+             T, _, H, W = frames.shape
+@@ -372,8 +399,11 @@ class GlmVisionTower:
+             per = max(1, PASS_PATCHES // (gh * gw))          # frame pairs a pass
+             for start in range(0, T // 2, per):
+                 pairs = frames[2 * start:2 * min(T // 2, start + per)].to(self.device, non_blocking=True)
+-                out.append(self.encode(self.patches(pairs), pairs.shape[0] // 2, gh, gw))
+-        return torch.cat(out) if out else torch.empty((0, self.out), dtype=torch.bfloat16, device=self.device)
++                x = self.encode(self.patches(pairs), pairs.shape[0] // 2, gh, gw)
++                out[at:at + x.shape[0]].copy_(x)
++                at += x.shape[0]
++                del x
++        return out
+ 
+ 
+ # -- the frontend ------------------------------------------------------------------------------------------------
+@@ -397,13 +427,64 @@ class GlmVision:
+         self.tower = GlmVisionTower(model_dir, device)
+         self.weight_bytes = self.tower.weight_bytes
+ 
++    @property
++    def image_limits(self):
++        """The shared image limits with this frontend's picture count; bytes and pixels scale with it (each picture
++        is fitted to its canvas as it is decoded, so one full-size picture is in host memory at a time)."""
++
++        from .images import DEFAULT_LIMITS as D
++
++        n = self.limits.max_images
++        if n <= D.max_images:
++            return replace(D, max_images=n)
++        return replace(D, max_images=n, max_total_encoded_bytes=64 * 1024 * 1024,
++                       max_total_pixels=max(D.max_total_pixels, n * 8 * 1024 * 1024),
++                       total_timeout_seconds=max(D.total_timeout_seconds, 2.0 * n))
++
++    @property
++    def max_videos(self) -> int:
++        return self.limits.max_videos
++
++    def load_images(self, sources) -> list:
++        """The request's pictures, each decoded and fitted to its canvas (uint8 [3, H, W]) in turn."""
++
++        from .images import _check_source, _data_bytes, _decode
++        from .images_http import fetch_image
++
++        L = self.image_limits
++        if len(sources) > L.max_images:
++            raise ImageInputError(f"a request supports at most {L.max_images} images")
++        tokens = self.limits.picture_tokens(len(sources))
++        total_bytes, total_pixels, out = 0, 0, []
++        deadline = time.monotonic() + L.total_timeout_seconds
++        for source in sources:
++            _check_source(source, L, self.allow_urls)
++            remaining = min(L.max_encoded_bytes, L.max_total_encoded_bytes - total_bytes)
++            if remaining <= 0 or time.monotonic() >= deadline:
++                raise ImageInputError("image request exceeds the total byte or time limit")
++            if source.url.startswith("data:"):
++                data = _data_bytes(source.url, remaining)
++            else:
++                data, _ = fetch_image(source.url, max_bytes=remaining,
++                                      deadline=min(deadline, time.monotonic() + L.timeout_seconds),
++                                      max_redirects=L.max_redirects, max_url_chars=L.max_url_chars)
++            total_bytes += len(data)
++            decoded = _decode(data, source.detail, L, L.max_total_pixels - total_pixels)
++            total_pixels += decoded.width * decoded.height
++            out.append(self._picture(decoded, tokens))
++            del decoded
++            if time.monotonic() >= deadline:
++                raise ImageInputError("image request exceeds the total time limit")
++        return out
++
+     def load_videos(self, sources) -> list[GlmClip]:
+         from .videos import DEFAULT_VIDEO_LIMITS as L, VIDEO_MEDIA_TYPES
+         from .images import _data_bytes
+         from .images_http import fetch_image
+ 
+-        if len(sources) > L.max_videos:
+-            raise ImageInputError(f"a request supports at most {L.max_videos} videos")
++        if len(sources) > self.limits.max_videos:
++            raise ImageInputError(f"a request supports at most {self.limits.max_videos} videos")
++        limits = replace(self.limits, video_tokens=self.limits.clip_tokens(len(sources)))
+         total, out = 0, []
+         deadline = time.monotonic() + L.total_timeout_seconds
+         for source in sources:
+@@ -420,16 +501,16 @@ class GlmVision:
+             else:
+                 raise ImageInputError("video URLs are off on this server")
+             total += len(data)
+-            out.append(decode_clip(data, self.limits, deadline, max_dimension=L.max_dimension,
++            out.append(decode_clip(data, limits, deadline, max_dimension=L.max_dimension,
+                                    max_seconds=L.max_seconds))
+         return out
+ 
+-    def _picture(self, image):
++    def _picture(self, image, tokens: int):
+         import torch
+ 
+         rgb = torch.frombuffer(bytearray(image.pixels), dtype=torch.uint8).view(image.height, image.width, 3)
+         rgb = rgb.permute(2, 0, 1)
+-        canvas = smart_resize(2, image.height, image.width, self.limits.image_tokens, self.limits.min_tokens)
++        canvas = smart_resize(2, image.height, image.width, tokens, self.limits.min_tokens)
+         return fit(rgb, canvas, content_size(2, image.height, image.width, canvas, self.limits.min_tokens))
+ 
+     def prepare(self, text: str, images, *, videos=(), max_prompt_tokens: int | None = None) -> GlmPrepared:
+@@ -440,6 +521,7 @@ class GlmVision:
+                 text.count(VIDEO) != len(videos) or text.count(VIDEO_SPAN) != len(videos):
+             raise ImageInputError("the prompt's image and video markers do not match its images and videos "
+                                   "(is <|image|> or <|video|> in the text?)")
++        tokens = self.limits.picture_tokens(len(images))
+         items: list[tuple[str, Any]] = []
+         pieces: list[str] = []
+         image_iter, video_iter = iter(images), iter(videos)
+@@ -450,7 +532,8 @@ class GlmVision:
+                 pieces.append(rest)
+                 break
+             if v < 0 or 0 <= i < v:
+-                picture = self._picture(next(image_iter))
++                picture = next(image_iter)          # load_images fits pictures as it decodes them
++                picture = picture if hasattr(picture, "dim") else self._picture(picture, tokens)
+                 n = picture.shape[1] // 28 * (picture.shape[2] // 28)
+                 pieces.append(rest[:i] + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
+                 items.append(("image", picture))
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+index e68c516..c90a79b 100644
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -114,9 +114,11 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+ 
+ 
+ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
+-                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
++                 allow_videos: bool = False, max_videos: int | None = None
++                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+     """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
+-    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
++    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
++    (default: the shared video limits')."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -150,9 +152,10 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+                     raise ImageInputError("video_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                     raise ImageInputError("video_url parts cannot contain other media")
++                most = max_videos or DEFAULT_VIDEO_LIMITS.max_videos
+                 videos = sum(type(s).__name__ == "VideoSource" for s in sources)
+-                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
+-                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
++                if videos >= most:
++                    raise ImageInputError(f"a request supports at most {most} videos")
+                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
+                 parts.append({"type": "video"})
+             elif kind == "image_url":

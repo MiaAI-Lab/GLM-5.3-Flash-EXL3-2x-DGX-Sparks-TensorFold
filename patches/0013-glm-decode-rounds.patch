@@ -1,0 +1,831 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 9a1b8d5..7abbd21 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -10,6 +10,7 @@ from .capacity import Geometry, Weights, headers, itemsize
+ PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
+ PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
+ PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
++MLA_DECODE_ROWS = 64    # GLM's decode windows the MLA estimate sizes buffers for (its verify windows: at most this)
+ MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
+ MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
+ 
+@@ -238,7 +239,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
+     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
+-    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
++    rows, d, streams = MLA_DECODE_ROWS, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
+     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
+     fixed += linear * rows * lh * (12 * ld + 4)
+diff --git tensorfold/families/glm5_next/cuda/copy_drafts.py tensorfold/families/glm5_next/cuda/copy_drafts.py
+index 25e4be7..3aa3b25 100644
+--- tensorfold/families/glm5_next/cuda/copy_drafts.py
++++ tensorfold/families/glm5_next/cuda/copy_drafts.py
+@@ -16,7 +16,7 @@ from typing import Sequence
+ import numpy as np
+ 
+ MATCH = 8        # the context's last this many tokens must have occurred before (TF_GLM_COPY_MATCH)
+-MOST = 5         # drafts a round: 5 keeps the verify window (6 rows) within the captured graphs (TF_GLM_COPY_MAX)
++MOST = 5         # drafts a round (TF_GLM_COPY_MAX, up to 15): graphs cover windows of 8 rows, wider ones run eagerly
+ 
+ 
+ @dataclass(frozen=True)
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index c75f90c..cd9a9f1 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -84,9 +84,11 @@ class Engine:
+ 
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+-                 taps: tuple[int, ...] = (), grid: int = 0, split=None) -> None:
++                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None) -> None:
+         """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
+-        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit."""
++        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit;
++        ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``): draft chains take one row a step,
++        so the MTP buffers need not be as wide as the verify windows."""
+ 
+         if grid and prefill_rows % grid:
+             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
+@@ -103,7 +105,7 @@ class Engine:
+             from .hcsplit import HcSplit
+ 
+             self.pbuf.split = HcSplit(w, self.pbuf, split)
+-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
++        self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
+         self.st = State(w, capacity, max_rows)
+         self.last_hidden: torch.Tensor | None = None
+         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
+@@ -113,7 +115,8 @@ class Engine:
+         if graphs:
+             from .graphs import Graphs
+ 
+-            self.graphs = Graphs(self, graph_rows, graph_rows)
++            mtp_graphs = tuple(r for r in graph_rows if self.mbuf is None or r <= self.mbuf.rows)
++            self.graphs = Graphs(self, tuple(r for r in graph_rows if r <= max_rows), mtp_graphs)
+             self.reset()
+ 
+     def reset(self) -> None:
+@@ -421,6 +424,8 @@ class DecodeResult:
+     rounds: int
+     drafted: int = 0
+     accepted: int = 0
++    # seconds by stage: "forward" the verify windows' GPU time (CUDA events), "sample" from a window's launch to its
++    # tokens (waiting for the window included: no sync of its own), "draft" and "commit" host time
+     stages: dict[str, float] = field(default_factory=dict)
+     depths: list[int] = field(default_factory=list)
+     keeps: list[int] = field(default_factory=list)
+@@ -439,6 +444,55 @@ def _sync(w: Weights) -> None:
+     torch.cuda.synchronize()
+ 
+ 
++class _Clock:
++    """A verify window's GPU time between two CUDA events, read after the round's sample has waited for the window
++    anyway (so timing adds no host-device sync); wall time where there is no GPU (the CPU tests' fake engines)."""
++
++    def __init__(self) -> None:
++        self.cuda = torch.cuda.is_available()
++        if self.cuda:
++            self.a = torch.cuda.Event(enable_timing=True)
++            self.b = torch.cuda.Event(enable_timing=True)
++        self.t = self.dt = 0.0
++
++    def start(self) -> None:
++        if self.cuda:
++            self.a.record()
++        else:
++            self.t = time.perf_counter()
++
++    def stop(self) -> None:
++        if self.cuda:
++            self.b.record()
++        else:
++            self.dt = time.perf_counter() - self.t
++
++    def seconds(self) -> float:
++        """Only after something has waited for the work queued before ``stop`` (the sample's device-to-host copy)."""
++        return self.a.elapsed_time(self.b) / 1e3 if self.cuda else self.dt
++
++
++class _Late:
++    """``on_tokens`` one round late: a round's tokens go to the caller once the next verify window is queued on the
++    GPU (``flush`` right after ``Engine.forward``), so the server's work on them (detokenizing, stop strings, the
++    stream write) runs while the GPU verifies instead of between rounds, where the GPU would wait for it. The loops
++    never read on_tokens' result (both ranks decode to the end), so only when the tokens arrive changes: one round
++    later, all of them before the loop returns (``flush`` again at its end)."""
++
++    def __init__(self, on_tokens) -> None:
++        self.fn, self.held = on_tokens, None
++
++    def __call__(self, tokens) -> None:
++        if self.fn is not None:
++            self.flush()
++            self.held = list(tokens)
++
++    def flush(self) -> None:
++        if self.held is not None:
++            held, self.held = self.held, None
++            self.fn(held)
++
++
+ @torch.no_grad()
+ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
+                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+@@ -447,24 +501,26 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+     w, st, b = e.w, e.st, e.buf
+     out = [pending]
+     stages = dict(forward=0.0, sample=0.0, commit=0.0)
++    clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+-        t0 = time.perf_counter()
++        clock.start()
+         logits = e.forward(e.verify_window([out[-1]]))
+-        torch.cuda.synchronize()
++        clock.stop()
++        late.flush()                        # the last step's token, while this step runs
+         t1 = time.perf_counter()
+         tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
+         e.follow([tok])
+         t2 = time.perf_counter()
+         commit(w, st, b, 1, 1)
+         t3 = time.perf_counter()
+-        stages["forward"] += t1 - t0
++        stages["forward"] += clock.seconds()
+         stages["sample"] += t2 - t1
+         stages["commit"] += t3 - t2
+         out.append(tok)
+-        if on_tokens is not None:
+-            on_tokens([tok])
++        late([tok])
++    late.flush()
+     _sync(w)
+     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
+ 
+@@ -505,6 +561,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+     c_rounds = c_drafted = c_accepted = 0
+     depths: list[int] = []
+     keeps: list[int] = []
++    clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+     t0 = time.perf_counter()
+@@ -517,12 +574,13 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+     stages["draft"] += time.perf_counter() - t0
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+-        t0 = time.perf_counter()
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+         R = len(tokens)
++        clock.start()
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        clock.stop()
++        late.flush()                        # the last round's tokens, while this window runs
+         t1 = time.perf_counter()
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+         keep = 1
+@@ -544,9 +602,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         out.extend(sampled[:keep])
+         if copies is not None:
+             copies.extend(sampled[:keep])
+-        if on_tokens is not None:
+-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+-        stages["forward"] += t1 - t0
++        late(sampled[:keep][:max(0, count - (len(out) - keep))])
++        stages["forward"] += clock.seconds()
+         stages["sample"] += t2 - t1
+         stages["commit"] += t3 - t2
+         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+@@ -562,6 +619,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+             drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+                             policy.confidence) if depth > 0 else [])
+         stages["draft"] += time.perf_counter() - t4
++    late.flush()
+     _sync(w)
+     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                         copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
+@@ -581,6 +639,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     c_rounds = c_drafted = c_accepted = 0
+     depths: list[int] = []
+     keeps: list[int] = []
++    clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+     depth = min(policy.next(0, 0), count - len(out))
+@@ -595,8 +654,10 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+         R = len(tokens)
++        clock.start()
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        clock.stop()
++        late.flush()                        # the last round's tokens, while this window runs
+         t2 = time.perf_counter()
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+         keep = 1
+@@ -620,14 +681,14 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         out.extend(sampled[:keep])
+         if copies is not None:
+             copies.extend(sampled[:keep])
+-        if on_tokens is not None:
+-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
++        late(sampled[:keep][:max(0, count - (len(out) - keep))])
+         stages["draft"] += (t1 - t0) + (t5 - t4)
+-        stages["forward"] += t2 - t1
++        stages["forward"] += clock.seconds()
+         stages["sample"] += t3 - t2
+         stages["commit"] += t4 - t3
+         # a copied round's acceptance does not move DFlash2's depth
+         depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
++    late.flush()
+     _sync(w)
+     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                         copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
+diff --git tensorfold/families/glm5_next/cuda/dflash2.py tensorfold/families/glm5_next/cuda/dflash2.py
+index 0ca8c5d..62c9373 100644
+--- tensorfold/families/glm5_next/cuda/dflash2.py
++++ tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -175,8 +175,10 @@ class Drafter:
+     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
+ 
+     def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
+-                 ring: bool = False) -> None:
+-        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts."""
++                 tap_rows: int = 0, ring: bool = False) -> None:
++        """``tap_rows``: context updates up to this many rows (a verify window's kept rows) replay captured graphs too
++        (the block's own size always does). ``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and
++        block, the same drafts."""
+ 
+         path = Path(draft_dir)
+         cfg = json.loads((path / "config.json").read_text())
+@@ -268,11 +270,20 @@ class Drafter:
+         self.ids_host = torch.zeros((1,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
+         self.ar = torch.arange(max(64, n), device=dev)
+         self.tap_in = torch.zeros((64, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=dev)
+-        self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
+-        self.proj: torch.Tensor | None = None         # [block - 1, selector rank] fp32
++        # a pass's candidates (every rank's [block - 1, 2 * top_k], values then ids as fp32 bits) and projected rows
++        # [block - 1, selector rank] fp32 in one device buffer, read back by one pinned copy (``candidates``)
++        self.gathered = self.world if self.world > 1 and w.comm is not None else 1
++        self.cand_n = self.gathered * (n - 1) * 2 * self.top_k
++        cuda = torch.cuda.is_available()
++        self.cand = torch.zeros((self.cand_n + (n - 1) * self.hproj.shape[0],), dtype=torch.float32, device=dev)
++        self.cand_host = torch.zeros(self.cand.shape, dtype=torch.float32, pin_memory=cuda)
++        self.cand_ready = torch.cuda.Event() if cuda else None
++        self.packed = self.cand[:self.cand_n].view(self.gathered, n - 1, 2 * self.top_k)
++        self.proj = self.cand[self.cand_n:].view(n - 1, self.hproj.shape[0])
+         self.pool = None
+         self.block_graph = None
+         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.tap_rows = min(max(self.block, int(tap_rows)), self.tap_in.shape[0])
+ 
+     def nbytes(self) -> int:
+         total = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
+@@ -390,23 +401,21 @@ class Drafter:
+         vals, local = torch.topk(logits.float(), self.top_k, dim=-1)
+         gids = (local + self.w.vocab_offset).to(torch.int32)
+         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
+-        if self.world > 1 and self.w.comm is not None:
+-            got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
+-            self.w.comm.all_gather(packed.view(-1), got)
+-            self.packed = got.view(self.world, n - 1, 2 * self.top_k)
++        if self.gathered > 1:
++            self.w.comm.all_gather(packed.view(-1), self.cand[:self.cand_n])
+         else:
+-            self.packed = packed.view(1, n - 1, 2 * self.top_k)
+-        self.proj = F.linear(h, self.hproj).float()
++            self.cand[:self.cand_n].copy_(packed.view(-1))
++        self.proj.copy_(F.linear(h, self.hproj).float())
+ 
+     @torch.no_grad()
+     def capture(self) -> None:
+-        """CUDA graphs for the block pass and for context updates of 1..block rows (both ranks together)."""
++        """CUDA graphs for the block pass and for context updates of 1..tap_rows rows (both ranks together)."""
+ 
+         self.pool = torch.cuda.graph_pool_handle()
+         self.reset()
+         self.tap_in.zero_()
+         self.ids[0] = 0
+-        for n in range(1, self.block + 1):
++        for n in range(1, self.tap_rows + 1):
+             for _ in range(2):
+                 self._taps_compute(n)
+             torch.cuda.synchronize()
+@@ -435,7 +444,15 @@ class Drafter:
+             self.block_graph.replay()
+         else:
+             self._block_compute()
+-        g = self.packed[:, :depth].cpu()
++        # one pinned copy of candidates and projected rows (two .cpu() calls were two syncs and two pageable copies)
++        if self.cand_ready is not None:
++            self.cand_host.copy_(self.cand, non_blocking=True)
++            self.cand_ready.record()
++            self.cand_ready.synchronize()
++        else:
++            self.cand_host.copy_(self.cand)
++        g = self.cand_host[:self.cand_n].view(self.gathered, self.block - 1, 2 * self.top_k)[:, :depth]
++        proj = self.cand_host[self.cand_n:].view(self.block - 1, -1)[:depth]
+         k = self.top_k
+         values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+@@ -444,7 +461,7 @@ class Drafter:
+             order = np.lexsort((tokens, -values), axis=-1)[:, :k]
+             values = np.take_along_axis(values, order, axis=1)
+             tokens = np.take_along_axis(tokens, order, axis=1)
+-        return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
++        return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps cand_host
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+               sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+diff --git tensorfold/families/glm5_next/cuda/drafter_choice.py tensorfold/families/glm5_next/cuda/drafter_choice.py
+index b14a7e9..01ad045 100644
+--- tensorfold/families/glm5_next/cuda/drafter_choice.py
++++ tensorfold/families/glm5_next/cuda/drafter_choice.py
+@@ -8,7 +8,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import Sampling
+ 
+-from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, copy_room, draft
++from .decode import DecodeResult, DepthPolicy, Engine, _Clock, _Late, _sync, absorb, copy_room, draft
+ from .forward import commit
+ 
+ 
+@@ -91,6 +91,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     arms: list[str] = []
+     last = {"m": (0, 0), "f": (0, 0), "c": (0, 0)}
+     c_rounds = c_drafted = c_accepted = 0
++    clock, late = _Clock(), _Late(on_tokens)
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+@@ -119,8 +120,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+         R = len(tokens)
++        clock.start()
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        clock.stop()
++        late.flush()                        # the last round's tokens, while this window runs
+         t2 = time.perf_counter()
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+         keep = 1
+@@ -159,12 +162,12 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+         out.extend(sampled[:keep])
+         if copies is not None:
+             copies.extend(sampled[:keep])
+-        if on_tokens is not None:
+-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
++        late(sampled[:keep][:max(0, count - (len(out) - keep))])
+         stages["draft"] += (t1 - t0) + (t5 - t4)
+-        stages["forward"] += t2 - t1
++        stages["forward"] += clock.seconds()
+         stages["sample"] += t3 - t2
+         stages["commit"] += t4 - t3
++    late.flush()
+     _sync(w)
+     seconds = time.perf_counter() - start
+     if drafter is not None and n_f:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 613a0f7..76602c5 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -14,8 +14,9 @@ from typing import Any, Callable
+ DEFAULT_POLICY = "auto"
+ DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+-GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+-MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
++GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
++MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts: copy drafts)
++MTP_ROWS = 8                          # rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+@@ -208,7 +209,7 @@ class GlmEngine:
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+ 
+-        from .qmm import dense_kind, fp8_weights, q4_weights
++        from .qmm import KVB_KINDS, dense_kind, fp8_weights, kvb_kind, kvb_weights, q4_weights
+ 
+         # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
+         weights_estimate = split_weights(rule)
+@@ -216,6 +217,9 @@ class GlmEngine:
+             weights_estimate = fp8_weights(weights_estimate)
+         elif cfg.quant == "exl3" and dense_kind() == "q4":
+             weights_estimate = q4_weights(weights_estimate)
++        # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
++        kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
++        weights_estimate = kvb_weights(weights_estimate, kvb)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+         if not self.mtp_on:
+@@ -261,8 +265,8 @@ class GlmEngine:
+         quant_code = DRAFT_QUANTS.index(draft_quant())
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + [
+-                int(self.dump is not None), quant_code, int(self.mtp_on), int(DRAFT_RING)]
++                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0]) + \
++            self.split.code() + [int(self.dump is not None), quant_code, int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -270,7 +274,7 @@ class GlmEngine:
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, "
++                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+@@ -299,10 +303,11 @@ class GlmEngine:
+         if drafter is not None:
+             from .dflash2 import Drafter
+ 
+-            self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
+-                        grid=self.grid, split=self.split)
++            self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
++        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++                        graph_rows=GRAPH_ROWS, long_context=long_context,
++                        taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
++                        split=self.split, mtp_rows=MTP_ROWS)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+@@ -364,7 +369,7 @@ class GlmEngine:
+             return [int(t) for t in rng.integers(0, vocab, n)]
+ 
+         prefill(e, tokens(64), None, mtp=True, drafter=self.drafter)
+-        hidden = e.pbuf.fnormed[:MAX_ROWS].clone()          # rows for timing the draft steps
++        hidden = e.pbuf.fnormed[:8].clone()                 # rows for timing the draft steps
+         one, six = tokens(1), tokens(6)
+         start = st.mtp_len
+ 
+@@ -372,7 +377,10 @@ class GlmEngine:
+             st.set_mtp_len(start)
+             st.mtp_drafted = 0
+ 
+-        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, MAX_ROWS + 1)}
++        # the verify windows the drafters' rounds use (MTP chains of 3, DFlash2 blocks of 5: the captured graphs);
++        # wider (copied) windows are not the choice's, and their eager launches would bend the fitted line
++        widest = max(GRAPH_ROWS)
++        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, widest + 1)}
+         if self.w.mtp is not None:
+             pieces["m1"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 1, None), rewind)
+             pieces["m3"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 3, None), rewind)
+@@ -411,7 +419,7 @@ class GlmEngine:
+         e.reset()
+         if self.drafter is not None:
+             self.drafter.reset()
+-        rows = list(range(2, MAX_ROWS + 1))
++        rows = list(range(2, widest + 1))
+         ys = [both[f"v{r}"] for r in rows]
+         slope = statistics.median((ys[j] - ys[i]) / (rows[j] - rows[i]) for i in range(len(rows))
+                                   for j in range(i + 1, len(rows)))
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 55e7e77..e6d7924 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -76,6 +76,46 @@ class AbsorbQ4:
+         return sum(t.numel() * t.element_size() for t in (self.wkw, self.wks, self.wkb, self.wvw, self.wvs, self.wvb))
+ 
+ 
++F8_BLOCK = 128     # latent columns a scale covers (qmm.make_f8's block)
++
++
++class AbsorbF8:
++    """kv_b split per head as FP8 e4m3 (TF_GLM_KVB=fp8): wk [H, qk_dim, latent], wv [H, v_dim, latent] and fp32
++    scales [H, dim, latent / 128], qmm.make_f8's rows as they are (W ~ q * scale). Lossy; half AbsorbW's bytes."""
++
++    def __init__(self, k, v, heads: int) -> None:
++        def per_head(q):
++            return (q.weight.reshape(heads, -1, q.k).contiguous(),
++                    q.scale.reshape(heads, -1, q.k // F8_BLOCK).contiguous())
++
++        self.wk, self.sk = per_head(k)
++        self.wv, self.sv = per_head(v)
++        self.heads, self.qk_dim, self.lw = self.wk.shape
++        self.v_dim = self.wv.shape[1]
++        if self.lw % F8_BLOCK or self.wv.shape[2] != self.lw:
++            raise ValueError("AbsorbF8: expected 128-column blocks along the latent")
++
++    def nbytes(self) -> int:
++        return sum(t.numel() * t.element_size() for t in (self.wk, self.sk, self.wv, self.sv))
++
++
++def from_bf16(k_rows: torch.Tensor, v_rows: torch.Tensor, heads: int, kind: str = "bf16"):
++    """An EXL3 checkpoint's kv_b rows (bf16, head order: k_rows [heads * qk_dim, latent], v_rows alike) as the latent
++    path holds them for TF_GLM_KVB ``kind``: AbsorbW (bf16, as stored), AbsorbF8 (fp8) or AbsorbQ4 (q4, MSE-searched
++    groups of 64 along the latent). A latent width the format does not tile stays bf16."""
++
++    from . import qmm
++
++    if kind not in ("bf16", "fp8", "q4"):
++        raise ValueError(f"kv_b as bf16, fp8 or q4, not {kind!r}")
++    lw = k_rows.shape[1]
++    if kind == "fp8" and lw % F8_BLOCK == 0:
++        return AbsorbF8(qmm.make_f8(k_rows), qmm.make_f8(v_rows), heads)
++    if kind == "q4" and lw % 64 == 0:
++        return AbsorbQ4(qmm.quantize4_mse_raw(k_rows), qmm.quantize4_mse_raw(v_rows), heads)
++    return AbsorbW.from_rows(k_rows, v_rows, heads)
++
++
+ # ----------------------------------------------------------------------------------------- absorb, expand ---
+ 
+ @triton.jit
+@@ -154,6 +194,43 @@ def _expand_v4(OL, WW, WS, WB, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl
+         tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
+ 
+ 
++@triton.jit
++def _absorb_q8(Q, WK, SK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
++    """_absorb_q over FP8 weights: the program's [D, BN] block (inside one 128-column scale block) dequantized to
++    fp32 once, then each row's one sum over k, whatever R is."""
++
++    h = tl.program_id(0)
++    n0 = tl.program_id(1) * BN
++    KB: tl.constexpr = LW // 128
++    k = tl.arange(0, D)
++    n = n0 + tl.arange(0, BN)
++    w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :]).to(tl.bfloat16).to(tl.float32)     # [D, BN], exact
++    s = tl.load(SK + (h * D + k) * KB + n0 // 128)                                              # [D]
++    w = w * s[:, None]
++    for r in range(R):
++        q = tl.load(Q + (r * H + h) * D + k).to(tl.float32)
++        acc = tl.sum(q[:, None] * w, axis=0)
++        tl.store(QA + (r * H + h) * LW + n, acc.to(tl.bfloat16))
++
++
++@triton.jit
++def _expand_v8(OL, WV, SV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr):
++    """_expand_v over FP8 weights: the program's [BN, LW] rows dequantized to fp32 once (a scale a 128 block), then
++    each row's output as one fp32 sum over the latent, whatever R is."""
++
++    h = tl.program_id(0)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    KB: tl.constexpr = LW // 128
++    k = tl.arange(0, LW)
++    w = tl.load(WV + (h * DV + n[:, None]) * LW + k[None, :]).to(tl.bfloat16).to(tl.float32)   # [BN, LW], exact
++    s = tl.load(SV + (h * DV + n[:, None]) * KB + (k // 128)[None, :])                          # [BN, LW]
++    w = w * s
++    for r in range(R):
++        x = tl.load(OL + (r * H + h) * LW + k).to(tl.float32)
++        acc = tl.sum(w * x[None, :], axis=1)
++        tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
++
++
+ @triton.jit
+ def _absorb_mma(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
+                 BN: tl.constexpr, BK: tl.constexpr):
+@@ -191,10 +268,56 @@ def _expand_mma(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.conste
+     tl.store(OUT + (rm[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
+ 
+ 
++@triton.jit
++def _absorb_mma8(Q, WK, SK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
++                 BN: tl.constexpr, BK: tl.constexpr):
++    """_absorb_mma over FP8 weights: each [BK, BN] tile (inside one 128-column scale block) dequantized to bf16 in
++    registers (a scale a k row), then the same tensor-core chain; a row's bits do not depend on the other rows."""
++
++    h = tl.program_id(0)
++    rm = tl.program_id(1) * BM + tl.arange(0, BM)
++    n0 = tl.program_id(2) * BN
++    n = n0 + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    KB: tl.constexpr = LW // 128
++    ok = rm < R
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for k0 in range(0, D, BK):
++        q = tl.load(Q + (rm[:, None] * H + h) * D + k0 + kk[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(WK + (h * D + k0 + kk[:, None]) * LW + n[None, :]).to(tl.bfloat16).to(tl.float32)
++        s = tl.load(SK + (h * D + k0 + kk) * KB + n0 // 128)
++        acc = tl.dot(q, (w * s[:, None]).to(tl.bfloat16), acc)
++    tl.store(QA + (rm[:, None] * H + h) * LW + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++@triton.jit
++def _expand_mma8(OL, WV, SV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
++                 BN: tl.constexpr, BK: tl.constexpr):
++    """_expand_mma over FP8 weights: each k step's product (bf16 inputs, the e4m3 values exact in bf16) times its
++    128-column block's scale per output, as qmm._fmm; a row's bits do not depend on the other rows."""
++
++    h = tl.program_id(0)
++    rm = tl.program_id(1) * BM + tl.arange(0, BM)
++    n = tl.program_id(2) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    KB: tl.constexpr = LW // 128
++    ok = rm < R
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for k0 in range(0, LW, BK):
++        o = tl.load(OL + (rm[:, None] * H + h) * LW + k0 + kk[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(WV + (h * DV + n[:, None]) * LW + k0 + kk[None, :]).to(tl.bfloat16)
++        s = tl.load(SV + (h * DV + n) * KB + k0 // 128)
++        acc = acc + tl.dot(o, tl.trans(w)) * s[None, :]
++    tl.store(OUT + (rm[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
+ # prompt chunks' tiles (rows, columns, k) and (warps, stages); fixed, so a row's bits never depend on the chunk
+ PROMPT_MMA = __import__("os").environ.get("TF_GLM_LATENT_MMA", "1") != "0"    # 0: prompts on the decode kernels
+ MMA_TILE = (64, 128, 64)
+ MMA_LAUNCH = (4, 3)
++F8_ABSORB_BN = 64          # FP8 absorb columns per decode program: 64-byte weight rows, inside one scale block
++if F8_BLOCK % MMA_TILE[1] or F8_BLOCK % MMA_TILE[2] or F8_BLOCK % F8_ABSORB_BN:
++    raise ValueError("the FP8 absorb tiles must sit inside 128-column scale blocks")
+ 
+ 
+ def row_block(R: int) -> int:
+@@ -212,6 +335,15 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False) ->
+         _absorb_mma[(H, triton.cdiv(R, BM), a.lw // BN)](q, a.wk, out, R, H=H, D=D, LW=a.lw, BM=BM, BN=BN, BK=BK,
+                                                           num_warps=warps, num_stages=stages)
+         return out
++    if isinstance(a, AbsorbF8):
++        if prompt and q.is_contiguous():
++            BM, BN, BK = MMA_TILE
++            warps, stages = MMA_LAUNCH
++            _absorb_mma8[(H, triton.cdiv(R, BM), a.lw // BN)](q, a.wk, a.sk, out, R, H=H, D=D, LW=a.lw, BM=BM, BN=BN,
++                                                               BK=BK, num_warps=warps, num_stages=stages)
++            return out
++        _absorb_q8[(H, a.lw // F8_ABSORB_BN)](q, a.wk, a.sk, out, R, H=H, D=D, LW=a.lw, BN=F8_ABSORB_BN, num_warps=4)
++        return out
+     if isinstance(a, AbsorbQ4):
+         rb = row_block(R)
+         _absorb_q4[(H, a.lw // 64, triton.cdiv(R, rb))](q, a.wkw, a.wks, a.wkb, out, R, H=H, D=D, LW=a.lw, RB=rb,
+@@ -231,6 +363,17 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False)
+         _expand_mma[(H, triton.cdiv(R, BM), a.v_dim // BN)](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw, BM=BM,
+                                                              BN=BN, BK=BK, num_warps=warps, num_stages=stages)
+         return out
++    if isinstance(a, AbsorbF8):
++        if prompt and o_lat.is_contiguous():
++            BM, BN, BK = MMA_TILE
++            warps, stages = MMA_LAUNCH
++            _expand_mma8[(H, triton.cdiv(R, BM), a.v_dim // BN)](o_lat, a.wv, a.sv, out, R, H=H, DV=a.v_dim, LW=a.lw,
++                                                                  BM=BM, BN=BN, BK=BK, num_warps=warps,
++                                                                  num_stages=stages)
++            return out
++        BN = 16
++        _expand_v8[(H, a.v_dim // BN)](o_lat, a.wv, a.sv, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN, num_warps=4)
++        return out
+     if isinstance(a, AbsorbQ4):
+         BN = 16
+         _expand_v4[(H, a.v_dim // BN)](o_lat, a.wvw, a.wvs, a.wvb, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN,
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 3c40295..e0b06a3 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -180,6 +180,14 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
+     """TF_GLM_DENSE=q4: bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings
+     (1.0 down to 0.55 of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
+ 
++    return make_q4(*quantize4_mse_raw(w, chunk, grid))
++
++
++def quantize4_mse_raw(w: torch.Tensor, chunk: int = 4096,
++                      grid: int = 16) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """``quantize4_mse``'s groups in MLX's layout, untiled: words [n, k / 8] int32 (8 nibbles low to high), scales and
++    biases [n, k / 64] bf16 (what ``latent.AbsorbQ4`` reads)."""
++
+     n, k = w.shape
+     words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
+     scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
+@@ -208,7 +216,7 @@ def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
+         for j in range(8):
+             part |= q[..., j] << (4 * j)
+         words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
+-    return make_q4(words, scales.contiguous(), biases.contiguous())
++    return words, scales.contiguous(), biases.contiguous()
+ 
+ 
+ DRAFT_QUANTS = ("minmax", "mse")
+@@ -509,6 +517,42 @@ def dense_kind() -> str:
+     return kind
+ 
+ 
++KVB_KINDS = ("bf16", "fp8", "q4")
++
++
++def kvb_kind(env=None) -> str:
++    """TF_GLM_KVB: how an EXL3 checkpoint's kv_b_proj is held for the latent path's absorb and expand (the kernels
++    every decode round runs once a DSA layer): bf16 (as stored, the default), fp8 (e4m3, an fp32 scale per row and
++    128 latent columns, ``make_f8``'s layout) or q4 (MSE-searched affine groups of 64 along the latent, the MLX
++    checkpoint's kernels). fp8 and q4 are lossy, like the rest of TF_GLM_DENSE; a row's bits still never depend on its
++    window's other rows, so drafted replies equal serial ones under each."""
++
++    import os
++
++    kind = (os.environ if env is None else env).get("TF_GLM_KVB", "bf16").strip() or "bf16"
++    if kind not in KVB_KINDS:
++        raise ValueError(f"TF_GLM_KVB is bf16, fp8 or q4, not {kind!r}")
++    return kind
++
++
++def kvb_weights(base, kind: str):
++    """A split_weights transform for TF_GLM_KVB: kv_b_proj at a byte a value plus fp32 scales a 128 block (fp8), or
++    half a byte plus a bf16 scale and bias a group of 64 (q4); the latent path then holds no other copy of it."""
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = base(name, info)
++        shape = info.get("shape") or []
++        if kind == "bf16" or not total or "kv_b_proj" not in name or info.get("dtype") != "BF16" or len(shape) != 2:
++            return total, extra
++        n = total // 2
++        if kind == "fp8" and shape[-1] % F8_BLOCK == 0:
++            return n + n // F8_BLOCK * 4, extra
++        if kind == "q4" and shape[-1] % 64 == 0:
++            return n // 2 + n // 64 * 4, extra
++        return total, extra
++    return transform
++
++
+ # The matrices TF_GLM_DENSE=fp8 converts (weights.py's q4 / stack / head), for the startup memory estimate
+ _F8_NAMES = __import__("re").compile(
+     r"(\.(q_proj|k_proj|v_proj|f_a_proj|g_a_proj|b_proj|f_b_proj|g_b_proj|o_proj|q_a_proj|kv_a_proj_with_mqa|q_b_proj"
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 55bb452..783bd39 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -13,8 +13,8 @@ from tensorfold.cuda import experts as grouped
+ 
+ from .exl3_mm import Exl3Experts, words as exl3_words
+ from . import latent
+-from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, make_b16, make_f8, make_q4, stack_b16, stack_f8,
+-                  stack_q4)
++from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, kvb_kind, make_b16, make_f8, make_q4, stack_b16,
++                  stack_f8, stack_q4)
+ 
+ PREFIX = "model.language_model."
+ 
+@@ -153,12 +153,12 @@ class DSAW:
+     q_norm: torch.Tensor
+     kv_norm: torch.Tensor
+     q_b: Q4
+-    kv_k: Q4                  # key rows of kv_b for the local heads
+-    kv_v: Q4                  # value rows
++    kv_k: Q4 | None           # key rows of kv_b for the local heads (TF_GLM_LATENT=0 only)
++    kv_v: Q4 | None           # value rows (TF_GLM_LATENT=0 only)
+     o: Q4
+     heads: int
+     index: IndexW | None = None
+-    absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
++    absorb: object = None     # latent.AbsorbW / AbsorbF8 / AbsorbQ4: kv_b split per head, for the latent cache
+ 
+ 
+ @dataclass
+@@ -227,7 +227,8 @@ class Weights:
+             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+-            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
++            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
++                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -280,6 +281,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         big, big_stack = make_dense_q4, stack_dense_q4
+     else:
+         big, big_stack = dense, dense_stack
++    kvb = kvb_kind() if exl3 else "bf16"         # an MLX checkpoint's kv_b is 4-bit as stored
+ 
+     def q4(name: str) -> Q4 | B16 | F8:
+         return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+@@ -305,18 +307,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
+         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
+         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
++        # the latent path reads kv_b only through ``absorb``: the per-head key and value matrices (kv_k, kv_v) exist
++        # only without it (TF_GLM_LATENT=0), so they take no memory beside it
++        kv_k = kv_v = None
+         if exl3:
+             w = t(p + "kv_b_proj.weight")
+-            kv_k, kv_v = dense(w[krows]), dense(w[vrows])
+-            full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
++            if not latent.ENABLED:
++                kv_k, kv_v = dense(w[krows]), dense(w[vrows])
+         else:
+             w, s, b = trip(p + "kv_b_proj")
+-            kv_k = make_q4(w[krows], s[krows], b[krows])
+-            kv_v = make_q4(w[vrows], s[vrows], b[vrows])
++            if not latent.ENABLED:
++                kv_k = make_q4(w[krows], s[krows], b[krows])
++                kv_v = make_q4(w[vrows], s[vrows], b[vrows])
+         if not latent.ENABLED:
+             absorb = None
+-        elif exl3:
+-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
++        elif exl3:                        # TF_GLM_KVB: bf16 as stored, or fp8 / q4 (lossy, half / a quarter the bytes)
++            absorb = latent.from_bf16(w[krows], w[vrows], HL, kvb)
+         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
+             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
+         else:

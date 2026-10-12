@@ -1,0 +1,165 @@
+diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
+index 4dda35a..c210a65 100644
+--- tensorfold/server/metrics.py
++++ tensorfold/server/metrics.py
+@@ -7,10 +7,12 @@ import time
+ from typing import Any
+ 
+ PREFIX = "tensorfold:"
++HEALTH = "tensorfold_health:"      # the CUDA server's /health fields, named as /health names them
+ # Request and time-to-first-token histograms share these upper edges. +Inf is added when rendered.
+ BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+ _MADE = threading.Lock()
+ _local = threading.local()
++_TRIES = 3                         # a decoder's tables read while its thread changes them: read again
+ 
+ 
+ class Histogram:
+@@ -135,7 +137,7 @@ def render(app: Any) -> str:
+         prompt, generation = metrics.prompt, metrics.generation
+         drafted, accepted = metrics.drafted, metrics.accepted
+         latency, ttft = metrics.latency.copy(), metrics.ttft.copy()
+-    running, waiting = _requests(app)
++    running, waiting = _read(lambda: _requests(app), (0, 0))
+     lines: list[str] = []
+     _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
+             [f"{PREFIX}requests_running {running}"])
+@@ -147,13 +149,15 @@ def render(app: Any) -> str:
+             [f"{PREFIX}generation_tokens_total {generation}"])
+     _family(lines, "kv_cache_usage_ratio", "gauge",
+             "Tokens in a stream cache divided by that stream's context window.",
+-            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in _pools(app)])
++            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}'
++             for pool, ratio in _read(lambda: _pools(app), [("0", 0.0)])])
+     _family(lines, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.",
+             [f"{PREFIX}mtp_drafted_total {drafted}"])
+     _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
+             [f"{PREFIX}mtp_accepted_total {accepted}"])
+     _histogram(lines, "request_latency_seconds", "Seconds from arrival to the reply leaving.", latency)
+     _histogram(lines, "time_to_first_token_seconds", "Seconds from arrival to the first generated token.", ttft)
++    _health(lines, app)
+     return "\n".join(lines) + "\n"
+ 
+ 
+@@ -161,18 +165,75 @@ def send(handler: Any, app: Any) -> None:
+     """Write ``render`` as Prometheus text, version 0.0.4."""
+ 
+     body = render(app).encode()
+-    handler.send_response(200)
+-    handler.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+-    handler.send_header("Content-Length", str(len(body)))
+-    handler.end_headers()
+     try:
++        handler.send_response(200)
++        handler.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
++        handler.send_header("Content-Length", str(len(body)))
++        handler.end_headers()
+         handler.wfile.write(body)
+     except (BrokenPipeError, ConnectionResetError):
+         handler.close_connection = True
+ 
+ 
+-def _family(lines: list[str], name: str, kind: str, help_text: str, samples: list[str]) -> None:
+-    full = PREFIX + name
++# /health's fields under HEALTH: (field, type, help); the totals are the finished requests' engine stats
++_HEALTH_TOTALS = (
++    ("requests_total", "counter", "Finished requests (as /health's requests_total)."),
++    ("completion_tokens_total", "counter", "Reply tokens, the running replies' tokens so far included."),
++    ("cached_tokens_total", "counter", "Prompt tokens found cached, finished requests."),
++    ("rounds_total", "counter", "Decode rounds of finished requests."),
++    ("prefill_seconds_total", "counter", "Engine prefill seconds of finished requests."),
++    ("decode_seconds_total", "counter", "Engine decode seconds of finished requests."),
++)
++_HEALTH_GAUGES = (
++    ("context_length", "Tokens a request's prompt and reply may hold (the server's effective window)."),
++    ("streams_max", "Streams the concurrent engine decodes at most (--parallel)."),
++    ("pool_tokens", "Token rows in the concurrent engine's shared cache pool."),
++    ("pool_free_tokens", "Pool rows no stream or kept prompt holds."),
++    ("kept_prompts", "Prompt states kept in the pool for reuse."),
++)
++
++
++def _health(lines: list[str], app: Any) -> None:
++    """The CUDA server's /health totals and the concurrent engine's streams and pool (the reads /health makes)."""
++
++    from tensorfold.cuda import health
++
++    snapshot = getattr(health.of(app), "snapshot", None)      # an app without the CUDA server's /health has none
++    body = _read(lambda: snapshot(app), None) if callable(snapshot) else None
++    if not isinstance(body, dict):
++        return
++    for name, kind, help_text in _HEALTH_TOTALS:
++        if isinstance(body.get(name), (int, float)):
++            _family(lines, name, kind, help_text, [f"{HEALTH}{name} {_num(body[name])}"], HEALTH)
++    streams = dict(body.get("streams") or {})
++    if "max" in streams:
++        body["streams_max"] = streams.pop("max")
++    prefilling = streams.pop("prefilling", None)        # GLM's decoder counts the same streams as "filling"
++    if prefilling is not None:
++        streams.setdefault("filling", prefilling)
++    if streams:
++        _family(lines, "streams", "gauge", "The concurrent engine's streams by state.",
++                [f'{HEALTH}streams{{state="{state}"}} {_num(n)}' for state, n in sorted(streams.items())
++                 if isinstance(n, (int, float))], HEALTH)
++    for name, help_text in _HEALTH_GAUGES:
++        if isinstance(body.get(name), (int, float)):
++            _family(lines, name, "gauge", help_text, [f"{HEALTH}{name} {_num(body[name])}"], HEALTH)
++
++
++def _read(read, default):
++    """``read()``, again if a table changed size under it; ``default`` if it keeps failing."""
++
++    for _ in range(_TRIES):
++        try:
++            return read()
++        except RuntimeError:              # "dictionary changed size during iteration" and the like
++            continue
++    return default
++
++
++def _family(lines: list[str], name: str, kind: str, help_text: str, samples: list[str],
++            prefix: str = PREFIX) -> None:
++    full = prefix + name
+     lines.append(f"# HELP {full} {help_text}")
+     lines.append(f"# TYPE {full} {kind}")
+     lines.extend(samples)
+@@ -235,7 +296,9 @@ def _pools(app: Any) -> list[tuple[str, float]]:
+ def _window(app: Any) -> int:
+     engine = getattr(app, "engine", None)
+     decoder = getattr(getattr(engine, "scheduler", None), "decoder", None) if engine is not None else None
+-    for owner, name in ((engine, "context_window"), (app, "context_window"), (decoder, "context")):
++    # the effective window first: GLM's engine keeps its own as ``limit``, below the checkpoint's native window
++    for owner, name in ((app, "effective_context_window"), (engine, "context_window"), (app, "context_window"),
++                        (decoder, "context")):
+         n = _positive(getattr(owner, name, None) if owner is not None else None)
+         if n:
+             return n
+@@ -256,16 +319,14 @@ def _lengths(app: Any) -> list[int]:
+ 
+ 
+ def _occupied(stream: Any) -> int:
+-    """Mac streams publish ``cache_len``. A CUDA stream's ``context`` gains the prompt when decode starts."""
++    """Mac streams publish ``cache_len``; a CUDA stream holds its prompt and reply so far (a ``Stream``'s ``context``
++    holds its reply, or its prompt and reply)."""
+ 
+     cache = getattr(stream, "cache_len", None)
+     if isinstance(cache, int):
+         return cache
+-    context = getattr(stream, "context", None) or ()
+-    if len(context):
+-        return len(context)
+-    prompt = getattr(stream, "prompt", None) or ()
+-    return len(prompt)
++    context = len(getattr(stream, "context", None) or ())
++    return max(context, len(getattr(stream, "prompt", None) or ()) + len(getattr(stream, "out", None) or ()))
+ 
+ 
+ def _positive(value: Any) -> int:
+@@ -286,5 +347,5 @@ def _edge(value: float) -> str:
+     return f"{value:.4f}".rstrip("0").rstrip(".")
+ 
+ 
+-__all__ = ["BUCKETS", "PREFIX", "Histogram", "Metrics", "begin", "bind", "finish_request", "note", "of", "render",
+-           "send", "tokens"]
++__all__ = ["BUCKETS", "HEALTH", "PREFIX", "Histogram", "Metrics", "begin", "bind", "finish_request", "note", "of",
++           "render", "send", "tokens"]

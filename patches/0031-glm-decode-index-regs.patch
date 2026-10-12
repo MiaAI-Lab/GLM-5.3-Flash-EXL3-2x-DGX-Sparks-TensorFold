@@ -1,0 +1,97 @@
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+index 6cfe91d..acfc069 100644
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -107,6 +107,51 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
+             tl.store(OUT + r * NP + p, sc, mask=p < NP)
+ 
+ 
++@triton.jit
++def _scores_rows(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, BASE, R, NP, scale, wscale, H: tl.constexpr,
++                 HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr, SEG: tl.constexpr):
++    """Decode rows, program (row, g): the row's index queries and head weights loaded once, then pool blocks g,
++    g + G, .. each through _scores' arithmetic for that row (the same key mask, dot tile, warps and head sum, so
++    RB = 1's bits). SEG False: NP columns a row from one position (POS[0] + r; pools past the row's -inf); SEG: a
++    segmented window's row r (skipped when dense) over its own visible pools, keys at its stream's base / 4."""
++
++    r = tl.program_id(0)
++    g = tl.program_id(1)
++    if SEG:
++        if tl.load(SPR + r) == 0:
++            return
++        npool = (tl.load(POS + r) + 1) // 4
++        pk = PK + (tl.load(BASE + r).to(tl.int64) // 4) * D
++        nb = (npool + BP - 1) // BP
++    else:
++        npool = (tl.load(POS) + r + 1) // 4
++        pk = PK
++        nb = (NP + BP - 1) // BP
++    if g >= nb:
++        return
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
++    w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++    for pb in tl.range(g, nb, G, num_stages=1):          # Triton's pipelining of this loop: slower (measured)
++        p = pb * BP + tl.arange(0, BP)
++        k = tl.load(pk + p[:, None] * D + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)
++        kr = tl.where((p < npool)[:, None], k, 0.0)
++        dots = tl.dot(q, tl.trans(kr))                                                # [HP, BP] fp32
++        sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++        if SEG:
++            tl.store(OUT + r * o_stride + p, sc, mask=p < npool)
++        else:
++            sc = tl.where(p < npool, sc, float("-inf"))
++            tl.store(OUT + r * o_stride + p, sc, mask=p < NP)
++
++
++# decode rows' scoring (_scores_rows): the tile (BP pools, 4 warps) is _scores', which sets the bits (8 warps or
++# 32-pool blocks give others); G, the programs a row, is speed only
++ROW_SCORE_G = 128
++
++
+ def _top_pools(scores: torch.Tensor, k: int) -> torch.Tensor:
+     """Reference top-k: each row's k best pools, ties to the lower pool, ascending, as a stable descending sort keeps them (unique int64 keys)."""
+     bits = (scores + 0.0).view(torch.int32)                              # + 0.0: -0 becomes +0, as the sort ties them
+@@ -237,23 +282,16 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+         return _select_prompt(qi, wts, pk, pos, R, np_max, pos_dev)
+     # score only visible pools, rounded up to a power of two so the allocator reuses a few sizes (exact sizes fragmented memory at 128k)
+     np_max = bucket if bucket is not None else pool_bucket(pos, R, np_max)
+-    # rows scored SELECT_ROWS at a time over the window's np_max pools (the same columns, so the same bits a row)
+-    B = min(R, SELECT_ROWS)
+-    scores = torch.empty((B, np_max), dtype=torch.float32, device=qi.device)
++    scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
+     # heads and width from the tensors: fixed ones read past a row's index query into its window neighbours
+     H = wts.shape[1]
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+-    blocks = []
+-    for a in range(0, R, B):
+-        n = min(B, R - a)
+-        at = pos_dev if a == 0 else pos_dev + a                        # the block's first row's position
+-        _scores[(n, triton.cdiv(np_max, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pk, scores, at, n, np_max,
+-                                             D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
+-                                             BP=64, RB=1, num_warps=4)
+-        blocks.append(top_pools(scores[:n], TOPK_POOLS, at))                           # ascending pool index
+-    del scores
+-    pools = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
++    grid = min(ROW_SCORE_G, triton.cdiv(np_max, 64))
++    _scores_rows[(R, grid)](qi, wts, wts.stride(0), pk, scores, np_max, pos_dev, pos_dev, pos_dev, R, np_max, D ** -0.5,
++                            wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid, SEG=False,
++                            num_warps=4)
++    pools = top_pools(scores, TOPK_POOLS, pos_dev)                                      # ascending pool index
+     dev = qi.device
+     width = TOPK_POOLS * POOL + POOL - 1
+     # all rows at once: the 512 pools' tokens ascending, then the incomplete last pool's visible tokens; rows within the dense limit count 0
+@@ -588,7 +626,9 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+                                                                                                           torch.Tensor]:
+     """select_tokens for a segmented window: each sparse row's attended tokens [R, 2051] (relative to its stream,
+     ascending, -1 padded) and counts (0 for dense rows). Scores every segment's pools up to its device-side pool
+-    count, so one CUDA graph per window size serves every context length (``scratch``: segments.SelectScratch)."""
++    count (_seg_scores: a pool block's keys loaded once for all the segment's rows; _scores_rows' row-major loop
++    measured no faster here, and slower on dense windows), so one CUDA graph per window size serves every context
++    length (``scratch``: segments.SelectScratch)."""
+ 
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("seg_select_tokens: index queries must be contiguous rows, weights unit-stride columns")

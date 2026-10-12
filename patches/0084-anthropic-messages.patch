@@ -1,0 +1,732 @@
+# Backport of upstream TensorFold's Anthropic Messages API (commits 8cca6e3 and ba18743, merged as e9fade0, plus
+# ced6139's request framing, released in v0.6.3) by evilpsycho42 and ashhart, and 977f2cc's request_body.py by Jordi Posthumus
+# (JordiPosthumus), backported onto the pinned v0.6.0 by
+# MiaAI-Lab, Apache-2.0: Anthropic's /v1/messages (also /messages, with /count_tokens suffixes) on both servers,
+# translated to the same chat completion the OpenAI route serves — system prompts, text and image blocks,
+# tool_use / tool_result, thinking as reasoning_content, stop_sequences, output_config effort/format — with Anthropic
+# SSE streaming, /count_tokens counting the exact chat render, and a matched stop string reported as
+# stop_reason "stop_sequence" back through the OpenAI routes too.
+# Deliberate deviations from upstream, all for the local tree: anthropic_translate.py is taken at e9fade0, not
+# ced6139, because ced6139 puts image_url parts inside the tool message and local patch 0056's tool-message
+# vocabulary refuses them — here a tool_result's images ride the following user message, the shape the v0.6.0 tree
+# accepts. error() maps 429 to overloaded_error beside upstream's 503, because local patches 0081/0082 render
+# capacity refusals as 429 (scripts/config.sh documents "529 overloaded_error through the Anthropic bridge"). The
+# body cap stays upstream's 32 MiB: anthropic.py is verbatim ced6139 and calls read_body(handler, limit=LIMIT) —
+# count_tokens fully renders the body it accepts, and a larger render on unified memory is this recipe's freeze
+# hazard (the chat route's 96 MiB intake does not carry over).
+# Two hunk pairs are hand-adapted to context upstream does not have: cuda/http.py's import line and do_POST hook
+# (this tree has no token_routes import and no /decisions branch, so the hook leads do_POST; /v1/messages is not a
+# responses route, so the placement is order-safe), and the final decodes of cuda/server.py and server/app.py (local
+# code splits with split(), not split_thinking, and carries call_deltas/calls_streamed): each hoists the raw decode
+# out of stops.visible() unchanged and feeds matched_stop from it, so requests without stop strings are untouched.
+# Non-recursion note: responses._run_chat fabricates path = "/v1/chat/completions" for its inner Wire request, so an
+# Anthropic request re-entering do_POST can never hit the anthropic.route hook again.
+
+diff --git tensorfold/server/request_body.py tensorfold/server/request_body.py
+new file mode 100644
+index 0000000..075c6c8
+--- /dev/null
++++ tensorfold/server/request_body.py
+@@ -0,0 +1,81 @@
++"""Bounded HTTP/1.1 request framing, shared by the CUDA and MLX handlers."""
++
++from __future__ import annotations
++
++import re
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++
++LIMIT = 32 * 1024**2
++_METADATA_LIMIT = 65536
++
++
++def read_body(handler: Any, *, limit: int = LIMIT) -> bytes:
++    """Read one fixed-length or chunked body without consuming the next request."""
++
++    def refuse(message: str) -> None:
++        # Once framing is uncertain, unread bytes must not become another request.
++        handler.close_connection = True
++        raise RequestError(message)
++
++    def check_size(size: int) -> None:
++        if size > limit:
++            refuse(f"request body exceeds the {limit // 1024**2} MiB limit")
++
++    def exact(size: int) -> bytes:
++        data = handler.rfile.read(size)
++        if len(data) != size:
++            refuse("incomplete request body")
++        return data
++
++    def line() -> bytes:
++        data = handler.rfile.readline(_METADATA_LIMIT + 1)
++        if len(data) > _METADATA_LIMIT or not data.endswith(b"\r\n"):
++            refuse("invalid or oversized chunked request framing")
++        return data[:-2]
++
++    transfers = handler.headers.get_all("Transfer-Encoding", [])
++    lengths = handler.headers.get_all("Content-Length", [])
++    if transfers:
++        if lengths:
++            refuse("Content-Length and Transfer-Encoding cannot be combined")
++        codings = [value.strip().lower() for header in transfers for value in header.split(",")]
++        if codings != ["chunked"] or getattr(handler, "request_version", "HTTP/1.1") != "HTTP/1.1":
++            refuse("unsupported request Transfer-Encoding; expected chunked over HTTP/1.1")
++        body = bytearray()
++        extensions = 0
++        while True:
++            header = line()
++            size_text, separator, extension = header.partition(b";")
++            size_text = size_text.rstrip(b" \t") if separator else size_text
++            if not re.fullmatch(rb"[0-9a-fA-F]+", size_text):
++                refuse("invalid chunk size")
++            extensions += len(extension)
++            if extensions > _METADATA_LIMIT:
++                refuse("chunk extensions exceed the request framing limit")
++            size = int(size_text, 16)
++            check_size(len(body) + size)
++            if size == 0:
++                trailers = 0
++                while trailer := line():
++                    trailers += len(trailer) + 2
++                    if trailers > _METADATA_LIMIT or not re.match(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+:", trailer):
++                        refuse("invalid or oversized request trailers")
++                return bytes(body)
++            body.extend(exact(size))
++            if exact(2) != b"\r\n":
++                refuse("invalid chunk terminator")
++    if not lengths:
++        return b""
++    values = [value.strip() for header in lengths for value in header.split(",")]
++    if any(not re.fullmatch(r"[0-9]+", value) for value in values):
++        refuse("invalid Content-Length")
++    try:
++        sizes = [int(value) for value in values]
++    except ValueError:
++        refuse("invalid Content-Length")
++    if len(set(sizes)) != 1:
++        refuse("conflicting Content-Length values")
++    check_size(sizes[0])
++    return exact(sizes[0])
+diff --git tensorfold/server/anthropic.py tensorfold/server/anthropic.py
+new file mode 100644
+index 0000000..d443807
+--- /dev/null
++++ tensorfold/server/anthropic.py
+@@ -0,0 +1,101 @@
++"""Anthropic HTTP routes on both servers, over their own chat-completions handler and connection."""
++from __future__ import annotations
++
++import json
++from typing import Any
++
++from tensorfold.server.anthropic_translate import Reply, error, translate
++from tensorfold.server.errors import CapacityError, RequestError
++from tensorfold.server.request_body import read_body
++from tensorfold.server.responses import LIMIT, Wire, _run_chat, _send
++
++
++def route(path: str) -> bool:
++    return path.split("?", 1)[0].rstrip("/") in ("/v1/messages", "/messages", "/v1/messages/count_tokens",
++                                                 "/messages/count_tokens")
++
++
++def count_tokens(app: Any, chat: dict[str, Any]) -> int:
++    """Render with the same tokenizer, tools and thinking controls as chat, without running generation."""
++    if hasattr(app, "prepare"):                   # CUDA's preparation includes vision token expansion
++        return len(app.prepare(chat, True).prompt)
++    from tensorfold.server.messages import normalize_messages
++    from tensorfold.server.prompts import has_images, prepare_images
++    from tensorfold.server.request_options import heard_effort, thinking_fields
++    from tensorfold.server.text import render_prompt_ids
++    from tensorfold.server.tools import active_tool_specs
++
++    fields = thinking_fields(chat, app.effort_levels)
++    thinking = fields.get("enable_thinking", app.enable_thinking)
++    effort = heard_effort(fields.get("reasoning_effort"), app.reasoning_effort, app.effort_levels)
++    tools = active_tool_specs(chat.get("tools"), chat.get("tool_choice"))
++    msgs = normalize_messages(chat["messages"], allow_images=getattr(app, "vision", None) is not None)
++    if has_images(msgs):
++        from tensorfold.server.messages import _normalize_tool_call_arguments
++        msgs = _normalize_tool_call_arguments(msgs)
++
++        def render(messages):
++            kwargs = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
++            if tools:
++                kwargs["tools"] = tools
++            if thinking and effort:
++                kwargs["reasoning_effort"] = effort
++            with app.tokenizer_lock:
++                return app.tokenizer.apply_chat_template(messages, **kwargs)
++
++        return len(prepare_images(app.vision, msgs, render, context_limit=app.context_window or None).tokens)
++    with app.tokenizer_lock:
++        return len(render_prompt_ids(app.tokenizer, msgs, tools=tools, enable_thinking=thinking,
++                                     reasoning_effort=effort, late_system=app.late_system))
++
++
++def post(handler: Any, app: Any) -> None:
++    from tensorfold.server.http import reply_model
++
++    count = handler.path.split("?", 1)[0].rstrip("/").endswith("/count_tokens")
++    try:
++        raw = read_body(handler, limit=LIMIT)
++        body = json.loads(raw or b"{}")
++        chat = translate(body, count=count)
++        late_system = getattr(app, "late_system", getattr(getattr(app, "template", None), "late_system", "system"))
++        if late_system != "system" and any(m.get("role") == "system" for m in body["messages"]):
++            raise RequestError("the model's chat template does not support mid-conversation system messages")
++        if count:
++            return _send(handler, 200, {"input_tokens": count_tokens(app, chat)})
++    except (RequestError, ValueError, UnicodeDecodeError) as exc:
++        return _send(handler, 503 if isinstance(exc, CapacityError) else 400,
++                     error(str(exc), 503 if isinstance(exc, CapacityError) else 400))
++
++    def send(event: dict[str, Any]) -> None:
++        handler.wfile.write(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
++        handler.wfile.flush()
++
++    reply = Reply(reply_model(app, body), send)
++
++    def opened() -> None:
++        handler.send_response(200)
++        handler.send_header("Content-Type", "text/event-stream")
++        handler.send_header("Cache-Control", "no-cache")
++        handler.send_header("Connection", "close")
++        handler.end_headers()
++        handler.close_connection = True
++        reply.start()
++
++    wire = Wire(opened, reply.chunk)
++    try:
++        _run_chat(handler, chat, wire)
++        if wire.stream or wire.status is None:
++            return
++        payload = json.loads(bytes(wire.data) or b"{}")
++        if wire.status != 200:
++            problem = payload.get("error") or {}
++            message = problem.get("message", "request failed") if isinstance(problem, dict) else str(problem)
++            return _send(handler, wire.status, error(message, wire.status))
++        _send(handler, 200, reply.completion(payload))
++    except OSError:
++        handler.close_connection = True
++    except (ValueError, KeyError, TypeError) as exc:
++        if wire.stream:
++            send(error(f"invalid model response: {exc}", 500))
++        else:
++            _send(handler, 500, error(f"invalid model response: {exc}", 500))
+diff --git tensorfold/server/anthropic_translate.py tensorfold/server/anthropic_translate.py
+new file mode 100644
+index 0000000..2bd0147
+--- /dev/null
++++ tensorfold/server/anthropic_translate.py
+@@ -0,0 +1,361 @@
++"""Anthropic Messages translated to the server's existing chat request and reply contracts."""
++from __future__ import annotations
++
++import json
++import uuid
++from collections.abc import Callable
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++from tensorfold.server.request_options import EFFORTS
++
++
++def _string(value: Any, name: str, *, empty: bool = True) -> str:
++    if not isinstance(value, str) or (not empty and not value):
++        raise RequestError(f"{name} must be a {'nonempty ' if not empty else ''}string")
++    return value
++
++
++def _parts(value: Any) -> list[dict[str, Any]]:
++    if isinstance(value, str):
++        return [{"type": "text", "text": value}]
++    if not isinstance(value, list) or any(not isinstance(p, dict) for p in value):
++        raise RequestError("content must be a string or an array of content blocks")
++    return value
++
++
++def _image(block: dict[str, Any]) -> dict[str, Any]:
++    source = block.get("source")
++    if not isinstance(source, dict):
++        raise RequestError("image.source must be an object")
++    if source.get("type") == "base64":
++        media = _string(source.get("media_type"), "image.source.media_type", empty=False)
++        if media not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
++            raise RequestError("unsupported image media_type")
++        url = f"data:{media};base64,{_string(source.get('data'), 'image.source.data', empty=False)}"
++    elif source.get("type") == "url":
++        url = _string(source.get("url"), "image.source.url", empty=False)
++    else:
++        raise RequestError("image.source.type must be base64 or url; file IDs are unsupported")
++    return {"type": "image_url", "image_url": {"url": url}}
++
++
++def messages(value: Any, system: Any = None) -> list[dict[str, Any]]:
++    if not isinstance(value, list) or not value:
++        raise RequestError("messages must be a nonempty array")
++    out: list[dict[str, Any]] = []
++    if system is not None:
++        parts = _parts(system)
++        if any(p.get("type") != "text" for p in parts):
++            raise RequestError("system accepts text blocks only")
++        out.append({"role": "system", "content": "\n\n".join(_string(p.get("text"), "system.text") for p in parts)})
++    for index, message in enumerate(value):
++        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "system"):
++            raise RequestError("message role must be user, assistant or system")
++        role = message["role"]
++        if role == "system":
++            previous = value[index - 1] if index else {}
++            following = value[index + 1] if index + 1 < len(value) else {"role": "assistant"}
++            if (not isinstance(previous, dict) or previous.get("role") not in ("user", "system")
++                    or not isinstance(following, dict) or following.get("role") not in ("assistant", "system")):
++                raise RequestError("mid-conversation system messages must follow a user turn and precede an assistant or end")
++            if message.get("clear_at") not in (None, "never") or message.get("output_config"):
++                raise RequestError("turn-scoped system messages and per-message output_config are unsupported")
++        content, calls, thoughts = [], [], []
++        for block in _parts(message.get("content")):
++            kind = block.get("type")
++            if kind == "text":
++                content.append({"type": "text", "text": _string(block.get("text"), "text")})
++            elif kind == "image" and role == "user":
++                content.append(_image(block))
++            elif kind == "thinking" and role == "assistant":
++                thoughts.append(_string(block.get("thinking"), "thinking"))
++            elif kind == "redacted_thinking" and role == "assistant":
++                raise RequestError("redacted thinking cannot be decoded by this local model; send plaintext thinking")
++            elif kind == "tool_use" and role == "assistant":
++                arguments = block.get("input")
++                if not isinstance(arguments, dict):
++                    raise RequestError("tool_use.input must be an object")
++                calls.append({"id": _string(block.get("id"), "tool_use.id", empty=False), "type": "function",
++                              "function": {"name": _string(block.get("name"), "tool_use.name", empty=False),
++                                           "arguments": json.dumps(arguments, ensure_ascii=False)}})
++            elif kind == "tool_result" and role == "user":
++                # Tool results precede the following user text, including a batch of parallel results.
++                texts, images = [], []
++                for part in _parts(block.get("content", "")):
++                    if part.get("type") == "text":
++                        texts.append(_string(part.get("text"), "tool_result.text"))
++                    elif part.get("type") == "image":
++                        images.append(_image(part))
++                    else:
++                        raise RequestError(f"unsupported tool_result content type {part.get('type')!r}")
++                text = "\n".join(texts)
++                if block.get("is_error"):
++                    text = "Tool error: " + text
++                out.append({"role": "tool", "tool_call_id": _string(block.get("tool_use_id"), "tool_use_id", empty=False),
++                            "content": text})
++                content.extend(images)
++            else:
++                raise RequestError(f"unsupported {role} content block type {kind!r}")
++        if content or calls or thoughts:
++            item: dict[str, Any] = {"role": role, "content": content or ""}
++            if calls:
++                item["tool_calls"] = calls
++            if thoughts:
++                item["reasoning_content"] = "".join(thoughts)
++            out.append(item)
++        elif not _parts(message.get("content")):
++            out.append({"role": role, "content": ""})
++    return out
++
++
++def translate(body: Any, *, count: bool = False) -> dict[str, Any]:
++    if not isinstance(body, dict):
++        raise RequestError("request body must be an object")
++    model = _string(body.get("model"), "model", empty=False)
++    chat: dict[str, Any] = {"model": model, "messages": messages(body.get("messages"), body.get("system"))}
++    if not count:
++        limit = body.get("max_tokens")
++        if type(limit) is not int or limit <= 0:
++            raise RequestError("max_tokens must be a positive integer")
++        chat["max_tokens"] = limit
++    else:
++        chat["max_tokens"] = 1
++    if "stream" in body:
++        if type(body["stream"]) is not bool:
++            raise RequestError("stream must be a boolean")
++        chat["stream"] = body["stream"]
++    for key in ("temperature", "top_p", "top_k"):
++        if key in body:
++            chat[key] = body[key]
++    if "stop_sequences" in body:
++        stops = body["stop_sequences"]
++        if not isinstance(stops, list) or any(not isinstance(s, str) or not s for s in stops):
++            raise RequestError("stop_sequences must be an array of nonempty strings")
++        chat["stop"] = stops
++    context = body.get("context_management")
++    # Claude Code keeps all thinking; the client supplies history and there is no stored context to edit.
++    if context is not None and (not isinstance(context, dict) or not isinstance(context.get("edits", []), list)
++            or any(edit != {"type": "clear_thinking_20251015", "keep": "all"} for edit in context.get("edits", []))):
++        raise RequestError("context_management supports clear_thinking with keep: all only")
++    for field in ("container", "mcp_servers", "service_tier"):
++        if body.get(field) not in (None, [], "auto"):
++            raise RequestError(f"{field} is not supported by this server")
++    tools = body.get("tools", [])
++    if not isinstance(tools, list):
++        raise RequestError("tools must be an array")
++    translated = []
++    for tool in tools:
++        if not isinstance(tool, dict) or tool.get("type", "custom") != "custom":
++            raise RequestError("only client-defined function tools are supported")
++        name = _string(tool.get("name"), "tool.name", empty=False)
++        schema = tool.get("input_schema")
++        if not isinstance(schema, dict):
++            raise RequestError("tool.input_schema must be an object")
++        fn = {"name": name, "parameters": schema}
++        if "description" in tool:
++            fn["description"] = _string(tool["description"], "tool.description")
++        translated.append({"type": "function", "function": fn})
++    if translated:
++        chat["tools"] = translated
++    choice = body.get("tool_choice")
++    if choice is not None:
++        if not isinstance(choice, dict):
++            raise RequestError("tool_choice must be an object")
++        kind = choice.get("type")
++        if kind in ("auto", "none", "any"):
++            chat["tool_choice"] = "required" if kind == "any" else kind
++        elif kind == "tool":
++            chat["tool_choice"] = {"type": "function", "function": {
++                "name": _string(choice.get("name"), "tool_choice.name", empty=False)}}
++        else:
++            raise RequestError("tool_choice.type must be auto, none, any or tool")
++        if "disable_parallel_tool_use" in choice:
++            if type(choice["disable_parallel_tool_use"]) is not bool:
++                raise RequestError("disable_parallel_tool_use must be a boolean")
++            chat["parallel_tool_calls"] = not choice["disable_parallel_tool_use"]
++    config = body.get("output_config", {})
++    config = {} if config is None else config
++    if not isinstance(config, dict):
++        raise RequestError("output_config must be an object")
++    if "effort" in config:
++        if config["effort"] not in EFFORTS:
++            raise RequestError("unsupported output_config.effort")
++        chat["reasoning_effort"] = config["effort"]
++    if config.get("format") is not None:
++        fmt = config["format"]
++        if not isinstance(fmt, dict) or fmt.get("type") != "json_schema" or not isinstance(fmt.get("schema"), dict):
++            raise RequestError("output_config.format must be json_schema with a schema object")
++        chat["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "schema": fmt["schema"],
++                                                                       "strict": True}}
++    thinking = body.get("thinking")
++    if thinking is None:
++        thinking = {"type": "disabled"}
++    if thinking is not None:
++        if not isinstance(thinking, dict) or thinking.get("type") not in ("disabled", "enabled", "adaptive"):
++            raise RequestError("thinking.type must be disabled, enabled or adaptive")
++        enabled = thinking["type"] != "disabled"
++        chat["chat_template_kwargs"] = {"enable_thinking": enabled}
++        if not enabled:
++            chat["reasoning_effort"] = "none"
++        if thinking["type"] == "enabled":
++            budget = thinking.get("budget_tokens")
++            if type(budget) is not int or budget <= 0 or (not count and budget >= body["max_tokens"]):
++                raise RequestError("thinking.budget_tokens must be positive and less than max_tokens")
++            chat["thinking_budget"] = budget
++    return chat
++
++
++def usage(value: dict[str, Any]) -> dict[str, Any]:
++    prompt = value.get("prompt_tokens", 0)
++    cached = min(prompt, max(0, (value.get("prompt_tokens_details") or {}).get("cached_tokens", 0)))
++    result = {"input_tokens": prompt - cached, "output_tokens": value.get("completion_tokens", 0),
++              "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached}
++    details = value.get("completion_tokens_details") or {}
++    if "reasoning_tokens" in details:
++        result["output_tokens_details"] = {"thinking_tokens": details["reasoning_tokens"]}
++    return result
++
++
++def error(message: str, status: int = 400) -> dict[str, Any]:
++    kind = ("invalid_request_error" if status == 400 else "not_found_error" if status == 404 else
++            "overloaded_error" if status in (429, 503) else "api_error")
++    return {"type": "error", "error": {"type": kind, "message": message}}
++
++
++class Reply:
++    """Typed Messages events from chat chunks, keeping each delta on a block of the matching type."""
++
++    def __init__(self, model: str, send: Callable[[dict[str, Any]], None]) -> None:
++        self.send = send
++        self.base = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
++                     "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage({})}
++        self.index = -1
++        self.kind: str | None = None
++        self.calls: dict[int, dict[str, Any]] = {}
++        self.pending_text: list[tuple[str, str]] = []
++        self.active_call: int | None = None
++        self.finished = False
++        self.finish = "end_turn"
++        self.stop_sequence: str | None = None
++        self.tokens = usage({})
++
++    def start(self) -> None:
++        self.send({"type": "message_start", "message": self.base})
++
++    def close(self) -> None:
++        if self.kind:
++            if self.kind == "thinking":
++                # Local reasoning is plaintext, with no provider signature or encryption.
++                self.send({"type": "content_block_delta", "index": self.index,
++                           "delta": {"type": "signature_delta", "signature": ""}})
++            self.send({"type": "content_block_stop", "index": self.index})
++            self.kind = None
++
++    def text(self, kind: str, value: str) -> None:
++        if not value:
++            return
++        if self.active_call is not None:
++            self.pending_text.append((kind, value))
++            return
++        if kind != self.kind:
++            self.close()
++            self.index += 1
++            self.kind = kind
++            block = {"type": kind, "thinking" if kind == "thinking" else "text": ""}
++            self.send({"type": "content_block_start", "index": self.index, "content_block": block})
++        self.send({"type": "content_block_delta", "index": self.index,
++                   "delta": {"type": kind + "_delta", "thinking" if kind == "thinking" else "text": value}})
++
++    def chunk(self, chunk: dict[str, Any] | None) -> None:
++        if self.finished:
++            return
++        if chunk is None:
++            self.drain_calls(final=True)
++            self.close()
++            self.send({"type": "message_delta", "delta": {"stop_reason": self.finish, "stop_sequence": self.stop_sequence},
++                       "usage": self.tokens})
++            self.send({"type": "message_stop"})
++            self.finished = True
++            return
++        if "error" in chunk:
++            self.close()
++            problem = chunk["error"]
++            self.send(error(problem.get("message", "generation failed"),
++                            400 if problem.get("type") == "invalid_request_error" else 500))
++            self.finished = True
++            return
++        if chunk.get("usage") is not None:
++            self.tokens = usage(chunk["usage"])
++        if chunk.get("stop_sequence") is not None:
++            self.stop_sequence = chunk["stop_sequence"]
++        for choice in chunk.get("choices", []):
++            if choice.get("finish_reason"):
++                self.finish = {"tool_calls": "tool_use", "length": "max_tokens"}.get(choice["finish_reason"], "end_turn")
++            if self.stop_sequence is not None:
++                self.finish = "stop_sequence"
++            delta = choice.get("delta") or {}
++            self.text("thinking", delta.get("reasoning_content") or "")
++            self.text("text", delta.get("content") or "")
++            for call in delta.get("tool_calls") or []:
++                at = call.get("index", 0)
++                target = self.calls.setdefault(at, {"id": "", "name": "", "arguments": "", "sent": 0, "done": False})
++                if call.get("id"):
++                    target["id"] = call["id"]
++                fn = call.get("function") or {}
++                target["name"] += fn.get("name") or ""
++                target["arguments"] += fn.get("arguments") or ""
++
++        self.drain_calls()
++
++    def drain_calls(self, *, final: bool = False) -> None:
++        for at, call in self.calls.items():
++            if call["done"]:
++                continue
++            if not call["id"] or not call["name"]:
++                return
++            if self.active_call is None:
++                self.close()
++                self.index += 1
++                self.kind, self.active_call = "tool_use", at
++                self.send({"type": "content_block_start", "index": self.index,
++                           "content_block": {"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}}})
++            if at != self.active_call:
++                return
++            delta = call["arguments"][call["sent"]:]
++            if delta:
++                self.send({"type": "content_block_delta", "index": self.index,
++                           "delta": {"type": "input_json_delta", "partial_json": delta}})
++                call["sent"] = len(call["arguments"])
++            complete = False
++            if call["arguments"].rstrip().endswith("}"):
++                try:
++                    complete = isinstance(json.loads(call["arguments"]), dict)
++                except ValueError:
++                    pass
++            if not complete and not final:
++                return
++            self.close()
++            call["done"], self.active_call = True, None
++            pending, self.pending_text = self.pending_text, []
++            for kind, text in pending:
++                self.text(kind, text)
++
++    def completion(self, chunk: dict[str, Any]) -> dict[str, Any]:
++        choice = chunk["choices"][0]
++        message = choice["message"]
++        content = []
++        if message.get("reasoning_content"):
++            content.append({"type": "thinking", "thinking": message["reasoning_content"], "signature": ""})
++        if message.get("content"):
++            content.append({"type": "text", "text": message["content"]})
++        for call in message.get("tool_calls") or []:
++            fn = call["function"]
++            args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
++            if not isinstance(args, dict):
++                raise TypeError("model tool arguments are not a JSON object")
++            content.append({"type": "tool_use", "id": call["id"], "name": fn["name"], "input": args})
++        return {**self.base, "content": content, "usage": usage(chunk.get("usage") or {}),
++                "stop_sequence": chunk.get("stop_sequence"),
++                "stop_reason": "stop_sequence" if chunk.get("stop_sequence") is not None else
++                {"tool_calls": "tool_use", "length": "max_tokens"}.get(choice["finish_reason"], "end_turn")}
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 59d55e3..c7c7f0b 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -8,7 +8,7 @@ import uuid
+ from typing import TYPE_CHECKING, Any
+ 
+ from tensorfold.cuda import health
+-from tensorfold.server import metrics, responses
++from tensorfold.server import anthropic, metrics, responses
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+ from tensorfold.server.http import Server
+@@ -101,6 +101,8 @@ def make_handler(app: App):
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
+             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
+                 return responses.post(self, app)
+             chat = self.path.rstrip("/").endswith("/chat/completions")
+@@ -190,6 +192,8 @@ def make_handler(app: App):
+                                               "function": {"name": call["function"]["name"],
+                                                            "arguments": call["function"]["arguments"]}}]})
+                 end = chunk({}, result["finish"])
++                if result.get("stop_sequence") is not None:
++                    end["stop_sequence"] = result["stop_sequence"]
+                 end["tensorfold"] = result["stats"]
+                 end["usage"] = usage_of(result)          # every stream, as the Mac server's: clients count from it
+                 try:
+@@ -230,6 +234,8 @@ def make_handler(app: App):
+                 payload = {"id": rid, "object": "text_completion", "created": created, "model": model,
+                            "choices": [{"index": 0, "text": result["content"], "finish_reason": result["finish"]}],
+                            "usage": usage, "tensorfold": result["stats"]}
++            if result.get("stop_sequence") is not None:
++                payload["stop_sequence"] = result["stop_sequence"]
+             self._json(200, payload)
+ 
+     return Handler
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index ee97e62..e94c8ff 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -16,7 +16,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
+ from tensorfold.server.messages import validate_modalities
+ from tensorfold.server.probabilities import TokenBytes, probability_options
+ from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
+-from tensorfold.server.stopping import stop_options
++from tensorfold.server.stopping import matched_stop, stop_options
+ from tensorfold.server.tool_policy import ToolCallPolicy
+ from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+ from tensorfold.engine.tool_draft import ToolCallStreamer
+@@ -589,7 +589,8 @@ class App:
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+-        text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)) + closing[0]
++        raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
++        text = stops.visible(raw_text) + closing[0]
+         raw_answer = split(text, True)[1]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -621,6 +622,7 @@ class App:
+             streamed = xml_stream.index + 1
+         return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
+                 "finish": finish, "content": content, "reasoning": reasoning,
++                "stop_sequence": matched_stop(raw_text, stops.strings),
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+diff --git tensorfold/server/stopping.py tensorfold/server/stopping.py
+index 95b7cd9..275d405 100644
+--- tensorfold/server/stopping.py
++++ tensorfold/server/stopping.py
+@@ -53,3 +53,9 @@ class StopPolicy:
+         shown = hide_tool_calls(content, finished=True) if tools else content
+         if shown.startswith(sent) and len(shown) > len(sent):
+             callback(shown[len(sent):])
++
++
++def matched_stop(text: str, strings: tuple[str, ...]) -> str | None:
++    """The first matched stop, ties in request order, before visible() strips it."""
++    matches = [(text.find(stop), at, stop) for at, stop in enumerate(strings) if stop in text]
++    return min(matches)[2] if matches else None
+diff --git tensorfold/server/app.py tensorfold/server/app.py
+index 58f7a68..a00ec32 100644
+--- tensorfold/server/app.py
++++ tensorfold/server/app.py
+@@ -21,7 +21,7 @@ from tensorfold.server.request_options import RequestOptions
+ from tensorfold.server.http import served_model_ids
+ from tensorfold.server import metrics
+ from tensorfold.server.scheduler import ChatJob, Scheduler
+-from tensorfold.server.stopping import StopPolicy
++from tensorfold.server.stopping import StopPolicy, matched_stop
+ from tensorfold.server.text import (
+     IncrementalText,
+     _LockedTokenizer,
+@@ -436,7 +436,8 @@ class ChatApp(RequestOptions, PromptBlocks):
+ 
+         content_tokens = strip_trailing_stops(collected, set(stops.eos_ids))
+         with self.tokenizer_lock:
+-            text = stops.visible(self.tokenizer.decode(content_tokens))
++            raw_text = self.tokenizer.decode(content_tokens)
++            text = stops.visible(raw_text)
+         if thinking:
+             reasoning_text, content = split_thinking(text, finished=True, markers=self.think_markers)
+             reasoning = reasoning_text.strip() or None
+@@ -449,6 +450,7 @@ class ChatApp(RequestOptions, PromptBlocks):
+         decode_tokens = max(0, len(collected) - 1)
+         reply: dict[str, Any] = {
+             "content": content,
++            "stop_sequence": matched_stop(raw_text, stops.strings),
+             "reasoning": reasoning,
+             "tool_calls_streamed": bool(calls_stream is not None and calls_stream.streamed),
+             "finish_reason": stream.finish_reason if stream is not None else "length",
+diff --git tensorfold/server/http.py tensorfold/server/http.py
+index c8ab8d6..e608725 100644
+--- tensorfold/server/http.py
++++ tensorfold/server/http.py
+@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from typing import Any
+ 
+ from tensorfold.engine import grammar
+-from tensorfold.server import responses
++from tensorfold.server import anthropic, responses
+ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
+                                      tool_choice_requires_call)
+ from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
+@@ -186,6 +186,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+ 
+         def do_POST(self) -> None:
+             route = self._route()
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
+             if responses.route(route) == "":         # a Response: this handler's chat completion, translated
+                 return responses.post(self, app)
+             is_chat_completion = route.endswith("/chat/completions")
+@@ -267,6 +269,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 extras: dict[str, Any] = {
+                     "exact_mode": app.exact_mode.get("mode", "target-verified")
+                 }
++                if reply.get("stop_sequence") is not None:
++                    extras["stop_sequence"] = reply["stop_sequence"]
+                 if reply.get("batch_size"):
+                     extras["tensorfold"] = {
+                         "batch_size": reply["batch_size"],

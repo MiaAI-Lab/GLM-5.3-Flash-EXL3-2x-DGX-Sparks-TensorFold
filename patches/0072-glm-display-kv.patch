@@ -1,0 +1,462 @@
+# The shared pool also takes part of the GB10's display reservation (DISPLAY_KV_MIB, off by default). The firmware keeps
+# ~2 GiB for a screen that a headless Spark never uses and MemAvailable never counts. With --parallel the pool is
+# credited TF_GLM_DISPLAY_KV_MIB of it, and the first DSA layers' latent planes are carved from one span: ordinary host
+# memory, then a DRM dumb buffer on /dev/dri/card0 mapped right above it, both registered with cuMemHostRegister, so the
+# planes take exactly the credit from the reservation and no more host memory than without it. CUDA refuses a memcpy
+# across the two registrations, so the pool's row copies of those planes go through an elementwise kernel. Placement
+# only: the same bits. Headless Sparks only: a connected display stops the start. Fails closed. After @gabewillen's
+# display-reserve KV for the vLLM kit (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks#234). By @ezoushen.
+
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index eeb54be..2e4b01e 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -143,14 +143,15 @@ class Engine:
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
+-                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
++                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None, display: int = 0) -> None:
+         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
+         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
+         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
+         chunks, None or off: unsplit; ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``):
+         draft chains take one row a step, so the MTP buffers need not be as wide as the verify windows; ``streams``:
+         stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``,
+-        default ``capacity``) for concurrent streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
++        default ``capacity``) for concurrent streams (``multi``); ``display``: bytes of the GB10's display reservation
++        the pool was sized with (``display_kv``, TF_GLM_DISPLAY_KV_MIB). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
+         ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
+ 
+         if grid and prefill_rows % grid:
+@@ -192,7 +193,7 @@ class Engine:
+ 
+         self.caches = Caches(w, pool_rows or capacity, streams=streams,
+                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
+-                             kv=kv8.kv_kind() if kv is None else kv)
++                             kv=kv8.kv_kind() if kv is None else kv, display=display)
+         self.slots = Slots(w, streams, max_rows)
+         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
+diff --git tensorfold/families/glm5_next/cuda/display_kv.py tensorfold/families/glm5_next/cuda/display_kv.py
+new file mode 100644
+index 0000000..8e8c621
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/display_kv.py
+@@ -0,0 +1,270 @@
++"""The cache pool's first latent planes in the GB10's UEFI display reservation (TF_GLM_DISPLAY_KV_MIB).
++
++The firmware sets aside a framebuffer region that nothing claims on a headless Spark and that MemAvailable never
++counts. A DRM dumb buffer on /dev/dri/card0, mmap'd and registered with cuMemHostRegister(DEVICEMAP|IOMEMORY), is
++memory the GPU reads like any other (on GB10 the device pointer is the host address). ``--parallel`` sizes its pool
++from free memory; with this setting it is credited the reservation's bytes too, and the first latent planes (one per
++DSA layer, every token's row) are carved from one span: an ordinary host mapping, then the display buffer right above
++it, so the planes take exactly the credited bytes of the reservation and nothing more of the host's memory than
++without it. Placement only: the planes hold the same bytes.
++
++``TF_GLM_DISPLAY_KV_MIB``: unset or 0 off; a multiple of 16 up to 2032 (2048 fails ENOMEM on GB10).
++``TF_GLM_DISPLAY_KV_CARD``: the DRM card (default /dev/dri/card0; the container needs it as a device).
++For headless Sparks only: a card with a connected output (a monitor) keeps its reservation, and the start stops.
++Fails closed: the credited bytes were never budgeted against host memory, so a span that cannot be mapped stops the
++start instead of falling back to ordinary memory.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++ENV = "TF_GLM_DISPLAY_KV_MIB"
++CARD_ENV = "TF_GLM_DISPLAY_KV_CARD"
++LARGEST_MIB = 2032
++SYSFS = "/sys/class/drm"
++
++
++def mib() -> int:
++    """The display reservation credited to the pool, in MiB; 0 when off."""
++    raw = (os.environ.get(ENV) or "").strip()
++    if not raw:
++        return 0
++    try:
++        value = int(raw)
++    except ValueError:
++        raise ValueError(f"{ENV}={raw!r}: a number of MiB") from None
++    if value == 0:
++        return 0
++    if value < 0 or value % 16 or value > LARGEST_MIB:
++        raise ValueError(f"{ENV}={value}: a multiple of 16 from 16 to {LARGEST_MIB} (1792 measured on GB10; 2048 "
++                         "fails ENOMEM)")
++    return value
++
++
++def credit() -> int:
++    """The bytes the pool is credited (0 when off)."""
++    return mib() << 20
++
++
++def span_planes(count: int, plane_bytes: int, display: int) -> int:
++    """How many of ``count`` latent planes of ``plane_bytes`` the span takes: the fewest that hold ``display``."""
++    k = -(-int(display) // int(plane_bytes))
++    if k > count:
++        raise ValueError(f"{ENV}: {display >> 20} MiB is more than the {count} latent planes hold "
++                         f"({count * plane_bytes >> 20} MiB); lower it")
++    return max(1, k)
++
++
++def connected_outputs(sysfs: str, card: str) -> list[str]:
++    """The outputs of ``card`` (e.g. card0) with a display connected, by their sysfs status."""
++    import glob
++
++    found = []
++    for path in sorted(glob.glob(os.path.join(sysfs, f"{card}-*", "status"))):
++        with open(path) as f:
++            if f.read().strip() == "connected":
++                found.append(os.path.basename(os.path.dirname(path))[len(card) + 1:])
++    return found
++
++
++class System:
++    """Every DRM and CUDA driver call the span makes, one method a call (the seam the checks replace)."""
++
++    CREATE_DUMB = 0xC02064B2       # DRM_IOCTL_MODE_CREATE_DUMB
++    MAP_DUMB = 0xC01064B3          # DRM_IOCTL_MODE_MAP_DUMB
++    GEM_CLOSE = 0x40086409         # DRM_IOCTL_GEM_CLOSE
++    DEVICEMAP, IOMEMORY = 0x02, 0x04
++    PITCH = 16384                  # 4096 pixels at 32 bits
++    MAP_FAILED = (1 << 64) - 1
++
++    def __init__(self) -> None:
++        import ctypes
++
++        self.card = os.environ.get(CARD_ENV, "/dev/dri/card0")
++        self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
++        self.libc.mmap.restype = ctypes.c_void_p
++        self.libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int,
++                                   ctypes.c_long]
++        self.libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++        # the _v2 entry points: the unversioned ones predate I/O-memory registration and fail on the display mapping
++        self.cuda = ctypes.CDLL("libcuda.so.1")
++        torch.zeros(1, device="cuda")      # registration needs a context current on this thread
++
++    def open_card(self) -> int:
++        return os.open(self.card, os.O_RDWR | os.O_CLOEXEC)
++
++    def create_dumb(self, fd: int, size: int) -> tuple[int, int]:
++        """(GEM handle, the bytes the kernel gave)."""
++        import fcntl
++        import struct
++
++        layout = "=6IQ"            # drm_mode_create_dumb: height width bpp flags handle pitch size
++        out = struct.unpack(layout, fcntl.ioctl(fd, self.CREATE_DUMB,
++                                                struct.pack(layout, -(-size // self.PITCH), 4096, 32, 0, 0, 0, 0)))
++        return out[4], out[6]
++
++    def map_offset(self, fd: int, handle: int) -> int:
++        import fcntl
++        import struct
++
++        layout = "=2IQ"            # drm_mode_map_dumb: handle pad offset
++        return struct.unpack(layout, fcntl.ioctl(fd, self.MAP_DUMB, struct.pack(layout, handle, 0, 0)))[2]
++
++    def reserve(self, size: int) -> int:
++        """A PROT_NONE placeholder for the whole span, so the halves land next to each other."""
++        return self._mmap(None, size, 0, 0x02 | 0x20 | 0x4000, -1, 0)
++
++    def map_ordinary(self, address: int, size: int) -> None:
++        self._mmap(address, size, 0x03, 0x02 | 0x20 | 0x10, -1, 0)
++
++    def map_display(self, address: int, size: int, fd: int, offset: int) -> None:
++        self._mmap(address, size, 0x03, 0x01 | 0x10, fd, offset)
++
++    def register(self, address: int, size: int, *, io_memory: bool) -> None:
++        import ctypes
++
++        flags = self.DEVICEMAP | (self.IOMEMORY if io_memory else 0)
++        self._check(self.cuda.cuMemHostRegister_v2(ctypes.c_void_p(address), ctypes.c_size_t(size),
++                                                   ctypes.c_uint(flags)))
++
++    def device_pointer(self, address: int) -> int:
++        import ctypes
++
++        pointer = ctypes.c_void_p()
++        self._check(self.cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(pointer), ctypes.c_void_p(address),
++                                                           ctypes.c_uint(0)))
++        return int(pointer.value or 0)
++
++    def unregister(self, address: int) -> None:
++        import ctypes
++
++        self._check(self.cuda.cuMemHostUnregister(ctypes.c_void_p(address)))
++
++    def unmap(self, address: int, size: int) -> None:
++        import ctypes
++
++        if self.libc.munmap(ctypes.c_void_p(address), ctypes.c_size_t(size)) != 0:
++            raise OSError(ctypes.get_errno(), "munmap")
++
++    def close_gem(self, fd: int, handle: int) -> None:
++        import fcntl
++        import struct
++
++        fcntl.ioctl(fd, self.GEM_CLOSE, struct.pack("=2I", handle, 0))
++
++    def close_fd(self, fd: int) -> None:
++        os.close(fd)
++
++    def _mmap(self, address, size: int, prot: int, flags: int, fd: int, offset: int) -> int:
++        import ctypes
++
++        ctypes.set_errno(0)
++        result = int(self.libc.mmap(address, size, prot, flags, fd, offset) or 0)
++        if result in (0, self.MAP_FAILED):
++            errno = ctypes.get_errno()
++            raise OSError(errno, os.strerror(errno))
++        return result
++
++    def _check(self, result: int) -> None:
++        import ctypes
++
++        if result:
++            name = ctypes.c_char_p()
++            self.cuda.cuGetErrorName(ctypes.c_int(result), ctypes.byref(name))
++            raise OSError(f"CUDA driver error {result} ({(name.value or b'?').decode()})")
++
++
++SYSTEM = System
++
++
++class Span:
++    """The mapped span as device memory (``__cuda_array_interface__``)."""
++
++    def __init__(self, pointer: int, size: int) -> None:
++        self.pointer, self.size = int(pointer), int(size)
++
++    @property
++    def __cuda_array_interface__(self) -> dict:
++        return {"shape": (self.size,), "typestr": "|u1", "data": (self.pointer, False), "version": 3}
++
++
++def _step(name: str, call, *args, **kwargs):
++    try:
++        return call(*args, **kwargs)
++    except Exception as exc:
++        raise RuntimeError(f"{ENV}: {name} failed: {exc}") from exc
++
++
++def _quiet(call, *args) -> None:
++    try:
++        call(*args)
++    except Exception:
++        pass                       # unwinding: the first failure is the one to report
++
++
++def map_span(ordinary: int, display: int) -> Span:
++    """``ordinary`` bytes of host memory and the ``display`` bytes of the reservation right above them, both
++    registered with CUDA, as one span. Unwound completely on any failure."""
++    card = os.path.basename(os.environ.get(CARD_ENV, "/dev/dri/card0"))
++    if busy := connected_outputs(SYSFS, card):
++        raise RuntimeError(f"{ENV}: {', '.join(f'{card}-{o}' for o in busy)} has a display connected, which uses the "
++                           f"reservation; unset {ENV} on a Spark with a monitor")
++    total = ordinary + display
++    system = SYSTEM()
++    fd = handle = base = None
++    registered: list[int] = []
++    try:
++        fd = _step("open(display card)", system.open_card)
++        handle, got = _step("DRM_IOCTL_MODE_CREATE_DUMB", system.create_dumb, fd, display)
++        if got < display:
++            raise RuntimeError(f"{ENV}: the display reserve gave {got} B, short of {display} B")
++        offset = _step("DRM_IOCTL_MODE_MAP_DUMB", system.map_offset, fd, handle)
++        base = _step("mmap(span)", system.reserve, total)
++        if ordinary:
++            _step("mmap(ordinary half)", system.map_ordinary, base, ordinary)
++        _step("mmap(display half)", system.map_display, base + ordinary, display, fd, offset)
++        if ordinary:
++            _step("cuMemHostRegister(ordinary half)", system.register, base, ordinary, io_memory=False)
++            registered.append(base)
++        _step("cuMemHostRegister(display half)", system.register, base + ordinary, display, io_memory=True)
++        registered.append(base + ordinary)
++        pointer = _step("cuMemHostGetDevicePointer", system.device_pointer, base)
++        top = _step("cuMemHostGetDevicePointer", system.device_pointer, base + ordinary)
++        if top - pointer != ordinary:
++            raise RuntimeError(f"{ENV}: the halves are {top - pointer} B apart on the device, not {ordinary}")
++        return Span(pointer, total)
++    except BaseException:
++        for address in reversed(registered):
++            _quiet(system.unregister, address)
++        if base is not None:
++            _quiet(system.unmap, base, total)
++        if handle is not None:
++            _quiet(system.close_gem, fd, handle)
++        if fd is not None:
++            _quiet(system.close_fd, fd)
++        raise
++
++
++def as_tensor(span: Span, device) -> torch.Tensor:
++    return torch.as_tensor(span, device=device)
++
++
++_OWNERS: list[Span] = []           # the span lives as long as the process: the pool never gives it back
++
++
++def latent_planes(count: int, rows: int, width: int, kind: str, device, display: int) -> list[torch.Tensor]:
++    """The first of ``count`` latent planes (``kv8.zeros(rows, width, kind)`` each) as views of one span whose top
++    ``display`` bytes are the display reservation: as many planes as hold it. Once a process."""
++    from . import kv8
++
++    if _OWNERS:
++        raise RuntimeError(f"{ENV}: the display reservation already holds a cache pool in this process")
++    like = kv8.zeros(rows, width, kind, "meta")
++    plane_bytes = like.numel() * like.element_size()
++    k = span_planes(count, plane_bytes, display)
++    span = map_span(k * plane_bytes - display, display)
++    _OWNERS.append(span)
++    flat = as_tensor(span, device)
++    return [flat[i * plane_bytes:(i + 1) * plane_bytes].view(like.dtype).view(like.shape).zero_() for i in range(k)]
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index be14353..4de2fb1 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -690,9 +690,11 @@ class GlmEngine:
+         # TF_GLM_CACHE_GIB gives kept prompts (their rows in the pool, their KDA states and DFlash2 windows beside it),
+         # whole 2,048-token extents; each stream holds up to the window (pool.py, multi.py)
+         pool_rows = None
++        display = 0
+         if parallel > 1:
+             from tensorfold.cuda.capacity import config as read_config
+ 
++            from . import display_kv
+             from .pool import ALIGN
+ 
+             text = read_config(model_dir)
+@@ -700,7 +702,10 @@ class GlmEngine:
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+             states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, world, rows=0, rank=rank) // 2 +
+                                                                           (22 << 20))
+-            pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
++            # TF_GLM_DISPLAY_KV_MIB: the display reservation's bytes too, which free memory never counted
++            display = display_kv.credit()
++            pool_rows = (capacity + max(0, self.cache_bytes + display - states) // per_token) // ALIGN * ALIGN
++            display_rows = pool_rows - (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+                                  f"extent; free memory or lower --context")
+@@ -744,7 +749,12 @@ class GlmEngine:
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
+                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
+-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv)
++                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv,
++                        display=display)
++        if display and rank == 0:
++            print(f"[tensorfold] {display >> 20} MiB of the pool in the GPU's display reservation "
++                  f"(TF_GLM_DISPLAY_KV_MIB), which free memory does not count: +{display_rows} tokens, "
++                  f"{sum(p.spanned for p in self.e.caches.arena.planes)} latent planes in its span", flush=True)
+         if self.e.pbuf.split is not None:
+             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
+             if rank == 0:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 4d6499e..e2cad87 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -183,10 +183,13 @@ class Caches:
+     pools still filling (``decode.Snapshot.tail``). None: arena planes (token t at its extent's row).
+ 
+     ``kv``: the latent planes' and pooled keys' format (TF_GLM_KV, ``kv8``): bf16, or fp8 (a uint8 row a token /
+-    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only."""
++    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only.
++
++    ``display``: bytes of the GB10's display reservation the pool was sized with (``display_kv``); the first DSA
++    layers' latent planes are then carved from one span that holds them."""
+ 
+     def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
+-                 kv: str = "bf16") -> None:
++                 kv: str = "bf16", display: int = 0) -> None:
+         from .pool import Arena, Plane
+ 
+         c = w.cfg
+@@ -198,17 +201,24 @@ class Caches:
+             raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
+         self.kv = kv
+         planes: list[Plane] = []
++        spanned: list[torch.Tensor] = []
++        if display:
++            if not self.latent:
++                raise ValueError("TF_GLM_DISPLAY_KV_MIB needs the latent cache (TF_GLM_LATENT=1)")
++            from . import display_kv
++
++            spanned = display_kv.latent_planes(dsa, rows, c.kv_lora, kv, dev, display)
+ 
+-        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
++        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16", tensor=None) -> int:
+             n = rows // div + pad
+-            t = (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
+-                 torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
+-            planes.append(Plane(t, div, pad))
++            t = tensor if tensor is not None else (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
++                                                   torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
++            planes.append(Plane(t, div, pad, spanned=tensor is not None))
+             return len(planes) - 1
+ 
+         def attention_planes() -> tuple[int, int | None]:
+             if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
+-                return add((c.kv_lora,), fmt=kv), None
++                return add((c.kv_lora,), fmt=kv, tensor=spanned.pop(0) if spanned else None), None
+             return add((HL, c.qk_dim)), add((HL, c.v_dim))
+ 
+         self.kc, self.vc = [], []
+diff --git tensorfold/families/glm5_next/cuda/pool.py tensorfold/families/glm5_next/cuda/pool.py
+index 1313652..2f39307 100644
+--- tensorfold/families/glm5_next/cuda/pool.py
++++ tensorfold/families/glm5_next/cuda/pool.py
+@@ -30,10 +30,11 @@ def align_up(n: int, align: int = ALIGN) -> int:
+ 
+ class Plane:
+     """One cache tensor over the arena's rows: row r of token t at t // div (``div`` tokens a row), ``pad`` rows
+-    past the last token's."""
++    past the last token's. ``spanned``: in the display reservation's span (``display_kv``), whose two registrations
++    a memcpy may not cross, so its rows move by a kernel."""
+ 
+-    def __init__(self, tensor, div: int = 1, pad: int = 0) -> None:
+-        self.tensor, self.div, self.pad = tensor, int(div), int(pad)
++    def __init__(self, tensor, div: int = 1, pad: int = 0, spanned: bool = False) -> None:
++        self.tensor, self.div, self.pad, self.spanned = tensor, int(div), int(pad), bool(spanned)
+ 
+     def rows_for(self, tokens: int) -> int:
+         return tokens // self.div
+@@ -79,21 +80,29 @@ class Arena:
+             a, b = src // p.div, dst // p.div
+             m = -(-n // p.div)
+             m = min(m, p.tensor.shape[0] - max(a, b))
+-            _move(p.tensor, a, b, m)
++            _move(p.tensor, a, b, m, p.spanned)
+ 
+ 
+-def _move(t, a: int, b: int, m: int) -> None:
+-    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap."""
++def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
++    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
++
++    def put(dst, src):
++        if spanned:                        # the same bytes through an elementwise kernel
++            import torch
++
++            torch.bitwise_or(src.view(torch.uint8), 0, out=dst.view(torch.uint8))
++        else:
++            dst.copy_(src)
+ 
+     gap = abs(a - b)
+     if gap >= m:
+-        t[b:b + m].copy_(t[a:a + m])
++        put(t[b:b + m], t[a:a + m])
+         return
+     step = gap
+     starts = range(0, m, step) if b < a else reversed(range(0, m, step))
+     for s in starts:                       # down: front to back; up: back to front
+         k = min(step, m - s)
+-        t[b + s:b + s + k].copy_(t[a + s:a + s + k])
++        put(t[b + s:b + s + k], t[a + s:a + s + k])
+ 
+ 
+ @dataclass(eq=False)

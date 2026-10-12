@@ -1,0 +1,97 @@
+# Backport of upstream TensorFold commit 50dfe38a (v0.6.1, #181, by Dorian / SxMShaDoW), Apache-2.0: a refused
+# POST's body no longer reaches the next request on its connection. Merged with 0037's routes by MiaAI-Lab.
+
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index bebd06f..faec521 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -52,11 +52,25 @@ def make_handler(app: App):
+                 self.send_response(code)
+                 self.send_header("Content-Type", "application/json")
+                 self.send_header("Content-Length", str(len(data)))
++                if self.close_connection:                # so a pooling client does not reuse the socket
++                    self.send_header("Connection", "close")
+                 self.end_headers()
+                 self.wfile.write(data)
+             except (BrokenPipeError, ConnectionResetError):          # the client has gone
+                 self.close_connection = True
+ 
++        def _discard_body(self) -> None:
++            """Read a refused request's body, so it cannot reach the next request on this connection."""
++
++            try:
++                length = int(self.headers.get("Content-Length", 0))
++            except ValueError:
++                length = -1
++            if 0 <= length <= 32 * 1024**2:
++                self.rfile.read(length)
++            else:
++                self.close_connection = True
++
+         def _stream_error(self, error: dict[str, Any]) -> None:
+             """End an open stream with an error event and ``[DONE]``, as the MLX server does."""
+ 
+@@ -90,6 +104,7 @@ def make_handler(app: App):
+             chat = self.path.rstrip("/").endswith("/chat/completions")
+             tokenizer = self.path.rstrip("/") in _TOKENIZER_ROUTES
+             if not chat and not tokenizer and not self.path.rstrip("/").endswith("/completions"):
++                self._discard_body()
+                 return self._json(404, {"error": "not found"})
+             try:
+                 length = int(self.headers.get("Content-Length", 0))
+diff --git tensorfold/server/http.py tensorfold/server/http.py
+index 9c9330d..98ac60d 100644
+--- tensorfold/server/http.py
++++ tensorfold/server/http.py
+@@ -92,9 +92,23 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+             self.send_response(status)
+             self.send_header("Content-Type", "application/json")
+             self.send_header("Content-Length", str(len(body)))
++            if self.close_connection:                    # so a pooling client does not reuse the socket
++                self.send_header("Connection", "close")
+             self.end_headers()
+             self.wfile.write(body)
+ 
++        def _discard_body(self) -> None:
++            """Read a refused request's body, so it cannot reach the next request on this connection."""
++
++            try:
++                length = int(self.headers.get("Content-Length", "0"))
++            except ValueError:
++                length = -1
++            if 0 <= length <= 32 * 1024**2:
++                self.rfile.read(length)
++            else:
++                self.close_connection = True
++
+         def _route(self) -> str:
+             # Tolerate query strings, trailing slashes and client URLs with or without the /v1 prefix.
+             return self.path.split("?", 1)[0].rstrip("/")
+@@ -174,12 +188,14 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+             is_chat_completion = route.endswith("/chat/completions")
+             is_text_completion = route.endswith("/completions") and not is_chat_completion
+             if not is_chat_completion and not is_text_completion:
++                self._discard_body()
+                 self._send_json({"error": {"message": f"unknown path {self.path}"}}, status=404)
+                 return
+ 
+             try:
+                 length = int(self.headers.get("Content-Length", "0"))
+                 if not 0 <= length <= 32 * 1024**2:
++                    self.close_connection = True         # the unread body must not reach the next request
+                     raise RequestError("request body exceeds the 32 MiB limit")
+                 body = parse_numbers(json.loads(self.rfile.read(length) or b"{}"))
+                 validate_modalities(body)
+diff --git tensorfold/server/responses.py tensorfold/server/responses.py
+index 8cf8212..90179db 100644
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -111,6 +111,8 @@ def _send(handler: Any, status: int, payload: dict[str, Any]) -> None:
+         handler.send_response(status)
+         handler.send_header("Content-Type", "application/json")
+         handler.send_header("Content-Length", str(len(data)))
++        if handler.close_connection:                 # so a pooling client does not reuse the socket
++            handler.send_header("Connection", "close")
+         handler.end_headers()
+         handler.wfile.write(data)
+     except OSError:                                  # the client has gone

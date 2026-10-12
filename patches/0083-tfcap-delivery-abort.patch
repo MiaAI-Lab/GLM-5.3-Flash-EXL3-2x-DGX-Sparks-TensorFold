@@ -1,0 +1,37 @@
+diff --git tensorfold/cuda/scheduler.py tensorfold/cuda/scheduler.py
+index 767a86c..a15ab62 100644
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -64,6 +64,22 @@ class Scheduler:
+         if self.decoder.live() + self.waiting.foreground_count() >= self.max_in_system:
+             raise CapacityError("all serving lanes are busy; retry shortly")
+ 
++    def _relay_token(self, emit: Callable[[list[int]], bool | None], value: list[int], cancel: list[bool]) -> None:
++        # TFCAP-0076: a True return (the client left, or a stop string) or a delivery failure ends
++        # the stream. The old code let an exception escape the relay and the lane leaked until
++        # generation ended — minutes of decode into a queue nobody reads. Fires at most once per
++        # stream: cancel latches and later tokens skip the emit. The GLM submit loop's equivalent,
++        # with cleanup-before-error for its rank coordination, is patch 0073 (PR #51).
++        stop = False
++        if not cancel[0]:
++            try:
++                stop = emit(value)
++            except Exception as exc:
++                print(f"[tensorfold] stream aborted: emit failed: {exc!r}", flush=True)
++                stop = True
++        if stop:
++            cancel[0] = True
++
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+@@ -79,8 +95,7 @@ class Scheduler:
+         while True:
+             kind, value = box.get()
+             if kind == "tokens":
+-                if not cancel[0] and emit(value):
+-                    cancel[0] = True                 # the client left: the stream ends after its next round
++                self._relay_token(emit, value, cancel)
+             elif kind == "error":
+                 raise value
+             else:

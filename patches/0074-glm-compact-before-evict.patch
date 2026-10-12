@@ -1,0 +1,100 @@
+# With --parallel, a request or a decoding stream that needed rows the pool had free, but not in one range, evicted
+# kept prompts (least recently used first) until a free range opened, and compacted only after evicting every one.
+# Two long conversations taking turns (two agents at once) then evicted each other: a turn whose extent could not
+# grow in place dropped the other conversation's only state, and its next turn read its whole history again (150-210K
+# tokens, 2-3 minutes). Now the pool compacts as soon as its free rows cover the request (for a growing extent, the
+# extents up to it slide down and the ones after it up, so the free rows follow it; each moves once at most), and
+# evicts only while they fall short. A turn of one conversation may then move the other's rows: a copy on the GPU,
+# against a prefill of the evicted conversation. Same replies: placement only, the moved rows are the same bytes.
+# By @ezoushen (PR #62).
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 35409ed..52a8ad3 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1005,34 +1005,51 @@ class MultiDecoder:
+         keep = set(id(x) for x in protect)
+         return [c for c in self.kept if c.extent.owner is None and id(c.extent) not in keep]
+ 
+-    def _compact(self) -> None:
+-        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range."""
++    def _compact(self, grow=None) -> None:
++        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
++        ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
++        follows ``grow`` (each extent moves once at most)."""
+ 
+         at = 0
+         for x in list(self.pool.extents):
++            if grow is not None and x.base > grow.base:
++                break
+             if x.base != at:
+                 self._emit(MOVE, [x.eid, at, x.size])
+                 self._move(x, at, x.size)
+             at += x.size
++        if grow is None:
++            return
++        top = self.pool.rows
++        for x in reversed(list(self.pool.extents)):
++            if x is grow:
++                break
++            top -= x.size
++            if x.base != top:
++                self._emit(MOVE, [x.eid, top, x.size])
++                self._move(x, top, x.size)
+ 
+     def _room(self, need: int, protect=()) -> int | None:
+         """Rank 0: a base with ``need`` free rows, evicting kept prompts (least recently used first, never
+-        ``protect``'s extents) and compacting as needed; None if even that leaves too little."""
++        ``protect``'s extents) only while the free rows fall short of ``need``, then compacting if they are not
++        together: moving rows costs far less than prefilling an evicted conversation again. None if even evicting
++        every other kept prompt leaves too little."""
+ 
+         base = self.pool.place(need)
+         while base is None:
++            if self.pool.free_rows() >= need:
++                self._compact()
++                return self.pool.place(need)
+             victims = self._victims(protect)
+             if not victims:
+                 break
+             self._evict(victims[0])
+             base = self.pool.place(need)
+-        if base is None and self.pool.free_rows() >= need:
+-            self._compact()
+-            base = self.pool.place(need)
+         return base
+ 
+     def _grow(self, x, size: int, protect=()) -> bool:
+-        """Rank 0: extent x to at least ``size`` rows, in place or moved (evicting and compacting as needed)."""
++        """Rank 0: extent x to at least ``size`` rows, in place or moved; as in ``_room``, compacting before evicting
++        more than the free rows fall short."""
+ 
+         size = align_up(size)
+         if size <= x.size:
+@@ -1048,22 +1065,13 @@ class MultiDecoder:
+                 self._emit(MOVE, [x.eid, base, size])
+                 self._move(x, base, size)
+                 return True
++            if self.pool.free_rows() + x.size >= size:
++                self._compact(grow=x)            # the rows are free, just not together: gathered right after x
++                continue
+             victims = self._victims(protect)
+             if not victims:
+-                break
++                return False
+             self._evict(victims[0])
+-        if self.pool.free_rows() + x.size >= size:
+-            self._compact()
+-            if self.pool.room_after(x) >= size - x.size:
+-                self._emit(GROW, [x.eid, size])
+-                self._resize(x, size)
+-                return True
+-            base = self.pool.place(size, ignore=[x])
+-            if base is not None:
+-                self._emit(MOVE, [x.eid, base, size])
+-                self._move(x, base, size)
+-                return True
+-        return False
+ 
+     # -- iterations ---------------------------------------------------------------------------------------------------------
+     @torch.no_grad()

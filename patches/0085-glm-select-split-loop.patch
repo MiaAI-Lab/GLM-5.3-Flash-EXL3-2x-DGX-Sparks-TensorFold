@@ -1,0 +1,55 @@
+diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -751,7 +751,7 @@
+ @triton.jit
+ def _select_split(S, s_stride, NPC, POS, SPR, TOT, HIST, GT, OUT, TOK, CNT, W: tl.constexpr, K: tl.constexpr,
+                   PL: tl.constexpr, CHS: tl.constexpr, CP: tl.constexpr, STEP: tl.constexpr, SEG: tl.constexpr,
+-                  VIS: tl.constexpr, TOKS: tl.constexpr):
++                  VIS: tl.constexpr, TOKS: tl.constexpr, BLK: tl.constexpr):
+     """Program (row, chunk), STEP 0..3: pass STEP over the chunk; STEP 4: its selected pools, as pool ids OUT[r, :K]
+     (SEG False: NPC scores a row, or with VIS the first _visible_bound of them for row r at POS[0] + r; chunks past
+     it exit; TOKS, with VIS: as select_tokens' tokens, tail and count instead, every row) or (SEG: the row's
+@@ -797,13 +797,20 @@
+         tl.store(own + bins, hist)
+         tl.atomic_add(TOT + (r * 4 + STEP) * 256 + bins, hist)
+     else:
+-        ci = tl.arange(0, CP)
+-        before = ci < c
+-        # earlier chunks: scores above the prefix at bytes 0..2 (GT), at byte 3 and equal to it (their last histograms)
+-        last = tl.load(HIST + (r * CP + ci[:, None]) * 256 + bins[None, :], mask=before[:, None], other=0)
+-        gt = tl.load(GT + r * CP + ci, mask=before, other=0) + tl.sum(tl.where(bins[None, :] > d, last, 0), 1)
+-        equal_seen = tl.sum(tl.sum(tl.where(bins[None, :] == d, last, 0), 1), 0)
+-        written = tl.sum(gt, 0) + tl.minimum(equal_seen, need)
++        # earlier chunks: scores above the prefix at bytes 0..2 (GT), at byte 3 and equal to it (their last histograms),
++        # BLK chunks an iteration over the chunks before this one only: a CP x 256 tile masked to them costs every
++        # program the whole table (CP is the scratch's, sized for the pool, not the row's context)
++        gt = tl.zeros((), dtype=tl.int32)
++        equal_seen = tl.zeros((), dtype=tl.int32)
++        cb = tl.arange(0, BLK)
++        for c0 in range(0, c, BLK):
++            ci = c0 + cb
++            before = ci < c
++            last = tl.load(HIST + (r * CP + ci[:, None]) * 256 + bins[None, :], mask=before[:, None], other=0)
++            gt += tl.sum(tl.load(GT + r * CP + ci, mask=before, other=0), 0)
++            gt += tl.sum(tl.sum(tl.where(bins[None, :] > d, last, 0), 1), 0)
++            equal_seen += tl.sum(tl.sum(tl.where(bins[None, :] == d, last, 0), 1), 0)
++        written = gt + tl.minimum(equal_seen, need)
+         e = (ok & (u == prefix)).to(tl.int32)
+         take = (ok & (u > prefix)) | ((e == 1) & (tl.cumsum(e, 0) - e + equal_seen < need))
+         t = take.to(tl.int32)
+@@ -827,6 +834,7 @@
+ SPLIT_FROM = 8192          # decode windows split rows of at least this many scores (fewer: one program a row)
+ SPLIT_ROWS = 64            # ... windows of fewer rows (prompt chunks' hundreds of rows fill the GPU as they are)
+ SPLIT_WARPS = 4
++SPLIT_BLK = 16             # step 4's earlier chunks an iteration (speed only)
+ 
+ 
+ def split_chunk(np_: int) -> int:
+@@ -872,5 +880,5 @@
+                                rows.sparse if seg else dummy, tot, hist, gt, out if out is not None else dummy,
+                                tokens if tokens is not None else dummy, counts if counts is not None else dummy,
+                                W=TOKENS, K=k, PL=POOL, CHS=chs, CP=cp, STEP=step, SEG=seg,
+-                               VIS=pos is not None and not seg, TOKS=toks, num_warps=warps)
++                               VIS=pos is not None and not seg, TOKS=toks, BLK=SPLIT_BLK, num_warps=warps)
+     return out

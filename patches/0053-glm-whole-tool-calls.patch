@@ -1,0 +1,100 @@
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+index 2f63be4..1ad8ca7 100644
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -237,11 +237,14 @@ def _json(value: Any) -> str:
+ 
+ class GlmCallStreamer:
+     """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
+-    deltas while they are written: a header (index, id, name) once the name is whole, then the arguments' JSON in
+-    pieces, a string value as it arrives and a typed one when whole, joining to what ``parse_tool_calls`` gives.
++    deltas: each call is followed while it is written (its arguments' JSON built a string value as it arrives and a
++    typed one when whole, joining to what ``parse_tool_calls`` gives) and sent whole, header and arguments in one delta,
++    once its ``</tool_call>`` arrives. A call the reply ends inside (its token limit) is never sent: a client could
++    store or run its cut arguments.
+ 
+-    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas. A block it cannot
+-    follow (not GLM's markup, a tool the request did not offer) is skipped and stays with the end parser."""
++    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas; ``sent`` counts the
++    calls sent. A block it cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays
++    with the end parser."""
+ 
+     def __init__(self, tools: list[dict[str, Any]]) -> None:
+         self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+@@ -253,6 +256,7 @@ class GlmCallStreamer:
+         self.schema: dict[str, Any] = {}               # the current call's parameter schemas
+         self.value_schema: dict[str, Any] | None = None     # the current typed value's schema, None for text
+         self.maybe_null = False                         # a nullable text value that may still be ``null``: held
++        self.sent = 0                                   # calls sent whole (the last one may still be open)
+ 
+     def _args(self, out: list[dict[str, Any]], piece: str) -> None:
+         index = len(self.calls) - 1
+@@ -264,6 +268,15 @@ class GlmCallStreamer:
+             out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
+ 
+     def feed(self, text: str) -> list[dict[str, Any]]:
++        self._follow(text)
++        whole = len(self.calls) - (1 if self.open else 0)
++        out = [{"tool_calls": [{"index": i, "id": c["id"], "type": "function",
++                                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]}
++               for i, c in enumerate(self.calls[self.sent:whole], self.sent)]
++        self.sent = whole
++        return out
++
++    def _follow(self, text: str) -> list[dict[str, Any]]:
+         out: list[dict[str, Any]] = []
+         while True:
+             rest = text[self.pos:]
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 673fc9f..762cd3d 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -29,6 +29,10 @@ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopSt
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
++# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
++# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
++CALL_KEEPALIVE_S = 2.0
++
+ 
+ # -- requests --------------------------------------------------------------------------------
+ 
+@@ -363,6 +367,7 @@ class App:
+         # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
+         glm_calls = bool(tools) and self._glm_calls()
+         calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
+         # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
+         # end parser
+         xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+@@ -424,6 +429,11 @@ class App:
+                 parts = [delta] if delta else []
+                 if calls_stream is not None:
+                     parts += calls_stream.feed(call_text(raw))
++                    if parts:
++                        quiet_since[0] = time.monotonic()
++                    elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
++                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
++                        quiet_since[0] = time.monotonic()
+                 if not all(emit(part) for part in parts):
+                     stopped["client"] = True
+                 if xml_stream is not None and not stopped["client"]:
+@@ -525,11 +535,13 @@ class App:
+         # (never streamed) are the end parser's, sent whole
+         if calls_stream is not None and (think is None or think.stream_from is not None):
+             call_deltas = calls_stream.feed(call_text(raw))
+-            streamed = len(calls_stream.calls)
+-            calls = [*calls_stream.calls, *calls_stream.rest(tools)] or None
+-        cut = calls_stream is not None and calls_stream.open        # a streamed call the reply ended inside
+-        if cut:                                 # its text went out as a call already, not again as content
++            streamed = calls_stream.sent
++            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
++        cut = calls_stream is not None and calls_stream.open        # a call the reply ended inside: never sent
++        if cut:                                 # nor its markup as content
+             content = answer.strip()
++        elif tools and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
++            content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail

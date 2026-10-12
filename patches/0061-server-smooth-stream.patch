@@ -1,0 +1,275 @@
+# TF_GLM_STREAM_SMOOTH=1 (STREAM_SMOOTH): a streamed reply's tokens go out one event each at a steady pace from a
+# short playout buffer (TF_GLM_STREAM_SMOOTH_MS, default 400), so drafted bursts and pauses shorter than the buffer
+# (another request's prompt slices) do not show; same text and end, tool calls in place, the last round flushes.
+# MiaAI-Lab, Apache-2.0.
+
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index fb24558..21f81ef 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -26,6 +26,7 @@ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+                                         close_glm_call, hide_tool_calls, parse_tool_calls)
++from tensorfold.cuda.stream_pacing import Playout, smooth_streaming
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+@@ -409,8 +410,36 @@ class App:
+ 
+         serving: list[Any] = [None]
+ 
++        # TF_GLM_STREAM_SMOOTH=1: a streamed reply's tokens go out one event each at a steady pace from a short
++        # playout buffer (``stream_pacing.Playout``), so drafted bursts and other requests' prompt fills do not show
++        playout = Playout(emit, cancelled=cancelled) if body.get("stream") and smooth_streaming() else None
++
++        def send(delta: dict[str, Any], paced: bool) -> bool:
++            """Write an event (through the playout queue when smoothing): False once the client has gone."""
++
++            if playout is None:
++                return emit(delta)
++            playout.put(delta, paced)
++            return not playout.gone
++
++        def text_delta(tokens: list[int]) -> tuple[dict[str, Any], str]:
++            """The reasoning and answer text these tokens add (the part not sent yet), and the raw text so far."""
++
++            stream.add(tokens)
++            reasoning, answer, raw = visible(False)
++            delta: dict[str, Any] = {}
++            if len(reasoning) > sent["reasoning"]:
++                delta["reasoning_content"] = reasoning[sent["reasoning"]:]
++                sent["reasoning"] = len(reasoning)
++            if len(answer) > sent["content"]:
++                delta["content"] = answer[sent["content"]:]
++                sent["content"] = len(answer)
++            return delta, raw
++
+         def on_tokens(new: list[int]) -> bool:
+             # True stops the engine after this round; engines that finish on both ranks keep calling and get True
++            if playout is not None and playout.gone:
++                stopped["client"] = True
+             if stopped["client"] or stopped["stop"] or failed:
+                 return True
+             try:
+@@ -425,28 +454,34 @@ class App:
+                     new = kept
+                 else:
+                     out.extend(new)
+-                stream.add(new)
+-                reasoning, answer, raw = visible(False)
+-                delta: dict[str, Any] = {}
+-                if len(reasoning) > sent["reasoning"]:
+-                    delta["reasoning_content"] = reasoning[sent["reasoning"]:]
+-                    sent["reasoning"] = len(reasoning)
+-                if len(answer) > sent["content"]:
+-                    delta["content"] = answer[sent["content"]:]
+-                    sent["content"] = len(answer)
+-                parts = [delta] if delta else []
+-                if calls_stream is not None:
++                # smooth streaming: token by token into the playout queue, unless the reply ends in this round (then
++                # the queue is flushed: the end is never later)
++                ending = stopped["stop"] or (bool(new) and (new[-1] in ends or len(out) >= max_tokens))
++                if playout is not None and ending:
++                    playout.flush()
++                pieces = [[t] for t in new] if playout is not None and not ending and len(new) > 1 else [new]
++                raw, wrote = "", False
++                for piece in pieces:
++                    delta, raw = text_delta(piece)
++                    if not delta:
++                        continue
++                    if not send(delta, True):
++                        stopped["client"] = True
++                        break
++                    wrote = True
++                parts: list[dict[str, Any]] = []
++                if calls_stream is not None and not stopped["client"]:
+                     parts += calls_stream.feed(call_text(raw))
+-                    if parts:
++                    if parts or wrote:
+                         quiet_since[0] = time.monotonic()
+                     elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+                         parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
+                         quiet_since[0] = time.monotonic()
+-                if not all(emit(part) for part in parts):
++                if not all(send(part, False) for part in parts):
+                     stopped["client"] = True
+                 if xml_stream is not None and not stopped["client"]:
+                     for call_delta in xml_stream.feed(answer_raw[0]):     # never the reasoning
+-                        if not emit(call_delta):
++                        if not send(call_delta, False):
+                             stopped["client"] = True
+                             break
+                 if not stopped["client"] and cancelled is not None and cancelled():   # every round, text or not
+@@ -520,8 +555,18 @@ class App:
+                 serving[0] = request
+                 try:
+                     stats = request.stats = generate_gated(generate, prompt, max_tokens, gates, on_tokens)
++                except BaseException:
++                    if playout is not None:
++                        playout.abort()
++                    raise
+                 finally:
+                     serving[0] = None
++                if playout is not None:             # what is still queued goes out now, before the reply's end
++                    (playout.abort if stopped["client"] or failed else playout.close)()
++                    if playout.error is not None:
++                        failed.append(playout.error)
++                    elif playout.gone:
++                        stopped["client"] = True
+         finally:
+             if turns is not None:
+                 turns.give()
+diff --git tensorfold/cuda/stream_pacing.py tensorfold/cuda/stream_pacing.py
+new file mode 100644
+index 0000000..9c6b61c
+--- /dev/null
++++ tensorfold/cuda/stream_pacing.py
+@@ -0,0 +1,147 @@
++"""Smooth streaming (``TF_GLM_STREAM_SMOOTH=1``): a streamed reply's text goes out token by token at a steady pace
++from a short playout buffer, instead of a burst of drafted tokens every round and a pause whenever the engine fills
++another request's prompt.
++
++The engine's rounds come in bursts: a round accepts ~3 drafted tokens, a round takes longer while other requests
++decode, and while a new prompt fills the rounds wait for its layer slices. The request's tokens enter a queue as they
++arrive and a writer thread sends them one event each: the next goes out ``hold / queued`` after the previous one
++(never before it arrived), so the queue settles at about ``hold`` seconds of tokens and a pause in the rounds shorter
++than that is spread over the tokens already queued instead of showing as a freeze. No token is held longer than
++``LONGEST_HOLD`` times ``hold``.
++
++The text, its order and the reply's end are unchanged: only when events go out. Events that are not text (tool-call
++deltas, keep-alives) keep their place in the queue and are not paced; the round that ends the reply flushes the queue
++at once, so the reply ends when it did. The engine never waits: the request thread only queues."""
++
++from __future__ import annotations
++
++import collections
++import os
++import threading
++import time
++from typing import Any, Callable
++
++HOLD_MS = 400               # the default playout buffer: about this much text is held, so shorter pauses never show
++LONGEST_HOLD = 2.5          # no token is held longer than this many times the buffer
++
++
++def smooth_streaming(value: str | None = None) -> bool:
++    """``TF_GLM_STREAM_SMOOTH``: 1 paces a streamed reply's tokens, 0 (the default) sends each round as one event."""
++
++    raw = (os.environ.get("TF_GLM_STREAM_SMOOTH", "0") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH={raw!r}: expected 0 or 1")
++    return raw == "1"
++
++
++def hold_seconds(value: str | None = None) -> float:
++    """``TF_GLM_STREAM_SMOOTH_MS``: the playout buffer in milliseconds (default ``HOLD_MS``)."""
++
++    raw = (os.environ.get("TF_GLM_STREAM_SMOOTH_MS", "") if value is None else value).strip() or str(HOLD_MS)
++    try:
++        ms = int(raw)
++    except ValueError:
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH_MS={raw!r}: expected whole milliseconds") from None
++    if not 1 <= ms <= 5000:
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH_MS={ms}: expected 1-5000")
++    return ms / 1000.0
++
++
++class _Item:
++    __slots__ = ("delta", "paced", "arrived")
++
++    def __init__(self, delta: dict[str, Any], paced: bool, arrived: float) -> None:
++        self.delta, self.paced, self.arrived = delta, paced, arrived
++
++
++class Playout:
++    """One streamed reply's playout queue, and the writer thread that empties it through ``emit``.
++
++    ``put`` queues an event (``paced``: a text delta; else it goes out as soon as it reaches the front); ``flush``
++    sends everything queued at once from then on; ``close`` flushes, waits for the queue to empty and stops the writer;
++    ``abort`` drops what is queued and stops it. ``gone`` holds once ``emit`` failed or ``cancelled()`` said the
++    client left (checked before each held event)."""
++
++    def __init__(self, emit: Callable[[dict[str, Any]], bool], hold: float | None = None,
++                 cancelled: Callable[[], bool] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
++        self.emit, self.cancelled, self.clock = emit, cancelled, clock
++        self.hold = hold_seconds() if hold is None else hold
++        self.queue: collections.deque[_Item] = collections.deque()
++        self.paced = 0                       # paced items queued
++        self.last: float | None = None       # when the previous event went out
++        self.flushing = self.closed = self.gone = False
++        self.error: BaseException | None = None
++        self.cond = threading.Condition()
++        self.thread = threading.Thread(target=self._run, name="tf-playout", daemon=True)
++        self.thread.start()
++
++    # -- the request thread -------------------------------------------------------------------------------------------
++
++    def put(self, delta: dict[str, Any], paced: bool = True) -> None:
++        with self.cond:
++            if self.closed or self.gone:
++                return
++            self.queue.append(_Item(delta, paced, self.clock()))
++            self.paced += paced
++            self.cond.notify()
++
++    def flush(self) -> None:
++        with self.cond:
++            self.flushing = True
++            self.cond.notify()
++
++    def close(self) -> None:
++        """Send everything still queued at once and stop the writer (the reply's end follows)."""
++
++        with self.cond:
++            self.flushing = self.closed = True
++            self.cond.notify()
++        self.thread.join()
++
++    def abort(self) -> None:
++        with self.cond:
++            self.queue.clear()
++            self.paced = 0
++            self.closed = True
++            self.cond.notify()
++        self.thread.join()
++
++    # -- the writer ---------------------------------------------------------------------------------------------------
++
++    def due(self, now: float) -> float:
++        """When the front of the queue goes out (the queue is not empty)."""
++
++        item = self.queue[0]
++        if self.flushing or not item.paced or self.last is None:
++            return now
++        at = max(item.arrived, self.last + self.hold / max(self.paced, 1))
++        return min(at, item.arrived + LONGEST_HOLD * self.hold)
++
++    def _run(self) -> None:
++        while True:
++            with self.cond:
++                while True:
++                    if not self.queue:
++                        if self.closed:
++                            return
++                        self.cond.wait()
++                        continue
++                    now = self.clock()
++                    at = self.due(now)
++                    if at <= now:
++                        break
++                    self.cond.wait(at - now)          # a new token shortens the wait; a flush ends it
++                item = self.queue.popleft()
++                self.paced -= item.paced
++                held = item.paced and not self.flushing and now > item.arrived
++            try:
++                ok = not (held and self.cancelled is not None and self.cancelled()) and self.emit(item.delta)
++            except BaseException as exc:              # noqa: BLE001  re-raised by the request after generate
++                self.error, ok = exc, False
++            with self.cond:
++                self.last = self.clock()
++                if not ok:
++                    self.gone = True
++                    self.queue.clear()
++                    self.paced = 0
++                    return

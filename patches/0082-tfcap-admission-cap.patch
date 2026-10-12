@@ -1,0 +1,95 @@
+diff --git tensorfold/cuda/scheduler.py tensorfold/cuda/scheduler.py
+index 4e9421b..767a86c 100644
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -10,6 +10,7 @@ from typing import Any, Callable
+ 
+ from .memory_gate import NoRoom
+ from .streams import Stream
++from tensorfold.server.errors import CapacityError  # TFCAP-0075
+ 
+ 
+ class Waiting(queue.PriorityQueue):
+@@ -25,6 +26,12 @@ class Waiting(queue.PriorityQueue):
+     def get(self, block: bool = True, timeout: float | None = None):
+         return super().get(block, timeout)[2]
+ 
++    def foreground_count(self) -> int:
++        # TFCAP-0075: queued background streams never consume admission slots; scheduling prefers
++        # foreground, so only foreground waiters count against the cap.
++        with self.mutex:
++            return sum(1 for _p, _o, (s, _b) in self.queue if not s.background)
++
+     def foreground(self) -> bool:
+         """Whether a foreground request waits."""
+ 
+@@ -33,9 +40,16 @@ class Waiting(queue.PriorityQueue):
+ 
+ 
+ class Scheduler:
+-    def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
++    def __init__(self, decoder: Any, *, max_streams: int = 4,
++                 max_in_system: int | None = None) -> None:
+         self.decoder = decoder
+         self.max_streams = max_streams
++        # TFCAP-0075: the mechanism is unconditional; the limit is configuration, as in vLLM — its
++        # check_admission runs on every request while max_num_queued_reqs/max_num_queued_tokens
++        # default to None ("bounds vLLM's otherwise unbounded request queue", "a coarse capacity
++        # valve"). None queues, as every scheduler always has; a cap turns saturation into a
++        # refusal with a retry hint instead of invisible stacking.
++        self.max_in_system = max_in_system
+         self.waiting = Waiting()
+         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
+         self.boxes: dict[int, queue.Queue] = {}
+@@ -43,10 +57,18 @@ class Scheduler:
+         self.thread = threading.Thread(target=self._loop, daemon=True)
+         self.thread.start()
+ 
++    def _check_admission(self, background: bool) -> None:
++        # TFCAP-0075: refusal at saturation. Background requests bypass: they yield and queue by design.
++        if background or self.max_in_system is None:
++            return
++        if self.decoder.live() + self.waiting.foreground_count() >= self.max_in_system:
++            raise CapacityError("all serving lanes are busy; retry shortly")
++
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
++        self._check_admission(background)
+ 
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 24d3e6f..e3261c7 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -46,6 +46,7 @@ import numpy as np
+ import torch
+ 
+ from tensorfold.cuda.scheduler import Scheduler
++from tensorfold.server.errors import CapacityError  # TFCAP-0075
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+ from . import multi_prefill, sliced_fill
+@@ -1765,11 +1766,19 @@ class GlmScheduler(Scheduler):
+         # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
+         # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
+         self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
+-        super().__init__(decoder, max_streams=max_streams)
++        # TFCAP-0075: the cap is operator configuration (TF_GLM_MAX_QUEUED, exported by scripts/config.sh):
++        # unset queues as every scheduler always has; N refuses past the lanes plus N. vLLM's default is
++        # likewise no limit — its own words, the cap "bounds vLLM's otherwise unbounded request queue".
++        # A single-instance LAN deployment has no load balancer to shed load ahead of the server, so an
++        # exposed one should set a small cap (ours: 0 — nothing waits past the lanes).
++        queued = os.environ.get("TF_GLM_MAX_QUEUED")
++        super().__init__(decoder, max_streams=max_streams,
++                         max_in_system=max_streams + int(queued) if queued else None)
+ 
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
++        self._check_admission(background)
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background)

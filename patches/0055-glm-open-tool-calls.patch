@@ -1,0 +1,159 @@
+# Issue #22: a tool call the model's end token left open is closed and sent when it parses, else its markup is
+# text (never dropped); a missing <arg_key> is put back. Reported by @teamlewis-bot, @andrejsstepanovs. MiaAI-Lab, Apache-2.0.
+
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+index 1ad8ca7..55ccf2f 100644
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -138,7 +138,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+                         for key, value in ((p.group(1).strip(), p.group(2))
+                                            for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
+             else:
+-                glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
++                glm = parse_glm_tool_call_block(repair_glm_keys(block), tools, complete=max_calls is not None)
+                 if glm is not None:
+                     name, args = glm
+         if not name or str(name).lower() not in known:
+@@ -162,6 +162,45 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+ _THINK_CLOSE = "</think>"
+ _CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+ THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
++_GLM_TAG = re.compile(r"</?arg_(?:key|value)>")
++_LAST_WORD = re.compile(r"(\S+)\s*$")
++
++
++def repair_glm_keys(block: str) -> str:
++    """A GLM call whose ``<arg_key>`` the model left out, writing whitespace where that token belongs (issue #22:
++    ``read path</arg_key><arg_value>..``, or ``</arg_value>\npath</arg_key>``), with it put back: the word before an
++    unopened ``</arg_key>`` is its key. A block where nothing is missing comes back as it is."""
++
++    if block.count(_KEY_END) <= block.count(_KEY):
++        return block
++    out, at, prev, prev_end = [], 0, None, 0     # prev: the last tag seen (ending at prev_end); at: text copied
++    for tag in _GLM_TAG.finditer(block):
++        if tag.group(0) == _KEY_END and prev in (None, _VALUE_END):
++            seg_start = 0 if prev is None else prev_end
++            word = _LAST_WORD.search(block, seg_start, tag.start())
++            # the name's segment keeps a name before the key (``read path``): no word, or no name, is not repaired
++            if word is None or (prev is None and not block[seg_start:word.start()].strip()):
++                return block
++            out += [block[at:word.start()], _KEY]
++            at = word.start()
++        prev, prev_end = tag.group(0), tag.end()
++    return "".join(out) + block[at:]
++
++
++def close_glm_call(text: str, tools: list[dict[str, Any]]) -> str:
++    """What closes the GLM call a reply ended inside when it parses as a whole call to an offered tool (issue #22:
++    the model wrote its end token before ``</tool_call>``): ``</tool_call>``, after ``</arg_value>`` when a value is
++    open; "" when the reply is not inside a call, or the closed call would not parse (its markup is then text)."""
++
++    at = text.rfind(_CALL_OPEN)
++    if at < 0:
++        return ""
++    block = text[at + len(_CALL_OPEN):]
++    if _CALL_CLOSE in block or _THINK_CLOSE in block:
++        return ""
++    suffix = (_VALUE_END if block.rfind(_VALUE) > block.rfind(_VALUE_END) else "") + _CALL_CLOSE
++    # the strict reading (one whole call, nothing but its markup, arguments a JSON object)
++    return suffix if parse_tool_calls(_CALL_OPEN + block + suffix, tools, max_calls=1)[1] else ""
+ 
+ 
+ def _call_run(text: str, start: int, finished: bool) -> tuple[int, str]:
+@@ -247,6 +286,7 @@ class GlmCallStreamer:
+     with the end parser."""
+ 
+     def __init__(self, tools: list[dict[str, Any]]) -> None:
++        self.tools = tools
+         self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+         self.schemas = parameter_schemas(tools)
+         self.calls: list[dict[str, Any]] = []          # every call whose header was sent, its arguments as sent
+@@ -315,6 +355,7 @@ class GlmCallStreamer:
+                 if close >= 0 and (key < 0 or close < key):
+                     self._args(out, "}" if self.calls[-1]["function"]["arguments"] else "{}")
+                     self.pos, self.state, self.open = self.pos + close + len(_CALL_CLOSE), "outside", False
++                    self._repaired(text[self.start:self.pos])
+                 elif key >= 0:
+                     self.pos, self.state = self.pos + key + len(_KEY), "key"
+                 else:
+@@ -363,6 +404,16 @@ class GlmCallStreamer:
+                         return out
+                 self.pos, self.state = self.pos + end + len(_VALUE_END), "arguments"
+ 
++    def _repaired(self, block: str) -> None:
++        """A whole call whose markup lost an ``<arg_key>`` (``repair_glm_keys``): its arguments as the end parser reads
++        it repaired (the streamer skipped the argument it could not see); it has not been sent yet."""
++
++        if block.count(_KEY_END) <= block.count(_KEY):
++            return
++        calls = parse_tool_calls(block, self.tools)[1] or []
++        if len(calls) == 1 and calls[0]["function"]["name"] == self.calls[-1]["function"]["name"]:
++            self.calls[-1]["function"]["arguments"] = calls[0]["function"]["arguments"]
++
+     def _callable(self, name: str) -> bool:
+         """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
+ 
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 762cd3d..d44ae09 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -25,7 +25,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+-                                        hide_tool_calls, parse_tool_calls)
++                                        close_glm_call, hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+@@ -372,6 +372,7 @@ class App:
+         # end parser
+         xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+         answer_raw = [""]
++        closing = [""]                       # what closes a GLM call the reply ended inside on an end token (#22)
+         # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
+         think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
+                  else None)
+@@ -392,6 +393,7 @@ class App:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
++            raw = raw + closing[0] if finished else raw
+             reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+@@ -522,11 +524,17 @@ class App:
+         if stopped["client"]:                                        # as the Mac server: nothing more is written
+             raise RequestCancelled("the client left during the reply")
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
++        # the model's end token (not a stop string or the token limit) ended the reply: a call it ended inside is
++        # closed when it then parses (#22), else its markup is the reply's text; it is never dropped
++        ended = bool(out) and out[-1] in ends and not stopped["stop"]
++        if ended and glm_calls:
++            final_raw = stream.final()
++            closing[0] = close_glm_call(stops.visible(final_raw) if stops.strings else final_raw, tools)
+         reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+-        text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
++        text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)) + closing[0]
+         raw_answer = split(text, True)[1]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -537,10 +545,12 @@ class App:
+             call_deltas = calls_stream.feed(call_text(raw))
+             streamed = calls_stream.sent
+             calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
+-        cut = calls_stream is not None and calls_stream.open        # a call the reply ended inside: never sent
+-        if cut:                                 # nor its markup as content
++        # a call the token limit cut (the reply ended inside it): never sent, nor its markup as content; one the
++        # model's end token left open that would not parse, its markup as text (``closing`` closed the others)
++        cut = calls_stream is not None and calls_stream.open and not ended
++        if cut:
+             content = answer.strip()
+-        elif tools and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
++        elif tools and not ended and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
+             content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:

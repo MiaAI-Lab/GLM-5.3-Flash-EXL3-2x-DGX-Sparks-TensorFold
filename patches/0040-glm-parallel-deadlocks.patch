@@ -1,0 +1,305 @@
+diff --git tensorfold/cuda/roce.py tensorfold/cuda/roce.py
+index 52bc376..bba421c 100644
+--- tensorfold/cuda/roce.py
++++ tensorfold/cuda/roce.py
+@@ -142,7 +142,11 @@ class RoceGather:
+ 
+     def fits(self, send: torch.Tensor) -> bool:
+         n = send.numel() * send.element_size()
+-        return 0 < n <= self.max_bytes and n % PACK == 0 and send.data_ptr() % PACK == 0 and send.is_contiguous()
++        return self.fits_bytes(n) and send.data_ptr() % PACK == 0 and send.is_contiguous()
++
++    def fits_bytes(self, n: int) -> bool:
++        """Whether a gather of ``n`` bytes a rank goes over RoCE (the same answer on every rank)."""
++        return 0 < n <= self.max_bytes and n % PACK == 0
+ 
+     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+         nbytes = send.numel() * send.element_size()
+@@ -183,9 +187,20 @@ class RoceComm:
+         self.small = self.large = 0
+ 
+     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+-        if self.roce.fits(send) and recv.is_contiguous() and recv.data_ptr() % PACK == 0:
++        """RoCE for a gather whose size fits, NCCL otherwise: decided by the byte count alone, which every rank's
++        matching call shares. A send or receive buffer that is not 16-byte aligned or contiguous goes through an
++        aligned copy: choosing by the buffers' addresses let two ranks pick different transports for the same gather
++        (one waiting in RoCE, the other in NCCL, forever)."""
++
++        n = send.numel() * send.element_size()
++        if self.roce.fits_bytes(n):
+             self.small += 1
+-            self.roce.all_gather(send, recv)
++            s = send if send.is_contiguous() and send.data_ptr() % PACK == 0 else send.contiguous().clone()
++            r = recv if recv.is_contiguous() and recv.data_ptr() % PACK == 0 else torch.empty_like(recv,
++                                                                                               memory_format=torch.contiguous_format)
++            self.roce.all_gather(s, r)
++            if r is not recv:
++                recv.copy_(r)
+         else:
+             self.large += 1
+             self.nccl.all_gather(send, recv)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index ae6a079..2e0d675 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -553,7 +553,7 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+-                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE, "
++                               "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 1c4af9d..9eafb09 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -46,6 +46,40 @@ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT = range(1, 10)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+        IDLE: "IDLE", SLOT: "SLOT"}
++
++
++def watchdog_seconds(value: str | None = None) -> float:
++    """TF_GLM_MULTI_WATCHDOG_S: seconds a rank-0 iteration (or a rank-1 message it is owed) may take before every
++    thread's Python stack is dumped to the log (faulthandler; 0: off; default 300)."""
++
++    value = os.environ.get("TF_GLM_MULTI_WATCHDOG_S", "") if value is None else value
++    try:
++        s = 300.0 if value.strip() == "" else float(value)
++    except ValueError:
++        s = -1.0
++    if s < 0:
++        raise ValueError(f"TF_GLM_MULTI_WATCHDOG_S: seconds (0: off), not {value!r}")
++    return s
++
++
++def _watch(seconds: float, what: str) -> None:
++    if seconds > 0:
++        import faulthandler
++        import sys
++
++        try:                                              # the process's stderr (a test may have swapped sys.stderr)
++            faulthandler.dump_traceback_later(seconds, repeat=True, file=sys.__stderr__, exit=False)
++        except (ValueError, OSError, AttributeError):     # no file descriptor to write to: no watchdog
++            pass
++
++
++def _unwatch(seconds: float) -> None:
++    if seconds > 0:
++        import faulthandler
++
++        faulthandler.cancel_dump_traceback_later()
++
++
+ LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+ MAX_WINDOW = 32                          # rows of every stream's windows together in one round
+@@ -320,9 +354,12 @@ class MultiDecoder:
+         self.row_ms = list(row_ms) if row_ms is not None else None
+         if self.tune.depth == "joint" and self.row_ms is None:
+             self.row_ms = self._time_rows()
+-        if self.profiles is not None and isinstance(self.verify, BatchedVerify) and self.verify.graphs:
++        # both ranks: the comparison replays graphs whose all-gathers the other rank must join (TF_GLM_MULTI_PROFILE
++        # is in the two-rank settings comparison, so both run it or neither)
++        if self.tune.profile and isinstance(self.verify, BatchedVerify) and self.verify.graphs and self.lone_rows:
+             self._compare_paths()
+         self.msg = None                                  # TF_GLM_MULTI_ASYNC: rank 0's pinned message staging
++        self.watchdog = watchdog_seconds()               # stack dumps of a stalled iteration (TF_GLM_MULTI_WATCHDOG_S)
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
+         self.next_sid = self.next_kid = self.next_order = 0
+@@ -379,32 +416,37 @@ class MultiDecoder:
+     def _send(self, values: list[int]) -> None:
+         """Rank 0, TF_GLM_MULTI_ASYNC: ``GlmEngine._share``'s two all-gathers (the length, then the values) without
+         reading anything back: the values go through a pinned staging buffer (reused once its last copy has left),
+-        so the host does not wait for the GPU. Rank 1 receives them with its ``_share`` as ever."""
++        so the host does not wait for the GPU. Rank 1 receives them with its ``_share`` as ever. Each gather sends a
++        device buffer of its own from its start, as rank 1's ``_share`` does: a transport may choose by the buffer's
++        address (TF_GLM_COMM=roce did), and a view past an allocation's start once split the ranks' choices."""
+ 
+         n = len(values)
+         dev = self.w.device
+         if self.msg is None or self.msg[0].numel() < n + 1:
+-            if self.msg is not None:
+-                self.msg[2].synchronize()
++            if self.msg is not None and self.msg[3] is not None:
++                self.msg[3].synchronize()
+             size = max(4096, 2 * (n + 1))
+             pinned = torch.cuda.is_available()
+             self.msg = (torch.zeros((size,), dtype=torch.int32, pin_memory=pinned),
++                        torch.zeros((1,), dtype=torch.int32, device=dev),
+                         torch.zeros((size,), dtype=torch.int32, device=dev),
+                         torch.cuda.Event() if pinned else None)
+-        host, buf, ready = self.msg
++        host, length, vals, ready = self.msg
+         if ready is not None:
+-            ready.synchronize()                          # the last message's copy has left the staging buffer
++            ready.synchronize()                          # the last message's copies have left the staging buffer
+         host[0] = n
+         if n:
+             host[1:1 + n].numpy()[:] = values
+-        buf[:1 + n].copy_(host[:1 + n], non_blocking=True)
++        length.copy_(host[:1], non_blocking=True)
++        if n:
++            vals[:n].copy_(host[1:1 + n], non_blocking=True)
+         if ready is not None:
+             ready.record()
+         comm = self.g.comm
+         got = torch.empty((2,), dtype=torch.int32, device=dev)
+-        comm.all_gather(buf[:1], got)
++        comm.all_gather(length, got)
+         allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
+-        comm.all_gather(buf[1:1 + n], allv)
++        comm.all_gather(vals[:n], allv)
+ 
+     def _time_rows(self, reps: int = 5) -> list[float]:
+         """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
+@@ -420,12 +462,13 @@ class MultiDecoder:
+         return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
+ 
+     def _compare_paths(self, reps: int = 5) -> None:
+-        """TF_GLM_MULTI_PROFILE (rank 0, at startup): a lone stream's verify window on the one-stream graphs and on
+-        the batched graphs, ms by rows (fastest of ``reps``; slot 0's states cleared after)."""
++        """TF_GLM_MULTI_PROFILE (at startup, on both ranks: the graphs all-gather; rank 0 prints): a lone stream's
++        verify window on the one-stream graphs and on the batched graphs, ms by rows up to the one-stream graphs'
++        widest (fastest of ``reps``; slot 0's states cleared after)."""
+ 
+         e, v = self.e, self.verify
+         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+-        solo = v.time_rows(reps)
++        solo = v.time_rows(reps, most=self.lone_rows)
+         out = []
+         for R in range(1, self.lone_rows + 1):
+             g = e.graphs.main.get((R, e.home.parity))
+@@ -441,8 +484,9 @@ class MultiDecoder:
+             out.append(f"{R}: {best:.2f} vs {solo[R - 1]:.2f}")
+         e.slots.rec[0].zero_()
+         e.slots.conv[0].zero_()
+-        print("[tensorfold] multi profile: a lone stream's verify window ms, one-stream graphs vs batched graphs, by "
+-              "rows: " + ", ".join(out), flush=True)
++        if self.rank == 0:
++            print("[tensorfold] multi profile: a lone stream's verify window ms, one-stream graphs vs batched graphs, by "
++                  "rows: " + ", ".join(out), flush=True)
+ 
+     def _row_cost(self, rows: int) -> float:
+         ms = self.row_ms
+@@ -798,6 +842,7 @@ class MultiDecoder:
+         """Rank 0: one prompt chunk or one decode round; returns the streams that finished."""
+ 
+         self._check()
++        _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
+         try:
+             return self._iterate()
+         except Exception as exc:
+@@ -1099,6 +1144,7 @@ class MultiDecoder:
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True
++        _unwatch(self.watchdog)
+ 
+     def _finish(self, sid: int) -> None:
+         """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
+@@ -1160,7 +1206,9 @@ class MultiDecoder:
+             if self.idle:
+                 self.g._await_bell()
+                 self.idle = False
++            _watch(self.watchdog, "rank 1 message")       # busy: rank 0's next message is due within a round
+             self.apply(self.g._share(None))
++            _unwatch(self.watchdog)
+             if once:
+                 return
+ 
+@@ -1312,22 +1360,35 @@ class GlmScheduler(Scheduler):
+         self.decoder.requeue = []
+ 
+     def _loop(self) -> None:
++        import sys
++        import traceback
++
+         while True:
+-            self._yield()
+-            idle = not self.decoder.live() and self.held is None
+-            done = self._admit(self.waiting.get() if idle else None)     # idle: wait for a request
+             try:
+-                done += self.decoder.round()
+-            except Exception as exc:                 # noqa: BLE001  (the live requests fail)
++                self._iteration()
++            except Exception as exc:                 # noqa: BLE001  (never a silent dead worker: log, fail, go on)
++                print(f"[tensorfold] --parallel scheduler iteration failed: {exc!r}", file=sys.stderr, flush=True)
++                traceback.print_exc()
+                 for s in self.decoder.drop():
+                     self._reply(s, "error", exc)
+-            self._requeue()
+-            try:
+-                self.decoder.finish(done)
+-            except Exception as exc:                 # noqa: BLE001
+-                for s in self.decoder.drop():
+-                    self._reply(s, "error", exc)
+-            for s in done:
+-                self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
+-            if self.held is not None and not self.decoder.live():
+-                time.sleep(0)                        # the held request retries next iteration (now alone)
++
++    def _iteration(self) -> None:
++        self._yield()
++        idle = not self.decoder.live() and self.held is None
++        done = self._admit(self.waiting.get() if idle else None)     # idle: wait for a request
++        try:
++            done += self.decoder.round()
++        except Exception as exc:                 # noqa: BLE001  (the live requests fail)
++            for s in self.decoder.drop():
++                self._reply(s, "error", exc)
++        self._requeue()
++        try:
++            self.decoder.finish(done)
++        except Exception as exc:                 # noqa: BLE001
++            for s in self.decoder.drop():
++                self._reply(s, "error", exc)
++        for s in done:
++            self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
++        if self.held is not None and not self.decoder.live():
++            time.sleep(0)                        # the held request retries next iteration (now alone)
++        _unwatch(getattr(self.decoder, "watchdog", 0))
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+index 4020b91..587d644 100644
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -85,11 +85,12 @@ class MultiSettings:
+         return s
+ 
+     def code(self) -> list[int]:
+-        """What both ranks must agree on (the profile is rank 0's alone)."""
++        """What both ranks must agree on: every setting that changes collectives or drafts, and whether the profile
++        is on (its startup timing replays graphs on both ranks; only rank 0 logs)."""
+ 
+         return [("streams", "packed").index(self.sampler), ("policy", "joint", "scale").index(self.depth),
+                 int(round(self.alpha * 1000)), int(round(self.overhead_ms * 1000)), int(self.async_msg),
+-                int(self.lone)]
++                int(self.lone), int(self.profile > 0)]
+ 
+     def describe(self) -> str:
+         depth = f"scale:{self.alpha:g}" if self.depth == "scale" else self.depth
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 34205f7..9bf8b95 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -136,7 +136,7 @@ class BatchedVerify:
+ 
+     # -- the window's tables -------------------------------------------------------------------------------------------
+     @torch.no_grad()
+-    def time_rows(self, reps: int = 5) -> list[float]:
++    def time_rows(self, reps: int = 5, most: int | None = None) -> list[float]:
+         """ms of the captured window of each size (1 .. its rows): the fastest of ``reps`` replays, on the capture's
+         own tables (slot 0 at the pool's first rows; its states cleared after), before any stream is admitted."""
+ 
+@@ -145,7 +145,7 @@ class BatchedVerify:
+         index = self.e.caches.index is not None
+         out = []
+         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+-        for R in range(1, self.rows_max + 1):
++        for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+             g = self.graphs[R]
+             self._stage([0] * R)
+             self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)

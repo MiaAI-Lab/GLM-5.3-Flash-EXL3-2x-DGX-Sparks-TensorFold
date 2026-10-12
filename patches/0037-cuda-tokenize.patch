@@ -1,0 +1,128 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index b800c81..84ae839 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -18,6 +18,9 @@ if TYPE_CHECKING:
+     from tensorfold.cuda.server import App
+ 
+ 
++_TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
++
++
+ def usage_of(result: dict[str, Any]) -> dict[str, Any]:
+     """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
+ 
+@@ -85,7 +88,8 @@ def make_handler(app: App):
+             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
+                 return responses.post(self, app)
+             chat = self.path.rstrip("/").endswith("/chat/completions")
+-            if not chat and not self.path.rstrip("/").endswith("/completions"):
++            tokenizer = self.path.rstrip("/") in _TOKENIZER_ROUTES
++            if not chat and not tokenizer and not self.path.rstrip("/").endswith("/completions"):
+                 return self._json(404, {"error": "not found"})
+             try:
+                 length = int(self.headers.get("Content-Length", 0))
+@@ -96,6 +100,16 @@ def make_handler(app: App):
+                 body = json.loads(self.rfile.read(length) or b"{}")
+             except (json.JSONDecodeError, UnicodeDecodeError):
+                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
++            if tokenizer:                                   # vLLM's /tokenize and /detokenize
++                try:
++                    reply = (app.detokenize(body) if self.path.rstrip("/").endswith("/detokenize")
++                             else app.tokenize(body))
++                except RequestError as exc:
++                    return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
++                except Exception as exc:
++                    _log_error(exc)
++                    return self._json(400, {"error": {"message": _error_message(exc)}})
++                return self._json(200, reply)
+             try:
+                 prepared = app.prepare(body, chat)
+             except RequestError as exc:
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 8a3ab2b..673fc9f 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -223,17 +223,66 @@ class App:
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             text = render(body["messages"])
++            prompt = self.tok.encode(text, add_special_tokens=False).ids
++        elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
++            prompt = self.token_ids(body["prompt"])
+         else:
+             text = body.get("prompt")
+             if not isinstance(text, str):
+-                raise RequestError("prompt must be a string")
+-        prompt = self.tok.encode(text, add_special_tokens=False).ids
++                raise RequestError("prompt must be a string or a list of token ids")
++            prompt = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", False)).ids
+         if not prompt:
+             raise RequestError("rendered prompt is empty")
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+ 
++    def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
++        """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
++
++        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
++            value = value[0]
++        if not isinstance(value, list) or any(type(t) is not int for t in value):
++            raise RequestError(f"{field} must be a list of integer token ids (one prompt a request)")
++        size = getattr(self.tok, "get_vocab_size", None)
++        vocab = size(with_added_tokens=True) if size is not None else None
++        if any(t < 0 or (vocab is not None and t >= vocab) for t in value):
++            top = "" if vocab is None else f" to {vocab - 1}"
++            raise RequestError(f"{field} token ids must be in the vocabulary's range 0{top}")
++        return list(value)
++
++    def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
++        """vLLM's ``/tokenize``: a prompt's ids (``add_special_tokens`` as vLLM, default true), or ``messages``' as the
++        chat route renders them (``add_generation_prompt``, default true)."""
++
++        if not isinstance(body, dict):
++            raise RequestError("the request body must be a JSON object")
++        if "messages" in body:
++            fields = dict(body)
++            if "add_generation_prompt" in body:
++                kwargs = body.get("chat_template_kwargs")
++                kwargs = {} if kwargs is None else kwargs
++                if not isinstance(kwargs, dict):
++                    raise RequestError("chat_template_kwargs must be a JSON object or null")
++                fields["chat_template_kwargs"] = {**kwargs,
++                                                  "add_generation_prompt": _flag(body, "add_generation_prompt", True)}
++            ids = self._prepare(fields, True).prompt
++        else:
++            text = body.get("prompt")
++            if not isinstance(text, str):
++                raise RequestError("prompt must be a string (or send messages)")
++            ids = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", True)).ids
++        limit = self._context_limit()
++        return {"count": len(ids), "max_model_len": limit if limit is not None else self.native_context_window,
++                "tokens": [int(t) for t in ids]}
++
++    def detokenize(self, body: dict[str, Any]) -> dict[str, Any]:
++        """vLLM's ``/detokenize``: the text of ``tokens``, special tokens included."""
++
++        if not isinstance(body, dict):
++            raise RequestError("the request body must be a JSON object")
++        return {"prompt": self.tok.decode(self.token_ids(body.get("tokens"), "tokens"), skip_special_tokens=False)}
++
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Why the request cannot run, or None; rendered before a stream's headers are sent."""
+ 
+@@ -555,6 +604,13 @@ class App:
+                                      encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+ 
+ 
++def _flag(body: dict[str, Any], name: str, default: bool) -> bool:
++    value = body.get(name, default)
++    if not isinstance(value, bool):
++        raise RequestError(f"{name} must be a boolean")
++    return value
++
++
+ def token_sha(tokens: list[int]) -> str:
+     """A reply's token ids, hashed as the Mac server does: drafted and ``"draft": false`` replies must match."""
+ 

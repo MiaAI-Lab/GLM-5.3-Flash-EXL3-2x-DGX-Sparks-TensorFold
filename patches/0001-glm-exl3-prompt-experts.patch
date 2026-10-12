@@ -1,0 +1,214 @@
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index a9931e7..789d20e 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -3,7 +3,7 @@
+ 
+ void exl3_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                        const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+-                       int64_t, int64_t, int64_t, int64_t);
++                       int64_t, int64_t, int64_t, int64_t, bool, bool);
+ void exl3_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                       at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -18,7 +18,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+ 
+ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
+              const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats,
+-             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt, int64_t warps) {
++             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt, int64_t warps, bool nfirst,
++             bool pf) {
+     const int64_t E = T0.size(0);
+     check(X0, at::kHalf, "X0");
+     check(X1, at::kHalf, "X1");
+@@ -30,7 +31,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, c
+     check(Z, at::kFloat, "Z");
+     TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
+     c10::cuda::CUDAGuard guard(X0.device());
+-    exl3_grouped_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, nt, warps, E);
++    exl3_grouped_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, nt, warps, E, nfirst, pf);
+ }
+ 
+ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index 2514bdc..47cf55c 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -53,12 +53,14 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
+ }
+ 
+ // Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
+-template <int NT, int W>
++template <int NT, int W, bool NFIRST, bool PF>
+ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
+     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
+     const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E) {
+-    const int item = blockIdx.x;
++    // NFIRST: the n blocks of an item are adjacent in launch order, so they read its rows while L2 holds them
++    const int item = NFIRST ? blockIdx.y : blockIdx.x;
++    const int nblock = NFIRST ? blockIdx.x : blockIdx.y;
+     if (item >= counts[0]) return;
+     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
+@@ -79,7 +81,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+ 
+     const int per_split = KT / SK, per_warp = per_split / W;
+     const int kt0 = split * per_split + warp * per_warp;
+-    const int nt0 = blockIdx.y * NT;
++    const int nt0 = nblock * NT;
+     const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
+ 
+     float acc[NT][2][4];
+@@ -90,21 +92,59 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+ #pragma unroll
+             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+ 
+-    for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
+-        uint32_t words[NT];
++    if (PF) {
++        // the next k step's words and A fragments load while this one decodes and multiplies (the same mma order)
++        uint32_t words[NT], a[4];
+ #pragma unroll
+         for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
+-        const int k = kt * 16;
+-        uint32_t a[4] = {load_pair(x0 + k, r0 >= 0), load_pair(x1 + k, r1 >= 0), load_pair(x0 + k + 8, r0 >= 0),
+-                         load_pair(x1 + k + 8, r1 >= 0)};
++        {
++            const int k = kt0 * 16;
++            a[0] = load_pair(x0 + k, r0 >= 0); a[1] = load_pair(x1 + k, r1 >= 0);
++            a[2] = load_pair(x0 + k + 8, r0 >= 0); a[3] = load_pair(x1 + k + 8, r1 >= 0);
++        }
++        for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
++            uint32_t nw[NT], na[4];
++            const bool more = kt + 1 < kt0 + per_warp;
++            if (more) {
++                const uint32_t* next = tile + (size_t)NTILES * 32;
++#pragma unroll
++                for (int i = 0; i < NT; ++i) nw[i] = __ldg(next + i * 32);
++                const int k = (kt + 1) * 16;
++                na[0] = load_pair(x0 + k, r0 >= 0); na[1] = load_pair(x1 + k, r1 >= 0);
++                na[2] = load_pair(x0 + k + 8, r0 >= 0); na[3] = load_pair(x1 + k + 8, r1 >= 0);
++            }
++#pragma unroll
++            for (int i = 0; i < NT; ++i) {
++                uint32_t b0[2], b1[2];
++                decode_tile(words[i], lane, b0, b1);
++                mma16816(acc[i][0], a, b0);
++                mma16816(acc[i][1], a, b1);
++            }
++            if (more) {
++#pragma unroll
++                for (int i = 0; i < NT; ++i) words[i] = nw[i];
++#pragma unroll
++                for (int c = 0; c < 4; ++c) a[c] = na[c];
++            }
++            tile += (size_t)NTILES * 32;
++        }
++    } else {
++        for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
++            uint32_t words[NT];
++#pragma unroll
++            for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
++            const int k = kt * 16;
++            uint32_t a[4] = {load_pair(x0 + k, r0 >= 0), load_pair(x1 + k, r1 >= 0),
++                             load_pair(x0 + k + 8, r0 >= 0), load_pair(x1 + k + 8, r1 >= 0)};
+ #pragma unroll
+-        for (int i = 0; i < NT; ++i) {
+-            uint32_t b0[2], b1[2];
+-            decode_tile(words[i], lane, b0, b1);
+-            mma16816(acc[i][0], a, b0);
+-            mma16816(acc[i][1], a, b1);
++            for (int i = 0; i < NT; ++i) {
++                uint32_t b0[2], b1[2];
++                decode_tile(words[i], lane, b0, b1);
++                mma16816(acc[i][0], a, b0);
++                mma16816(acc[i][1], a, b1);
++            }
++            tile += (size_t)NTILES * 32;
+         }
+-        tile += (size_t)NTILES * 32;
+     }
+ 
+     // warps' partial sums through shared memory, added in warp order
+@@ -240,19 +280,23 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
+ void exl3_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
+                        const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+                        int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t nt,
+-                       int64_t warps, int64_t E) {
++                       int64_t warps, int64_t E, bool nfirst, bool pf) {
+     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
+-    dim3 grid((unsigned)max_items, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
++    dim3 grid = nfirst ? dim3((unsigned)(N / (16 * nt)), (unsigned)max_items, (unsigned)(mats * SK))
++                       : dim3((unsigned)max_items, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto x0 = reinterpret_cast<const half*>(X0.data_ptr());
+     auto x1 = reinterpret_cast<const half*>(X1.data_ptr());
+     auto t0 = reinterpret_cast<const uint32_t*>(T0.data_ptr());
+     auto t1 = reinterpret_cast<const uint32_t*>(T1.data_ptr());
+ #define LAUNCH(NT_, W_)                                                                                          \
+-    grouped_kernel<NT_, W_><<<grid, W_ * 32, 0, stream>>>(x0, x1, t0, t1, items.data_ptr<int>(),                \
+-                                                          counts.data_ptr<int>(), members.data_ptr<int>(),     \
+-                                                          Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, \
+-                                                          (int)E)
++    do {                                                                                                         \
++        auto fn = nfirst ? (pf ? grouped_kernel<NT_, W_, true, true> : grouped_kernel<NT_, W_, true, false>)   \
++                         : (pf ? grouped_kernel<NT_, W_, false, true> : grouped_kernel<NT_, W_, false, false>); \
++        fn<<<grid, W_ * 32, 0, stream>>>(x0, x1, t0, t1, items.data_ptr<int>(), counts.data_ptr<int>(),          \
++                                         members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P,   \
++                                         (int)SK, (int)E);                                                       \
++    } while (0)
+     if (nt == 8 && warps == 4) LAUNCH(8, 4);
+     else if (nt == 4 && warps == 4) LAUNCH(4, 4);
+     else if (nt == 4 && warps == 8) LAUNCH(4, 8);
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index b816401..58e739d 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -13,6 +13,22 @@ from tensorfold.cuda import experts as grouped
+ # Gate/up and down tile counts, warps, and K splits stay fixed across row counts to preserve each row's bits.
+ GATEUP_CFG = (8, 4, 4)
+ DOWN_CFG = (8, 4, 1)
++# Prompt chunks launch an item's n blocks next to each other (TF_GLM_EXL3_NFIRST=0: the decode order), so they read
++# its rows while L2 still holds them: the same kernel and arithmetic, 2.3-2.5x faster at 4,096 rows.
++PROMPT_ROWS = 64          # rows from which a window takes the prompt order
++
++
++def _pf() -> bool:
++    """TF_GLM_EXL3_PF=0: no register prefetch in the expert kernel (the same bits either way)."""
++    import os
++
++    return os.environ.get("TF_GLM_EXL3_PF", "1") != "0"
++
++
++def _nfirst() -> bool:
++    import os
++
++    return os.environ.get("TF_GLM_EXL3_NFIRST", "1") != "0"
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -20,7 +36,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v1", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v9", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -78,9 +94,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
+     D, NI = ex.dims, ex.width
+     items = grouped.max_items(R * slots, plan.experts)
+     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++    nfirst = R >= PROMPT_ROWS and _nfirst()
+     nt, w, sk = GATEUP_CFG
+-    ext.grouped(s.xg, s.xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, sk, items, nt, w)
++    ext.grouped(s.xg, s.xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, sk, items, nt,
++                w, nfirst, _pf())
+     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, sk, slots, float(limit))
+     nt, w, sk = DOWN_CFG
+-    ext.grouped(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, sk, items, nt, w)
++    ext.grouped(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, sk, items, nt,
++                w, nfirst, _pf())
+     ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, sk, slots)

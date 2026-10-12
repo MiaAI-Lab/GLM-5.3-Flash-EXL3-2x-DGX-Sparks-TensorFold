@@ -1,0 +1,36 @@
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+index 59d55e3..37eee90 100644
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -152,6 +152,11 @@ def make_handler(app: App):
+                         "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
+ 
+             if stream:
++                try:
++                    app.admit(body, chat, prepared)      # a full server answers 429 here, not 200 and an error event
++                except RequestError as exc:
++                    code, _hd = admission_response(exc)
++                    return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/event-stream")
+                 self.send_header("Cache-Control", "no-cache")
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index ee97e62..53cbc80 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -335,6 +335,15 @@ class App:
+             prepared.max_tokens = min(prepared.max_tokens, limit - len(prepared.prompt))
+         return prepared
+ 
++    def admit(self, body: dict[str, Any], chat: bool, prepared: PreparedRequest) -> None:
++        """Refuse a request with ``CapacityError`` while the scheduler's admission cap holds, before a streamed reply's
++        200 and headers go out (``Scheduler.submit`` checks again, but by then a stream can only carry the error as an
++        event, with status 200, which a client's retry logic never sees)."""
++
++        check = getattr(getattr(self.engine, "scheduler", None), "_check_admission", None)
++        if check is not None:
++            check(body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), prepared.tools)))
++
+     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
+         """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy; RequestError if malformed."""
+ 

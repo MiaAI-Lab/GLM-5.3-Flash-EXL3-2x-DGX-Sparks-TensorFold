@@ -1,0 +1,42 @@
+# Kept prompt cap: a shared-prefix state (a system block, where prompts stop sharing) is no longer dropped as superseded
+# by its writer's own longer state; it goes by recency only. Since 0071 every run and every cold start keeps its states
+# in an extent of its own, whose latest state is never superseded, so past TF_GLM_CACHE_ENTRIES the cap filled with
+# conversations' latest states within hours of a start; from then on a new run's system-block state was the only
+# superseded entry and went at its next kept state, and the next run of that agent read its whole prompt again (first
+# token 14 s -> 40 s). A larger cap only delayed it. A conversation's earlier non-shared states still go first (0063),
+# then the least recently used of any. Same replies: which state is kept only. Issue #75, diagnosed and the fix
+# proposed by @meleesciony.
+
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 0b743b7..75d50b4 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -179,19 +179,20 @@ def fill_share(value: str | None = None) -> float:
+ def cap_victim(kept: list):
+     """The kept prompt to drop past TF_GLM_CACHE_ENTRIES (``kept``: least recently used first). An extent's kept
+     prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
+-    conversation, superseded by the longer one: those go first (the oldest that is not a shared-prefix state, then
+-    the oldest of any), then the least recently used. A conversation taking many turns thus drops its own earlier
+-    turns instead of the only state of a conversation that is waiting on a long reply. Deterministic in ``kept``'s
+-    order and extents, so both ranks drop the same one."""
++    conversation, superseded by the longer one: the oldest of those goes first, then the least recently used of any.
++    A conversation taking many turns thus drops its own earlier turns instead of the only state of a conversation
++    that is waiting on a long reply. A shared-prefix state (a system block, where prompts stop sharing) is never
++    dropped as superseded: it is what the next conversation or run with that prefix resumes from, and its writer's
++    longer state cannot serve them, so it goes by recency only, with the other conversations' latest states.
++    Deterministic in ``kept``'s order and extents, so both ranks drop the same one."""
+ 
+     longest: dict[int, int] = {}
+     for c in kept:
+         longest[id(c.extent)] = max(longest.get(id(c.extent), 0), len(c.ids))
+-    superseded = [c for c in kept if len(c.ids) < longest[id(c.extent)]]
+-    for c in superseded:
+-        if not getattr(c, "shared", False):
++    for c in kept:
++        if len(c.ids) < longest[id(c.extent)] and not getattr(c, "shared", False):
+             return c
+-    return superseded[0] if superseded else kept[0]
++    return kept[0]
+ 
+ 
+ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:

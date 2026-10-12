@@ -1,0 +1,24 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index b626ecf..e37584a 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -12,7 +12,9 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ DEFAULT_POLICY = "auto"
+-DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
++# DFlash2 drafts every round: by default up to 5 while their probability product holds 0.3; TF_GLM_DFLASH_POLICY picks
++# another DFlash2 policy (e.g. fnc7:0.3, the noise-aware stop rule) for requests that name none
++DFLASH_POLICY = os.environ.get("TF_GLM_DFLASH_POLICY", "").strip() or "fc5:0.3"
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+ GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
+ MAX_ROWS = 16                         # the widest verify window (a pending token and up to 15 drafts: copy drafts)
+@@ -301,6 +303,8 @@ class GlmEngine:
+                                               split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
++        if not encode_policy(DFLASH_POLICY)[0] >= 10:
++            raise ValueError(f"TF_GLM_DFLASH_POLICY={DFLASH_POLICY!r}: a DFlash2 policy (f...), e.g. fc5:0.3 or fnc7:0.3")
+         from .copy_drafts import CopySettings
+ 
+         # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of

@@ -1,0 +1,331 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 7c7cf73..b16ad04 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -84,8 +84,13 @@ class Engine:
+ 
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+-                 taps: tuple[int, ...] = ()) -> None:
++                 taps: tuple[int, ...] = (), grid: int = 0) -> None:
++        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere)."""
++
++        if grid and prefill_rows % grid:
++            raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
+         self.w = w
++        self.grid = grid
+         w.meta["long_context"] = long_context
+         self.rows, self.prefill_rows = max_rows, prefill_rows
+         self.buf = Buffers(w, max_rows, capacity)
+@@ -341,8 +346,8 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ # -- prefill ----------------------------------------------------------------------------------------------------
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, feed=None) -> int:
+-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``)."""
++            resume: Snapshot | None = None, feed=None, sample: bool = True) -> int | None:
++    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -355,6 +360,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+             drafter.reset()
+     else:
+         begin = len(resume.ids)
++        if e.grid and begin % e.grid:
++            raise ValueError(f"a resumed prefill starts on the {e.grid}-row grid, not at {begin}")
+         if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
+             raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+@@ -363,36 +370,18 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         if use_mtp:
+             k = resume.pending.shape[0]
+             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
+-    from .forward import Cut
+-
+-    if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
+-        raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
+-    kept = resume if keep_at == begin else None
+     last = None
+     prof.active = True
+     for start in range(begin, len(prompt), e.prefill_rows):
+         chunk = list(prompt[start:start + e.prefill_rows])
+         R = len(chunk)
+-        point = keep_at - start if keep_at is not None else 0
+-        cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
+         inject = feed.chunk(start, R) if feed is not None else None
+-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut,
+-                       inject=inject).clone()
++        out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
++                      head=sample)
++        last = out.clone() if sample else None
+         e.last_hidden = b.fnormed[R - 1:R].clone()
+-        if 0 < point <= R:
+-            rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
+-            conv = cut.conv if cut is not None else st.conv.clone()
+-            kept = Snapshot(list(prompt[:keep_at]), rec, conv,
+-                            b.fnormed[point - 1:point].clone() if use_mtp else None,
+-                            keep_at - 1 if use_mtp else -1, keep_at if drafter is not None else -1)
+         if drafter is not None:
+             drafter.add_taps(e.tap_rows(R, b))
+-            if 0 < point <= R and getattr(drafter, "ring", 0):
+-                # a ring keeps the kept point's window unless this chunk wrote past it by more than the ring's slack
+-                if R - point < drafter.ring - drafter.window:
+-                    kept.drafter_rows = _ring_window(drafter, keep_at)
+-                else:
+-                    kept.drafter_end = -1
+         if use_mtp:
+             nxt = list(prompt[start + 1:start + R + 1])
+             if nxt:
+@@ -400,10 +389,10 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+         with prof.timed("commit"):
+             commit(w, st, b, R, R)
+-    if kept is not None:
+-        keep(kept)
+     prof.active = False
+     prof.report(len(prompt) - begin)
++    if not sample:
++        return None
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+         e.window = e.constraint.window([0], [-1])
+     first = e.sample(last, [len(prompt)], sampling)[0]
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 62a1117..b508ba0 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -37,6 +37,40 @@ def vision_workspace() -> int:
+     return int(value) * 2**20
+ 
+ 
++GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
++
++
++def prompt_grid(prefill_rows: int, value: str | None = None) -> int:
++    """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
++
++    With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
++    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly."""
++
++    value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
++    value = value.strip()
++    if value in ("", "0"):
++        return 0
++    if not value.isdecimal() or int(value) not in GRIDS:
++        raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
++    grid = int(value)
++    if prefill_rows % grid:
++        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
++                         f"must be a multiple of it")
++    return grid
++
++
++def grid_point(n: int, cut: int, grid: int) -> int | None:
++    """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
++
++    Off (grid 0) and on-grid prompts: at n. Otherwise at B = floor(n / grid) * grid, when B lies past ``cut`` (so
++    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n."""
++
++    if not grid or n % grid == 0:
++        return n
++    point = n // grid * grid
++    return point if point > cut else None
++
++
+ def encode_policy(spec: str) -> list[int]:
+     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
+ 
+@@ -186,6 +220,8 @@ class GlmEngine:
+         prefill_rows = int(prefill_rows)
+         if not 64 <= prefill_rows <= 16384 or prefill_rows % 64:
+             raise ValueError(f"prefill rows: a multiple of 64 from 64 to 16,384, not {prefill_rows}")
++        # TF_GLM_PROMPT_GRID=G: prompt chunks start on multiples of G and kept prompt states sit on them
++        self.grid = prompt_grid(prefill_rows)
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+         if vision:                           # the tower's bf16 weights, which the split rule drops
+@@ -211,7 +247,8 @@ class GlmEngine:
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows] + (self.copy.code() if self.copy is not None else [0, 0]) + [int(self.mtp_on), int(DRAFT_RING)]
++                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + \
++            [int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -219,7 +256,8 @@ class GlmEngine:
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT, TF_GLM_COPY_*, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
++                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, TF_GLM_MTP, "
++                               "TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -248,7 +286,11 @@ class GlmEngine:
+ 
+             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
++                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
++                        grid=self.grid)
++        if rank == 0 and self.grid:
++            print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
++                  f"(TF_GLM_PROMPT_GRID)", flush=True)
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+@@ -426,6 +468,7 @@ class GlmEngine:
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
++            fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
+             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+@@ -499,7 +542,7 @@ class GlmEngine:
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                   feed=None) -> dict[str, Any]:
+-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
++        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+@@ -515,9 +558,26 @@ class GlmEngine:
+             hit.rows, hit.nbytes = None, 0            # live again
+         # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
+         self.live = list(prompt) if feed is None else []
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, feed=feed,
+-                        keep_at=max(1, len(prompt) - 1) if draft and feed is None else None, keep=self._remember)
++        # a drafted text prompt keeps its state at ``point``: its end, or with TF_GLM_PROMPT_GRID the last grid
++        # multiple in it. Short of the end, the prompt prefills to the point as a prompt of that length would (no
++        # first token), keeps that state, and resumes from it as a later request would: so any prompt extending
++        # prompt[:point] passes through the same state there, fresh or resumed. Both ranks decide alike
++        point = grid_point(len(prompt), cut, self.grid) if draft and feed is None else None
++        resume, kept = hit, None
++        if point is not None and point < len(prompt):
++            head = list(prompt[:point])
++            prefill(self.e, head, sampling, mtp=use_mtp, drafter=drafter, resume=hit, sample=False)
++            kept = resume = take_snapshot(self.e, head, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                          drafter=drafter)
++        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume, feed=feed)
+         prefill_s = time.perf_counter() - t0
++        if point == len(prompt):
++            kept = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                 drafter=drafter)
++        if kept is not None:
++            self._remember(kept)
++        elif draft and feed is None and hit is not None:     # the resume point is the grid point: keep it newest
++            self.cache = [c for c in self.cache if c is not hit] + [hit]
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 0e130f5..a5a4180 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -2,7 +2,6 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
+ from typing import Sequence
+ 
+ import torch
+@@ -18,15 +17,6 @@ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+ 
+-@dataclass
+-class Cut:
+-    """The recurrent state and convolution windows at an interior prompt row."""
+-
+-    point: int
+-    rec: torch.Tensor
+-    conv: torch.Tensor
+-
+-
+ class Buffers:
+     """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
+ 
+@@ -259,7 +249,7 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
+     return gather(w, b, R)
+ 
+ 
+-def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut | None = None) -> torch.Tensor:
++def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+     c = w.cfg
+     k = layer.kda
+     li = st.kda_index[layer.index]
+@@ -273,18 +263,9 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
+         mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+     cur = st.cur[li]
+     with prof.timed("kda: recurrence"):
+-        if cut is None:
+-            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                                k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+-                                st.rec[1 - cur, li])
+-        else:
+-            n = cut.point
+-            first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+-                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+-            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+-            rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+-                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+-            out = torch.cat((first, rest))
++        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
++                            st.rec[1 - cur, li])
+     if pre:                              # a prompt chunk keeps every row: the layer commits now
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+@@ -428,7 +409,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+-                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None) -> None:
++                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
+@@ -436,7 +417,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+     if layer.kind == "kda":
+         with prof.timed("kda"):
+-            g = kda_block(layer, w, st, b, R, cut)
++            g = kda_block(layer, w, st, b, R)
+     else:
+         di = st.dsa_index[layer.index]
+         with prof.timed("dsa (total)"):
+@@ -476,24 +457,24 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, inject=None):
++            host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True):
+     """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
+-    if cut is not None and (not b.prefill or not 0 < cut.point < R):
+-        raise ValueError("a prompt cut must lie inside a prefill chunk")
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+     for layer in w.layers:
+-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
++        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+         for slot in b.tap_at.get(layer.index, ()):
+             glue.stream_mean(b.x[:R], b.taps[slot][:R])
+     glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if not head:                         # the normed rows (MTP, last_hidden) without the head: None
++        return None
+     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
+         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
+     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])

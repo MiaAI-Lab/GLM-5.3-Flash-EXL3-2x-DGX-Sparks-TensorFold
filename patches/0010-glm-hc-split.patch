@@ -1,0 +1,603 @@
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index 2e50cdc..b94a2ce 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -1,4 +1,5 @@
+-"""NCCL all-gather on the current stream so CUDA graphs capture it; a rank-order sum after it keeps ranks bit-equal."""
++"""NCCL all-gather (and paired send/receive) on the current stream so CUDA graphs capture it; a rank-order sum after
++it keeps ranks bit-equal."""
+ 
+ from __future__ import annotations
+ 
+@@ -47,6 +48,11 @@ class NCCL:
+         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
+         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_void_p]
++        for name in ("ncclSend", "ncclRecv"):
++            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
++                                           ctypes.c_void_p, ctypes.c_void_p]
++        lib.ncclGroupStart.argtypes = []
++        lib.ncclGroupEnd.argtypes = []
+         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
+         uid = _UniqueId()
+         if rank == 0:
+@@ -97,6 +103,25 @@ class NCCL:
+             print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
+                   flush=True)
+ 
++    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
++        """One NCCL group on the current stream: every ``sends[i]`` to ``peer`` and ``recvs[i]`` from it (contiguous
++        tensors; the peer's matching call has the same count, sizes and dtypes in the same order)."""
++
++        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
++            raise ValueError("exchange: one receive per send, from another rank")
++        for s, r in zip(sends, recvs):
++            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
++                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
++        stream = torch.cuda.current_stream().cuda_stream
++        self._check(self.lib.ncclGroupStart())
++        try:
++            for s, r in zip(sends, recvs):
++                if s.numel():
++                    self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
++                    self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
++        finally:
++            self._check(self.lib.ncclGroupEnd())
++
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index b16ad04..c75f90c 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -84,8 +84,9 @@ class Engine:
+ 
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+-                 taps: tuple[int, ...] = (), grid: int = 0) -> None:
+-        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere)."""
++                 taps: tuple[int, ...] = (), grid: int = 0, split=None) -> None:
++        """``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0: anywhere); ``split``: a
++        ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt chunks, None or off: unsplit."""
+ 
+         if grid and prefill_rows % grid:
+             raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
+@@ -98,6 +99,10 @@ class Engine:
+         if taps:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
++        if split is not None and split.split:
++            from .hcsplit import HcSplit
++
++            self.pbuf.split = HcSplit(w, self.pbuf, split)
+         self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+         self.st = State(w, capacity, max_rows)
+         self.last_hidden: torch.Tensor | None = None
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index b508ba0..3c2b10e 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -160,9 +160,11 @@ class GlmEngine:
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+-                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False) -> None:
++                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False,
++                 split=None) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+-        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows)."""
++        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows); ``split``: a ``hcsplit.SplitSettings``
++        instead of TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (tests)."""
+ 
+         import torch
+ 
+@@ -180,6 +182,11 @@ class GlmEngine:
+         # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
+         # the MTP head and DFlash2; both ranks must agree, so the settings join the startup comparison below
+         self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
++        from .hcsplit import SplitSettings
++
++        # TF_GLM_HC_SPLIT=1 / TF_GLM_PREFILL_OVERLAP=1: prompt chunks' hyper-connection glue split by rows between the
++        # ranks (and its exchanges overlapped); the same bits, both ranks must agree (the comparison below)
++        self.split = SplitSettings.from_env() if split is None else split
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank = rank
+@@ -247,7 +254,7 @@ class GlmEngine:
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + \
++                prefill_rows, self.grid] + (self.copy.code() if self.copy is not None else [0, 0]) + self.split.code() + \
+             [int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+@@ -256,8 +263,8 @@ class GlmEngine:
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, TF_GLM_MTP, "
+-                               "TF_GLM_DRAFT_RING): "
++                               "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_COPY_*, "
++                               "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -287,7 +294,11 @@ class GlmEngine:
+             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
+-                        grid=self.grid)
++                        grid=self.grid, split=self.split)
++        if self.e.pbuf.split is not None:
++            self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
++            if rank == 0:
++                print(f"[tensorfold] {self.split.describe()}", flush=True)
+         if rank == 0 and self.grid:
+             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                   f"(TF_GLM_PROMPT_GRID)", flush=True)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index a961a94..98ed9e6 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -123,6 +123,8 @@ class Buffers:
+         self.tap_at: dict[int, list[int]] = {}
+         self.experts = c.experts
+         self.top_k = c.top_k
++        # TF_GLM_HC_SPLIT: a prompt buffer's row split (``hcsplit.HcSplit``), set by the engine; None runs unsplit
++        self.split = None
+ 
+     def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
+         self.tap_at = {}
+@@ -244,9 +246,27 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 
+-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor:
+-    mm(b, x, q, xs, b.part[:R], f32=True)
+-    return gather(w, b, R)
++def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None) -> torch.Tensor | None:
++    """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
++    [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
++    and runs hc_post itself (``hcsplit.HcSplit``)."""
++
++    sp = b.split
++    if sp is not None and sp.active:
++        sp.partial(fill)
++        return None
++    fill(0, R)
++    if label is None:
++        return gather(w, b, R)
++    with prof.timed(label):
++        return gather(w, b, R)
++
++
++def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor | None:
++    def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
++        mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
++
++    return partials(w, b, R, fill)
+ 
+ 
+ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+@@ -406,26 +426,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         with prof.timed("moe: routed (exl3)"):
+             exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+         s = m.shared
+-        with prof.timed("moe: shared expert"):
+-            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+-            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-            mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+-        with prof.timed("moe: combine"):
+-            if b.prefill:                # the shared row read from sy where it is (the copy's bits, one pass less)
+-                glue.combine_shared(b.ey[:R], b.sy[:R], b.wts[:R], b.part[:R])
+-            else:
+-                b.ey[:R, c.top_k].copy_(b.sy[:R])
+-                glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+-        with prof.timed("moe: all-gather"):
+-            return gather(w, b, R)
++
++        def fill(lo: int, hi: int) -> None:
++            with prof.timed("moe: shared expert"):
++                mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
++                glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
++                mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
++            with prof.timed("moe: combine"):
++                if b.prefill:            # the shared row read from sy where it is (the copy's bits, one pass less)
++                    glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++                else:
++                    b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
++                    glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++
++        return partials(w, b, R, fill, "moe: all-gather")
+     with prof.timed("moe: gate/up"):
+         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
+     with prof.timed("moe: down"):
+         grouped.down(b.eact, m.experts, b.plan, b.ey.view(-1, c.hidden), R)
+-    with prof.timed("moe: combine"):
+-        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+-    with prof.timed("moe: all-gather"):
+-        return gather(w, b, R)
++
++    def fill(lo: int, hi: int) -> None:
++        with prof.timed("moe: combine"):
++            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++
++    return partials(w, b, R, fill, "moe: all-gather")
++
++
++def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
++           sparse_np: int | None) -> torch.Tensor | None:
++    """The layer's KDA or DSA block on b.normed: every rank's partials, or None row-split (``partials``)."""
++
++    if layer.kind == "kda":
++        with prof.timed("kda"):
++            return kda_block(layer, w, st, b, R)
++    di = st.dsa_index[layer.index]
++    with prof.timed("dsa (total)"):
++        return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
++                         st.index[di] if st.index is not None else None, host_pos, sparse_np)
++
++
++def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
++    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
++        return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+@@ -435,24 +477,43 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     h = layer.attn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+-    if layer.kind == "kda":
+-        with prof.timed("kda"):
+-            g = kda_block(layer, w, st, b, R)
+-    else:
+-        di = st.dsa_index[layer.index]
+-        with prof.timed("dsa (total)"):
+-            g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
+-                          st.index[di] if st.index is not None else None, host_pos, sparse_np)
++    g = _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
+     with prof.timed("hc"):
+         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+-    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
++    g = _ffn(layer, w, b, R)
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
++def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None) -> None:
++    """Every layer of a prompt chunk with its hyper-connection glue split by rows between the ranks
++    (``hcsplit``): the first hc_pre runs on every row as unsplit, each later one on this rank's rows, and b.normed,
++    the taps and b.hidden come back whole from the peer. The same bits as the unsplit loop and its final mean."""
++
++    c = w.cfg
++    sp = b.split
++    layers = w.layers
++    sp.begin(R)
++    try:
++        Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
++        first, h = layers[0], layers[0].attn_hc
++        glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
++                    b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++        for i, layer in enumerate(layers):
++            _mixer(layer, w, st, b, R, nch, host_pos, None)
++            with prof.timed("hc"):
++                sp.glue(layer.ffn_hc, layer.post_norm)
++            _ffn(layer, w, b, R)
++            nxt = layers[i + 1] if i + 1 < len(layers) else None
++            with prof.timed("hc (layer end)"):
++                sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
++                        taps=tuple(b.tap_at.get(layer.index, ())), final=nxt is None)
++    finally:
++        sp.finish()
++
++
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+     pos = st.pos if pos is None else pos
+     if pos + R > w.cfg.dense_limit and st.index is None:
+@@ -485,11 +546,14 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+-    for layer in w.layers:
+-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+-        for slot in b.tap_at.get(layer.index, ()):
+-            glue.stream_mean(b.x[:R], b.taps[slot][:R])
+-    glue.stream_mean(b.x[:R], b.hidden[:R])
++    if b.prefill and b.split is not None and sparse_np is None and b.split.applies(R):
++        split_layers(w, st, b, R, nch, host_pos)             # also leaves the taps and b.hidden[:R]
++    else:
++        for layer in w.layers:
++            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
++            for slot in b.tap_at.get(layer.index, ()):
++                glue.stream_mean(b.x[:R], b.taps[slot][:R])
++        glue.stream_mean(b.x[:R], b.hidden[:R])
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index dbde3f1..620025a 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -242,6 +242,24 @@ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: t
+                                  num_warps=4)
+ 
+ 
++def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
++                 comb: torch.Tensor) -> None:
++    """``hc_post`` of two ranks' fp32 partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the same kernel
++    with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum (rank 0
++    first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
++
++    rows, d = g0.shape
++    if (g1.shape != g0.shape or g0.dtype != torch.float32 or g1.dtype != torch.float32
++            or not (g0.is_contiguous() and g1.is_contiguous())):
++        raise ValueError("hc_post_pair: two contiguous fp32 partials of one shape")
++    if not rows:
++        return
++    s = x.shape[1] // d
++    block = min(1024, d)
++    rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
++    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
++
++
+ @triton.jit
+ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+new file mode 100644
+index 0000000..0002a96
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -0,0 +1,246 @@
++"""TF_GLM_HC_SPLIT=1: a prompt chunk's hyper-connection glue split by rows between the two ranks (decode untouched).
++
++Unsplit, each exchange site (after the attention block and after the MLP/MoE block) all-gathers both ranks' fp32
++partials [R, D], and both ranks run hc_post and the next hc_pre over all R rows. Split, rank r owns rows
++[r H, r H + H) (H = R / 2; an odd chunk gets one zero pad row, which nothing reads): each rank sends the peer its
++partial of the peer's rows (fp32), adds the two partials of its own rows rank 0's first (``glue.hc_post_pair``, the
++same kernel as hc_post), runs hc_post and the next hc_pre on its own rows, and swaps its normed rows (bf16) for the
++peer's, so both ranks hold the next block's full input. The residual streams (b.x) stay current for own rows only;
++DFlash2 taps and the final stream mean (b.hidden) are computed on own rows and swapped like the normed rows. Every
++glue kernel is row-independent and the partial sum order is unchanged, so every bit is the unsplit path's.
++
++The group sums b.xs of the normed rows are not swapped: no prompt-chunk matmul reads them (4-bit projections of a
++prompt chunk run ``prefill_matmul``, BF16 and FP8 ones ignore them). The tests compare split and unsplit states bit
++for bit, so a later reader would show up there.
++
++TF_GLM_PREFILL_OVERLAP=1 (with the split) runs the swaps on a second CUDA stream in row pieces: a site computes the
++peer's rows of its partial first, piece by piece, each piece's swap starting as it is done, then its own rows; then
++the glue piece by piece, each piece waiting only for its own partial rows and its normed rows swapped while the next
++piece's glue runs. Events order the two streams; the arithmetic is the same kernels on the same rows.
++
++TF_GLM_HC_EXCHANGE: ``p2p`` (the default) swaps rows with ncclSend/ncclRecv; ``gather`` uses the NCCL all-gather
++instead (whole halves, one piece: the partial halves out of place into the unused all-gather buffer, the bf16 rows in
++place), the same bytes on the wire, for when NCCL's point-to-point path is slower or misbehaves on a fabric."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Callable
++
++import torch
++
++from . import glue
++
++EXCHANGES = ("p2p", "gather")
++
++
++def _flag(env, name: str) -> bool:
++    value = str(env.get(name, "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"{name}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def _int(env, name: str, default: int, lo: int, hi: int) -> int:
++    value = str(env.get(name, "") or default).strip()
++    if not value.isdecimal() or not lo <= int(value) <= hi:
++        raise ValueError(f"{name}: a whole number from {lo} to {hi}, not {value!r}")
++    return int(value)
++
++
++@dataclass(frozen=True)
++class SplitSettings:
++    """What TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP ask for; both ranks must agree (the startup comparison)."""
++
++    split: bool = False
++    overlap: bool = False
++    pieces: int = 2               # TF_GLM_OVERLAP_PIECES: row pieces a site's swaps run in (overlap, p2p only)
++    min_rows: int = 64            # TF_GLM_HC_SPLIT_MIN_ROWS: shorter chunks (a prompt's tail) run unsplit
++    exchange: str = "p2p"         # TF_GLM_HC_EXCHANGE: p2p (ncclSend/ncclRecv) or gather (the all-gather)
++
++    @classmethod
++    def from_env(cls, env=None) -> "SplitSettings":
++        env = os.environ if env is None else env
++        split = _flag(env, "TF_GLM_HC_SPLIT")
++        overlap = _flag(env, "TF_GLM_PREFILL_OVERLAP")
++        if overlap and not split:
++            raise ValueError("TF_GLM_PREFILL_OVERLAP=1 overlaps the row-split exchanges: it needs TF_GLM_HC_SPLIT=1")
++        exchange = str(env.get("TF_GLM_HC_EXCHANGE", "") or "p2p").strip()
++        if exchange not in EXCHANGES:
++            raise ValueError(f"TF_GLM_HC_EXCHANGE: {' or '.join(EXCHANGES)}, not {exchange!r}")
++        return cls(split, overlap, _int(env, "TF_GLM_OVERLAP_PIECES", 2, 1, 8),
++                   _int(env, "TF_GLM_HC_SPLIT_MIN_ROWS", 64, 2, 16384), exchange)
++
++    def piece_count(self) -> int:
++        return self.pieces if self.overlap and self.exchange == "p2p" else 1
++
++    def code(self) -> list[int]:
++        if not self.split:
++            return [0, 0, 0, 0, 0]
++        return [1, int(self.overlap), self.piece_count(), self.min_rows, EXCHANGES.index(self.exchange)]
++
++    def describe(self) -> str:
++        what = "rows split between the ranks"
++        what += ", exchanges by " + ("send/receive" if self.exchange == "p2p" else "all-gather")
++        if self.overlap:
++            n = self.piece_count()
++            what += f" on a second stream{f' in {n} pieces' if n > 1 else ''}"
++        return f"prompt chunks' hyper-connections: {what} (chunks of {self.min_rows}+ rows)"
++
++
++class HcSplit:
++    """One prompt buffer's row split: rows, pieces, the second stream and its events."""
++
++    def __init__(self, w, b, settings: SplitSettings) -> None:
++        if w.world != 2 or w.comm is None or (settings.exchange == "p2p" and not hasattr(w.comm, "exchange")):
++            raise ValueError("TF_GLM_HC_SPLIT needs two ranks and a communicator with exchange (send/receive), "
++                             "or TF_GLM_HC_EXCHANGE=gather")
++        self.w, self.b, self.settings = w, b, settings
++        self.rank, self.peer = w.rank, 1 - w.rank
++        self.gather = settings.exchange == "gather"
++        # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
++        self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
++        self.active = False
++        self.R = self.Rp = self.H = 0
++        self.pieces: list[tuple[int, int]] = []
++        self.got: list[torch.Tensor] = []
++        self.stream = None
++        if settings.overlap:
++            self.stream = torch.cuda.Stream(priority=-1)
++            n = settings.piece_count()
++            self.ev_fill = [torch.cuda.Event() for _ in range(n)]
++            self.ev_part = [torch.cuda.Event() for _ in range(n)]
++            self.ev_glue = [torch.cuda.Event() for _ in range(n)]
++            self.ev_done = torch.cuda.Event()
++
++    def applies(self, R: int) -> bool:
++        return R >= self.settings.min_rows and R + (R & 1) <= self.b.rows
++
++    def warm(self) -> None:
++        """Open the NCCL send/receive connection to the peer at startup (both ranks call this together)."""
++
++        if self.gather:
++            return
++        a = torch.zeros((1,), dtype=torch.float32, device="cuda")
++        z = torch.empty_like(a)
++        self.w.comm.exchange([a], [z], self.peer)
++        torch.cuda.synchronize()
++
++    # -- per chunk ------------------------------------------------------------------------------------------------
++    def begin(self, R: int) -> None:
++        b = self.b
++        self.R, self.Rp = R, R + (R & 1)
++        self.H = H = self.Rp // 2
++        n = self.settings.piece_count()
++        size = -(-H // n)
++        if size > 64:                                 # whole 64-row tiles for the glue kernels where possible
++            size = min(H, -(-size // 64) * 64)
++        self.pieces = [(off, min(size, H - off)) for off in range(0, H, size)]
++        # where the peer's partial of each piece of this rank's rows lands: [n, D] fp32 in the all-gather buffer,
++        # unused while split (gather: the peer's slot of the piece's [2, n, D])
++        d = b.part.shape[1]
++        if self.gather:
++            self.got = [b.gath[(2 * off + self.peer * n) * d:(2 * off + self.peer * n + n) * d].view(n, d)
++                        for off, n in self.pieces]
++        else:
++            self.got = [b.gath[off * d:(off + n) * d].view(n, d) for off, n in self.pieces]
++        if self.Rp > R:                                # the pad row: zero streams and partials, never read
++            b.x[R:self.Rp].zero_()
++            b.part[R:self.Rp].zero_()
++        if self.stream is not None:
++            self.stream.wait_stream(torch.cuda.current_stream())
++        self.active = True
++
++    def finish(self) -> None:
++        if self.stream is not None and self.active:
++            torch.cuda.current_stream().wait_stream(self.stream)
++        self.active = False
++
++    def mine(self) -> int:
++        return self.rank * self.H
++
++    def theirs(self) -> int:
++        return self.peer * self.H
++
++    def _fill(self, fill: Callable[[int, int], None], lo: int, hi: int) -> None:
++        hi = min(hi, self.R)
++        if hi > lo:
++            fill(lo, hi)
++
++    def _swap_partial(self, j: int) -> None:
++        """Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows in."""
++
++        off, n = self.pieces[j]
++        lo = self.theirs() + off
++        send = self.b.part[lo:lo + n]
++        if self.gather:
++            d = send.shape[1]
++            self.all_gather(send.reshape(-1), self.b.gath[2 * off * d:2 * (off + n) * d])
++        else:
++            self.w.comm.exchange([send], [self.got[j]], self.peer)
++
++    def _swap_rows(self, j: int, outs: list[torch.Tensor]) -> None:
++        """Piece j of bf16 row buffers: this rank's rows out, the peer's rows in (gather: in place, whole halves)."""
++
++        off, n = self.pieces[j]
++        mine, theirs = self.mine() + off, self.theirs() + off
++        if self.gather:                                 # one piece: rank order is row order
++            for t in outs:
++                self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))
++            return
++        self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
++
++    def partial(self, fill: Callable[[int, int], None]) -> None:
++        """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peer's rows sent to it and its
++        partial of this rank's rows received (``got``)."""
++
++        theirs, mine = self.theirs(), self.mine()
++        if self.stream is None:
++            fill(0, self.R)
++            for j in range(len(self.pieces)):
++                self._swap_partial(j)
++            return
++        main = torch.cuda.current_stream()
++        for j, (off, n) in enumerate(self.pieces):
++            self._fill(fill, theirs + off, theirs + off + n)
++            self.ev_fill[j].record(main)
++            with torch.cuda.stream(self.stream):
++                self.stream.wait_event(self.ev_fill[j])
++                self._swap_partial(j)
++                self.ev_part[j].record(self.stream)
++        self._fill(fill, mine, mine + self.H)
++
++    def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False) -> None:
++        """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
++        and the next hc_pre (``hc``, ``norm``); their rows swapped with the peer's."""
++
++        b, c = self.b, self.w.cfg
++        mine = self.mine()
++        main = torch.cuda.current_stream()
++        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
++        for j, (off, n) in enumerate(self.pieces):
++            lo, hi = mine + off, mine + off + n
++            if self.stream is not None:
++                main.wait_event(self.ev_part[j])
++            own, got = b.part[lo:hi], self.got[j]
++            g0, g1 = (own, got) if self.rank == 0 else (got, own)
++            x = b.x[lo:hi]
++            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
++            for slot in taps:
++                glue.stream_mean(x, b.taps[slot][lo:hi])
++            if final:
++                glue.stream_mean(x, b.hidden[lo:hi])
++            if hc is not None:
++                glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
++                            b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++            if self.stream is None:
++                self._swap_rows(j, outs)
++                continue
++            self.ev_glue[j].record(main)
++            with torch.cuda.stream(self.stream):
++                self.stream.wait_event(self.ev_glue[j])
++                self._swap_rows(j, outs)
++        if self.stream is not None:
++            self.ev_done.record(self.stream)
++            main.wait_event(self.ev_done)

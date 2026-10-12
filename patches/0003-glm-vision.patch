@@ -1,0 +1,1239 @@
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 552720d..3707349 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -408,11 +408,15 @@ class App:
+                 end = None if think_end is None or think_end in ids[len(prompt):] else think_end
+                 extra["constraint"] = self._grammars().constraint(compiled, think_end=end, spec=spec)
+             if prepared.vision is not None:          # a gate's continuation keeps the images, positions extended
+-                from tensorfold.vision.qwen_processing import continued
+-
+                 same = list(ids) == list(prepared.vision.token_ids)
+-                extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
+-                                                                       self.vision.frontend.config)
++                if same:
++                    extra["vision"] = prepared.vision
++                elif hasattr(prepared.vision, "continued"):     # a frontend that extends its own prompts
++                    extra["vision"] = prepared.vision.continued(ids)
++                else:
++                    from tensorfold.vision.qwen_processing import continued
++
++                    extra["vision"] = continued(prepared.vision, ids, self.vision.frontend.config)
+             stats = self.engine.generate(ids, count, sampling, feed, **extra)
+             if not cached:
+                 cached.append(int((stats or {}).get("cached") or 0))
+diff --git tensorfold/families/glm5_next/__init__.py tensorfold/families/glm5_next/__init__.py
+index 5d8cac3..a2f4a6f 100644
+--- tensorfold/families/glm5_next/__init__.py
++++ tensorfold/families/glm5_next/__init__.py
+@@ -222,7 +222,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+     return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
+                      drafter=Path(drafter) if drafter and not no_drafts else None,
+                      context=options.get("context"), context_explicit=options.get("context_explicit"),
+-                     serial_only=bool(no_drafts))
++                     serial_only=bool(no_drafts), vision=bool(options.get("vision", False)),
++                     vision_urls=bool(options.get("vision_urls", False)))
+ 
+ 
+ def __getattr__(name: str) -> Any:
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index 0b6d35e..350e5b0 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+@@ -15,16 +16,38 @@ class ThinkingOffTemplate:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
+ 
+-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
+-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
++    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
++        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra,
++                                 allow_images=allow_images)
+         return text if enable_thinking else thinking_off(text)
+ 
+ 
++# the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
++# (Glm5NextProcessor's layout), and every text-only prompt renders as before
++_NO_MEDIA = ('{{- "<reminder>You are unable to process this " ~ media_type ~ " because you don\'t have multi-modal '
++             'input ability. Try different methods.</reminder>" }}')
++_MEDIA = ("{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>"
++          "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
++          "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
++
++
++def media_template(inner, model_dir) -> None:
++    """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
++
++    source = (model_dir / "chat_template.jinja").read_text()
++    if source.count(_NO_MEDIA) != 1:
++        raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
++                         "extend (GLM-5.3 Flash's chat_template.jinja)")
++    inner.template = inner.template.environment.from_string(source.replace(_NO_MEDIA, _MEDIA))
++
++
+ class GlmApp(App):
+     reads_ignore_eos = True             # ``run`` hands it to the engine's request
+ 
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
++        if self.vision is not None:
++            media_template(self.template, Path(model_dir))
+         self.template = ThinkingOffTemplate(self.template)
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index f8b4ec4..4850d92 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -341,8 +341,8 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ # -- prefill ----------------------------------------------------------------------------------------------------
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
+-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
++            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, feed=None) -> int:
++    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``)."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -375,7 +375,9 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         R = len(chunk)
+         point = keep_at - start if keep_at is not None else 0
+         cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
+-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
++        inject = feed.chunk(start, R) if feed is not None else None
++        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut,
++                       inject=inject).clone()
+         e.last_hidden = b.fnormed[R - 1:R].clone()
+         if 0 < point <= R:
+             rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index b29529c..47d2a02 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -19,6 +19,22 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
++# --vision (rank 0): what startup reserves beside the tower's 1.05 GiB of bf16 weights for an encode and its
++# prompt's feature rows. Measured peaks: 0.47 GiB (a 2,048-token picture), 0.56 (four), 1.08 (a 16,384-token clip,
++# 16,384 patches a pass), 1.73 (an 8,000-token picture, one 31,724-patch pass). A picture cap past 4,096 tokens
++# scales it; TENSORFOLD_VISION_WORKSPACE_MIB sets it outright
++VISION_WORKSPACE = 3 * 2**29
++
++
++def vision_workspace() -> int:
++    value = os.environ.get("TENSORFOLD_VISION_WORKSPACE_MIB", "")
++    if value == "":
++        from tensorfold.vision.glm import GlmVisionLimits
++
++        return VISION_WORKSPACE * max(4096, GlmVisionLimits.from_env().image_tokens) // 4096
++    if not value.isdecimal() or int(value) > 16384:
++        raise ValueError(f"TENSORFOLD_VISION_WORKSPACE_MIB: 0 to 16,384 MiB, not {value!r}")
++    return int(value) * 2**20
+ 
+ 
+ def encode_policy(spec: str) -> list[int]:
+@@ -110,8 +126,9 @@ class GlmEngine:
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+-                 prefill_rows: int | None = None) -> None:
+-        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
++                 prefill_rows: int | None = None, vision: bool = False, vision_urls: bool = False) -> None:
++        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
++        ``vision``: rank 0 runs the image tower (rank 1 only takes its rows)."""
+ 
+         import torch
+ 
+@@ -146,9 +163,22 @@ class GlmEngine:
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
++        vision = bool(vision) and rank == 0
++        workspace = vision_workspace() if vision else 0
++        if vision:                           # the tower's bf16 weights, which the split rule drops
++            import math
++
++            text_weights = weights_estimate
++            weights_estimate = lambda name, info: ((math.prod(info["shape"]) * 2, 0)
++                                                   if name.startswith("model.visual.") else text_weights(name, info))
++
++        def geometry(text):
++            from tensorfold.cuda.capacity import Geometry
++
++            g = mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT, mtp=self.mtp_on)
++            return Geometry(lambda slots: g.bytes_at(slots) + workspace, g.reserve, g.minimum_slots) if workspace else g
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+-                                                             latent=LATENT, mtp=self.mtp_on),
++                                   geometry,
+                                    weights_estimate, rank=rank, world=2, gather=self._gather_ints,
+                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
+                                    draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
+@@ -206,6 +236,18 @@ class GlmEngine:
+                    if w.mtp is not None else "")
+             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
+                   f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
++        self.vision = None                   # rank 0's image tower (``tensorfold.vision.glm.GlmVision``), --vision
++        if vision:
++            from tensorfold.vision.glm import GlmVision
++
++            self.vision = GlmVision(model_dir, torch.device("cuda", 0), allow_urls=vision_urls)
++            self.vision.warm()
++            torch.cuda.empty_cache()
++            lim = self.vision.limits
++            print(f"[tensorfold] vision: image and video input, a {self.vision.weight_bytes / 2**30:.2f} GiB tower "
++                  f"with {workspace / 2**30:.2f} GiB of workspace; at most {lim.image_tokens} tokens a picture, "
++                  f"{lim.video_tokens} a clip ({lim.video_frames} frames at {lim.fps:g} a second)"
++                  f"{'; https URLs allowed' if vision_urls else ''}", flush=True)
+         self.eos = tuple(w.cfg.eos)
+         self.model_dir = Path(model_dir)
+         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+@@ -424,15 +466,16 @@ class GlmEngine:
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, constraint=None, feed=None) -> dict[str, Any]:
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
++            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed)
+         finally:
+             self.e.constraint = self.e.window = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
++                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
++                  feed=None) -> dict[str, Any]:
+         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
+         from .drafter_choice import DrafterChoice, auto_decode
+ 
+@@ -447,9 +490,10 @@ class GlmEngine:
+         if hit is not None and hit.rows is not None:
+             load_rows(self.e, hit)
+             hit.rows, hit.nbytes = None, 0            # live again
+-        self.live = list(prompt)
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
+-                        keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
++        # an image prompt's rows are not its token ids' rows: nothing resumes from them, and they are not kept
++        self.live = list(prompt) if feed is None else []
++        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit, feed=feed,
++                        keep_at=max(1, len(prompt) - 1) if draft and feed is None else None, keep=self._remember)
+         prefill_s = time.perf_counter() - t0
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+         on_tokens([first])
+@@ -476,7 +520,8 @@ class GlmEngine:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                              on_tokens=on_tokens)
+         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
+-        self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
++        if feed is None:
++            self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
+                      tokens_per_round=round((len(res.tokens) - 1) / max(res.rounds, 1), 3),
+                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
+@@ -487,8 +532,8 @@ class GlmEngine:
+         return stats
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
+-                 constraint=None) -> dict[str, Any]:
+-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
++                 constraint=None, *, vision=None) -> dict[str, Any]:
++        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``)."""
+ 
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+@@ -499,13 +544,27 @@ class GlmEngine:
+             spec = getattr(self.request, "policy", None) or self.policy
+         code = self._effective(encode_policy(spec))
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+-        hit = self._resume(list(prompt), code) if draft else None
++        positions: list[int] = []
++        feed = None
++        if vision is not None:               # encoded here, before rank 1 is told anything, so a failure stops both
++            if self.vision is None:
++                raise ValueError("image inputs require starting this server with --vision")
++            positions = [int(p) for p in vision.positions]
++            if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
++                raise ValueError("image rows must sit at increasing positions inside the prompt")
++            t = time.perf_counter()
++            rows = self.vision.features(vision)
++            if rows.shape[0] != len(positions):
++                raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
++            feed = VisionFeed(self, positions, rows)
++            feed.encode_s = time.perf_counter() - t
++        hit = self._resume(list(prompt), code) if draft and feed is None else None
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+-                  int(constraint is not None)] + code
++                  int(constraint is not None), len(positions)] + code
+         from tensorfold.engine.grammar import pack
+ 
+         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
+@@ -513,8 +572,12 @@ class GlmEngine:
+         self._share(list(prompt))
+         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
+             self._share(pack(constraint))
+-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
++        if positions:
++            self._share(positions)
++        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed)
+         stats.update(policy=spec, drafts=draft)
++        if feed is not None:
++            stats.update(image_rows=len(positions), encode_s=round(feed.encode_s, 3))
+         return stats
+ 
+     def follow(self) -> None:
+@@ -525,7 +588,7 @@ class GlmEngine:
+         while True:
+             self._await_bell()
+             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-             *code) = self._share(None)
++             images, *code) = self._share(None)
+             prompt = self._share(None)
+             packed = self._share(None) if shaped else []
+             constraint = None
+@@ -533,6 +596,7 @@ class GlmEngine:
+                 from tensorfold.engine import grammar
+ 
+                 constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
++            feed = VisionFeed(self, self._share(None), None) if images else None
+             temperature = _ints_f64(t_lo, t_hi)
+             seed = (s_top << 62) | (s_hi << 31) | s_lo
+             sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
+@@ -543,4 +607,32 @@ class GlmEngine:
+                 if hit is None:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                      constraint)
++                      constraint, feed)
++
++
++class VisionFeed:
++    """An image prompt's feature rows for each prefill chunk: rank 0 holds them all, and hands a chunk's rows to
++    rank 1 through the all-gather as the chunk comes (rank 1 sends zeros), so neither rank holds a second copy."""
++
++    def __init__(self, engine: GlmEngine, positions: list[int], rows) -> None:
++        self.engine, self.positions, self.rows = engine, positions, rows
++        self.width = engine.w.cfg.hidden
++        self.encode_s = 0.0
++
++    def chunk(self, start: int, count: int):
++        """(row indices within the chunk, their features) for prompt rows start .. start + count, or None."""
++
++        import bisect
++
++        torch = self.engine.torch
++        lo = bisect.bisect_left(self.positions, start)
++        hi = bisect.bisect_left(self.positions, start + count)
++        if lo == hi:
++            return None
++        n = hi - lo
++        mine = (self.rows[lo:hi].contiguous() if self.rows is not None else
++                torch.zeros((n, self.width), dtype=torch.bfloat16, device="cuda"))
++        both = torch.empty((2 * n, self.width), dtype=torch.bfloat16, device="cuda")
++        self.engine.comm.all_gather(mine, both)
++        index = torch.tensor([p - start for p in self.positions[lo:hi]], dtype=torch.int64, device="cuda")
++        return index, both[:n]
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index f73f253..225109f 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -472,13 +472,16 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None):
+-    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
++            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, inject=None):
++    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``inject``: (rows, features) replacing those rows' embeddings (an image prompt's tower output, on every hyper-connection stream)."""
+ 
+     if cut is not None and (not b.prefill or not 0 < cut.point < R):
+         raise ValueError("a prompt cut must lie inside a prefill chunk")
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    if inject is not None:
++        rows, features = inject
++        b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+     for layer in w.layers:
+         layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
+         for slot in b.tap_at.get(layer.index, ()):
+diff --git tensorfold/serve_options.py tensorfold/serve_options.py
+index 658f828..f36736e 100644
+--- tensorfold/serve_options.py
++++ tensorfold/serve_options.py
+@@ -13,8 +13,6 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
+     if getattr(args, "vision_urls", False) and not getattr(args, "vision", False):
+         raise ValueError("--vision-urls needs --vision")
+     if getattr(args, "vision", False):             # only --vision reads the config here
+-        if family.model_type == "glm5_next" and backend != "mlx":
+-            raise ValueError("GLM-5.3-Flash image input is currently MLX-only")
+         from tensorfold.families import read_config
+         from tensorfold.vision.config import validate_vision_config
+ 
+diff --git tensorfold/server/messages.py tensorfold/server/messages.py
+index 24bbd82..dde2b67 100644
+--- tensorfold/server/messages.py
++++ tensorfold/server/messages.py
+@@ -28,6 +28,9 @@ def late_system_role(render: Callable[[list[dict[str, Any]]], Any]) -> str:
+         return "user"
+ 
+ 
++_VISUAL = ("image_url", "image", "video_url", "video")      # a video part reaches here only where videos are on
++
++
+ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "system",
+                        allow_images: bool = False) -> list[dict[str, Any]]:
+     """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged."""
+@@ -45,12 +48,12 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+             raise RequestError("this server accepts text only; image, audio and video inputs are unsupported")
+         content = message.get("content")
+         if isinstance(content, list) and allow_images and any(
+-                isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in content):
++                isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
+             if role != "user":
+-                raise RequestError("images are supported only in user messages")
++                raise RequestError("images and videos are supported only in user messages")
+             for part in content:
+-                if not isinstance(part, dict) or part.get("type") not in ("text", "image_url", "image"):
+-                    raise RequestError("image messages may contain text and image_url parts only")
++                if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
++                    raise RequestError("image messages may contain text and image_url (or video_url) parts only")
+                 if part["type"] == "text" and not isinstance(part.get("text"), str):
+                     raise RequestError("a text content part must contain a text string")
+             out.append({**message, "content": list(content)})
+diff --git tensorfold/server/prompts.py tensorfold/server/prompts.py
+index 1b709a7..ee19680 100644
+--- tensorfold/server/prompts.py
++++ tensorfold/server/prompts.py
+@@ -18,7 +18,7 @@ class RenderedPrompt:
+ 
+ def has_images(messages):
+     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
+-               and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in m['content'])
++               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
+                for m in messages or [])
+ 
+ 
+@@ -45,14 +45,27 @@ def prepare_images(frontend, messages, render, *, context_limit=None):
+     if frontend is None:
+         raise RequestError('image input requires a supported vision checkpoint served with --vision')
+     allow_urls = bool(getattr(frontend, 'allow_urls', False))
++    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
+     try:
+-        template, sources = split_images(messages, allow_urls=allow_urls)
++        template, sources = split_images(messages, allow_urls=allow_urls, allow_videos=videos)
+     except (ImageInputError, ValueError) as exc:
+         raise RequestError(str(exc)) from exc
+     slot = image_slot()
+     try:
+-        images = load_images(sources, allow_urls=allow_urls)
+-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
++        from tensorfold.vision.images import ImageSource
++
++        images = load_images([s for s in sources if isinstance(s, ImageSource)], allow_urls=allow_urls)
++        clips = [s for s in sources if not isinstance(s, ImageSource)]
++        if clips:
++            if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
++                clips = frontend.load_videos(clips)
++            else:
++                from tensorfold.vision.videos import load_videos
++
++                clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
++            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
++        else:
++            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+     except (ImageInputError, ValueError, ImportError) as exc:
+         raise RequestError(str(exc)) from exc
+     finally:
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+new file mode 100644
+index 0000000..77a96f9
+--- /dev/null
++++ tensorfold/vision/glm.py
+@@ -0,0 +1,491 @@
++"""GLM-5.3 Flash image and video input on CUDA: the checkpoint's processors (resize with pad, frame choice, prompt
++layout) and its vision tower, run on rank 0.
++
++The arithmetic follows transformers 5.17's ``Glm5NextImageProcessor`` / ``Glm5NextVideoProcessor`` /
++``Glm5NextVisionModel``: images and frame pairs become 14x14x2 patches, 24 blocks of 2-D rotary attention over one
++image (or one frame pair) at a time, a 2x2 downsample and a SwiGLU merger into the language model's 4,096 columns.
++The language model takes the features in place of its ``<|image|>`` rows; its positions are the token positions
++(the MLA layers carry no rotary part), so nothing else about the prompt changes.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import math
++import os
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++from .images_http import ImageInputError
++
++IMAGE, VIDEO = "<|image|>", "<|video|>"
++IMAGE_SPAN = "<|begin_of_image|><|image|><|end_of_image|>"     # what the chat template writes for a picture
++VIDEO_SPAN = "<|begin_of_video|><|video|><|end_of_video|>"     # and for a clip, expanded frame pair by frame pair
++MEAN = (0.48145466, 0.4578275, 0.40821073)                    # CLIP's, from processor_config.json
++STD = (0.26862954, 0.26130258, 0.27577711)
++PASS_PATCHES = 16384                 # patches the tower encodes at once (its workspace scales with this)
++
++
++def _env_int(name: str, default: int, low: int, high: int) -> int:
++    value = os.environ.get(name, "")
++    if value == "":
++        return default
++    if not value.isdecimal() or not low <= int(value) <= high:
++        raise ValueError(f"{name}: {low:,} to {high:,}, not {value!r}")
++    return int(value)
++
++
++@dataclass(frozen=True, slots=True)
++class GlmVisionLimits:
++    """Token caps: the checkpoint allows 8,000 tokens a picture and 240,000 a clip; these keep a request's
++    encode within the tower's reserved workspace and the prompt within a sensible share of the window."""
++
++    image_tokens: int = 2048         # a picture's tokens at most (a 1080p frame is 2,040 at 2,048)
++    video_tokens: int = 16384        # a clip's tokens at most, over all its frame pairs
++    video_frames: int = 128          # frames sampled from a clip at most (2 a second, spread wider past this)
++    fps: float = 2.0                 # the processor's rate
++    min_tokens: int = 16
++
++    @classmethod
++    def from_env(cls) -> "GlmVisionLimits":
++        d = cls()                            # a slots class keeps its defaults on instances, not the class
++        return cls(image_tokens=_env_int("TENSORFOLD_GLM_IMAGE_TOKENS", d.image_tokens, 16, 8000),
++                   video_tokens=_env_int("TENSORFOLD_GLM_VIDEO_TOKENS", d.video_tokens, 64, 240000),
++                   video_frames=_env_int("TENSORFOLD_GLM_VIDEO_FRAMES", d.video_frames, 2, 2048))
++
++
++# -- the processors' geometry ---------------------------------------------------------------------------------
++def smart_resize(frames: int, height: int, width: int, max_tokens: int, min_tokens: int = 16, temporal: int = 2,
++                 factor: int = 28) -> tuple[int, int]:
++    """The canvas (height, width), multiples of ``factor``, within ``max_tokens`` over ``frames`` frames."""
++
++    per_token = temporal * factor ** 2
++    low_pixels, high_pixels = min_tokens * per_token, max_tokens * per_token
++
++    def align(v: float) -> int:
++        return math.ceil(v / factor) * factor
++
++    aligned = max(temporal, round(frames / temporal) * temporal)
++    h, w = align(height), align(width)
++    if aligned * h * w < low_pixels:
++        scale = math.sqrt(low_pixels / (frames * height * width))
++        h, w = align(max(1, math.ceil(height * scale))), align(max(1, math.ceil(width * scale)))
++    if aligned * h * w > high_pixels:
++        if high_pixels < aligned * factor ** 2:
++            raise ImageInputError("the token cap is too small for one patch per frame pair")
++        lo, hi, h, w = 1, height, factor, factor
++        while lo <= hi:                      # the largest content height whose aligned canvas fits
++            mid = (lo + hi) // 2
++            ch, cw = align(mid), align(max(1, math.floor(width * mid / height)))
++            if aligned * ch * cw <= high_pixels:
++                h, w, lo = ch, cw, mid + 1
++            else:
++                hi = mid - 1
++    return h, w
++
++
++def content_size(frames: int, height: int, width: int, canvas: tuple[int, int], min_tokens: int = 16,
++                 temporal: int = 2, factor: int = 28) -> tuple[int, int]:
++    """The resized picture inside the canvas (the rest is zero padding, right and bottom)."""
++
++    th, tw = canvas
++    scale = min(th / height, tw / width)
++    if frames * height * width >= temporal * factor ** 2 * min_tokens:
++        scale = min(1.0, scale)
++    return max(1, min(th, math.floor(height * scale))), max(1, min(tw, math.floor(width * scale)))
++
++
++def fit(frame, canvas: tuple[int, int], content: tuple[int, int]):
++    """One uint8 [3, H, W] frame resized (bicubic, antialiased, as torchvision does for the processor) and padded."""
++
++    import torch
++    from torchvision.transforms.v2 import functional as tvF
++
++    if tuple(frame.shape[-2:]) != content:
++        frame = tvF.resize(frame, list(content), interpolation=tvF.InterpolationMode.BICUBIC, antialias=True)
++    out = torch.zeros((3, *canvas), dtype=torch.uint8)
++    out[:, :content[0], :content[1]] = frame
++    return out
++
++
++def sample_frames(total: int, fps: float, duration: float, limits: GlmVisionLimits) -> list[int]:
++    """``Glm5NextVideoProcessor.sample_frames``: one frame each 1/fps seconds from the start, at most
++    ``video_frames`` (then spread evenly), duplicates dropped, an even count (the last frame repeated)."""
++
++    duration = duration or round((total - 1) / fps) + 1
++    max_seconds = int(duration)
++    want = min(int(duration * limits.fps), limits.video_frames)
++    if total < want:
++        picks = np.linspace(0, total - 1, want, dtype=int).tolist()
++    else:
++        picks, second, step = [], 0.0, 1 / limits.fps
++        for i in range(total):
++            if i / fps >= second:
++                second += step
++                picks.append(i)
++                if second >= max_seconds:
++                    break
++    if len(picks) < want:
++        start, end = (picks[0], picks[-1]) if picks else (0, max(total - 1, 0))
++        picks = np.linspace(start, end, want, dtype=int).tolist()
++    elif len(picks) > want:
++        picks = np.linspace(0, total - 1, want, dtype=int).tolist()
++    seen: set[int] = set()
++    unique = [i for i in picks if not (i in seen or seen.add(i))]
++    if not unique:
++        unique = [0]
++    if len(unique) % 2:
++        unique.append(unique[-1])
++    return unique
++
++
++# -- inputs -----------------------------------------------------------------------------------------------------
++@dataclass(frozen=True, slots=True)
++class GlmClip:
++    """A clip's sampled frames at the tower's canvas: uint8 [frames, 3, H, W], and each frame pair's time."""
++
++    frames: Any
++    seconds: tuple[float, ...]           # one per frame pair: its first frame's time
++    content_hash: str = field(init=False)
++
++    def __post_init__(self) -> None:
++        digest = hashlib.sha256(b"tensorfold-glm-clip-v1\0" + json.dumps(list(self.frames.shape)).encode())
++        digest.update(self.frames.numpy().tobytes())
++        object.__setattr__(self, "content_hash", digest.hexdigest())
++
++
++def decode_clip(data: bytes, limits: GlmVisionLimits, deadline: float, *, max_dimension: int = 8192,
++                max_seconds: float = 3600.0) -> GlmClip:
++    """Decode one clip's sampled frames, each resized onto the clip's canvas as it is decoded."""
++
++    import torch
++
++    from .videos import _av
++
++    av = _av()
++    try:
++        with av.open(io.BytesIO(data), mode="r") as container:
++            if not container.streams.video:
++                raise ImageInputError("the video has no video stream")
++            stream = container.streams.video[0]
++            stream.thread_type = "AUTO"
++            width, height = int(stream.codec_context.width or 0), int(stream.codec_context.height or 0)
++            if min(width, height) <= 0 or max(width, height) > max_dimension:
++                raise ImageInputError("video dimensions are missing or exceed the pixel limit")
++            fps = float(stream.average_rate or stream.guessed_rate or 0)
++            total = int(stream.frames or 0)
++            if not total and fps > 0:        # WebM and some MKV files carry no frame count
++                seconds = (float(stream.duration * stream.time_base) if stream.duration else
++                           container.duration / 1e6 if container.duration else 0.0)
++                total = int(round(seconds * fps))
++            if not 0 < fps <= 1000 or total <= 0:
++                raise ImageInputError("the video's frame count or rate is missing")
++            if total / fps > max_seconds:
++                raise ImageInputError(f"videos are limited to {max_seconds / 60:.0f} minutes")
++            picks = sample_frames(total, fps, total / fps, limits)
++            canvas = smart_resize(len(picks), height, width, limits.video_tokens, limits.min_tokens)
++            content = content_size(len(picks), height, width, canvas, limits.min_tokens)
++            wanted = set(picks)
++            got: dict[int, Any] = {}
++            for n, frame in enumerate(container.decode(stream)):
++                if n > picks[-1] or time.monotonic() >= deadline:
++                    break
++                if n in wanted:
++                    rgb = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
++                    got[n] = fit(rgb, canvas, content)
++            if time.monotonic() >= deadline:
++                raise ImageInputError("video decoding exceeds the time limit")
++    except ImageInputError:
++        raise
++    except (OSError, ValueError, MemoryError) as exc:
++        raise ImageInputError(f"video bytes are invalid or unsupported ({type(exc).__name__}); use MP4 or "
++                              "WebM") from None
++    if not got:
++        raise ImageInputError("the video has no decodable frames")
++    last = max(got)                           # a stream shorter than its header: repeat the last frame decoded
++    frames = torch.stack([got.get(i, got[last]) if i <= last else got[last] for i in picks])
++    return GlmClip(frames, tuple(i / fps for i in picks[::2]))
++
++
++@dataclass
++class GlmPrepared:
++    """A prompt with pictures or clips: its tokens, where the tower's rows go, and what to encode.
++
++    ``items``: in prompt order, ("image", uint8 [3, H, W]) or ("video", uint8 [frames, 3, H, W]); ``positions``:
++    the prompt positions of their feature rows, in order (a picture's rows, then the next item's)."""
++
++    token_ids: list[int]
++    items: list[tuple[str, Any]]
++    positions: list[int]
++    content_hash: str = ""
++
++    def continued(self, ids: list[int]) -> "GlmPrepared":
++        """The same pictures under a longer prompt (a tool gate's continuation): positions are token positions."""
++
++        if list(ids[:len(self.token_ids)]) != list(self.token_ids):
++            raise ValueError("a continued image prompt must extend the original prompt")
++        return GlmPrepared(list(ids), self.items, self.positions, self.content_hash)
++
++
++# -- the tower --------------------------------------------------------------------------------------------------
++class GlmVisionTower:
++    """``Glm5NextVisionModel`` in plain torch on bf16 weights; one image or frame pair attends within itself."""
++
++    def __init__(self, model_dir: Path, device) -> None:
++        import torch
++        from safetensors import safe_open
++
++        cfg = json.loads((model_dir / "config.json").read_text())
++        v = cfg["vision_config"]
++        self.hidden, self.heads = int(v["hidden_size"]), int(v["num_heads"])
++        self.head_dim = self.hidden // self.heads
++        self.depth, self.eps = int(v["depth"]), float(v["rms_norm_eps"])
++        self.patch, self.temporal = int(v["patch_size"]), int(v["temporal_patch_size"])
++        self.merge, self.out = int(v["spatial_merge_size"]), int(v["out_hidden_size"])
++        self.limit = float(v.get("swiglu_limit", 10.0))
++        theta = float((v.get("rope_parameters") or {}).get("rope_theta", 10000.0))
++        if self.merge != 2 or self.patch != 14 or self.temporal != 2 or self.head_dim % 4:
++            raise ValueError("this GLM vision tower's geometry is not the one TensorFold implements")
++        spatial = self.head_dim // 2
++        self.inv_freq = 1.0 / (theta ** (torch.arange(0, spatial, 2, dtype=torch.float32, device=device) / spatial))
++        index = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
++        names = sorted(n for n in index if n.startswith("model.visual."))
++        if not names:
++            raise ValueError("this checkpoint has no vision tower (model.visual.*)")
++        t: dict[str, Any] = {}
++        for file in sorted({index[n] for n in names}):
++            with safe_open(str(model_dir / file), framework="pt", device="cpu") as f:
++                for n in names:
++                    if index[n] == file:
++                        t[n[len("model.visual."):]] = f.get_tensor(n).to(device=device, dtype=torch.bfloat16)
++        self.weight_bytes = sum(x.numel() * x.element_size() for x in t.values())
++        self.t = t
++        self.device = device
++        self.mean = torch.tensor(MEAN, device=device).view(3, 1, 1) * 255
++        self.std = torch.tensor(STD, device=device).view(3, 1, 1) * 255
++
++    # the processors' patch layout: rows are merge blocks (2x2 patches), a patch's values (channel, time, y, x)
++    def patches(self, frames):
++        """uint8 [T, 3, H, W] (T even) on the device -> normalized [T/2 * H/14 * W/14, 3 * 2 * 14 * 14] float32."""
++
++        T, C, H, W = frames.shape
++        p, m = self.patch, self.merge
++        x = (frames.float() - self.mean) / self.std
++        x = x.view(T // 2, 2, C, H // p // m, m, p, W // p // m, m, p)
++        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
++        return x.reshape(T // 2 * (H // p) * (W // p), C * 2 * p * p)
++
++    def _rms(self, x, w):
++        import torch
++
++        xf = x.float()
++        return w * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)).to(x.dtype)
++
++    def _rope(self, gh: int, gw: int):
++        import torch
++
++        m = self.merge
++        hpos, wpos = torch.meshgrid(torch.arange(gh, device=self.device), torch.arange(gw, device=self.device),
++                                    indexing="ij")
++        shape = (gh // m, m, gw // m, m)
++        pos = torch.stack([hpos.reshape(shape).transpose(1, 2).flatten(),
++                           wpos.reshape(shape).transpose(1, 2).flatten()], dim=-1).float()
++        freqs = (pos[..., None] * self.inv_freq).flatten(1)        # [S, h freqs then w freqs]
++        freqs = torch.cat([freqs, freqs], dim=-1)
++        return freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
++
++    @staticmethod
++    def _rotate(x, cos, sin):
++        import torch
++
++        xf = x.float()
++        half = xf.shape[-1] // 2
++        return (xf * cos + torch.cat((-xf[..., half:], xf[..., :half]), dim=-1) * sin).to(x.dtype)
++
++    def _block(self, i: int, x, cos, sin):
++        import torch
++        import torch.nn.functional as F
++
++        t, L = self.t, self.limit
++        g = f"blocks.{i}."
++        B, S, D = x.shape
++        h = self._rms(x, t[g + "norm1.weight"])
++        q, k, v = F.linear(h, t[g + "attn.qkv.weight"], t[g + "attn.qkv.bias"]).view(B, S, 3, self.heads,
++                                                                                     self.head_dim).unbind(2)
++        q = self._rotate(self._rms(q, t[g + "attn.q_norm.weight"]), cos, sin)
++        k = self._rotate(self._rms(k, t[g + "attn.k_norm.weight"]), cos, sin)
++        o = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
++                                           scale=self.head_dim ** -0.5)
++        x = x + F.linear(o.transpose(1, 2).reshape(B, S, D), t[g + "attn.proj.weight"], t[g + "attn.proj.bias"])
++        h = self._rms(x, t[g + "norm2.weight"])
++        gate = F.linear(h, t[g + "mlp.gate_proj.weight"], t[g + "mlp.gate_proj.bias"]).clamp(max=L)
++        up = F.linear(h, t[g + "mlp.up_proj.weight"], t[g + "mlp.up_proj.bias"]).clamp(-L, L)
++        del h
++        return x + F.linear(F.silu(gate) * up, t[g + "mlp.down_proj.weight"], t[g + "mlp.down_proj.bias"])
++
++    def encode(self, patches, groups: int, gh: int, gw: int):
++        """``groups`` images (or frame pairs) of gh x gw patches each, [groups * gh * gw, 1176] -> their
++        [groups * gh * gw / 4, out] features in the language model's dtype."""
++
++        import torch
++        import torch.nn.functional as F
++
++        t = self.t
++        S = gh * gw
++        # the reference's convolutions, not the equal matmuls: 24 blocks turn their last-bit differences into ~3%
++        x = F.conv3d(patches.to(torch.bfloat16).view(-1, 3, self.temporal, self.patch, self.patch),
++                     t["patch_embed.proj.weight"], t["patch_embed.proj.bias"], stride=(self.temporal, self.patch,
++                                                                                      self.patch))
++        x = x.view(groups, S, self.hidden)
++        cos, sin = self._rope(gh, gw)
++        for i in range(self.depth):
++            x = self._block(i, x, cos, sin)
++        x = self._rms(x, t["post_layernorm.weight"]).reshape(-1, self.merge, self.merge, self.hidden)
++        x = F.conv2d(x.permute(0, 3, 1, 2), t["downsample.weight"], t["downsample.bias"],
++                     stride=self.merge).view(-1, self.out)
++        x = F.linear(x, t["merger.proj.weight"])
++        x = F.gelu(F.layer_norm(x, (self.out,), t["merger.post_projection_norm.weight"],
++                                t["merger.post_projection_norm.bias"]))
++        gate = F.linear(x, t["merger.gate_proj.weight"]).clamp(max=self.limit)
++        up = F.linear(x, t["merger.up_proj.weight"]).clamp(-self.limit, self.limit)
++        return F.linear(F.silu(gate) * up, t["merger.down_proj.weight"])
++
++    def features(self, items: list[tuple[str, Any]]):
++        """Every item's feature rows, in order: [rows, out] bf16 on the device."""
++
++        import torch
++
++        out = []
++        for _, frames in items:
++            frames = frames if frames.dim() == 4 else frames.unsqueeze(0).expand(2, -1, -1, -1)
++            T, _, H, W = frames.shape
++            gh, gw = H // self.patch, W // self.patch
++            per = max(1, PASS_PATCHES // (gh * gw))          # frame pairs a pass
++            for start in range(0, T // 2, per):
++                pairs = frames[2 * start:2 * min(T // 2, start + per)].to(self.device, non_blocking=True)
++                out.append(self.encode(self.patches(pairs), pairs.shape[0] // 2, gh, gw))
++        return torch.cat(out) if out else torch.empty((0, self.out), dtype=torch.bfloat16, device=self.device)
++
++
++# -- the frontend ------------------------------------------------------------------------------------------------
++class GlmVision:
++    """What the server needs for GLM pictures and clips: ``prepare`` (rendered text -> tokens and items),
++    ``load_videos``, and the tower's ``features`` (rank 0)."""
++
++    videos = True
++
++    def __init__(self, model_dir: Path, device, *, allow_urls: bool = False,
++                 limits: GlmVisionLimits | None = None) -> None:
++        from tokenizers import Tokenizer
++
++        cfg = json.loads((model_dir / "config.json").read_text())
++        self.image_token = int(cfg.get("image_token_id", 154854))
++        self.allow_urls = allow_urls
++        self.limits = limits or GlmVisionLimits.from_env()
++        self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
++        if self.tok.token_to_id(IMAGE) != self.image_token:
++            raise ValueError("the tokenizer's <|image|> id does not match config.json's image_token_id")
++        self.tower = GlmVisionTower(model_dir, device)
++        self.weight_bytes = self.tower.weight_bytes
++
++    def load_videos(self, sources) -> list[GlmClip]:
++        from .videos import DEFAULT_VIDEO_LIMITS as L, VIDEO_MEDIA_TYPES
++        from .images import _data_bytes
++        from .images_http import fetch_image
++
++        if len(sources) > L.max_videos:
++            raise ImageInputError(f"a request supports at most {L.max_videos} videos")
++        total, out = 0, []
++        deadline = time.monotonic() + L.total_timeout_seconds
++        for source in sources:
++            remaining = min(L.max_encoded_bytes, L.max_total_encoded_bytes - total)
++            if remaining <= 0 or time.monotonic() >= deadline:
++                raise ImageInputError("video request exceeds the total byte or time limit")
++            if source.url.startswith("data:"):
++                data = _data_bytes(source.url, remaining)
++            elif self.allow_urls:
++                data, _ = fetch_image(source.url, max_bytes=remaining,
++                                      deadline=min(deadline, time.monotonic() + L.timeout_seconds),
++                                      max_redirects=L.max_redirects, max_url_chars=L.max_url_chars,
++                                      media_types=VIDEO_MEDIA_TYPES)
++            else:
++                raise ImageInputError("video URLs are off on this server")
++            total += len(data)
++            out.append(decode_clip(data, self.limits, deadline, max_dimension=L.max_dimension,
++                                   max_seconds=L.max_seconds))
++        return out
++
++    def _picture(self, image):
++        import torch
++
++        rgb = torch.frombuffer(bytearray(image.pixels), dtype=torch.uint8).view(image.height, image.width, 3)
++        rgb = rgb.permute(2, 0, 1)
++        canvas = smart_resize(2, image.height, image.width, self.limits.image_tokens, self.limits.min_tokens)
++        return fit(rgb, canvas, content_size(2, image.height, image.width, canvas, self.limits.min_tokens))
++
++    def prepare(self, text: str, images, *, videos=(), max_prompt_tokens: int | None = None) -> GlmPrepared:
++        """The rendered prompt with each picture's and clip's placeholder expanded as Glm5NextProcessor does."""
++
++        videos = list(videos or ())
++        if text.count(IMAGE) != text.count(IMAGE_SPAN) or text.count(IMAGE_SPAN) != len(images) or \
++                text.count(VIDEO) != len(videos) or text.count(VIDEO_SPAN) != len(videos):
++            raise ImageInputError("the prompt's image and video markers do not match its images and videos "
++                                  "(is <|image|> or <|video|> in the text?)")
++        items: list[tuple[str, Any]] = []
++        pieces: list[str] = []
++        image_iter, video_iter = iter(images), iter(videos)
++        rest = text
++        while True:
++            i, v = rest.find(IMAGE_SPAN), rest.find(VIDEO_SPAN)
++            if i < 0 and v < 0:
++                pieces.append(rest)
++                break
++            if v < 0 or 0 <= i < v:
++                picture = self._picture(next(image_iter))
++                n = picture.shape[1] // 28 * (picture.shape[2] // 28)
++                pieces.append(rest[:i] + "<|begin_of_image|>" + IMAGE * n + "<|end_of_image|>")
++                items.append(("image", picture))
++                rest = rest[i + len(IMAGE_SPAN):]
++            else:
++                clip = next(video_iter)
++                n = clip.frames.shape[2] // 28 * (clip.frames.shape[3] // 28)
++                frames = "".join(f"<|begin_of_image|>{IMAGE * n}<|end_of_image|>{s:.1f} seconds"
++                                 for s in clip.seconds)
++                pieces.append(rest[:v] + "<|begin_of_video|>" + frames + "<|end_of_video|>")
++                items.append(("video", clip.frames))
++                rest = rest[v + len(VIDEO_SPAN):]
++        ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
++        if max_prompt_tokens and len(ids) >= max_prompt_tokens:
++            raise ValueError(f"the prompt with its images is {len(ids):,} tokens; this server's window is "
++                             f"{max_prompt_tokens:,}: send fewer or smaller images, or a shorter video")
++        positions = [p for p, t in enumerate(ids) if t == self.image_token]
++        rows = sum(self._rows(kind, x) for kind, x in items)
++        if len(positions) != rows:
++            raise ImageInputError(f"the prompt has {len(positions)} image positions for {rows} feature rows")
++        digest = hashlib.sha256(b"tensorfold-glm-vision-v1\0")
++        for kind, x in items:
++            digest.update(kind.encode() + json.dumps(list(x.shape)).encode())
++            digest.update(x.numpy().tobytes())
++        return GlmPrepared(ids, items, positions, digest.hexdigest())
++
++    @staticmethod
++    def _rows(kind: str, x) -> int:
++        pairs = x.shape[0] // 2 if kind == "video" else 1
++        return pairs * (x.shape[-2] // 28) * (x.shape[-1] // 28)
++
++    def features(self, prepared: GlmPrepared):
++        return self.tower.features(prepared.items)
++
++    def warm(self) -> None:
++        """Run a small picture through the tower once, so its kernels are loaded before the first request."""
++
++        import torch
++
++        self.tower.features([("image", torch.zeros((3, 56, 56), dtype=torch.uint8))])
++        torch.cuda.synchronize()
+diff --git tensorfold/vision/images.py tensorfold/vision/images.py
+index cd4b1d2..e68c516 100644
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -113,9 +113,10 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
+         raise ImageInputError("image URL is too long")
+ 
+ 
+-def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False
+-                 ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
+-    """Preserve ordered parts, replacing user image URLs with processor image markers."""
++def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
++                 allow_videos: bool = False) -> tuple[list[dict[str, Any]], list[ImageSource]]:
++    """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
++    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template)."""
+     if not isinstance(messages, list) or not messages:
+         raise ImageInputError("messages must be a non-empty list")
+     output, sources = [], []
+@@ -142,18 +143,32 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
+                 if not isinstance(part.get("text"), str) or any(part.get(key) for key in _MEDIA):
+                     raise ImageInputError("text parts must contain a text string without media")
+                 parts.append(dict(part))
++            elif kind == "video_url" and allow_videos:
++                from .videos import DEFAULT_VIDEO_LIMITS, video_source
++
++                if role != "user":
++                    raise ImageInputError("video_url parts are supported only in user messages")
++                if any(part.get(key) for key in _MEDIA - {"video_url"}):
++                    raise ImageInputError("video_url parts cannot contain other media")
++                videos = sum(type(s).__name__ == "VideoSource" for s in sources)
++                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
++                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
++                sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
++                parts.append({"type": "video"})
+             elif kind == "image_url":
+                 if role != "user":
+                     raise ImageInputError("image_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
+                     raise ImageInputError("image_url parts cannot contain other media")
+-                if len(sources) >= limits.max_images:
++                if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
+                     raise ImageInputError(f"a request supports at most {limits.max_images} images")
+                 source = _source(part.get("image_url"), limits, allow_urls)
+                 sources.append(source)
+                 parts.append({"type": "image", "detail": source.detail})
+             else:
+-                raise ImageInputError("content parts must be text or image_url; audio and video are unsupported")
++                raise ImageInputError("content parts must be text, image_url or video_url; audio is unsupported"
++                                      if allow_videos else
++                                      "content parts must be text or image_url; audio and video are unsupported")
+         output.append({**message, "content": parts})
+     return output, sources
+ 
+diff --git tensorfold/vision/images_http.py tensorfold/vision/images_http.py
+index 16d6627..f354aea 100644
+--- tensorfold/vision/images_http.py
++++ tensorfold/vision/images_http.py
+@@ -109,7 +109,7 @@ def _close_socket(sock: socket.socket) -> None:
+ 
+ 
+ def _request(host: str, port: int, target: str, addresses: list[tuple],
+-             max_bytes: int, deadline: float) -> tuple[bytes | None, str | None, str | None]:
++             max_bytes: int, deadline: float, media_types=MEDIA_TYPES) -> tuple[bytes | None, str | None, str | None]:
+     """A watchdog bounds slow headers and TLS handshakes, not just individual reads."""
+     timeout = _remaining(deadline)
+     family, kind, protocol, _, address = addresses[0]
+@@ -128,7 +128,7 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+         sock.settimeout(_remaining(deadline))
+         sock.do_handshake()
+         connection.sock = sock
+-        connection.request("GET", target, headers={"Accept": ", ".join(MEDIA_TYPES), "Accept-Encoding": "identity",
++        connection.request("GET", target, headers={"Accept": ", ".join(media_types), "Accept-Encoding": "identity",
+                                                    "User-Agent": f"TensorFold/{__version__}"})
+         response = connection.getresponse()
+         _remaining(deadline)
+@@ -142,8 +142,9 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+         if response.getheader("Content-Encoding", "identity").lower() != "identity":
+             raise ImageInputError("compressed HTTP image responses are unsupported")
+         media = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+-        if media not in MEDIA_TYPES:
+-            raise ImageInputError("image URL content type must be JPEG, PNG or WebP")
++        if media not in media_types:
++            raise ImageInputError("image URL content type must be JPEG, PNG or WebP" if media_types is MEDIA_TYPES
++                                  else f"media URL content type must be one of {', '.join(media_types)}")
+         length = response.getheader("Content-Length")
+         if length is not None:
+             if not length.isascii() or not length.isdecimal() or int(length) > max_bytes:
+@@ -166,13 +167,13 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
+ 
+ 
+ def fetch_image(url: str, *, max_bytes: int, deadline: float, max_redirects: int,
+-                max_url_chars: int) -> tuple[bytes, str]:
++                max_url_chars: int, media_types=MEDIA_TYPES) -> tuple[bytes, str]:
+     """Resolve and validate each redirect, then connect directly to its checked address."""
+     try:
+         for redirect in range(max_redirects + 1):
+             host, port, target = _url(url, max_url_chars)
+             addresses = _resolve(host, port, deadline)
+-            data, location, media = _request(host, port, target, addresses, max_bytes, deadline)
++            data, location, media = _request(host, port, target, addresses, max_bytes, deadline, media_types)
+             if location is None:
+                 return data, media
+             if redirect == max_redirects:
+diff --git tensorfold/vision/videos.py tensorfold/vision/videos.py
+new file mode 100644
+index 0000000..271f7ce
+--- /dev/null
++++ tensorfold/vision/videos.py
+@@ -0,0 +1,172 @@
++"""CPU video inputs: bounded bytes, frames sampled at a fixed rate, decoded straight to the tower's resolution."""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import math
++import time
++from dataclasses import dataclass, field
++from typing import Any, Callable
++
++import numpy as np
++
++from .images import _data_bytes
++from .images_http import ImageInputError, fetch_image
++
++VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
++
++
++@dataclass(frozen=True, slots=True)
++class VideoLimits:
++    max_videos: int = 2
++    max_encoded_bytes: int = 64 * 1024 * 1024
++    max_total_encoded_bytes: int = 96 * 1024 * 1024
++    max_dimension: int = 8192
++    max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
++    fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)
++    min_frames: int = 4
++    max_frames: int = 256                 # a longer video is sampled more sparsely, over its whole length
++    timeout_seconds: float = 20.0
++    total_timeout_seconds: float = 120.0
++    max_redirects: int = 3
++    max_url_chars: int = 4096
++
++
++DEFAULT_VIDEO_LIMITS = VideoLimits()
++
++
++@dataclass(frozen=True, slots=True)
++class VideoSource:
++    url: str
++
++
++@dataclass(frozen=True, slots=True)
++class VideoInput:
++    frames: np.ndarray            # [frames, height, width, 3] uint8, already at the tower's resolution
++    indices: tuple[int, ...]      # each frame's index in the source
++    fps: float                    # the source's frame rate
++    content_hash: str = field(init=False)
++
++    def __post_init__(self) -> None:
++        if (not isinstance(self.frames, np.ndarray) or self.frames.dtype != np.uint8 or self.frames.ndim != 4
++                or self.frames.shape[-1] != 3 or len(self.indices) != self.frames.shape[0] or not self.indices
++                or not math.isfinite(self.fps) or self.fps <= 0):
++            raise ImageInputError("video input requires RGB frames, one index each and a positive frame rate")
++        self.frames.setflags(write=False)
++        digest = hashlib.sha256(b"tensorfold-video-v1\0" + np.asarray(self.frames.shape, dtype=">u4").tobytes())
++        digest.update(np.asarray(self.indices, dtype=">u8").tobytes())
++        digest.update(self.frames.tobytes())
++        object.__setattr__(self, "content_hash", digest.hexdigest())
++
++    def timestamps(self, temporal: int) -> list[float]:
++        """Each group of ``temporal`` frames' time: the mean of its first and last frame (Qwen3-VL's processor)."""
++        indices = list(self.indices)
++        if len(indices) % temporal:
++            indices.extend(indices[-1] for _ in range(temporal - len(indices) % temporal))
++        seconds = [i / self.fps for i in indices]
++        return [(seconds[i] + seconds[i + temporal - 1]) / 2 for i in range(0, len(seconds), temporal)]
++
++
++def video_source(value: Any, limits: VideoLimits, allow_urls: bool) -> VideoSource:
++    if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
++        raise ImageInputError("video_url must contain a non-empty url string")
++    url = value["url"]
++    if url.startswith("data:"):
++        if len(url) > limits.max_encoded_bytes * 3 // 2 + 256:
++            raise ImageInputError("video data URL exceeds the encoded byte limit")
++    elif not url.startswith("https://"):
++        raise ImageInputError("videos require data URLs or public HTTPS URLs")
++    elif not allow_urls:
++        raise ImageInputError("video URLs are off on this server; send the video as a data URL, or start the server "
++                              "with --vision-urls")
++    elif len(url) > limits.max_url_chars:
++        raise ImageInputError("video URL is too long")
++    return VideoSource(url)
++
++
++def _av():
++    try:
++        import av
++    except ImportError:
++        raise ImageInputError("video inputs require PyAV (pip install av)") from None
++    return av
++
++
++def sample_indices(total: int, fps: float, limits: VideoLimits) -> np.ndarray:
++    """Qwen3-VL's frame choice: ``limits.fps`` frames a second (at least min_frames, at most max_frames) spread
++    evenly over the whole video."""
++    count = int(total / fps * limits.fps)
++    count = min(max(count, limits.min_frames), limits.max_frames, total)
++    return np.linspace(0, total - 1, count).round().astype(int)
++
++
++def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], limits: VideoLimits,
++                 deadline: float) -> VideoInput:
++    """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic)."""
++    av = _av()
++    try:
++        with av.open(io.BytesIO(data), mode="r") as container:
++            if not container.streams.video:
++                raise ImageInputError("the video has no video stream")
++            stream = container.streams.video[0]
++            stream.thread_type = "AUTO"
++            width, height = int(stream.codec_context.width or 0), int(stream.codec_context.height or 0)
++            if min(width, height) <= 0 or max(width, height) > limits.max_dimension:
++                raise ImageInputError("video dimensions are missing or exceed the pixel limit")
++            rate = stream.average_rate or stream.guessed_rate or 24
++            fps = float(rate)
++            seconds = float(stream.duration * stream.time_base) if stream.duration else (
++                container.duration / 1e6 if container.duration else 0.0)
++            total = int(stream.frames or round(seconds * fps))
++            if not 0 < fps <= 1000 or total <= 0:
++                raise ImageInputError("the video's frame count or rate is missing")
++            if total / fps > limits.max_seconds:
++                raise ImageInputError(f"videos are limited to {limits.max_seconds / 60:.0f} minutes")
++            wanted = sample_indices(total, fps, limits)
++            out_h, out_w = size(len(wanted), height, width)
++            keep = set(int(i) for i in wanted)
++            frames, indices = [], []
++            for n, frame in enumerate(container.decode(stream)):
++                if n > wanted[-1] or time.monotonic() >= deadline:
++                    break
++                if n in keep:
++                    frames.append(frame.to_ndarray(format="rgb24", width=out_w, height=out_h,
++                                                   interpolation="BICUBIC"))
++                    indices.append(n)
++            if time.monotonic() >= deadline:
++                raise ImageInputError("video decoding exceeds the time limit")
++    except ImageInputError:
++        raise
++    except (OSError, ValueError, MemoryError) as exc:
++        raise ImageInputError(f"video bytes are invalid or unsupported ({type(exc).__name__}); use MP4 or "
++                              "WebM") from None
++    if len(frames) < 2:
++        raise ImageInputError("the video has fewer than two decodable frames")
++    return VideoInput(np.stack(frames), tuple(indices), fps)
++
++
++def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tuple[int, int]], *,
++                limits: VideoLimits = DEFAULT_VIDEO_LIMITS, allow_urls: bool = False) -> list[VideoInput]:
++    """Bound encoded bytes and decoding time across the videos of one request."""
++    if len(sources) > limits.max_videos:
++        raise ImageInputError(f"a request supports at most {limits.max_videos} videos")
++    total = 0
++    deadline = time.monotonic() + limits.total_timeout_seconds
++    output = []
++    for source in sources:
++        remaining = min(limits.max_encoded_bytes, limits.max_total_encoded_bytes - total)
++        if remaining <= 0 or time.monotonic() >= deadline:
++            raise ImageInputError("video request exceeds the total byte or time limit")
++        if source.url.startswith("data:"):
++            data = _data_bytes(source.url, remaining)
++        elif allow_urls:
++            data, _ = fetch_image(source.url, max_bytes=remaining,
++                                  deadline=min(deadline, time.monotonic() + limits.timeout_seconds),
++                                  max_redirects=limits.max_redirects, max_url_chars=limits.max_url_chars,
++                                  media_types=VIDEO_MEDIA_TYPES)
++        else:
++            raise ImageInputError("video URLs are off on this server")
++        total += len(data)
++        output.append(decode_video(data, size, limits, deadline))
++    return output

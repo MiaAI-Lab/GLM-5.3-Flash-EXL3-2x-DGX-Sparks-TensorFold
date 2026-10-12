@@ -1,0 +1,335 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index b98d846..b29529c 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -136,9 +136,14 @@ class GlmEngine:
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+ 
++        from .qmm import dense_kind, fp8_weights
++
++        # TF_GLM_DENSE=fp8 (an EXL3 checkpoint): its BF16 matrices take a byte a value, which the estimate counts
++        weights_estimate = split_weights(rule)
++        if cfg.quant == "exl3" and dense_kind() == "fp8":
++            weights_estimate = fp8_weights(weights_estimate)
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+-        weights_estimate = split_weights(rule)
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 01a173c..f73f253 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -260,29 +260,32 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
+     k = layer.kda
+     li = st.kda_index[layer.index]
+     p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
+-    mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+-    fa = p[:, k.fa_off:k.fa_off + 128]
+-    ga = p[:, k.ga_off:k.ga_off + 128]
+     pre = b.prefill
+-    mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+-    mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++    with prof.timed("kda: projections"):
++        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
++        fa = p[:, k.fa_off:k.fa_off + 128]
++        ga = p[:, k.ga_off:k.ga_off + 128]
++        mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
++        mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+     cur = st.cur[li]
+-    if cut is None:
+-        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+-                            st.rec[1 - cur, li])
+-    else:
+-        n = cut.point
+-        first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+-        _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+-        rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+-        out = torch.cat((first, rest))
++    with prof.timed("kda: recurrence"):
++        if cut is None:
++            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                                k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
++                                st.rec[1 - cur, li])
++        else:
++            n = cut.point
++            first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
++                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
++            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
++            rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
++                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
++            out = torch.cat((first, rest))
+     if pre:                              # a prompt chunk keeps every row: the layer commits now
+         st.cur[li] = 1 - cur
+         _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+-    return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
++    with prof.timed("kda: out + all-gather"):
++        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
+ 
+ 
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -398,14 +401,18 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+ 
+-        exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
++        with prof.timed("moe: routed (exl3)"):
++            exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+         s = m.shared
+-        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+-        glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-        mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+-        b.ey[:R, c.top_k].copy_(b.sy[:R])
+-        glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+-        return gather(w, b, R)
++        with prof.timed("moe: shared expert"):
++            mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
++            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
++            mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
++        with prof.timed("moe: combine"):
++            b.ey[:R, c.top_k].copy_(b.sy[:R])
++            glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
++        with prof.timed("moe: all-gather"):
++            return gather(w, b, R)
+     with prof.timed("moe: gate/up"):
+         grouped.gate_up(b.normed[:R], m.experts, b.plan, b.eact, R)
+     with prof.timed("moe: down"):
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index a366806..827db2b 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -220,10 +220,12 @@ B16_CONFIG = {16: (4, 3), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
+ 
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+            f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+-    """Multiply strided bf16 x by Q4 or BF16 q.T, returning bf16 or unrounded fp32 with f32; BF16 weights ignore xs."""
++    """Multiply strided bf16 x by Q4, BF16 or FP8 q.T, returning bf16 or unrounded fp32 with f32; BF16 and FP8 weights ignore xs."""
+ 
+     if isinstance(q, B16):
+         return _matmul_b16(x, q, out=out, f32=f32, part=part)
++    if isinstance(q, F8):
++        return _matmul_f8(x, q, out=out, f32=f32, part=part)
+     if x.shape[1] != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+     if out is not None and (out.shape != (x.shape[0], q.n) or not out.is_contiguous()):
+@@ -265,3 +267,141 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
+         total = m * q.n
+         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
+     return out
++
++
++# -- FP8 weights (TF_GLM_DENSE=fp8): the checkpoint's BF16 matrices stored as e4m3 with an fp32 scale per row and
++# 128-column block, quantized once at load. Lossy (replies differ from BF16 weights); the activations stay bf16 and
++# the kernel keeps _bmm's structure (a row's bits never depend on the other rows), so drafted replies still equal
++# serial ones under it.
++F8_BLOCK = 128
++F8_MAX = 448.0
++
++
++@dataclass
++class F8:
++    """A BF16 matrix [n, k] held as FP8 e4m3 [n, k] and fp32 scales [n, k / 128]: W ~ q * scale."""
++
++    weight: torch.Tensor      # [n, k] torch.float8_e4m3fn
++    scale: torch.Tensor       # [n, k // 128] fp32
++    n: int
++    k: int
++
++    def nbytes(self) -> int:
++        return self.weight.numel() + self.scale.numel() * 4
++
++
++def make_f8(weight: torch.Tensor, rows: int = 8192) -> F8 | B16:
++    """Quantize a BF16 matrix a block of 128 columns at a time (absmax / 448 scale, round to nearest); a matrix whose
++    width is not a multiple of 128 stays BF16."""
++
++    n, k = weight.shape
++    if k % F8_BLOCK:
++        return make_b16(weight)
++    q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=weight.device)
++    scale = torch.empty((n, k // F8_BLOCK), dtype=torch.float32, device=weight.device)
++    for r in range(0, n, rows):
++        g = weight[r:r + rows].float().view(-1, k // F8_BLOCK, F8_BLOCK)
++        s = (g.abs().amax(-1) / F8_MAX).clamp_min(1e-30)
++        q[r:r + rows] = (g / s[..., None]).clamp(-F8_MAX, F8_MAX).view(-1, k).to(torch.float8_e4m3fn)
++        scale[r:r + rows] = s
++    return F8(q, scale, int(n), int(k))
++
++
++def stack_f8(parts: list[torch.Tensor]) -> F8 | B16:
++    return make_f8(torch.cat([p.to(torch.bfloat16) for p in parts]))
++
++
++@triton.jit
++def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
++         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
++    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales."""
++
++    PER: tl.constexpr = K // SK
++    KB: tl.constexpr = K // 128
++    pid_n = tl.program_id(1)
++    pid_s = tl.program_id(2)
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    n_ok = rn < N
++    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
++        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++        s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
++        acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    if SK == 1:
++        if F32:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
++        else:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=out_mask)
++    else:
++        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
++
++
++def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
++               part: torch.Tensor | None) -> torch.Tensor:
++    m, k = x.shape
++    if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16 or k % F8_BLOCK:
++        raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
++    bm = bucket(min(m, 128))
++    warps, stages = F8_CONFIG[bm]
++    sk = b16_split_k(q.n, q.k)
++    if out is None:
++        out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    elif out.shape != (m, q.n) or not out.is_contiguous():
++        raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
++    if sk > 1:
++        need = sk * m * q.n
++        if part is None or part.numel() < need:
++            part = torch.empty((need,), dtype=torch.float32, device=x.device)
++    bn = F8_BN_DECODE if bm == 16 else F8_BN
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
++    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
++               BLOCK_N=bn, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
++    if sk > 1:
++        total = m * q.n
++        _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
++    return out
++
++
++F8_BN = 64
++F8_BN_DECODE = 32          # decode windows (up to 16 rows): narrower column tiles, deeper pipeline (measured +8%)
++# (warps, stages) by row bucket; neither they nor the column tile change a row's bits
++F8_CONFIG = {16: (4, 6), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
++
++
++def dense_kind() -> str:
++    """TF_GLM_DENSE: how an EXL3 checkpoint's BF16 (non-expert) weights are held: bf16 (as stored) or fp8."""
++
++    import os
++
++    kind = os.environ.get("TF_GLM_DENSE", "bf16")
++    if kind not in ("bf16", "fp8"):
++        raise ValueError(f"TF_GLM_DENSE is bf16 or fp8, not {kind!r}")
++    return kind
++
++
++# The matrices TF_GLM_DENSE=fp8 converts (weights.py's q4 / stack / head), for the startup memory estimate
++_F8_NAMES = __import__("re").compile(
++    r"(\.(q_proj|k_proj|v_proj|f_a_proj|g_a_proj|b_proj|f_b_proj|g_b_proj|o_proj|q_a_proj|kv_a_proj_with_mqa|q_b_proj"
++    r"|wk|weights_proj|wq_b|gate_proj|up_proj|down_proj|eh_proj)\.weight|^lm_head\.weight)$")
++
++
++def fp8_weights(base):
++    """A split_weights transform that counts the matrices held as FP8 at a byte a value plus their block scales."""
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = base(name, info)
++        shape = info.get("shape") or []
++        if (total and info.get("dtype") == "BF16" and len(shape) == 2 and shape[-1] % F8_BLOCK == 0
++                and "experts." not in name.replace("shared_experts.", "") and _F8_NAMES.search(name)):
++            if name == "lm_head.weight":                  # keep the 4-bit draft head split_weights adds
++                n = total * 16 // (2 * 16 + 9)          # its values: total = 2n + 9n / 16
++                return n + n // F8_BLOCK * 4 + n * 9 // 16, extra
++            n = total // 2
++            return n + n // F8_BLOCK * 4, extra
++        return total, extra
++    return transform
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index 48c4190..fd9db9d 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -13,7 +13,7 @@ from tensorfold.cuda import experts as grouped
+ 
+ from .exl3_mm import Exl3Experts, words as exl3_words
+ from . import latent
+-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
++from .qmm import B16, F8, Q4, as_i32, dense_kind, make_b16, make_f8, make_q4, quantize4, stack_b16, stack_f8, stack_q4
+ 
+ PREFIX = "model.language_model."
+ 
+@@ -204,7 +204,7 @@ class Weights:
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+     layers: list[LayerW]
+     norm: torch.Tensor
+-    head: Q4 | B16
++    head: Q4 | B16 | F8
+     mtp: MTPW | None
+     rank: int
+     world: int
+@@ -226,7 +226,7 @@ class Weights:
+             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
++            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -269,12 +269,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
+-    def q4(name: str) -> Q4 | B16:
+-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++    # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
++    fp8 = exl3 and dense_kind() == "fp8"
++    dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
+ 
+-    def stack(names: list[str]) -> Q4 | B16:
++    def q4(name: str) -> Q4 | B16 | F8:
++        return dense(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++
++    def stack(names: list[str]) -> Q4 | B16 | F8:
+         if exl3:
+-            return stack_b16([t(n + ".weight") for n in names])
++            return dense_stack([t(n + ".weight") for n in names])
+         return stack_q4([trip(n) for n in names])
+ 
+     def hc(i: int, site: str) -> HCW:
+@@ -295,7 +299,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+         if exl3:
+             w = t(p + "kv_b_proj.weight")
+-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
++            kv_k, kv_v = dense(w[krows]), dense(w[vrows])
+             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+         else:
+             w, s, b = trip(p + "kv_b_proj")
+@@ -417,9 +421,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         vl = cfg.vocab // world
+         draft_head = None
+         if exl3:
+-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
+-            # Draft steps use the quantized head; verification keeps the original head.
+-            draft_head = quantize4(head.weight)
++            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
++            head = dense(raw)
++            draft_head = quantize4(raw)    # Draft steps use the quantized head; verification keeps the original head.
+         else:
+             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
+             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
