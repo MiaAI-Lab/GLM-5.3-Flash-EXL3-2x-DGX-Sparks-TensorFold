@@ -1,0 +1,161 @@
+# A rank that left cannot rejoin the ranks still running (issue #129): the NCCL communicator they formed, which rank
+# 0's CUDA graphs captured, takes no new process in its place. A worker started again alone never paired (rank 0's
+# rendezvous store stays open, and a new rank 1 read the old session's NCCL id from it), while rank 0 kept its
+# weights, answered /v1/models and hung every request. Now every rank ends (exit code 1) when the ranks it needs are
+# gone, so a supervisor (FOREGROUND=1 in a systemd unit, a container restart policy) starts them again and they form
+# a new set: rank 0 when another rank shows no sign of life for TENSORFOLD_PEER_TIMEOUT_S seconds (default 120; 0:
+# never) or starts again, a rank past 0 when rank 0's store has not answered for as long (at three Sparks the worker
+# that did not restart otherwise waits in a collective forever), except after rank 0 marked a clean stop: a flush that
+# rank still writes then finishes. Each rank calls the store every 2 s from a daemon thread on a connection of its own
+# (the engine's waits on the idle doorbell for up to an hour); rank 0 reads the beats and the count a rank adds as it
+# reaches the rendezvous, drops the NCCL id once every rank holds it (a rank starting again waits for a new rank 0's),
+# and marks a clean stop as cuda/http.py's serve begins it (SIGTERM, Ctrl-C). CPU check: tools/peer_watch_check.py.
+
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -33,6 +33,108 @@ def _library() -> ctypes.CDLL:
+     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
+ 
+ 
++def peer_timeout(value: str | None = None) -> float:
++    """TENSORFOLD_PEER_TIMEOUT_S: seconds a rank waits for a sign of life before it ends (rank 0: from each other
++    rank; the others: from rank 0's rendezvous store) (0: never; default 120). Read at start, so a typo fails there."""
++
++    raw = os.environ.get("TENSORFOLD_PEER_TIMEOUT_S", "") if value is None else value
++    try:
++        seconds = 120.0 if raw.strip() == "" else float(raw)
++    except ValueError:
++        seconds = -1.0
++    if not seconds >= 0:
++        raise ValueError(f"TENSORFOLD_PEER_TIMEOUT_S: seconds (0: never), not {raw!r}")
++    return seconds
++
++
++_WATCHES: list = []                # this process's PeerWatch (``announce_stop``)
++
++
++def announce_stop() -> None:
++    """Rank 0, as a clean stop begins (SIGTERM, Ctrl-C; ``cuda.http.serve``): its watch ends no rank any more, and
++    the other ranks' watches, which read the mark, leave their rank to whoever stops it, so a flush it still writes
++    after rank 0 has gone finishes."""
++
++    for watch in list(_WATCHES):
++        watch.stopping()
++
++
++class PeerWatch:
++    """A rank that left cannot rejoin: the NCCL communicator the ranks formed, which rank 0's CUDA graphs captured,
++    takes no new process in its place. So every rank ends (exit code 1) when the ranks it needs are gone, and a
++    restart of all ranks (a supervisor, a restart policy) forms a new set, instead of a dead set serving forever
++    (issue #129):
++    - rank 0, when another rank shows no sign of life for ``timeout`` seconds, or starts again (its join count in the
++      store passes 1);
++    - a rank past 0, when no call to rank 0's rendezvous store has answered for ``timeout`` seconds (rank 0 ended):
++      at three ranks and more, the rank that did not restart would otherwise wait in a collective forever. Not after
++      rank 0 marked a clean stop (``announce_stop``): a flush the rank still writes finishes, and whoever stops rank 0
++      stops it too. A stop rank 0 makes and ends within one beat goes unseen: that rank then has ``timeout`` seconds.
++    Every rank calls the store from a daemon thread on a connection of its own (the engine's connection waits on the
++    idle doorbell for up to an hour, and a call on it would wait behind that), every 2 s or an eighth of ``timeout``
++    when that is shorter. A rank past 0 whose store call failed never calls that store again: a new rank 0's store on
++    the same port is a new set, which this process cannot join."""
++
++    def __init__(self, master: str, port: int, rank: int, world: int, timeout: float) -> None:
++        import threading
++        from datetime import timedelta
++
++        from torch.distributed import TCPStore
++
++        self.rank, self.world, self.timeout = rank, world, timeout
++        self.stop = threading.Event()               # a clean stop began here (``announce_stop``, rank 0 only)
++        self.store = TCPStore(master, port, world, False, timeout=timedelta(seconds=60), wait_for_workers=False)
++        _WATCHES.append(self)
++        self.thread = threading.Thread(target=self._run, name="tf-peer-watch", daemon=True)
++        self.thread.start()
++
++    def stopping(self) -> None:
++        self.stop.set()
++        self.store.set("tf_stop", "1")              # the mark the other ranks read (to the store in this process)
++
++    def _run(self) -> None:
++        import time
++
++        every = min(2.0, self.timeout / 8)
++        heard = {r: (-1, time.monotonic()) for r in range(1, self.world)}   # rank -> (its last count, when it moved)
++        answered = time.monotonic()                     # a rank past 0: the store's last answer
++        while not self.stop.is_set():
++            asked = time.monotonic()
++            try:
++                if self.rank:
++                    self.store.add(f"tf_alive/{self.rank}", 1)
++                    if self.store.check(["tf_stop"]):
++                        return                       # rank 0 is stopping cleanly: its stopper stops this rank
++                    answered = asked
++                else:
++                    for r, (count, since) in heard.items():
++                        if self.store.add(f"tf_join/{r}", 0) > 1:
++                            self._end(f"rank {r} started again")
++                        beats = self.store.add(f"tf_alive/{r}", 0)
++                        if beats != count:
++                            heard[r] = (beats, asked)
++                        elif asked - since >= self.timeout:
++                            self._end(f"rank {r} showed no sign of life for {asked - since:.0f} s")
++            except Exception as exc:                  # noqa: BLE001  (the store is gone)
++                if not self.rank:
++                    print(f"[tensorfold] rank 0 stopped watching the other ranks: {exc!r}", flush=True)
++                    return
++                print(f"[tensorfold] rank {self.rank} lost rank 0's rendezvous store ({exc!r}); it ends "
++                      f"{self.timeout:g} s after the store last answered", flush=True)
++                time.sleep(max(0.0, answered + self.timeout - time.monotonic()))
++                self._end(f"rank 0 showed no sign of life for {time.monotonic() - answered:.0f} s")
++                return
++            time.sleep(every)
++
++    def _end(self, why: str) -> None:
++        import sys
++
++        print(f"[tensorfold] {why}: rank {self.rank} ends, since a rank that left cannot rejoin the ranks still "
++              f"running; restart every rank (a supervisor does) for a new set (TENSORFOLD_PEER_TIMEOUT_S="
++              f"{self.timeout:g})", file=sys.__stderr__, flush=True)
++        os._exit(1)
++
++
+ class NCCL:
+     def __init__(self, rank: int, world: int, master: str, port: int) -> None:
+         from datetime import timedelta
+@@ -53,17 +155,22 @@ def __init__(self, rank: int, world: int
+                                            ctypes.c_void_p, ctypes.c_void_p]
+         lib.ncclGroupStart.argtypes = []
+         lib.ncclGroupEnd.argtypes = []
++        timeout = peer_timeout()
+         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
+         uid = _UniqueId()
+         if rank == 0:
+             self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
+             self.store.set("tf_nccl_uid", bytes(uid.internal))
+         else:
++            self.store.add(f"tf_join/{rank}", 1)       # a second start of this rank: rank 0 sees it (``PeerWatch``)
+             raw = self.store.get("tf_nccl_uid")
+             ctypes.memmove(ctypes.addressof(uid), raw, 128)
+         self.comm = ctypes.c_void_p()
+         torch.cuda.current_device()
+         self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
++        if rank == 0:          # every rank has its id now: one starting again waits for a new rank 0's, not this one
++            self.store.delete_key("tf_nccl_uid")
++        self.watch = PeerWatch(master, port, rank, world, timeout) if timeout > 0 and world > 1 else None
+ 
+     def _check(self, code: int) -> None:
+         if code != 0:
+diff --git tensorfold/cuda/http.py tensorfold/cuda/http.py
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -254,6 +254,9 @@ def _terminate(signum: int, frame: Any)
+     try:
+         server.serve_forever()
+     except KeyboardInterrupt:
++        from tensorfold.cuda.comm import announce_stop
++
++        announce_stop()     # the other ranks' peer watch lets this stop end them (their flush included; issue #129)
+         hook = getattr(app, "on_exit", None)      # e.g. the spill tier's shutdown flush (cli._flush_on_exit)
+         if hook is not None:
+             try:
