@@ -5,6 +5,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Long agent sessions no longer stall before each request starts** (patch `0120-glm-kept-reasoning-linear`, by
+  [cawilliamson](https://github.com/cawilliamson)): `KeptReasoning.restore` (patch `0036`) looks up the reasoning of
+  every assistant tool step a client sent back without any, by a signature of the conversation before that step, and
+  rebuilt that signature from the whole history for every step: each request re-encoded and hashed its conversation
+  once per tool step, the square of its length, in Python with the GIL held, before admission (so outside the TTFT
+  metric) and with the engine loop and every other stream stopped meanwhile. A client that returns empty think blocks
+  bare makes nearly every step a candidate. Three Sparks, `PARALLEL=4`, a real ~2,000-message, ~404k-token agent
+  session replayed fully cached (`prefill_s` 0.2): 4.8-5.3 s before the response headers, the thread inside
+  `kept_reasoning.restore` in every stack dump; the fixed part of each turn grew from ~0.4 s at ~100k tokens to ~7 s
+  at ~400k while decode held ~45-55 tok/s. One running SHA-256 over the message shapes, copied at each step, makes it
+  one pass: that session's restore 4.06 -> 0.014 s, the same restores (the same history in each key; ids are still
+  tried first). CPU check: `tools/kept_reasoning_check.py` (fails on the unpatched source).
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

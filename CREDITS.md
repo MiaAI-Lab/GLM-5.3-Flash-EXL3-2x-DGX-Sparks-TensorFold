@@ -210,4 +210,6 @@ If you believe something here is missing or credited wrongly, please open an iss
 - `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
   `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
 - `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
+- `0120-glm-kept-reasoning-linear` (kept reasoning restored in one pass over the conversation): by
+  [cawilliamson](https://github.com/cawilliamson).
 - `0103-glm-qmm-decode-noclusters` (decode matmuls reduce through the partials buffer at few rows): by
