@@ -5,6 +5,14 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A streamed Anthropic reply opens with the prompt's token count** (patch `0115-anthropic-stream-head-usage`,
+  by [kky42](https://github.com/kky42), fixing TensorFold #672): `message_start` carried `usage({})`, all zeros, and
+  the real counts only arrived in the final `message_delta`, so a client that reads prompt counts from the head
+  (Claude Code's context-window indicator) showed ~0% used on every streaming request. The CUDA chat handler now
+  hands its prepared prompt's length to the translated request's wire before the stream head, and the head reports
+  it whole (cache fields 0); the final delta keeps the engine's input/cache_read split, the two totals equal, and
+  no second render runs. The Mac server's head is written before its render, so it keeps the old zeros (in the
+  patch header). CPU check: `tools/test_anthropic_stream_head.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
