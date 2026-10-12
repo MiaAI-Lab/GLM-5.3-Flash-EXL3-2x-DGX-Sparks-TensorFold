@@ -207,6 +207,8 @@ If you believe something here is missing or credited wrongly, please open an iss
 - `0107-glm-decode-indexer` (a decode window's indexer: the scoring in CUDA, the selection in one pass): by
 - `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
 - `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
+- `0119-cuda-budget-parked-pages` (the start-up budget counts the pages parked on the per-CPU free lists): by
+  [wojo](https://github.com/wojo).
 - `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
   `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
 - `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).

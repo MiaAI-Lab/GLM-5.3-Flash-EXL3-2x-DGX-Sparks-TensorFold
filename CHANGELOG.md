@@ -5,6 +5,21 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The first start of a new image no longer gets a smaller pool** (patch `0119-cuda-budget-parked-pages`, by
+  [wojo](https://github.com/wojo)). TensorFold budgets each rank from `MemAvailable` at start; the first start of an
+  image the worker lacked read 89.44 GiB "within" on rank 0 against 94.86 for a warm restart of the same image, and
+  kept 2 prompt states, not 32. On kernel 6.7+ a bulk free leaves GiBs of free pages on the per-CPU lists (`pagesets`
+  `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`: the image copy in `prepare.sh` (`docker save`
+  / `docker load`) parks 5-9 GiB there, which comes back at ~0.05-0.1 GiB/s over 1-2 minutes, and the first start of a new
+  image compiles `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, which parks 2.4 GiB
+  more. `capacity.admit` now reads `/proc/meminfo` and, right after it, the lists once at start-up (every zone and CPU,
+  less their `high_min:` resting level, so a warm start's idle 0.28 GiB, 0.11 GiB over it, does not move the budget; 0
+  when `/proc/zoneinfo` is unreadable) and adds the excess to that one `MemAvailable` reading (capped at `MemTotal`) for
+  both `available_bytes` and `page_room`, so pages that drain in between are undercounted, never counted twice. The
+  start-up log says how many it counted, from 0.25 GiB. Only that start-up read counts them: the Qwen families' live memory gate
+  keeps its figure, and the GLM family reads `MemAvailable` nowhere else. `start.sh`'s own "memory available" check
+  (and its warning below ~110 GiB) counts the same excess. Cold first start of a new image, TP=2: 94.58 GiB "within"
+  on rank 0 (rank 1 95.20) against 89.44 with nothing counted; a warm restart 94.86. CPU check on synthetic zoneinfo / meminfo files, admit() included: `tools/parked_pages_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

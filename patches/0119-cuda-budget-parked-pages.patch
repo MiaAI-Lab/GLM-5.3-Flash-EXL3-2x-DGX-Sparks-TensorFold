@@ -1,0 +1,145 @@
+# The startup budget counts the pages parked on the kernel's per-CPU free lists. TensorFold sizes the KV pool (and the
+# kept prompt states) from MemAvailable when the ranks start (capacity.admit: available_bytes / page_room). On kernel
+# 6.7+ (6.17 on the GB10) a bulk free leaves GiBs of free pages on the per-CPU lists ("pcp", the ``count:`` lines under
+# each zone's ``pagesets`` in /proc/zoneinfo) instead of the buddy lists: they are free, and the kernel drains them when
+# an allocation needs them, but neither MemFree nor MemAvailable counts them, and they drain back at only ~0.05-0.1
+# GiB/s. Two sources measured on a Spark: an image copy (docker save | load) parks 5-9 GiB for 1-2 minutes, and the
+# compile of the first start of a new image (tensorfold_roce_v1, built ~1 s before the budget is read) parks 2.4 GiB
+# (MemAvailable -2.41 GiB at +1 s, still -0.53 GiB at +49 s). The first start of a new image then budgeted ~5 GiB too
+# little: 89.44 GiB "within" on rank 0 against 94.58 with the pages counted (rank 1 95.20) and 94.86 on a warm restart
+# of the same image, a smaller pool for as long as the server ran.
+# start.sh's ~110 GiB free-memory warning counts the image copy's pages too (_avail_gb), but it runs before the rank
+# container and cannot see the ones parked inside it.
+# capacity.parked_bytes() sums those counts (x the page size; every zone and CPU) less their ``high_min:`` lines, the
+# level they hold at rest (a Spark's idle lists hold 0.28 GiB, of which 0.11 GiB is over it; without high_min: the
+# first 512 MiB), so a warm start's budget does not move: only the excess counts. 0 when /proc/zoneinfo is
+# unreadable or has no page lists, never an error. admit() reads /proc/meminfo first and the lists right after, once,
+# and passes that one reading (``counting``: MemAvailable plus the excess, capped at MemTotal) to available_bytes and
+# page_room, so pages that drain in between are undercounted, never counted twice; it prints the start-up line "budget
+# counts the N GiB free on the per-CPU page lists", from 0.25 GiB.
+# Only that startup read counts them: the live memory gate of the qwen3_5 / qwen4_exp families (torch_live) calls
+# available_bytes without a reading and keeps its figure; the GLM family reads MemAvailable only here. The 10 % reserve
+# is unchanged. Same replies: sizing only. tools/parked_pages_check.py. By @wojo.
+
+diff --git tensorfold/cuda/capacity.py tensorfold/cuda/capacity.py
+--- tensorfold/cuda/capacity.py
++++ tensorfold/cuda/capacity.py
+@@ -138,15 +138,57 @@ def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int |
+     return Weights(resident, staging, mapped)
+ 
+ 
++MEMINFO, ZONEINFO = "/proc/meminfo", "/proc/zoneinfo"       # tools/parked_pages_check.py reads canned ones
++PARKED_REST = GIB // 2            # what the lists hold at rest when /proc/zoneinfo has no high_min (kernels before 6.7)
++
++
++def parked_bytes() -> int:
++    """Bytes free on the kernel's per-CPU page lists beyond what they hold at rest: the ``count:`` lines under each
++    zone's ``pagesets`` less their ``high_min:`` lines (PARKED_REST when there are none). A bulk free (an image copy, a
++    compiler's exit) leaves GiBs there on kernel 6.7+; they are free, the kernel drains them when an allocation needs
++    them, but neither MemFree nor MemAvailable counts them and they drain back at ~0.05-0.1 GiB/s. A warm start parks
++    ~0.3 GiB, which the budget never counted: that is ~0, so it stays unchanged. 0 when the file is unreadable or has
++    no page lists."""
++
++    count = rest = 0
++    listed = False
++    try:
++        for row in Path(ZONEINFO).read_text().splitlines():
++            word = row.split()
++            if row.strip() == "pagesets":
++                listed = True
++            elif listed and row[:4] != "    " and not row.startswith("  vm stats"):
++                listed = False                      # the next zone's or the next field of this one
++            elif listed and word[:1] == ["count:"]:
++                count += int(word[1])
++            elif listed and word[:1] == ["high_min:"]:
++                rest += int(word[1])
++        page = os.sysconf("SC_PAGE_SIZE")
++        return max(0, count * page - (rest * page if rest else PARKED_REST)) if count else 0
++    except (OSError, ValueError, IndexError):
++        return 0
++
++
+ def _meminfo() -> dict | None:
+     try:
+-        rows = Path("/proc/meminfo").read_text().splitlines()
++        rows = Path(MEMINFO).read_text().splitlines()
+         memory = {key.rstrip(":"): int(value) * 1024 for key, value, *_ in (row.split() for row in rows)}
+     except (OSError, ValueError):
+         return None
+     return memory if {"MemTotal", "MemAvailable"} <= memory.keys() else None
+ 
+ 
++_READ = object()                  # available_bytes / page_room read /proc/meminfo themselves unless given a reading
++
++
++def counting(memory: dict | None, parked: int) -> dict | None:
++    """A /proc/meminfo reading with ``parked`` (parked_bytes()) added to MemAvailable, at most MemTotal."""
++
++    if memory is None:
++        return None
++    return {**memory, "MemAvailable": min(memory["MemTotal"], memory["MemAvailable"] + parked)}
++
++
+ def unified(torch) -> bool:
+     """A GPU on the host's memory (GB10): its free figure is MemFree, which counts the page cache as used."""
+ 
+@@ -171,10 +213,10 @@ def reserve_bytes(total: int, *, host: bool = False) -> int:
+     return int(gib * GIB)
+ 
+ 
+-def available_bytes(torch) -> int:
++def available_bytes(torch, memory: dict | None = _READ) -> int:
+     free, total = map(int, torch.cuda.mem_get_info())
+     available = max(0, free - reserve_bytes(total))
+-    memory = _meminfo()
++    memory = _meminfo() if memory is _READ else memory
+     if memory is None:
+         return available
+     host = max(0, memory["MemAvailable"] - reserve_bytes(memory["MemTotal"], host=True))
+@@ -188,10 +230,10 @@ def total_bytes(torch) -> int:
+     return int(torch.cuda.mem_get_info()[1])
+ 
+ 
+-def page_room(torch) -> int | None:
++def page_room(torch, memory: dict | None = _READ) -> int | None:
+     """What caches and mapped read-only tables share on a unified GPU (MemAvailable); None on a discrete GPU."""
+ 
+-    memory = _meminfo()
++    memory = _meminfo() if memory is _READ else memory
+     return memory["MemAvailable"] if memory is not None and unified(torch) else None
+ 
+ 
+@@ -279,6 +321,7 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+     build.refuse_old_gpu(floor(model_dir))          # an old GPU is refused here, before any weight loads
+     error = None
+     plan = None
++    parked = 0
+     try:
+         text = config(model_dir)
+         geometry = geometry(text) if callable(geometry) else geometry
+@@ -300,9 +343,14 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+                 main = geometry
+                 geometry = Geometry(lambda slots: main.bytes_at(slots) + draft_geometry.bytes_at(slots),
+                                     main.reserve, main.minimum_slots)
++        # MemAvailable first, the lists right after, one reading for both figures: pages that drain from the lists in
++        # between are counted by neither (an undercount), never by both
++        memory = _meminfo()
++        parked = parked_bytes()
++        memory = counting(memory, parked)
+         plan = make_plan(int(text.get("max_position_embeddings") or 0), requested,
+                          requested is not None if explicit is None else explicit,
+-                         available_bytes(torch), weights, geometry, room=page_room(torch))
++                         available_bytes(torch, memory), weights, geometry, room=page_room(torch, memory))
+     except (OSError, ValueError, KeyError, TypeError, struct.error) as exc:
+         error = f"{type(exc).__name__}: {exc}"     # name the cause: its text alone has hidden a dtype's KeyError
+     status = [1 if error else 0, *(plan.settings + [plan.fitting, plan.largest] if plan else [0, -1, 0, 0, 0])]
+@@ -315,6 +363,9 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+     print(f"[tensorfold] CUDA rank {rank} startup estimate {receipt['total_bytes_estimate'] / GIB:.2f} GiB "
+           f"within {plan.budget / GIB:.2f} GiB; native {plan.native}, allocated prompt/reply window {window}, "
+           f"cache slots {receipt['cache_slots']}", flush=True)
++    if parked >= GIB // 4:
++        print(f"[tensorfold] CUDA rank {rank} budget counts the {parked / GIB:.2f} GiB free on the per-CPU page lists "
++              "beyond their resting level (neither MemFree nor MemAvailable does)", flush=True)
+     note = tables_note(plan)
+     if note:
+         print(f"[tensorfold] {note}", flush=True)
