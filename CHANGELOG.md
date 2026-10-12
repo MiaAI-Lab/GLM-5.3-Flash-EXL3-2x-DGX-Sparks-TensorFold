@@ -5,6 +5,27 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A call to a tool the request did not offer stays text, and is now reported** (patch `0113-glm-unoffered-tool-call`,
+  by [kky42](https://github.com/kky42), adapted from [BadAd84](https://github.com/BadAd84)'s #137, #103): such a call
+  stayed content text with `finish_reason` "stop" and nothing said why, so a gateway could not tell it from an answer.
+  It still stays text and never runs, as in TensorFold since 7be90a36b / 806af974c (v1.0.0 on, only an offered name is
+  a call; a one-call reply drops it). Now the server logs `tool call rejected: unknown_tool_name ['<name>']` (names
+  only), and with `TF_GLM_TOOL_DIAGNOSTICS=1` the reply's `tensorfold` block lists them as `tool_call_rejections`.
+  Tokens, content, calls and `finish_reason` are unchanged. CPU check: `tools/test_unoffered_tool_call.py`.
+- **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0112-glm-tool-tag-mention`, by
+  [kky42](https://github.com/kky42)): every place the server finds GLM calls ran a block from any `<tool_call>` to the
+  next `</tool_call>`, so a reply that mentioned the tag ("the literal `<tool_call>` markup") before its real call made
+  one unparseable block of both: across `</think>` in the reasoning (cut at the mention), across the prose in the
+  answer. The call came back as content text with `finish_reason` "stop" and no `tool_calls`, and the agent stopped.
+  An opener now starts a block only when a call's head follows (GLM's name then `<arg_key>` or `</tool_call>`, Qwen's
+  `<function=`, or JSON), and a call in the think block does not cross `</think>`. A word the tags enclose with space
+  ("The tags are `<tool_call> and </tool_call>`.") is prose too, not a call without arguments, which the chat template
+  writes `<tool_call>name</tool_call>`: it stays in `content`, streamed as well (the content hider used to drop it from
+  the stream), and naming an offered tool that way is no longer a call. Two Sparks, 30 live replies to five prompts
+  about the tag, each ending in a real `bash` call (seeded; v1.10's image and the same image with only this file
+  changed, token-identical replies): `tool_calls` 15/30 -> 30/30, whole and streamed alike, and call markup in
+  `content` 18 -> 0. A whole example call the model quotes is still read as a call, as before (3 of the 30 gave two
+  calls). CPU check: `tools/test_think_tag_mention.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
