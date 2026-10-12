@@ -29,6 +29,7 @@ jobs:
             curl -fsSL -o "$MD/$f" "$B/$f"
           done
           python tools/test_chunked_bodies.py --source-root /tmp/tf/src
+          python tools/test_get_bodies.py --source-root /tmp/tf/src
           python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
       - name: Image pin matches the patch set
         run: |
