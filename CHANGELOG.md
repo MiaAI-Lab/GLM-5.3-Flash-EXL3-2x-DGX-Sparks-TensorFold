@@ -5,6 +5,13 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A request's `cache_salt` isolates its kept prompt states** (patch `0117-glm-cache-salt`, by
+  [BadAd84](https://github.com/BadAd84)): vLLM's `cache_salt` field was ignored, so a request resumed any kept state
+  of its token ids. Benchmarks that salt their cold samples (RigMark sends a fresh salt per cold / replay prefill pair
+  and fails a run whose cold sample reports cached tokens) failed on a server that still held an earlier run's
+  states. A salted request now resumes only states kept under its own salt, and neither reads nor writes the spill
+  store; a malformed salt (not a non-empty string) is refused before the stream opens. Unsalted requests and every
+  reply are unchanged. CPU check: `tools/cache_salt_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
