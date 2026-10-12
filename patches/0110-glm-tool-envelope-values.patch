@@ -1,0 +1,123 @@
+# Keep literal </tool_call> inside GLM argument values out of assistant content.
+# Share argument-aware envelope boundaries across hiding, final parsing and ThinkSplit.
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -16,7 +16,8 @@
+ from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
++_TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>", re.IGNORECASE)
++_TOOL_CALL_EDGE_RE = re.compile(r"(?P<close>(?i:</tool_call>))|</arg_key>\s*<arg_value>")
+ _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
+ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
+ 
+@@ -78,6 +79,35 @@
+         """The text before the first match; ``partial`` also holds back an end that may begin one (the Mac's rule)."""
+ 
+         return StopPolicy.visible(self, text, partial=partial)
++
++
++def _tool_call_end(text: str, start: int) -> int | None:
++    """End of an envelope, not a literal closer inside a GLM argument value.
++
++    GLM values are delimited by </arg_value>; tool markup inside that value is
++    file/argument data, not an envelope boundary. Incomplete values stay held.
++    This boundary is shared by content hiding, end parsing and ThinkSplit.
++    """
++
++    pos = start + len(_CALL_OPEN)
++    while (edge := _TOOL_CALL_EDGE_RE.search(text, pos)) is not None:
++        if edge.group("close") is not None:
++            return edge.end()
++        value_end = text.find("</arg_value>", edge.end())
++        if value_end < 0:
++            return None
++        pos = value_end + len("</arg_value>")
++    return None
++
++
++def _tool_call_blocks(text: str):
++    pos = 0
++    while (opened := _TOOL_CALL_OPEN_RE.search(text, pos)) is not None:
++        end = _tool_call_end(text, opened.start())
++        if end is None:
++            return
++        yield opened.start(), end, text[opened.end():end - len(_CALL_CLOSE)].strip()
++        pos = end
+ 
+ 
+ def hide_tool_calls(text: str, *, finished: bool) -> str:
+@@ -90,10 +120,10 @@
+             out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+             return "".join(out)
+         out.append(text[pos:start])
+-        end = text.find(_CALL_CLOSE, start)
+-        if end < 0:
++        end = _tool_call_end(text, start)
++        if end is None:
+             return "".join(out)
+-        pos = end + len(_CALL_CLOSE)
++        pos = end
+ 
+ 
+ def _tool_name(tool: dict[str, Any]) -> str:
+@@ -111,12 +141,11 @@
+     calls: list[dict[str, Any]] = []
+     residue: list[str] = []
+     cursor = 0
+-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+-        residue.append(text[cursor:match.start()])
+-        cursor = match.end()
++    for start, end, block in _tool_call_blocks(text):
++        residue.append(text[cursor:start])
++        cursor = end
+         if max_calls is not None and len(calls) >= max_calls:
+             continue
+-        block = match.group(1).strip()
+         name, args = None, {}
+         try:
+             payload = json.loads(block)
+@@ -143,7 +172,7 @@
+                     name, args = glm
+         if not name or str(name).lower() not in known:
+             if max_calls is None:
+-                residue.append(match.group(0))
++                residue.append(text[start:end])
+             continue
+         if max_calls is not None:
+             try:
+@@ -160,7 +189,6 @@
+ 
+ 
+ _THINK_CLOSE = "</think>"
+-_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+ THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
+ _GLM_TAG = re.compile(r"</?arg_(?:key|value)>")
+ _LAST_WORD = re.compile(r"(\S+)\s*$")
+@@ -209,8 +237,8 @@
+     come true, ``"reasoning"`` once text follows it (more reasoning, or an answer after the think block)."""
+ 
+     end = pos = start
+-    while (block := _CALL_BLOCK.match(text, pos)) is not None:
+-        end = block.end()
++    while text.startswith(_CALL_OPEN, pos) and (block_end := _tool_call_end(text, pos)) is not None:
++        end = block_end
+         pos = len(text) - len(text[end:].lstrip())
+     after = text[end:].lstrip()
+     if after.startswith(_THINK_CLOSE) and not after[len(_THINK_CLOSE):].strip():
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -418,8 +418,9 @@
+             reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+-                answer = (policy.content(answer, finished=finished) if policy.single
+-                          else hide_tool_calls(answer, finished=finished))
++                answer = hide_tool_calls(answer, finished=finished)
++                if policy.single:
++                    answer = policy.content(answer, finished=finished)
+             return reasoning, answer, raw
+ 
+         serving: list[Any] = [None]
+
