@@ -1,0 +1,83 @@
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -103,16 +103,18 @@
+         return cls(image_tokens=_env_int("TENSORFOLD_GLM_IMAGE_TOKENS", d.image_tokens, 16, 8000),
+                    video_tokens=_env_int("TENSORFOLD_GLM_VIDEO_TOKENS", d.video_tokens, 64, 240000),
+                    video_frames=_env_int("TENSORFOLD_GLM_VIDEO_FRAMES", d.video_frames, 2, 2048),
+-                   max_images=_env_int("TENSORFOLD_GLM_MAX_IMAGES", d.max_images, 1, 256),
++                   max_images=_env_int("TENSORFOLD_GLM_MAX_IMAGES", d.max_images, 0, 256),
+                    max_videos=_env_int("TENSORFOLD_GLM_MAX_VIDEOS", d.max_videos, 1, 16),
+                    request_image_tokens=_env_int("TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS", d.request_image_tokens,
+-                                                 16, 262144),
++                                                 0, 262144),
+                    request_video_tokens=_env_int("TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS", d.request_video_tokens,
+                                                  64, 1048576))
+ 
+     def picture_tokens(self, pictures: int) -> int:
+         """Each picture's token cap in a request with ``pictures`` of them."""
+ 
++        if self.request_image_tokens == 0:  # no count-based reduction of image detail
++            return self.image_tokens
+         return max(self.min_tokens, min(self.image_tokens, self.request_image_tokens // max(1, pictures)))
+ 
+     def clip_tokens(self, clips: int) -> int:
+@@ -515,6 +517,10 @@
+         from .images import DEFAULT_LIMITS as D
+ 
+         n = self.limits.max_images
++        if n == 0:  # uncapped count; retain the native 50-image byte/pixel/time budgets
++            return replace(D, max_images=0, max_total_encoded_bytes=64 * 1024 * 1024,
++                           max_total_pixels=max(D.max_total_pixels, 50 * 8 * 1024 * 1024),
++                           total_timeout_seconds=max(D.total_timeout_seconds, 100.0))
+         if n <= D.max_images:
+             return replace(D, max_images=n)
+         return replace(D, max_images=n, max_total_encoded_bytes=64 * 1024 * 1024,
+@@ -536,7 +542,7 @@
+         from .images_http import fetch_image
+ 
+         L = self.image_limits
+-        if len(sources) > L.max_images:
++        if L.max_images and len(sources) > L.max_images:
+             raise ImageInputError(f"a request supports at most {L.max_images} images")
+         tokens = self.limits.picture_tokens(len(sources))
+         total_bytes, total_pixels, out = 0, 0, []
+@@ -559,6 +565,8 @@
+             if seen is not None:
+                 self._pictures.move_to_end(key)
+                 total_pixels += seen.pixels
++                if total_pixels > L.max_total_pixels:
++                    raise ImageInputError("image request exceeds the total pixel limit")
+                 out.append(seen)
+             else:
+                 decoded = _decode(data, source.detail, L, budget)
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -38,8 +38,8 @@
+         for name in self.__dataclass_fields__:
+             value = getattr(self, name)
+             if (not isinstance(value, (int, float)) or isinstance(value, bool)
+-                    or not math.isfinite(value) or value < 0 or (name != "max_redirects" and value == 0)):
+-                raise ValueError(f"{name} must be finite and positive, except zero redirects")
++                    or not math.isfinite(value) or value < 0 or (name not in {"max_redirects", "max_images"} and value == 0)):
++                raise ValueError(f"{name} must be finite and positive, except zero redirects or uncapped image count")
+             if name not in {"timeout_seconds", "total_timeout_seconds"} and not isinstance(value, int):
+                 raise ValueError(f"{name} must be an integer")
+ 
+@@ -164,7 +164,7 @@
+                     raise ImageInputError("image_url parts are supported only in user messages")
+                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
+                     raise ImageInputError("image_url parts cannot contain other media")
+-                if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
++                if limits.max_images and sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
+                     raise ImageInputError(f"a request supports at most {limits.max_images} images")
+                 source = _source(part.get("image_url"), limits, allow_urls)
+                 sources.append(source)
+@@ -233,7 +233,7 @@
+ def load_images(sources: list[ImageSource], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False
+                 ) -> list[ImageInput]:
+     """Bound encoded bytes and decoded pixels across all images in one request."""
+-    if not isinstance(sources, (list, tuple)) or len(sources) > limits.max_images:
++    if not isinstance(sources, (list, tuple)) or (limits.max_images and len(sources) > limits.max_images):
+         raise ImageInputError(f"a request supports at most {limits.max_images} images")
+     total_bytes, total_pixels = 0, 0
+     deadline = time.monotonic() + limits.total_timeout_seconds
