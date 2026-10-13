@@ -5,6 +5,21 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A quoted `<think>` stays text** (patch `0122-glm-literal-added-tokens`, by [ahinore](https://github.com/ahinore)):
+  the chat route renders a request into one string and encodes it whole, and HF tokenizers takes every added
+  token's text out of a string, special or not (`<think>` and `</think>` are not special), so a request that only
+  quoted one got that token: an agent reading another model's raw output, a chat template or a log saw `<think>`,
+  `</think>`, `<tool_call>` or `<|user|>` as the tokens themselves, and wrote such a quote back as the token, where
+  the reply's reasoning/content split broke. The request's text (content, reasoning, call arguments, JSON-escaped
+  ones too, and the tools' definitions) is now masked before the template renders and encoded as text, around the
+  template's own tokens; GLM's kept reasoning is put back before masking, so it is still found for clients that
+  renumber call ids. A prompt without such text encodes to the same ids; `/nothink`, assistant turns with their
+  reasoning inline and requests with pictures are as before; `TF_GLM_LITERAL_TOKENS=0` turns it off. The same
+  prompts as tokens and as text, 10 sampled replies each, two Sparks (four): replies that wrote a quoted `</think>`
+  as the token 7 (8) -> 0; an expected value starting with `<think>` written right 0 (0) -> 10 (10); which side of a
+  failing assertion starts with `</think>` 4 (3) -> 8 (7). A quote the model writes as text inside its reasoning
+  still ends the reasoning where the reply is split today (at the first `</think>` in the text). CPU check:
+  `tools/literal_tokens_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
