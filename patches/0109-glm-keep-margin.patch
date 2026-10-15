@@ -1,0 +1,126 @@
+# Kept prompt states short of the prompt's end, so the next turn that branches off in its last tokens still resumes.
+#
+# A kept prompt state is a recurrent (KDA) state: a later prompt resumes from it only when it holds every one of its
+# tokens. grid_point keeps a request's own state at the last grid point of its prompt (with TF_GLM_KDA_CHUNKED=1, the
+# default, a 64-token grid), i.e. within 63 tokens of its end, often at the end itself. A next prompt that differs in
+# those last tokens finds no usable state of its own and resumes at the conversation's previous kept state, or at 0: the
+# generation prompt ends in tokens the client does not send back (GLM's <think> after <|assistant|>), a retried or
+# edited last message, a client that re-renders the tail. Measured on four Sparks (TP=4, 64 kept states): 2 of 12
+# follow-up turns of 17k-token conversations prefilled from 0; a 200k conversation's branching turn took 79 s instead
+# of ~0.7 s.
+#
+# TF_GLM_KEEP_MARGIN=M (default 0: off, as before): the state is kept at floor((n - M) / grid) * grid, M to M + grid - 1
+# tokens short of the end, still on the grid (the spill tier and _longest_kept are unchanged), when that lies past the
+# resume point. Shared-prefix points stay short of it. Cost: every resumed turn prefills up to M + grid - 1 tokens again
+# (~0.05 s at M=64), and an exact replay of a whole prompt prefills its tail instead of sampling the kept head row.
+# Every rank checks the value with the other start-up settings. tools/keep_margin_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -118,12 +118,37 @@
+     return grid
+ 
+ 
+-def grid_point(n: int, cut: int, grid: int) -> int | None:
++def keep_margin(value: str | None = None) -> int:
++    """TF_GLM_KEEP_MARGIN: 0 (off, the default) or the fewest tokens a request keeps its own prompt state short of its
++    prompt's end (``grid_point``), 0 to 4,096."""
++
++    value = os.environ.get("TF_GLM_KEEP_MARGIN", "") if value is None else value
++    value = value.strip()
++    if value in ("", "0"):
++        return 0
++    if not value.isdecimal() or int(value) > 4096:
++        raise ValueError(f"TF_GLM_KEEP_MARGIN: 0 (off) or the tokens to keep a prompt state short of its end, "
++                         f"at most 4096; not {value!r}")
++    return int(value)
++
++
++def grid_point(n: int, cut: int, grid: int, margin: int = 0) -> int | None:
+     """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
+ 
+     Off (grid 0) and on-grid prompts: at n. Otherwise at B = floor(n / grid) * grid, when B lies past ``cut`` (so
+-    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n."""
++    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n.
++
++    ``margin`` (TF_GLM_KEEP_MARGIN, 0: off): at B = floor((n - margin) / grid) * grid instead (n - margin without a
++    grid), when B lies past ``cut``. A kept state is a recurrent state, so only a later prompt that holds all of its
++    tokens resumes from it; one at (or within a few tokens of) n is lost to the next prompt that branches off in the
++    last tokens: the next turn of a conversation whose generation prompt ended in tokens the client does not send
++    back (GLM's ``<think>`` after ``<|assistant|>``), an edited or retried last message, a tool call's re-rendered
++    tail. That prompt then resumed at the conversation's previous kept state, or at 0. With a margin it resumes at B
++    and prefills the margin's tokens again."""
+ 
++    if margin:
++        point = (n - margin) // grid * grid if grid else n - margin
++        return point if point > cut else None
+     if not grid or n % grid == 0:
+         return n
+     point = n // grid * grid
+@@ -615,6 +640,8 @@
+         # TF_GLM_SHARED_PREFIX: kept states where prompts stop sharing, and saved states keep DFlash2's window; rank 0
+         # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
+         self.shared = shared_prefix()
++        # TF_GLM_KEEP_MARGIN: a request keeps its own prompt state this many tokens (or more) short of its end
++        self.margin = keep_margin()
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+         if vision:                           # the tower's bf16 weights, which the split rule drops
+@@ -703,7 +730,7 @@
+         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
+         from .multi import PRELAUNCH                          # TF_GLM_DRAFT_PRELAUNCH: every rank alike
+ 
+-        mine = mine + [int(PRELAUNCH)]                      # checked alike, not in the spill tier's key (``agreed``)
++        mine = mine + [int(PRELAUNCH), self.margin]         # checked alike, not in the spill tier's key (``agreed``)
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+         if odd:
+@@ -713,7 +740,7 @@
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+-                               "TF_GLM_DRAFT_PRELAUNCH): "
++                               "TF_GLM_DRAFT_PRELAUNCH, TF_GLM_KEEP_MARGIN): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -830,6 +857,9 @@
+         if rank == 0 and self.grid:
+             print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
+                   f"(TF_GLM_PROMPT_GRID)", flush=True)
++        if rank == 0 and self.margin:
++            print(f"[tensorfold] kept prompt states at least {self.margin} tokens short of the prompt's end "
++                  f"(TF_GLM_KEEP_MARGIN)", flush=True)
+         if rank == 0 and kda_chunked_on():
+             print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
+                   "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -499,6 +499,7 @@
+         self.pool = Pool(e.caches.rows)
+         self.arena = e.caches.arena
+         self.grid = engine.grid
++        self.margin = getattr(engine, "margin", 0)  # TF_GLM_KEEP_MARGIN (engine.grid_point)
+         self.fill_rows = fill_rows(e.prefill_rows, self.grid)
+         self.fill_budget = sliced_fill.budget_ms()
+         self.fill_drafts = sliced_fill.drafted_rounds()     # rank 0 decides; the ROUND message carries it
+@@ -877,7 +878,7 @@
+         shared: list[int] = []
+         if draft and key is not None and g.shared:
+             known = [known_key(c) for c in self.kept if c.key is not None]
+-            shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
++            shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid, self.margin), self.grid, g.shared, known,
+                                    g.opener)
+         sid = self.next_sid
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+@@ -1013,7 +1014,7 @@
+             self._touch(hit)
+         # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
+         if a["draft"]:
+-            lane.point = grid_point(len(prompt), cut, self.grid)
++            lane.point = grid_point(len(prompt), cut, self.grid, self.margin)
+             lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
+             lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
+                                               else [])
