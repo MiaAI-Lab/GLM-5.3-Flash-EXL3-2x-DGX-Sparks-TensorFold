@@ -296,6 +296,13 @@ export TF_GLM_EXL3_DEC_ORDER="${TF_GLM_EXL3_DEC_ORDER:-0}"
 # later chats prefill in 0.13 s instead of 4.24 s. Same replies. SHARED_PREFIX=0 turns it off.
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
 export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
+# A conversation's own kept prompt state sits at least KEEP_MARGIN tokens short of the prompt's end (patch 0109): a next
+# prompt that differs in the last tokens (another last user message, a retry, a re-rendered tail) resumes from it
+# instead of from 0. Four Sparks, 64 kept states: follow-ups of 17k conversations 2 of 12 resumed at 0 -> 16 of 16
+# resumed, a 200k conversation's branching turn 79 s -> 0.6-0.8 s; decode and prefill speed unchanged. Each resumed turn
+# prefills up to KEEP_MARGIN + 63 tokens again (~0.05 s). 0: at the last grid point, as before.
+KEEP_MARGIN="${KEEP_MARGIN:-64}"
+export TF_GLM_KEEP_MARGIN="$KEEP_MARGIN"
 # The shared KV pool beyond the 1,048,576-token window (kept prompt states, several long conversations at once) grows
 # into the memory left at start. TensorFold sizes it from MemAvailable at start minus MEMORY_RESERVE_GIB
 # (TENSORFOLD_MEMORY_RESERVE_GIB), capped at KV_POOL_GIB (its TF_GLM_CACHE_GIB). The server uses about 10 GiB more than

@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A next turn that changes the last tokens no longer prefills from 0** (patch `0109-glm-keep-margin`): a request
+  kept its own prompt state at the last 64-token grid point of its prompt (the grid `KDA_CHUNKED=1` sets), within 63
+  tokens of the end. A kept state is a recurrent state, so a next prompt that differed in those tokens (another last
+  user message, a retry, a re-rendered tail) could not use it and resumed at the conversation's previous kept state,
+  or at 0. `KEEP_MARGIN` (`TF_GLM_KEEP_MARGIN`, 64 in `scripts/config.sh`) keeps it 64-127 tokens short of the end.
+  Four Sparks, 64 kept states: follow-ups of 17k-token conversations 2 of 12 from 0 -> 16 of 16 resumed; three 200k
+  conversations asked again with another last message 79 s -> 0.6-0.8 s; an agent's tool loop fully cached; decode
+  and prefill unchanged. Each resumed turn prefills up to 127 tokens again. `KEEP_MARGIN=0`: as before. CPU check:
+  `tools/keep_margin_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
