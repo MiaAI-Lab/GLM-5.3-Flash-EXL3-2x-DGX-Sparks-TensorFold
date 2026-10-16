@@ -316,9 +316,10 @@ every Spark. Tensor parallelism splits the attention heads, but every head reads
 held a full copy: 11 DSA layers x (528 bytes of fp8 latent + 36 of pooled keys) = 6,204 bytes a token a Spark. With
 the shard the pool is split in parts, one a Spark; a conversation lives in one part, and only that Spark (its owner)
 keeps its latents, the pooled keys staying on every Spark: 3,300 bytes a token at two Sparks, so the same memory holds
-1.87x the tokens (computed: 2.66x at three, untested there). Four Sparks or more are refused at start, as are the
-tp4 branch's `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH` and `TF_NCCL_RING`: the shard has not been ported to
-that branch's prompt paths and switchless ring (#152).
+1.87x the tokens (computed: 2.66x at three, untested there). The same shard code serves the tp4 branch (four Sparks):
+there its own-row prompt front and microbatching run with it, and on a switchless ring a carry is relayed over the
+neighbour links; four Sparks on a ring measured 3.4x the pool with byte-equal replies (#152). On this branch a carry
+always goes straight from owner to owner.
 
 - **Decode**: the queries are all-gathered and each row's owner computes all 64 heads over its latents, sending the
   other Sparks their heads' outputs (64 heads at once give the same bits as 32 + 32).
@@ -363,8 +364,7 @@ streams, 60k to ~1M-token prompts, real text, multi-turn, borrows taken back mid
 | Lowest free memory, 1M prompt + 7 decoding | rank 0 12.1 GiB | 10.6 GiB (rank 1 unchanged) |
 
 Open items being measured: the ~1 GiB of extra worst-case memory on the owner, the decode stalls beside two restores
-at once, and TP3 (the code handles N Sparks; a part a Spark, the prompt rows broadcast from the owner). TP4 needs a
-port to the tp4 branch first (refused until then).
+at once, and TP3 (the code handles N Sparks; a part a Spark, the prompt rows broadcast from the owner).
 
 ## Spill tier (optional)
 
