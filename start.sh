@@ -42,6 +42,7 @@
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$PWD"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
 
@@ -340,8 +341,8 @@ launch() {
     log "Rank $i on $(worker_host "$i"): ${rankw[*]}"
     worker_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
                 $(rank_nccl_env "$i")
-                -v "${WORKER_MOUNT[i]}" -v "\$HOME/.cache/tensorfold-glm53/$KCACHE:/cache"
-                "$IMAGE" "${rankw[@]}")
+                ${TF_GLM_TMPL:+-v "$SCRIPT_DIR/patches/0110-glm-template-emit-media:/opt/tf-patch:ro"}
+                ${TF_GLM_TMPL:+-e "TF_GLM_TMPL=/opt/tf-patch/chat_template.jinja"} "$IMAGE" "${rankw[@]}")
     remote=""; for a in "${worker_cmd[@]}"; do
       case "$a" in '$HOME'*) remote+=" \"$a\"" ;; *) remote+=" $(printf '%q' "$a")" ;; esac
     done
@@ -356,8 +357,9 @@ launch() {
   log "Rank 0 here: ${rank0[*]}"
   here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
             $(rank_nccl_env 0)
-            -v "$HF_CACHE":/root/.cache/huggingface -v "$KERNEL_CACHE/$KCACHE":/cache
-            "$IMAGE" "${rank0[@]}")
+            -v "$HF_CACHE":/root/.cache/huggingface -v "$KERNEL_CACHE/$KCACHE":/cache \
+            ${TF_GLM_TMPL:+-v "$SCRIPT_DIR/patches/0110-glm-template-emit-media:/opt/tf-patch:ro"
+            -e TF_GLM_TMPL=/opt/tf-patch/chat_template.jinja} "$IMAGE" "${rank0[@]}")
   if (( DRY )); then
     printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here_cmd[@]}" | sed 's/ $//')"
     exit 0
