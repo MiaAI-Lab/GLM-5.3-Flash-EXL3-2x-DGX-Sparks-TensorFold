@@ -1,0 +1,39 @@
+# The upstream checkpoint ships a newer chat_template.jinja: per-kind media macros
+# (emit_image / emit_video / emit_audio) instead of one branch printing a "cannot
+# process" reminder, a clear_thinking default, and stricter tool-result pairing.
+# 0003/0056 patched the old branch by exact string, which breaks on the new one;
+# accept both shapes.  TF_GLM_TMPL, when set, names a chat_template.jinja that
+# wins over the snapshot's copy, so a template fix is a restart, not a rebuild.
+# MiaAI-Lab, Apache-2.0.
+--- a/tensorfold/families/glm5_next/cuda/app.py
++++ b/tensorfold/families/glm5_next/cuda/app.py
+@@ -51,10 +51,15 @@
+     """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
+ 
+     source = (model_dir / "chat_template.jinja").read_text()
+-    if source.count(_NO_MEDIA) != 1:
+-        raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
+-                         "extend (GLM-5.3 Flash's chat_template.jinja)")
+-    inner.template = inner.template.environment.from_string(source.replace(_NO_MEDIA, _MEDIA))
++    if "macro emit_image" in source:      # newer upstream template: per-kind macros, no reminder
++        mark = "{%- macro visible_text(content) -%}"
++        pre = "{%- if media_type == 'image' -%}<img>{%- elif media_type == 'video' -%}<video>{%- else -%}"
++        source = source[:source.index(mark)].rstrip("\n") + "\n" + pre + "{%- endif -%}\n\n" + source[source.index(mark):]
++    elif source.count(_NO_MEDIA) == 1:    # the older template's single reminder branch
++        source = source.replace(_NO_MEDIA, _MEDIA)
++    else:
++        raise ValueError("--vision: no known media branch in the chat template")
++    inner.template = inner.template.environment.from_string(source)
+ 
+ 
+ class GlmApp(App):
+@@ -71,6 +76,9 @@
+             raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
+         effort_tail_enabled()       # a typo fails at load, not at the first request
+         self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
++        override = os.environ.get("TF_GLM_TMPL", "").strip()
++        if override:
++            self.template = type(self.template)(Path(override))
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
