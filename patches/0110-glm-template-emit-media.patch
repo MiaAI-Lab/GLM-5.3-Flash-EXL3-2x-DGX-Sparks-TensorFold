@@ -5,8 +5,8 @@
 # accept both shapes.  TF_GLM_TMPL, when set, names a chat_template.jinja that
 # wins over the snapshot's copy, so a template fix is a restart, not a rebuild.
 # MiaAI-Lab, Apache-2.0.
---- a/tensorfold/families/glm5_next/cuda/app.py
-+++ b/tensorfold/families/glm5_next/cuda/app.py
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
 @@ -51,10 +51,15 @@
      """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
  
