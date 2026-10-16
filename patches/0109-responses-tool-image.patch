@@ -1,0 +1,34 @@
+# Images inside a Responses function_call_output: pi (and any agent) sends a tool's
+# screenshot as input_image parts in the output array; v0.6.0 refuses them with
+# "a function_call_output's output must be a string or input_text parts" (HTTP 400)
+# even though the chat path renders tool-result media since 0056. The chat-side
+# plumbing those parts flow into (messages.py's tool roles, images.py's split, the
+# GLM frontend's tool_media) is already here; only responses_translate's _output
+# predates it. The _output hunk of upstream 69d0ca9 (v0.6.3, issue #235, "image
+# parts are accepted inside tool results"), verbatim; its messages.py/images.py
+# hunks are already landed here via 0056. MiaAI-Lab, Apache-2.0.
+diff --git tensorfold/server/responses_translate.py tensorfold/server/responses_translate.py
+index a5c1122d..023f860b 100644
+--- tensorfold/server/responses_translate.py
++++ tensorfold/server/responses_translate.py
+@@ -55,14 +55,17 @@ def _content(content: Any) -> str | list[dict[str, Any]]:
+     return parts
+ 
+ 
+-def _output(output: Any) -> str:
+-    """A function_call_output's output as a tool message's text."""
++def _output(output: Any) -> str | list[dict[str, Any]]:
++    """A function_call_output's output as a tool message's content: text, or text and image_url parts."""
+ 
+     if isinstance(output, str):
+         return output
+     if isinstance(output, list) and all(isinstance(p, dict) and p.get("type") == "input_text" for p in output):
+         return "".join(str(p.get("text") or "") for p in output)
+-    raise RequestError("a function_call_output's output must be a string or input_text parts")
++    if isinstance(output, list) and all(isinstance(p, dict) and p.get("type") in ("input_text", "input_image")
++                                        for p in output):
++        return _content(output)          # a screenshot a tool returns, as a chat client sends it
++    raise RequestError("a function_call_output's output must be a string or input_text and input_image parts")
+ 
+ 
+ def messages(items: list[Any]) -> list[dict[str, Any]]:
