@@ -1,0 +1,149 @@
+# Kept states: a stream that continues its conversation without resuming from that conversation's own turn state keeps
+# the conversation id (patch 0089 minted a new one), so TF_GLM_KEEP_PER_CHAT counts the conversation once. That
+# happens when a client rewinds before the kept turns (an edit, a regenerate, a tool loop re-sent: issue #104), when a
+# state comes back from the spill tier, or when the conversation's states were dropped. The conversation is the one
+# whose own kept state the prompt repeats past its first prompt and the first 32 tokens of the reply to it, ids no other
+# conversation wrote. /health and /metrics count these streams and their prefill (chats_continued,
+# chats_continued_prefill_tokens); rank 0 logs one prefilling 4096 tokens or more, with where the prompt left the kept
+# state and what it resumed from. Builds on 0089-glm-kept-state (Thomas Wade, PR #65). By @wojo. Apache-2.0.
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 06f33e7..9eccfff 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -249,6 +249,44 @@ def cap_victim(kept: list):
+     return kept[0]
+ 
+ 
++# a conversation's first reply: the tokens of it a later prompt must repeat to continue that conversation
++CHAT_MATCH = 32
++# a continued conversation's prefill from this many tokens on is logged (rank 0)
++CHAT_LOG_TOKENS = 4096
++
++
++def continued_chat(kept: list, prompt: list[int], roots: dict[int, int]):
++    """The kept state of the conversation a prompt continues when it did not resume from one of that conversation's own
++    turn states (it fell back to a shared prefix, to a state read back from disk or a paused prefill, or to nothing):
++    the most recently used own state whose ids repeat the prompt past its conversation's first prompt (``roots``: its
++    length) and the first ``CHAT_MATCH`` tokens of the reply to it. Only that conversation wrote those, so a second
++    conversation behind the same system prompt and opening message does not join it, and an edit of the first message
++    starts a new one. None when there is none. Deterministic in ``kept``'s order, so both ranks agree."""
++
++    for c in reversed(kept):
++        chat = getattr(c, "chat", 0)
++        if not getattr(c, "own", False) or chat not in roots or getattr(c, "images", False):
++            continue
++        n = roots[chat] + CHAT_MATCH
++        if len(c.ids) >= n and len(prompt) >= n and c.ids[n - 1] == prompt[n - 1] and c.ids[:n] == prompt[:n]:
++            return c
++    return None
++
++
++def common_prefix(a: list[int], b: list[int]) -> int:
++    """The tokens two id lists share from the start."""
++
++    n = min(len(a), len(b))
++    lo, hi = 0, n                       # a[:lo] == b[:lo]; the first difference is before hi
++    while lo < hi:
++        mid = (lo + hi + 1) // 2
++        if a[lo:mid] == b[lo:mid]:
++            lo = mid
++        else:
++            hi = mid - 1
++    return lo
++
++
+ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
+     """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
+     policy its DFlash2 twin; without a draft model, serial."""
+@@ -562,6 +600,8 @@ class MultiDecoder:
+         self.disk = self._spill_store()                  # --spill-gib: the disk tier for kept prompts (cuda/spill.py)
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.next_chat = 0
++        self.chat_roots: dict[int, int] = {}             # each conversation's first prompt length (continued_chat)
++        self.chats_continued = self.chats_continued_prefill = 0
+         self.outbox: list[int] = []
+         self.idle = True
+         self.broken: Exception | None = None
+@@ -591,6 +631,10 @@ class MultiDecoder:
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+                 "kept_prompts": len(self.kept),
++                # streams that continued their conversation without resuming from its own turn state (a rewind before
++                # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
++                "chats_continued": self.chats_continued,
++                "chats_continued_prefill_tokens": self.chats_continued_prefill,
+                 "kept_bytes": self._held_bytes(), "kept_bytes_cap": self.kept_bytes_cap,
+                 # what the slots are holding. own = a conversation's turn-boundary state (capped by
+                 # TF_GLM_KEEP_PER_CHAT); shared = a shared-prefix point or a mid-prefill pause state (not capped);
+@@ -976,13 +1020,24 @@ class MultiDecoder:
+         code = a["code"]
+         dflash = code[0] >= 10 and self.drafts is not None
+         policy = decode_policy(code, g.costs) if code[0] else None
+-        # the conversation this stream belongs to: the chain it resumed from when that state is a turn's own, else a
+-        # new one (a shared-prefix state belongs to everyone, so resuming from it starts no chain)
++        # the conversation this stream belongs to: the chain it resumed from when that state is a turn's own; else the
++        # one whose own state it still repeats past that conversation's first reply (it rewound before its kept turns,
++        # or resumed from a shared prefix, from disk or from nothing: continued_chat); else a new one
+         if hit is not None and getattr(hit, "own", False) and getattr(hit, "chat", 0):
+             chat = hit.chat
+         else:
+-            self.next_chat += 1
+-            chat = self.next_chat
++            # (draft:false never resumes, by design: not a continuation to count, and it keeps no state)
++            prior = None if a["images"] or not a["draft"] else continued_chat(self.kept, prompt, self.chat_roots)
++            if prior is not None:
++                chat = prior.chat
++                self._continued(chat, prior, hit, cut, prompt)
++            else:
++                self.next_chat += 1
++                chat = self.next_chat
++                self.chat_roots[chat] = len(prompt)
++                if len(self.chat_roots) > 4 * max(16, self.g.cache_entries):   # conversations no kept state is in
++                    live = {getattr(c, "chat", 0) for c in self.kept} | {chat}
++                    self.chat_roots = {k: v for k, v in self.chat_roots.items() if k in live}
+         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
+                     constraint=constraint, images=a["images"], chat=chat)
+         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
+@@ -1021,6 +1076,25 @@ class MultiDecoder:
+         lane.t0 = s.started
+         self.lanes[lane.sid] = lane
+ 
++    def _continued(self, chat: int, prior, hit, cut: int, prompt: list[int]) -> None:
++        """Both ranks: a stream continues conversation ``chat`` without resuming from its own turn state (``prior``:
++        that conversation's state it repeats; ``hit``: what it resumed from, None for nothing). Counted; rank 0 logs a
++        large prefill with where the prompt left the kept state and what it resumed from."""
++
++        self.chats_continued += 1
++        self.chats_continued_prefill += len(prompt) - cut
++        if self.rank or len(prompt) - cut < CHAT_LOG_TOKENS:
++            return
++        source = ("nothing" if hit is None else "a shared prefix" if getattr(hit, "shared", False)
++                  else "a state that is not a turn's own (read back from disk, or a paused prefill)")
++        at = common_prefix(prior.ids, prompt)
++        why = (f"it went back to token {at}, before that conversation's newest kept state ({len(prior.ids)} tokens)"
++               if at < len(prior.ids) else
++               f"its kept state of {len(prior.ids)} tokens could not serve it (no DFlash2 window, off the grid, or "
++               "draft:false)")
++        print(f"[tensorfold] conversation {chat}: resumed at {cut} of {len(prompt)} tokens from {source}, "
++              f"prefilling {len(prompt) - cut}; {why}", flush=True)
++
+     def _ctx(self, lane: Lane):
+         """The lane's slot's DFlash2 context."""
+         return self.drafts.contexts[lane.slot]
+diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
+index c96a9a8..ed8b409 100644
+--- tensorfold/server/metrics.py
++++ tensorfold/server/metrics.py
+@@ -192,6 +192,12 @@ _HEALTH_GAUGES = (
+     ("pool_free_tokens", "Pool rows no stream or kept prompt holds."),
+     ("kept_prompts", "Prompt states kept in the pool for reuse."),
+ )
++# the GLM engine's conversation counters: streams that continued a conversation without its own kept turn state
++_HEALTH_TOTALS += (
++    ("chats_continued", "counter",
++     "Streams that continued a conversation without resuming from its own turn state (a rewind, or it was dropped)."),
++    ("chats_continued_prefill_tokens", "counter", "Prompt tokens those streams prefilled."),
++)
+ 
+ 
+ def _health(lines: list[str], app: Any) -> None:
