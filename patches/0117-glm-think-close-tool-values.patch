@@ -1,0 +1,89 @@
+# Standalone follow-up patch requiring upstream PR #134 and #158; draft until integrated.
+# Keep literal </think> in GLM <arg_value> (and Qwen <parameter=>) from splitting a real tool call.
+# This preserves #158 argument-aware envelope handling and Codex streaming / alias support.
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -239,6 +239,46 @@
+ 
+ 
+ _THINK_CLOSE = "</think>"
++def _think_close_outside_values(text: str, start: int, end: int) -> int:
++    """Find a reasoning terminator without reading through an actual tool argument.
++
++    A text explanation mentioning <arg_value> is not an argument. Only valid
++    <tool_call> heads may own GLM/Qwen values or JSON string literals.
++    """
++    pos = start
++    while (close := text.find(_THINK_CLOSE, pos, end)) >= 0:
++        inside_tool_value = False
++        for opened in _TOOL_CALL_OPEN_RE.finditer(text, start, close):
++            if not _call_head(text, opened.end()):
++                continue
++            call_end = _tool_call_end(text, opened.start())
++            if call_end is not None and call_end <= close:
++                continue
++            body = text[opened.end():close]
++            if body.rfind("<arg_value>") > body.rfind("</arg_value>"):
++                inside_tool_value = True
++                break
++            qwen = list(re.finditer(r"<parameter=[^>\s]+>", body, re.IGNORECASE))
++            if qwen and qwen[-1].start() > body.rfind("</parameter>"):
++                inside_tool_value = True
++                break
++            if body.lstrip().startswith(("{", "[")):
++                quoted = escaped = False
++                for char in body:
++                    if escaped:
++                        escaped = False
++                    elif quoted and char == "\\":
++                        escaped = True
++                    elif char == '"':
++                        quoted = not quoted
++                if quoted:
++                    inside_tool_value = True
++                    break
++        if not inside_tool_value:
++            return close
++        pos = close + len(_THINK_CLOSE)
++    return -1
++
+ THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
+ _GLM_TAG = re.compile(r"</?arg_(?:key|value)>")
+ _LAST_WORD = re.compile(r"(\S+)\s*$")
+@@ -274,7 +314,7 @@
+     if at < 0:
+         return ""
+     block = text[at + len(_CALL_OPEN):]
++    if _tool_call_end(text, at) is not None or _think_close_outside_values(text, at, len(text)) >= 0:
+-    if _CALL_CLOSE in block or _THINK_CLOSE in block:
+         return ""
+     suffix = (_VALUE_END if block.rfind(_VALUE) > block.rfind(_VALUE_END) else "") + _CALL_CLOSE
+     # the strict reading (one whole call, nothing but its markup, arguments a JSON object)
+@@ -288,7 +328,7 @@
+ 
+     end = pos = start
+     while text.startswith(_CALL_OPEN, pos) and _call_head(text, pos + len(_CALL_OPEN)) and (block_end := _tool_call_end(text, pos)) is not None:
++        if _think_close_outside_values(text, pos, block_end) >= 0:
+-        if _THINK_CLOSE in text[pos:block_end]:
+             break  # ThinkSplit: one tool-call block must not cross the end of reasoning
+         end = block_end
+         pos = len(text) - len(text[end:].lstrip())
+@@ -297,7 +337,8 @@
+         after = ""
+     if not after:
+         return end, "calls" if finished and end > start else "pending"
++    if after.startswith(_CALL_OPEN) and (not _call_head(after, len(_CALL_OPEN))
++                                         or _think_close_outside_values(after, 0, len(after)) >= 0):
+-    if after.startswith(_CALL_OPEN) and (not _call_head(after, len(_CALL_OPEN)) or _THINK_CLOSE in after):
+         return end, "reasoning"
+     if not finished and (after.startswith(_CALL_OPEN) or _CALL_OPEN.startswith(after)
+                          or _THINK_CLOSE.startswith(after)):
+@@ -326,7 +367,7 @@
+         if self.committed is not None:
+             at = self.committed
+             return text[:at], text[at:].replace(_THINK_CLOSE, "", 1).lstrip()
++        close = _think_close_outside_values(text, 0, len(text))
+-        close = text.find(_THINK_CLOSE)
+         while True:
+             call = text.find(_CALL_OPEN, self.floor)
+             if close >= 0 and (call < 0 or close < call):
