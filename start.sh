@@ -117,8 +117,14 @@ if [[ "$ENGINE" == zig ]]; then
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
   (( DISPLAY_KV_MIB == 0 )) || [[ " $ZIG_HAS " == *" displaykv "* ]] || zig_unsupported "DISPLAY_KV_MIB (set ZIG_HAS=displaykv)"
-  # TP=3/4 control plane is in the engine. This project does not run those GPUs; split prefill is two ranks only.
-  if (( TP == 3 )); then (( DRY )) || zig_unsupported "TP=3 (spark3 is not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=3 commands only (spark3 is not in this project)"; fi
+  # TP=3/4 control plane is in the engine; split prefill is two ranks only. TP=4 is not run in this project yet.
+  if (( TP == 3 )); then
+    # three Sparks (a triangle): unsplit prefill over NCCL, the path the engine has for three ranks; the kernel set holds
+    # the TP=3 shapes (22/21/21 heads), captured from the Python engine at TP=3 and checked equal to it
+    [[ "$SPLIT" == 0 ]] || die "ENGINE=zig at TP=3 needs SPLIT=0 (split prefill is two ranks)"
+    [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=3 needs COMM=nccl"
+    warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, NCCL)"
+  fi
   if (( TP == 4 )); then (( DRY )) || zig_unsupported "TP=4 (spark3/spark4 are not in this project; split prefill is two ranks)"; warn "ENGINE=zig: TP=4 commands only (spark3/spark4 are not in this project)"; fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
     warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"

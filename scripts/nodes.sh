@@ -285,12 +285,20 @@ detect_link() {
 
 # node_inventory [master]: this node's default-route netdev ("default <netdev>"), whether it routes to <master>
 # ("master ok|none"), and one line per RoCE netdev that is up with an IPv4 address: "<netdev> <rdma device>
-# <address/prefix> <RoCE v2 GID index of that address, or ->". Read-only (ip and sysfs).
+# <address/prefix> <RoCE v2 GID index of that address, or ->". Read-only (ip and sysfs). The netdevs come in uverbs
+# order (rocep1s0f0, rocep1s0f1, then the PCIe twins), not /sys/class/net's (enP2p1... sorts first): on DGX Sparks
+# with NCCL 2.30.7 that is the order NCCL numbers the devices in, so "NCCL device <n>" in a graph file (graph_xml) is
+# the device meant (checked from NCCL's own device list on three Sparks; check it on other hosts before relying on
+# graph files there). A netdev without a uverbs device sorts last.
 node_inventory() {
-  local n dev hca cidr want idx f
+  local n dev hca cidr want idx f u
   echo "default $(ip -o -4 route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
   [[ -z "${1:-}" ]] || { ip -o -4 route get "$1" >/dev/null 2>&1 && echo "master ok" || echo "master none"; }
-  for n in /sys/class/net/*; do
+  for n in $(for n in /sys/class/net/*; do
+               [[ -d $n/device/infiniband ]] || continue
+               u=$(ls "$n/device/infiniband_verbs" 2>/dev/null | head -1); u=${u#uverbs}
+               [[ "$u" =~ ^[0-9]+$ ]] || u=9999; echo "$u $n"
+             done | sort -n | cut -d' ' -f2); do
     dev=${n##*/}
     [[ -d $n/device/infiniband && "$(cat "$n/operstate" 2>/dev/null)" == up ]] || continue
     hca=$(ls "$n/device/infiniband" | head -1)
@@ -308,11 +316,11 @@ node_inventory() {
 
 # pair_links <ranks...> (stdin: node_inventory lines, each prefixed with its rank): two nodes are linked where they
 # have addresses in one subnet (a direct cable, or a switch). Prints "rank <r> <default netdev> <hcas> <gid or ->" (a
-# node's RoCE devices toward all its peers, in its sysfs order; the GID index when it is one for all of them), "peer <i>
+# node's RoCE devices toward all its peers, in its inventory order (node_inventory); the GID index when it is one for all of them), "peer <i>
 # <worker i's lowest address on its link to the head>", "missing <a> <b>" for two ranks without a common subnet, and
 # "ring <ranks...>" when the links form one ring through four or more ranks and no others (every rank linked to two),
 # in its order from rank 0 toward its lower-numbered neighbour, "toward <r> <s> <hcas>" for every linked pair (r's
-# RoCE devices on the subnets it shares with s, in its sysfs order), and "prefix <len>": the shortest prefix length
+# RoCE devices on the subnets it shares with s, in its inventory order), and "prefix <len>": the shortest prefix length
 # (longer than the links' own) at which, on every link, each device's address and exactly one of the peer's share a
 # subnet and no two of a node's devices do (a port and its PCIe twin addressed .N and .10N in one /24: 26), so NCCL's
 # subnet-aware routing can tell the twins apart.
@@ -345,7 +353,7 @@ for r in ranks:
         if r == 0:
             print("peer", s, min(o[2].ip for o in nodes[s] if linked(o, mine)))
     hcas, gids = [], set()
-    for e in nodes.get(r, []):              # in the node sysfs order
+    for e in nodes.get(r, []):              # in the node inventory order
         if id(e) in used and e[1] not in hcas:
             hcas.append(e[1]); gids.add(e[3])
     print("rank", r, default.get(r) or "-", ",".join(hcas) or "-", gids.pop() if len(gids) == 1 else "-")
@@ -451,6 +459,16 @@ detect_links() {
       log "rank $i ($(worker_host "$i")) is across the ring from this node: its rendezvous and NFS go to ${LINK_HEAD_ADDR[i]} (through a neighbour)"
     done
     [[ "${RING_GRAPH:-1}" == 0 ]] || ring_graphs   # RING_GRAPH=0: NCCL picks the devices itself
+  elif (( TP == 3 )) && [[ -z "$missing" && "${RING_GRAPH:-1}" != 0 ]]; then
+    # a triangle is a ring of three whose neighbours are all its peers: without graph files NCCL can listen on a port
+    # cabled to the other peer and the connect times out (measured: rank 2's port toward rank 0 connecting to rank 1's
+    # PCIe twin, which is cabled to rank 0 only: ibv_modify_qp ... Connection timed out), and subnet-aware routing on
+    # the sending side cannot repair a receiver's choice. With the ring's graph files (listen toward the previous
+    # rank) every main-communicator collective connects over a cable; the Python engine also gets TF_NCCL_RING's
+    # two-rank links (its exchange_all). Neither engine sends raw p2p on the main communicator at TP=3 (on the tested
+    # triangle it did not connect).
+    log "a triangle: NCCL ring graphs (rank 0 -> 1 -> 2 -> 0) and two-rank links per cable (TF_NCCL_RING=1)"
+    ring_graphs
   fi
   for r in 0 $(worker_ids); do
     if [[ -n "${WORKER_DOWN[$r]:-}" ]]; then
@@ -484,7 +502,8 @@ detect_links() {
 # file names, channel by channel, a device toward the previous rank (where the node listens); subnet-aware routing then
 # moves each send to the device on the next rank's subnet. Channels alternate over the devices toward the peer (a port
 # and its PCIe twin). Measured on four Sparks: a decode-sized all-gather 109 us against 184 with NCCL's fused devices,
-# prompt-sized ones the same. NCCL numbers the devices in NCCL_IB_HCA's (sysfs) order, which NODE_HCAS keeps.
+# prompt-sized ones the same. NODE_HCAS keeps node_inventory's order, which is NCCL's device numbering on the tested
+# Sparks (see node_inventory: check it on other hosts before relying on these graph files).
 ring_graphs() {
   local r prev next path spec
   for r in 0 $(worker_ids); do
@@ -551,11 +570,15 @@ nccl_env() {
 # (TF_NCCL_RING=1: each message passed round the ring over two-rank links with the neighbours, the same bytes as p2p,
 # overlapped; an 8 MiB block a peer 2.7 ms against 4.6), else as all-gathers (TF_GLM_HC_EXCHANGE=gather: p2p sends to
 # every peer; three times the bytes, no overlap).
-# The ring's ports come from the node's graph file (ring_graphs), with NCCL's NIC fusion off.
+# The ring's ports come from the node's graph file (ring_graphs). NCCL's NIC fusion is off on every TP>2 fabric: it
+# joins a card's two ports into one device, but here each port is cabled to a different node, so a fused device
+# connects a peer through the port cabled to the other one (measured on a triangle: rank 0's port toward rank 2
+# connecting to rank 2's port toward rank 1, ibv_modify_qp ... Connection timed out; "mergedDev ... different number
+# of devices").
 nccl_env_n() {
   local dev=$1 hcas=$2 gid=$3 ring=""   # $4: the node's NCCL graph file (FABRIC=ring)
-  if [[ "$FABRIC" == ring && -n "${4:-}" ]]; then
-    ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e NCCL_IB_MERGE_NICS=0 -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}.xml:/nccl-graph.xml:ro"
+  if [[ -n "${4:-}" ]]; then     # graph files: a ring (FABRIC=ring), or a triangle (detect_links)
+    ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e NCCL_GRAPH_FILE=/nccl-graph.xml -v ${4}.xml:/nccl-graph.xml:ro"
     ring+=" -e TF_NCCL_RING=1 -e TF_NCCL_RING_GRAPHS=/nccl-link-prev.xml,/nccl-link-next.xml"
     ring+=" -v ${4}-link-prev.xml:/nccl-link-prev.xml:ro -v ${4}-link-next.xml:/nccl-link-next.xml:ro"
   elif [[ "$FABRIC" == ring ]]; then
@@ -569,7 +592,7 @@ nccl_env_n() {
   [[ -z "${4:-}" || -z "$RING_PREFIX" ]] || ring+=" -e NCCL_IB_SUBNET_PREFIX_LEN=${NCCL_IB_SUBNET_PREFIX_LEN:-$RING_PREFIX}"
   echo "-e NCCL_SOCKET_IFNAME=$dev -e NCCL_IB_HCA=$hcas ${gid:+-e NCCL_IB_GID_INDEX=$gid} $ring" \
        "-e NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1} -e NCCL_IB_SUBNET_AWARE_ROUTING=${NCCL_IB_SUBNET_AWARE_ROUTING:-1}" \
-       "-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1" \
+       "-e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e NCCL_IB_MERGE_NICS=0" \
        "-e NCCL_MIN_NCHANNELS=${NCCL_CHANNELS:-4} -e NCCL_MAX_NCHANNELS=${NCCL_CHANNELS:-4}" \
        "-e TF_ROCE_HCA=$hcas" \
        ${NCCL_DEBUG:+-e NCCL_DEBUG=$NCCL_DEBUG}

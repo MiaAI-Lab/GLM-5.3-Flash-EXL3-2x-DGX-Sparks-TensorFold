@@ -1,0 +1,47 @@
+zig-engine TP=3/4: agree the KV pool over every rank (the all-gather was sized for two)
+Apply from the checkout root with: git apply 0009-zig-glm-tpn-pool.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index f9af7c0..f8dd150 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -376,15 +376,17 @@ pub const Engine = struct {
+             }
+             }
+             if (o.comm) |c| {
+-                var words = try cuda.DeviceBuffer.alloc(ctx.d, 3 * 8);
++                // one word out (this rank's proposal) and one in per rank: every rank takes the smallest
++                const w: usize = c.world;
++                var words = try cuda.DeviceBuffer.alloc(ctx.d, (1 + w) * 8);
+                 defer words.free();
+                 var mine: u64 = @intCast(pool_rows);
+                 try words.upload(0, std.mem.asBytes(&mine));
+                 try c.allGather(words.ptr, words.ptr + 8, 1, .u64, e.stream.handle);
+                 try e.stream.synchronize();
+-                var both: [2]u64 = undefined;
+-                try words.download(8, std.mem.asBytes(&both));
+-                pool_rows = @intCast(@min(both[0], both[1]));
++                var all: [comm.max_world]u64 = undefined;
++                try words.download(8, std.mem.sliceAsBytes(all[0..w]));
++                pool_rows = @intCast(agreedPool(all[0..w]));
+             }
+             // Free the provisional single-window planes before their final allocation; graphs have not captured yet.
+             e.caches.deinit();
+@@ -1168,3 +1170,17 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
+     try std.testing.expect(e.committed[0]);
+     try std.testing.expect(!e.committed[1]);
+ }
++
++/// The pool every rank can hold: the smallest of the ranks' proposals (one per rank, in rank order).
++fn agreedPool(proposals: []const u64) u64 {
++    var m: u64 = std.math.maxInt(u64);
++    for (proposals) |p| m = @min(m, p);
++    return m;
++}
++
++test "the agreed pool is the smallest proposal of every rank, whichever rank makes it (TP=2, 3, 4)" {
++    try std.testing.expectEqual(@as(u64, 4096), agreedPool(&.{ 8192, 4096 }));
++    try std.testing.expectEqual(@as(u64, 2048), agreedPool(&.{ 8192, 6144, 2048 })); // rank 2 smallest at TP=3
++    try std.testing.expectEqual(@as(u64, 2048), agreedPool(&.{ 2048, 6144, 8192 }));
++    try std.testing.expectEqual(@as(u64, 1024), agreedPool(&.{ 8192, 6144, 4096, 1024 })); // rank 3 at TP=4
++}
