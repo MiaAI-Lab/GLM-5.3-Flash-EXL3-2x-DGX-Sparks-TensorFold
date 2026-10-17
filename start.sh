@@ -28,6 +28,7 @@
 #            WORKER_WEIGHTS (copy | nfs: rank 1 reads the head's HF_CACHE over NFS), NFS_PATH, NFS_SERVER, NFS_VOLUME,
 #            WORKER_WEIGHTS2, NFS_SERVER2,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
+#            CUDA_ALLOC_CONF (PYTORCH_CUDA_ALLOC_CONF for every rank; default expandable_segments:True, "" unsets)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -309,6 +310,7 @@ fi
 env_args() {
   local _skip='^$' name
   ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
+  [[ -n "${CUDA_ALLOC_CONF:-}" ]] && ENV_ARGS+=(-e PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC_CONF")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }

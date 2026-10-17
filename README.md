@@ -287,6 +287,13 @@ next to one more of 1M, or next to three of ~640k. A request the pool cannot pla
 first, least recently used first, and only while the free rows fall short: free rows in several ranges are gathered by
 moving caches instead, patch `0074`); `/health` shows `pool_tokens`, `pool_free_tokens` and the streams decoding, filling and paused.
 
+Every rank runs with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (`CUDA_ALLOC_CONF`). Without it the caching
+allocator grows in fixed segments it never gives back, so under days of mixed-size requests a rank's allocation ratchets
+up until the host runs out (#143: ~17 GiB on rank 1 over two days). Measured on two Sparks at `PARALLEL=4`, 1M window,
+FP8 KV, with the setting: 80 minutes of 4 concurrent agent-shaped streams (294 requests, ~78k-token median prompt, the
+pool driven to ~230k free tokens) left rank 0's `MemAvailable` flat (5.6 to 5.2 GiB, +0.17 GiB/h over the last 40 min)
+and rank 1's at 7.0 GiB, with no OOM killer event on either Spark. Same replies; nothing else changes.
+
 TensorFold's budget on each Spark is `MemAvailable` at start minus a host reserve (`MEMORY_RESERVE_GIB`, 14.5 GiB here;
 TensorFold's own default is a tenth of RAM). The server uses about 10 GiB beyond its own estimate at its peak, so the
 reserve also sets the lowest free memory.
@@ -507,6 +514,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `CONTEXT` | `1048576` | prompt + reply window per request (with `KV=fp8`; other defaults in [KV pool and memory](#kv-pool-and-memory)); `0`: the largest that fits |
 | `KV` | `fp8` | `fp8` or `bf16` (exact, shorter window) DSA latent cache and indexer keys |
 | `WORKER_WEIGHTS` | `copy` | `copy`: the worker keeps its own copy of the weights; `nfs`: it reads the head's over NFS ([Worker weights over NFS](#worker-weights-over-nfs)); with `NFS_PATH`, `NFS_SERVER`, `NFS_VOLUME` |
+| `CUDA_ALLOC_CONF` | `expandable_segments:True` | `PYTORCH_CUDA_ALLOC_CONF` for every rank: lets the caching allocator grow and reclaim within one mapping instead of keeping fixed segments, which ratchet a rank's allocation up over days (#143); `""` unsets it |
 | `KV_POOL_GIB` / `MEMORY_RESERVE_GIB` | `12.5` (`32` at `TP=3`) / `14.5`, plus ~0.95 a request past 4 and ~0.04 a window row past 32 (`19.6` at 8 requests and 64 rows) | the shared pool beyond the window (kept prompts, more long conversations at once) grows into what is free at start minus the reserve, up to `KV_POOL_GIB` GiB a Spark; the reserve sets the lowest free memory on the head (~4.5-5 GiB under a 1M-token prompt); it grows with `PARALLEL` because more requests at once take more than the startup estimate counts; raise it when other work shares the Sparks |
 | `DISPLAY_KV_MIB` | `0` (off) | MiB of the GPU's display reservation added to the shared pool on every rank (patch 0072, `PARALLEL` above 1; a multiple of 16 up to 2032, 1792 measured): pool tokens without host memory, on top of `KV_POOL_GIB`; needs `/dev/dri/card0`; headless Sparks only (refused while a display is connected) |
 | `DISPLAY_KV_BACKEND` | `drm` | where `DISPLAY_KV_MIB`'s reservation comes from: `drm` (a DRM dumb buffer on `card0`, `nvidia_drm` with `modeset=1`) or `dispram` (kindling spark-os's `dispramd`; `start.sh` mounts its socket and client into every rank) (patch 0087) |
