@@ -583,12 +583,18 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   `"chat_template_kwargs": {"enable_thinking": false}`) answers without thinking. `chat_template_kwargs.thinking`
   (`true` / `false`, or `{"type": "enabled"}` / `{"type": "disabled"}`, as DeepSeek-V4 clients such as pi send it) is
   read as `enable_thinking` when that is absent; other values leave the server's default.
+- A `/no_think` (or `/think`) suffix in the prompt text does not switch thinking off: this template does not
+  read it, so the request keeps the server's default. With thinking on, a client that sends it gets `content: null`,
+  the whole budget in `reasoning_content` and `finish_reason: "length"`. Use `"chat_template_kwargs":
+  {"enable_thinking": false}`, `{"thinking": {"type": "disabled"}}` or `reasoning_effort: "none"` instead.
 - Earlier turns' reasoning stays in the prompt (as in zai-org's current template), so an agent's previous tool loop
   is resumed from the cache at a new user message; `"chat_template_kwargs": {"clear_thinking": true}` or
   `TF_GLM_CLEAR_THINKING=1` drops it, as the checkpoint's template does.
 - The reasoning comes back in `reasoning_content`, the answer in `content`. A request without `max_tokens` gets
   32,768 tokens for both (`MAX_TOKENS`; cut to what the window has left, never refused). An empty `content` means the model
-  thought until `max_tokens`: give more, or use `reasoning_effort: "low"`.
+  thought until `max_tokens`: give more, or use `reasoning_effort: "low"`. A client should not accept that reply as
+  an answer: `content: null` with `reasoning_content` filled and `finish_reason: "length"` is a retry condition
+  (more `max_tokens`, or thinking off).
 
 ### API notes
 
