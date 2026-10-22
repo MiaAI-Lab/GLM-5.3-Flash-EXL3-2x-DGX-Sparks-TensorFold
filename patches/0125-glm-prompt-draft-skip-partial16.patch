@@ -1,0 +1,281 @@
+# Two opt-in prompt switches, off by default, on top of 0124. Neither changes a bit of any reply (four Sparks cabled as
+# a ring, 2026-10-21: five solo greedy prompts of 5K-13K tokens, identical replies with and without).
+#
+# TF_GLM_DRAFT_SKIP=1: a prompt's DFlash2 taps go into the drafter's context only within reach of where it is read
+#   (dflash2_multi.WindowTaps, multi._prompt_ctx): DFlash2's context is a 2,176-row ring read by 2,048-token sliding
+#   windows, so only the rows within the ring's reach before the prompt's end and its kept points are committed
+#   (ranges start on a full commit's 128-row steps, so those rows get the same launches); the context's end still
+#   moves over every row. The rest were 128-row graph replays the host waited on at every chunk's end. +1.5-2 %
+#   prompt (client time to first content, 8K-64K).
+# TF_GLM_PARTIAL16=1: with bf16 partials sent p2p past two ranks (TF_GLM_PROMPT_PARTIALS=bf16, the overlap), the
+#   attention output projections and the MoE combine write the peers' rows straight into the bf16 send staging and
+#   this rank's into its slot of each received block (hcsplit.HcSplit.direct16; the fills take an ``out``). The e4m3
+#   projections' result is bf16 already, so its fp32 widening and the side stream's conversions go; the combine's
+#   fp32 sums are rounded as copy_ rounds them. +5 % prompt.
+
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index e7b069a..5c2ba66 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -20,6 +20,7 @@ API (both ranks call it identically, the same streams in the same order):
+ 
+ from __future__ import annotations
+ 
++import os
+ import sys
+ from dataclasses import dataclass
+ from typing import Sequence
+@@ -115,6 +116,46 @@ class DraftContext:
+         return self.owner.propose([DraftRequest(self, pending, depth, sampling, confidence, beta, round_ms)])[0]
+ 
+ 
++# TF_GLM_DRAFT_SKIP=1: a prompt's taps go into DFlash2's context only within reach of the points its context is read
++# at (the prompt's end, its kept points); the rows before are never read
++DRAFT_SKIP = os.environ.get("TF_GLM_DRAFT_SKIP", "0") == "1"
++
++
++class WindowTaps:
++    """``ctx.add_taps`` for a prompt's chunks, committing only the rows within ``reach`` before one of ``points``: a
++    ring holds its last ``ring`` rows only and a block pass reads its window only, so what a later pass or kept state
++    reads is what a full commit leaves. The ranges start on the ``t_max`` steps a full commit takes from the chunk's
++    start (the same launches for those rows); the context's end moves past the rows left out."""
++
++    def __init__(self, ctx: DraftContext, points: Sequence[int]) -> None:
++        self.ctx, self.points = ctx, sorted(set(points))
++        self.reach = ctx.ring or ctx.window + ctx.block + 1
++        self.step = ctx.owner.t_max
++
++    def _skip_to(self, p: int) -> None:
++        if p > self.ctx.context_end:
++            self.ctx.context_end = p
++            self.ctx.pos_dev.fill_(p)
++
++    def add_taps(self, taps: torch.Tensor) -> None:
++        a = self.ctx.context_end
++        z = a + taps.shape[0]
++        spans: list[list[int]] = []
++        for p in self.points:
++            lo, hi = max(a, p - self.reach), min(z, p)
++            if lo >= hi:
++                continue
++            lo = a + (lo - a) // self.step * self.step
++            if spans and lo <= spans[-1][1]:
++                spans[-1][1] = max(spans[-1][1], hi)
++            else:
++                spans.append([lo, hi])
++        for lo, hi in spans:
++            self._skip_to(lo)
++            self.ctx.add_taps(taps[lo - a:hi - a])
++        self._skip_to(z)
++
++
+ @dataclass
+ class DraftRequest:
+     """One stream's draft for a round: ``Drafter.propose``'s arguments with the stream's context."""
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 800809a..7f79052 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -457,6 +457,13 @@ def _rows_e4m3(X, Y, S, ldx, K: tl.constexpr, BK: tl.constexpr):
+     tl.store(S + r, s)
+ 
+ 
++def _w8_takes(b: Buffers, x: torch.Tensor, q) -> bool:
++    """Whether ``mm`` runs this projection on TF_GLM_PROMPT_W8's e4m3 copy (whose result is bf16)."""
++
++    return (b.prefill and isinstance(q, qmm.Q4) and PROMPT_W8 and x.shape[0] >= PROMPT_FP8_MIN_ROWS
++            and getattr(q, "w8", None) is not None and x.stride(1) == 1)
++
++
+ def _w8_mm(x: torch.Tensor, q, f32: bool, out: torch.Tensor) -> torch.Tensor:
+     m, k = x.shape
+     x8 = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+@@ -475,8 +482,7 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
+ 
+     if b.prefill and isinstance(q, qmm.Q4):
+-        if PROMPT_W8 and x.shape[0] >= PROMPT_FP8_MIN_ROWS and getattr(q, "w8", None) is not None \
+-                and x.stride(1) == 1:
++        if _w8_takes(b, x, q):
+             return _w8_mm(x, q, f32, out)
+         if PROMPT_FP8 and x.shape[0] >= PROMPT_FP8_MIN_ROWS and q.gs == 64:
+             return shared.prefill_matmul8(shared.quantize_rows(x, q.gs), q, f32=f32, out=out)
+@@ -505,8 +511,13 @@ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, sit
+ 
+ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int,
+              site: tuple | None = None) -> torch.Tensor | None:
+-    def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
++    def fill(lo: int, hi: int, out: torch.Tensor | None = None) -> None:   # rows are independent: any row range
++        if out is not None and _w8_takes(b, x[lo:hi], q):                     # gives the same bits
++            _w8_mm(x[lo:hi], q, False, out)              # bf16 already: the partial's bits rounded
++            return
+         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
++        if out is not None:
++            out.copy_(b.part[lo:hi])
+ 
+     return partials(w, b, R, fill, site=site)
+ 
+@@ -867,18 +878,19 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+         if side is not None:
+             main.wait_stream(side)
+ 
+-        def fill(lo: int, hi: int) -> None:
++        def fill(lo: int, hi: int, out: torch.Tensor | None = None) -> None:
+             for a, z in undone(hi, done):     # rows lo .. hi the front has not run on
+                 if max(a, lo) < z:
+                     shared_front(layer, w, b, max(a, lo), z)
++            dst = b.part[lo:hi] if out is None else out    # bf16: the fp32 sums rounded as a copy rounds them
+             with prof.timed("moe: combine"):
+                 # the shared row read from sy where it is (the copy's bits, one pass less); decode windows too unless
+                 # TF_GLM_COMBINE_SY=0
+                 if b.prefill or __import__("os").environ.get("TF_GLM_COMBINE_SY", "1") != "0":
+-                    glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++                    glue.combine_shared(b.ey[lo:hi], b.sy[lo:hi], b.wts[lo:hi], dst)
+                 else:
+                     b.ey[lo:hi, c.top_k].copy_(b.sy[lo:hi])
+-                    glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++                    glue.combine(b.ey[lo:hi], b.wts[lo:hi], dst)
+ 
+         return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+     with prof.timed("moe: gate/up"):
+@@ -886,9 +898,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+     with prof.timed("moe: down"):
+         grouped.down(b.eact, m.experts, b.plan, b.ey.view(-1, c.hidden), R)
+ 
+-    def fill(lo: int, hi: int) -> None:
++    def fill(lo: int, hi: int, out: torch.Tensor | None = None) -> None:
+         with prof.timed("moe: combine"):
+-            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi])
++            glue.combine(b.ey[lo:hi], b.wts[lo:hi], b.part[lo:hi] if out is None else out)
+ 
+     return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+ 
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 74d42ce..e762610 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -204,6 +204,11 @@ class HcSplit:
+         self.round = settings.partials == "bf16"
+         self.half = self.round and p2p
+         self.send16: torch.Tensor | None = None
++        # TF_GLM_PARTIAL16=1 (bf16 partials sent p2p past two ranks, with the overlap): ``fill`` writes the peers' rows
++        # straight into ``send16`` and this rank's into its slot of each received block, rounded as copy_ rounds them
++        # (the same bits), instead of fp32 partials converted on the way out
++        self.direct16 = self.half and world > 2 and settings.overlap and os.environ.get("TF_GLM_PARTIAL16", "0") == "1"
++        self.filled16 = False
+         # the plain NCCL all-gather (RoceComm sends small gathers over RoCE, whose kernel is not written for in place)
+         self.all_gather = getattr(w.comm, "nccl", w.comm).all_gather
+         self.active = False
+@@ -325,6 +330,13 @@ class HcSplit:
+         if hi > lo:
+             fill(lo, hi)
+ 
++    def _fill16(self, fill: Callable[..., None], lo: int, hi: int, out: torch.Tensor) -> None:
++        """``fill`` of rows lo .. hi (the pad rows left out) into bf16 ``out``'s first rows."""
++
++        hi = min(hi, self.R)
++        if hi > lo:
++            fill(lo, hi, out=out[:hi - lo])
++
+     def _swap_partial(self, j: int) -> None:
+         """Piece j: this rank's partial of the peers' rows out, the peers' partials of this rank's rows in."""
+ 
+@@ -339,7 +351,8 @@ class HcSplit:
+                 for p in self.peers:
+                     lo = p * self.H + off
+                     sends[p] = [self.send16[lo:lo + n]]
+-                    sends[p][0].copy_(b.part[lo:lo + n])
++                    if not self.filled16:
++                        sends[p][0].copy_(b.part[lo:lo + n])
+             else:
+                 sends = {p: [b.part[p * self.H + off:p * self.H + off + n]] for p in self.peers}
+             self.w.comm.exchange_all(sends, {p: [self.got[j][p]] for p in self.peers})
+@@ -417,6 +430,7 @@ class HcSplit:
+         their partials of this rank's rows received (``got``)."""
+ 
+         mine = self.mine()
++        self.filled16 = False
+         if self.stream is None or (self.world > 2 and self.gather):
+             fill(0, self.R)
+             if self.stream is None:
+@@ -432,15 +446,23 @@ class HcSplit:
+             return
+         main = torch.cuda.current_stream()
+         others = [self.theirs()] if self.world == 2 else [p * self.H for p in self.peers]
++        self.filled16 = self.direct16
+         for j, (off, n) in enumerate(self.pieces):
+             for start in others:
+-                self._fill(fill, start + off, start + off + n)
++                if self.filled16:
++                    self._fill16(fill, start + off, start + off + n, self.send16[start + off:start + off + n])
++                else:
++                    self._fill(fill, start + off, start + off + n)
+             self.ev_fill[j].record(main)
+             with torch.cuda.stream(self.stream):
+                 self.stream.wait_event(self.ev_fill[j])
+                 self._swap_partial(j)
+                 self.ev_part[j].record(self.stream)
+-        self._fill(fill, mine, mine + self.H)
++        if self.filled16:
++            for j, (off, n) in enumerate(self.pieces):
++                self._fill16(fill, mine + off, mine + off + n, self.got[j][self.rank])
++        else:
++            self._fill(fill, mine, mine + self.H)
+ 
+     def own(self) -> tuple[int, int]:
+         """This rank's rows of the chunk, [lo, hi) (the pad rows left out)."""
+@@ -465,7 +487,8 @@ class HcSplit:
+                                b.comb[lo:hi], round_parts=self.round)
+         else:
+             block = self.got[j]
+-            block[self.rank].copy_(own)                 # bf16: rounded as the peers rounded theirs
++            if not self.filled16:
++                block[self.rank].copy_(own)             # bf16: rounded as the peers rounded theirs
+             glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi], round_parts=self.round)
+ 
+     def glue_side(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index ced0e68..1027a78 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -1020,6 +1020,16 @@ class MultiDecoder:
+         """The lane's slot's DFlash2 context."""
+         return self.drafts.contexts[lane.slot]
+ 
++    def _prompt_ctx(self, lane: Lane):
++        """The context a prompt chunk's taps go to: TF_GLM_DRAFT_SKIP's window of it (``dflash2_multi.WindowTaps``)
++        over the lane's kept points and its end, else the context."""
++        from . import dflash2_multi
++
++        ctx = self._ctx(lane)
++        if not dflash2_multi.DRAFT_SKIP or not isinstance(ctx, dflash2_multi.DraftContext):
++            return ctx
++        return dflash2_multi.WindowTaps(ctx, [*lane.stops, len(lane.s.prompt)])
++
+     # -- kept prompts ------------------------------------------------------------------------------------------------------
+     def _kept_by_id(self, kid: int):
+         for c in self.kept:
+@@ -1944,12 +1954,12 @@ class MultiDecoder:
+                 out, lane.head = lane.head, None
+             else:
+                 if layers is None:
+-                    out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
++                    out = prefill_chunk(e, prompt, start, stop - start, drafter=self._prompt_ctx(lane) if lane.dflash else None,
+                                         feed=lane.feed, mtp=False, head=stop == n)
+                 else:
+                     complete, out = sliced_fill.advance(self.partial, *layers, len(self.w.layers),
+                         lambda: prefill_chunk_steps(e, prompt, start, stop - start,
+-                            drafter=self._ctx(lane) if lane.dflash else None, feed=lane.feed, head=stop == n),
++                            drafter=self._prompt_ctx(lane) if lane.dflash else None, feed=lane.feed, head=stop == n),
+                         before_finalize=self.partial.layer_event.record)
+                     if not complete:
+                         return None
+@@ -2003,7 +2013,7 @@ class MultiDecoder:
+             if not start < stop <= n or stop - start > e.prefill_rows:
+                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+-                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
++                                              drafter=self._prompt_ctx(lane) if lane.dflash else None, head=stop == n))
+         t = time.perf_counter()
+         if layers is None:
+             heads = multi_prefill.prefill_pieces(e, pieces)
