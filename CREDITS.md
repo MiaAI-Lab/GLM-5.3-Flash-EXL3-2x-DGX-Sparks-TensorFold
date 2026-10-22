@@ -194,11 +194,14 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
 - `0124-glm-prompt-fp8-y16` to `0127-glm-prx-failstop-idle` (the prompt switches of README "Prompt switches of patches
-  0124-0127"): by [mxfp0](https://github.com/mxfp0). In `0126-glm-prompt-ring-exchange` the KDA layers' FP8 handoff
-  (`TF_GLM_PROMPT_HANDOFF8`) and the two-way relay round the ring (`TF_GLM_PRX`) follow the prefill ring of
-  [RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE) (`src/tp4/glm53_prefill_rdma`,
-  Apache 2.0), and the proxy's verbs setup follows b12x's `roce_proxy.c` (above); no code of either is copied beyond
-  the verbs calls' shape.
+  0124-0127"): by [mxfp0](https://github.com/mxfp0), working toward the TP4 prefill of
+  [RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE) by othexmr (Apache 2.0), whose
+  designs the largest gains follow: `TF_GLM_PROMPT_W8` is its dual-path online FP8 for the dense projections
+  (`glm53_dual_fp8_dense.py`), `TF_GLM_PROMPT_HANDOFF8` its KDA FP8 handoff, and `TF_GLM_PRX` its prefill RDMA ring
+  (`src/tp4/glm53_prefill_rdma`: the prompt collectives as RDMA writes round the ring over both PCIe functions of each
+  cable, the all-gather relaying from the receive buffer as `TF_GLM_PRX_RINGAG` does). The four patches were measured
+  on its switchless dual-PF NCCL build. No RiNGSiDE code is copied. The proxy's verbs setup follows b12x's
+  `roce_proxy.c` (above), beyond the verbs calls' shape not copied either.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

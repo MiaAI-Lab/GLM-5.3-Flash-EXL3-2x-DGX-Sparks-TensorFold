@@ -17,9 +17,13 @@
 #   failed RDMA write or a dead peer leaves the GPU waiting on a flag: the host raises at its next exchange call
 #   (patch 0127 bounds this).
 #
-# Provenance and credit: the KDA FP8 handoff and the two-way relay round the ring follow RiNGSiDE's prefill ring
-# (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, Apache License 2.0); prx_proxy.c's verbs setup follows
-# b12x's roce_proxy.c (Apache License 2.0). No code of either is copied beyond the verbs calls' shape.
+# Provenance and credit: RiNGSiDE (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, Apache License 2.0)
+# designed most of this: TF_GLM_PROMPT_HANDOFF8 is its KDA FP8 handoff, and TF_GLM_PRX follows its prefill RDMA ring
+# (src/tp4/glm53_prefill_rdma): the prompt collectives on RDMA writes round the ring instead of NCCL, both directions
+# over both PCIe functions of each cable, and (TF_GLM_PRX_RINGAG) an all-gather that relays the across rank's halves
+# straight from the receive buffer. TF_GLM_PRX_SHARE's second channel and TF_GLM_PRX_ZC's zero-copy partials are ours.
+# prx_proxy.c's verbs setup follows b12x's roce_proxy.c (Apache License 2.0). No code of either is copied beyond the
+# verbs calls' shape.
 
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
 index 070329c..45ccba2 100644

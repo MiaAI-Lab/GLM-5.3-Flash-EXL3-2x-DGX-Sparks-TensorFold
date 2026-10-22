@@ -22,6 +22,11 @@
 # All three are in forward.prompt_arith_code (patch 0107), with TF_GLM_PROMPT_FP8_MIN_ROWS while FP8 or W8 is on:
 # ranks started with different switches refuse to start, and a kept state is never resumed under other switches than
 # made it. Tests (CPU): tests/cpu/test_prompt_arith_identity.py.
+#
+# Provenance and credit: TF_GLM_PROMPT_W8 follows RiNGSiDE's dual-path online FP8 for the dense projections
+# (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/vllm/.../glm53_dual_fp8_dense.py, Apache
+# License 2.0): one per-output-channel e4m3 copy (absmax / 448) and W8A8 with per-token scales at prompt sizes. No code
+# of it is copied. TF_GLM_PROMPT_FP8 runs TensorFold's own prefill_matmul8; TF_GLM_PROMPT_Y16 is ours.
 
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
 index 1fc3089..ae09a0e 100644
