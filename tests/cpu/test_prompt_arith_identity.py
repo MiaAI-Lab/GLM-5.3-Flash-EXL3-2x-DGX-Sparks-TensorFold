@@ -2,7 +2,8 @@
 comparison and in the prompt cache's identity. On CPU, no model:
 
 - the code changes with every choice that changes Flash's prompt bits (TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA,
-  TF_GLM_EXL3_PROMPT, TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED), one int each, and
+  TF_GLM_EXL3_PROMPT, TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED, and patch 0124's
+  TF_GLM_PROMPT_FP8, TF_GLM_PROMPT_W8, TF_GLM_PROMPT_Y16), one int each, and
   not with the ones that leave every bit as it was (TF_GLM_EXL3_PASS / _ORDER / _ROWROT, the
   split's exchange, overlap, own-row front and micro-batches);
 - the startup comparison (``engine.odd_ranks`` on the rows the ranks gather) rejects ranks started with different
@@ -37,13 +38,14 @@ def switch(monkeypatch):
         else:
             module, attr = {"msa": (msa, "ENABLED"), "onepass": (latent, "SPARSE_ONEPASS"),
                             "latent_mma": (latent, "PROMPT_MMA"), "hc_mma": (glue, "HC_MMA"),
-                            "kda": (kda, "CHUNKED")}[name]
+                            "kda": (kda, "CHUNKED"), "fp8": (forward, "PROMPT_FP8"),
+                            "w8": (forward, "PROMPT_W8"), "y16": (forward, "PROMPT_Y16")}[name]
             monkeypatch.setattr(module, attr, on)
         return {}
     return put
 
 
-CHOICES = ["partials", "msa", "exl3", "onepass", "latent_mma", "hc_mma", "kda"]
+CHOICES = ["partials", "msa", "exl3", "onepass", "latent_mma", "hc_mma", "kda", "fp8", "w8", "y16"]
 
 
 def test_code_is_ints_one_a_choice():
@@ -63,6 +65,19 @@ def test_code_changes_with_each_choice(switch, name):
     assert a != b and len(a) == len(b)
     # only that choice's int moved
     assert sum(x != y for x, y in zip(a, b)) == 1
+
+
+def test_fp8_min_rows_counts_only_while_fp8_or_w8_is_on(monkeypatch):
+    base = code()
+    monkeypatch.setattr(forward, "PROMPT_FP8_MIN_ROWS", 512)
+    assert code() == base
+    for flag in ("PROMPT_FP8", "PROMPT_W8"):
+        monkeypatch.setattr(forward, flag, True)
+        at512 = code()
+        monkeypatch.setattr(forward, "PROMPT_FP8_MIN_ROWS", 256)
+        assert code() != at512, flag
+        monkeypatch.setattr(forward, flag, False)
+        monkeypatch.setattr(forward, "PROMPT_FP8_MIN_ROWS", 512)
 
 
 def test_code_ignores_choices_that_keep_every_bit(monkeypatch):
@@ -93,7 +108,7 @@ def test_engine_row_ends_in_the_code_and_names_it():
     src = inspect.getsource(engine.GlmEngine.__init__)
     assert "+ prompt_arith_code(self.split)" in src and "odd = odd_ranks(rows)" in src
     for var in ("TF_GLM_PROMPT_PARTIALS", "TF_GLM_MSA", "TF_GLM_EXL3_PROMPT", "TF_GLM_SPARSE_ONEPASS",
-                "TF_GLM_LATENT_MMA", "TF_GLM_HC_MMA", "TF_GLM_KDA_CHUNKED"):
+                "TF_GLM_LATENT_MMA", "TF_GLM_HC_MMA", "TF_GLM_KDA_CHUNKED", "TF_GLM_PROMPT_FP8"):
         assert var in src, var
     # what the spill tier's folders are keyed on (everything but the window's slots) holds the code at its end
     assert "self.agreed = mine[:1] + mine[2:]" in src

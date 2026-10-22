@@ -1,0 +1,267 @@
+# Faster prompt chunks: three opt-in switches, all off by default. Each gives the prompt other bits than without it;
+# decode keeps its bits. Measured on four Sparks cabled as a ring (2026-10-21).
+#
+# TF_GLM_PROMPT_FP8=1: a prompt chunk's 4-bit dense projections of at least TF_GLM_PROMPT_FP8_MIN_ROWS rows (256) run
+#   on TensorFold's own e4m3 tensor-core kernel, qmm.prefill_matmul8 (rows rounded to e4m3 with a scale each, the
+#   4-bit weights exact); 1.8x the bf16 prefill kernel on one GB10. +7 % prefill on the ring.
+# TF_GLM_PROMPT_W8=1: instead, every 4-bit dense projection also keeps an e4m3 copy of its BF16 checkpoint matrix (a
+#   scale a row, about 1.7 GiB a rank), and those prompt projections run on cuBLASLt's FP8 matmul (torch._scaled_mm,
+#   row-wise scales; fp32 outputs widened from its bf16 result). The same speed as FP8 on the ring today (the chunk
+#   waits on its exchanges), closer to the checkpoint than the 4-bit prompt path: 3.6-3.8 % relative error against
+#   the BF16 matrices on random inputs. Decode keeps the 4-bit weights.
+# TF_GLM_PROMPT_Y16=1: an EXL3 prompt chunk's routed-expert rows are written as bf16 (prompt_down_kernel's store)
+#   and the combine reads bf16: half its traffic. +6.7 % prefill on the ring. The extension builds under its own name
+#   (tensorfold_glm_exl3_v21), so an image without this patch keeps its kernel cache.
+#
+# Drafted replies: with W8 on, drafted replies differ from serial ones ("draft": false) on prompts past ~2K tokens
+# (four Sparks, 2026-10-23; each path gives the same reply cold and resumed). With W8 off and every other switch of
+# 0124-0127 on, they are equal. Likely cause: the 256-row cutoff and cuBLASLt's per-shape kernels give a prompt other
+# bits under other chunkings, and drafted and serial requests chunk a prompt differently. FP8 has the same cutoff and
+# was not checked; HANDOFF8 needs W8.
+#
+# All three are in forward.prompt_arith_code (patch 0107), with TF_GLM_PROMPT_FP8_MIN_ROWS while FP8 or W8 is on:
+# ranks started with different switches refuse to start, and a kept state is never resumed under other switches than
+# made it. Tests (CPU): tests/cpu/test_prompt_arith_identity.py.
+
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 1fc3089..ae09a0e 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -729,7 +729,8 @@ class GlmEngine:
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+                                "TF_GLM_PROMPT_PARTIALS, TF_GLM_EXL3_PROMPT, TF_GLM_SPARSE_ONEPASS, TF_GLM_LATENT_MMA, "
+-                               "TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED, TF_GLM_MSA): "
++                               "TF_GLM_HC_MMA, TF_GLM_KDA_CHUNKED, TF_GLM_PROMPT_FP8 / _W8 / _Y16 / _FP8_MIN_ROWS, "
++                               "TF_GLM_MSA): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/exl3.cpp tensorfold/families/glm5_next/cuda/exl3.cpp
+index 19b09ff..5bdbb55 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -101,7 +101,7 @@ void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, co
+     for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
+     for (auto* t : {&Tg, &Tu, &Td, &items, &counts, &members}) check(*t, at::kInt, "prompt: int32 input");
+     check(xd, at::kHalf, "prompt: xd");
+-    check(y, at::kFloat, "prompt: y");
++    check(y, y.scalar_type() == at::kBFloat16 ? at::kBFloat16 : at::kFloat, "prompt: y");
+     TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
+     TORCH_CHECK(slots > 0, "prompt: slots");
+     if (order.has_value()) check(*order, at::kInt, "prompt: order");
+diff --git tensorfold/families/glm5_next/cuda/exl3.cu tensorfold/families/glm5_next/cuda/exl3.cu
+index c14c1b3..155998e 100644
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -874,11 +874,11 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
+     }  // halves
+ }
+ 
+-template <int PM, int NW>
++template <int PM, int NW, bool Y16>
+ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+     const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
+     const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
+-    float* __restrict__ y, int K, int D, int E, const int* __restrict__ order) {
++    void* __restrict__ y_out, int K, int D, int E, const int* __restrict__ order) {
+     constexpr int MT = 16 / NW, PH = PM / 2;
+     extern __shared__ __align__(16) unsigned char smem_raw[];
+     __shared__ int rows_sh[PM];
+@@ -910,9 +910,17 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
+             fwht128(v, lane);
+             const uint2 sv = *reinterpret_cast<const uint2*>(svh_d + (size_t)e * D + n);
+             const half2 s01 = *reinterpret_cast<const half2*>(&sv.x), s23 = *reinterpret_cast<const half2*>(&sv.y);
+-            *reinterpret_cast<float4*>(y + (size_t)p * D + n) =
+-                make_float4(v[0] * HAD_SCALE * __low2float(s01), v[1] * HAD_SCALE * __high2float(s01),
+-                            v[2] * HAD_SCALE * __low2float(s23), v[3] * HAD_SCALE * __high2float(s23));
++            const float4 o = make_float4(v[0] * HAD_SCALE * __low2float(s01), v[1] * HAD_SCALE * __high2float(s01),
++                                         v[2] * HAD_SCALE * __low2float(s23), v[3] * HAD_SCALE * __high2float(s23));
++            if constexpr (Y16) {
++                const __nv_bfloat162 o01 = __floats2bfloat162_rn(o.x, o.y), o23 = __floats2bfloat162_rn(o.z, o.w);
++                uint2 packed;
++                packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++                packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++                *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(y_out) + (size_t)p * D + n) = packed;
++            } else {
++                *reinterpret_cast<float4*>(reinterpret_cast<float*>(y_out) + (size_t)p * D + n) = o;
++            }
+         }
+     }
+     }  // halves
+@@ -1081,7 +1089,8 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+                              (int)SMEM);
+         cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              (int)SMEM_SHX);
+-        cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
++        cudaFuncSetAttribute(prompt_down_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
++        cudaFuncSetAttribute(prompt_down_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+         return true;
+     }();
+     (void)once;
+@@ -1100,9 +1109,15 @@ static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::
+             h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
+             (float)limit, (int)slots, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+-    prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
+-        reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
+-        members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, order);
++    const dim3 dn_grid((unsigned)(D / 256), (unsigned)max_items);
++    if (y.scalar_type() == at::kBFloat16)
++        prompt_down_kernel<PM, NW, true><<<dn_grid, NW * 32, SMEM, stream>>>(
++            reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
++            members.data_ptr<int>(), h(svh_d), y.data_ptr(), (int)N, (int)D, (int)E, order);
++    else
++        prompt_down_kernel<PM, NW, false><<<dn_grid, NW * 32, SMEM, stream>>>(
++            reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
++            members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, order);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/families/glm5_next/cuda/exl3_mm.py tensorfold/families/glm5_next/cuda/exl3_mm.py
+index bcf616f..6c97fc9 100644
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -87,7 +87,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v20", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v21", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 3775bba..800809a 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import Sequence
+ 
+ import torch
+@@ -118,7 +119,9 @@ class Buffers:
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+         self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
+         exl3 = c.quant == "exl3"
+-        self.ey = torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32, device=dev)
++        # TF_GLM_PROMPT_Y16=1: an EXL3 prompt chunk's routed rows in bf16 too (other bits; half the combine's reads)
++        y16 = prefill and exl3 and PROMPT_Y16
++        self.ey = torch.empty((rows, slots, D), dtype=bf if prefill and (not exl3 or y16) else f32, device=dev)
+         self.exl3 = None
+         prompt = False
+         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
+@@ -433,10 +436,50 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     return out.view(b.world, R, d)
+ 
+ 
++# TF_GLM_PROMPT_FP8=1: a prompt chunk's 4-bit projections of at least TF_GLM_PROMPT_FP8_MIN_ROWS rows on the e4m3
++# tensor-core prefill matmul (activations rounded to e4m3 with a per-row scale, the 4-bit weights exact): other bits
++PROMPT_FP8 = os.environ.get("TF_GLM_PROMPT_FP8", "0") == "1"
++PROMPT_FP8_MIN_ROWS = int(os.environ.get("TF_GLM_PROMPT_FP8_MIN_ROWS", "256"))
++# TF_GLM_PROMPT_W8=1: those projections on cuBLASLt's FP8 matmul with the e4m3 copy of the checkpoint's matrix
++# (qmm.make_dense_q4), the rows rounded to e4m3 with a scale each
++PROMPT_W8 = os.environ.get("TF_GLM_PROMPT_W8", "0") == "1"
++PROMPT_Y16 = os.environ.get("TF_GLM_PROMPT_Y16", "0") == "1"
++
++
++@triton.jit
++def _rows_e4m3(X, Y, S, ldx, K: tl.constexpr, BK: tl.constexpr):
++    r = tl.program_id(0)
++    k = tl.arange(0, BK)
++    x = tl.load(X + r * ldx + k, mask=k < K, other=0.0).to(tl.float32)
++    a = tl.max(tl.abs(x), 0)
++    s = tl.where(a > 0.0, a / 448.0, 1.0)
++    tl.store(Y + r * K + k, (x / s).to(tl.float8e4nv), mask=k < K)
++    tl.store(S + r, s)
++
++
++def _w8_mm(x: torch.Tensor, q, f32: bool, out: torch.Tensor) -> torch.Tensor:
++    m, k = x.shape
++    x8 = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
++    sx = torch.empty((m, 1), dtype=torch.float32, device=x.device)
++    bk = triton.next_power_of_2(k)
++    _rows_e4m3[(m,)](x, x8, sx, x.stride(0), K=k, BK=bk, num_warps=8 if bk >= 4096 else 4)
++    # row-wise scales give bf16 results only: an fp32 output (a partial) is that bf16 result widened
++    if out.dtype == torch.bfloat16 and out.is_contiguous() and out.shape == (m, q.n):
++        torch._scaled_mm(x8, q.w8.t(), scale_a=sx, scale_b=q.w8s, out_dtype=torch.bfloat16, out=out)
++    else:
++        out.copy_(torch._scaled_mm(x8, q.w8.t(), scale_a=sx, scale_b=q.w8s, out_dtype=torch.bfloat16))
++    return out
++
++
+ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
+     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
+ 
+     if b.prefill and isinstance(q, qmm.Q4):
++        if PROMPT_W8 and x.shape[0] >= PROMPT_FP8_MIN_ROWS and getattr(q, "w8", None) is not None \
++                and x.stride(1) == 1:
++            return _w8_mm(x, q, f32, out)
++        if PROMPT_FP8 and x.shape[0] >= PROMPT_FP8_MIN_ROWS and q.gs == 64:
++            return shared.prefill_matmul8(shared.quantize_rows(x, q.gs), q, f32=f32, out=out)
+         return shared.prefill_matmul(x, q, f32=f32, out=out)
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+@@ -895,15 +938,18 @@ def prompt_arith_code(split=None) -> list[int]:
+     routed experts' prompt kernels, not the decode kernels' bits), TF_GLM_SPARSE_ONEPASS (the one-pass sparse attention,
+     not the chunk programs' bits), TF_GLM_LATENT_MMA (the latent projections on the tensor cores, not the decode
+     kernels' bits), TF_GLM_HC_MMA (hc_pre's mixing dots on the tensor cores), TF_GLM_KDA_CHUNKED (KDA's chunked
+-    form). Not in it, because they leave every bit as it was: TF_GLM_EXL3_PASS / _ORDER /
+-    _ROWROT, TF_GLM_PREFILL_OVERLAP, the split's exchange and its microbatches."""
++    form), TF_GLM_PROMPT_FP8 and TF_GLM_PROMPT_W8 (the e4m3 prompt projections; TF_GLM_PROMPT_FP8_MIN_ROWS when on, as
++    it picks the chunks they take, else 0), TF_GLM_PROMPT_Y16 (bf16 routed-expert rows). Not in it, because they leave
++    every bit as it was: TF_GLM_EXL3_PASS / _ORDER / _ROWROT, TF_GLM_PREFILL_OVERLAP, the split's exchange and its
++    microbatches."""
+ 
+     from . import hcsplit
+     from .exl3_mm import prompt_kernels
+ 
+     partials = "fp32" if split is None else split.partials
+     return [hcsplit.PARTIALS.index(partials), int(msa.ENABLED), int(prompt_kernels()), int(latent.SPARSE_ONEPASS),
+-            int(latent.PROMPT_MMA), int(glue.HC_MMA), int(kda_mod.CHUNKED)]
++            int(latent.PROMPT_MMA), int(glue.HC_MMA), int(kda_mod.CHUNKED), PROMPT_FP8_MIN_ROWS if PROMPT_FP8 else 0,
++            PROMPT_FP8_MIN_ROWS if PROMPT_W8 else 0, int(PROMPT_Y16)]
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+diff --git tensorfold/families/glm5_next/cuda/glue.py tensorfold/families/glm5_next/cuda/glue.py
+index 9d36de2..e1c2695 100644
+--- tensorfold/families/glm5_next/cuda/glue.py
++++ tensorfold/families/glm5_next/cuda/glue.py
+@@ -538,7 +538,7 @@ def combine_shared(y: torch.Tensor, sy: torch.Tensor, wts: torch.Tensor, out: to
+     """combine(y with its last slot replaced by sy): y [R, slots, D] (the last slot not read), sy [R, D] fp32."""
+ 
+     rows, d = out.shape
+-    if y.dtype != torch.float32 or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
++    if y.dtype not in (torch.float32, torch.bfloat16) or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
+         raise ValueError("combine_shared: contiguous fp32 expert rows")
+     block = min(1024, d)
+     _combine_sy[(rows, d // block)](y, sy, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 074a507..1403d45 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -242,8 +242,19 @@ def draft_quantize4(w: torch.Tensor, kind: str | None = None) -> Q4:
+     return quantize4_mse(w) if draft_quant(kind) == "mse" else quantize4(w)
+ 
+ 
++PROMPT_W8 = __import__("os").environ.get("TF_GLM_PROMPT_W8", "0") == "1"
++
++
+ def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
+-    return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
++    q = quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
++    if PROMPT_W8 and isinstance(q, Q4) and weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0:
++        # TF_GLM_PROMPT_W8: the prompt matmuls' e4m3 copy of the checkpoint's matrix, a scale per output row
++        w = weight.to(torch.float32)
++        s = (w.abs().amax(1) / 448.0).clamp_min(1e-12)
++        q.w8 = (w / s[:, None]).to(torch.float8_e4m3fn).contiguous()
++        q.w8s = s.view(1, -1).contiguous()
++        del w
++    return q
+ 
+ 
+ def stack_dense_q4(parts: list[torch.Tensor]) -> "Q4 | F8":
