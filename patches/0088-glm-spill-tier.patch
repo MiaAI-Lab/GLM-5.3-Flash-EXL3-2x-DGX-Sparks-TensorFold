@@ -2,7 +2,8 @@
 # every rank and are read back beside decoding streams when a request extends them, also after a clean restart. New
 # tensorfold/cuda/spill.py (no model code), hooks in the one-stream and --parallel paths. With 0072's display span the
 # rows there go to and from disk through a kernel, as 0072's own moves do (CUDA refuses a memcpy across its two
-# registrations); a request 0073 cancels leaves the tier's read bookkeeping too. By @wojo, Apache-2.0.
+# registrations); a request 0073 cancels leaves the tier's read bookkeeping too.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo), Apache-2.0.
 diff --git tensorfold/cli.py tensorfold/cli.py
 index c2e3768..c57336d 100644
 --- tensorfold/cli.py
@@ -142,7 +143,7 @@ index 0000000..c7a8eb8
 +read is used only when it worked on every rank, and at start only entries every rank holds are kept, in rank 0's
 +order.
 +
-+Credits: wojo (Robert Wojciechowski, https://github.com/wojo) wrote this module and its hooks. The idea of NVMe session
++Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo) wrote this module and its hooks. The idea of NVMe session
 +state per rank was proposed in MiaAI-Lab's GLM-5.3-Flash vLLM kit pull request #232, authored by gabewillen (the idea
 +only, no code). The multi-rank design (one directory a rank, rank 0 deciding, an agreement on every read, a reconcile
 +at start) is that of patch 0250 of jayleaton/glm53-tensorfold-spark, authored by Jay Leaton (Apache-2.0). The file
