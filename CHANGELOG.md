@@ -5,6 +5,22 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A `<tool_call>` or `</think>` the reply spells as text stays text** (patch `0123-glm-reply-marker-ids`, by [ahinore](https://github.com/ahinore)):
+  GLM writes its markup as single tokens, but the server read the decoded reply as text.
+  - **What went wrong:**
+    - a `</think>` the model quoted in its reasoning ended the reasoning there;
+    - an example call written as text became a real `tool_calls` entry;
+    - a real call whose argument contains `</arg_value>`, `</tool_call>` or `</think>` was cut.
+  - **The fix:**
+    - each marker token in the reply is recorded with the occurrence of its text it wrote;
+    - every other occurrence is made inert at the same length before the parsers read the reply (`ThinkSplit`, the call hiding and streaming, the end parser, #22's closing), so the parsers are unchanged;
+    - everything the server sends has the text back.
+  - **Scope:** a reply without spelled markup parses as before; `TF_GLM_REPLY_IDS=0` turns it off; other families are unchanged. It is the reply's side of patch 0122's rule and applies with or without it. It ports `TENSORFOLD_REPLY_IDS` from [bertholomus/TensorFold@113a151c](https://github.com/bertholomus/TensorFold/commit/113a151cc69dba111a3bab3f9d6f33cb0dac61c5).
+  - **Measured:** four Sparks with 0122, 10 sampled replies per case, recorded and parsed both ways. The answer was right:
+    - which side of a failing assertion starts with `</think>`: 4 -> 7;
+    - an expected value starting with `<think>`: 9 -> 10;
+    - echo `<think>hello</think> world`: 0 -> 5.
+  - **CPU check:** `tools/reply_ids_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
