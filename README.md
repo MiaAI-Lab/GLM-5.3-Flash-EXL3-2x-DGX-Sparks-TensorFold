@@ -1053,3 +1053,7 @@ expert loads). Patches 0099-0109 are ported from the
   stop at chunk boundaries ([05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b)) that 0109 follows.
 
 The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+
+## Optional TP4 registered relay
+
+`TP4_NETWORK=registered-rdma` opts into registered host memory for ring relay or direct all-peer switched RDMA while preserving the existing default. Switched hardware is unverified; code tests cover route planning and option conflicts. See the [profile, topology support, research evidence and qualification limits](docs/tp4-registered-relay.md).

@@ -398,6 +398,10 @@ detect_links() {
   if (( TP == 2 )); then detect_link; return; fi
   local r i k peer kind a b c d pairs line missing="" names ring="" order=""
   [[ -n "$MASTER_ADDR" ]] || die "no MASTER_ADDR: set it to an address of this node that every worker reaches (its LAN address)"
+  if [[ "${TP4_NETWORK:-upstream}" == registered-rdma && ${#WORKER_DOWN[@]} != 0 ]]; then
+    die "TP4_NETWORK=registered-rdma requires every worker inventory; discovery cannot use unreachable DRY_RUN placeholders"
+  fi
+  FABRIC=mesh
   local -a inv=()
   inv[0]=$(node_inventory)
   for i in $(worker_ids); do
@@ -491,6 +495,14 @@ detect_links() {
     fi
     die "ranks $a and $b share no RoCE subnet: $TP Sparks need a link between every pair (a triangle of direct cables), or four a ring in rank order (on a ring of four no three Sparks are all cabled to each other: ./start-tp4-switchless.sh, or ./start.sh with a neighbour); see README"
   done
+  if [[ "${TP4_NETWORK:-upstream}" == registered-rdma ]]; then
+    local expected_ring=0
+    [[ "$FABRIC" != ring ]] || expected_ring=1
+    [[ -z "${TF_ROCE_RING+set}" || "$TF_ROCE_RING" == "$expected_ring" ]] ||
+      die "TP4_NETWORK=registered-rdma: TF_ROCE_RING=$TF_ROCE_RING conflicts with discovered FABRIC=$FABRIC"
+    [[ "$FABRIC" != mesh ]] ||
+      warn "TP4_NETWORK=registered-rdma on a switched mesh is code-tested only, not hardware-verified; working NCCL is still required for fallback collectives."
+  fi
   return 0
 }
 
@@ -585,7 +597,12 @@ nccl_env_n() {
     ring="-e NCCL_ALGO=${NCCL_ALGO:-Ring} -e TF_GLM_HC_EXCHANGE=gather"
   fi
   # COMM=roce on a ring: each rank's small gathers to its neighbours, relayed by them to the rank across (patch 0099)
-  [[ "$FABRIC" != ring ]] || ring+=" -e TF_ROCE_RING=1"
+  if [[ "${TP4_NETWORK:-upstream}" == registered-rdma ]]; then
+    local roce_ring=0; [[ "$FABRIC" != ring ]] || roce_ring=1
+    ring+=" -e TF_ROCE_RING=$roce_ring"
+  else
+    [[ "$FABRIC" != ring ]] || ring+=" -e TF_ROCE_RING=1"
+  fi
   # the prefix that keeps a port and its PCIe twin apart (pair_links), so each send goes out the device the graph means:
   # NCCL's default puts both in one subnet and sends every channel on the first (measured: twins idle, prompt-sized
   # all-gathers 16.7 GB/s; with the prefix both carry half, 25.6 GB/s, a decode-sized one 94 -> 69 us)

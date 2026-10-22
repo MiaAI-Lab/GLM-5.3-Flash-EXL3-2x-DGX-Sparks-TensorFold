@@ -23,7 +23,7 @@
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
 #            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
-#            MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
+#            MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, TP4_NETWORK, SERVED_NAME, HOST, PORT
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
 #            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks),
 #            WORKER3, FABRIC_PEER3, WORKER_HF_CACHE3 (4 Sparks), NCCL_ALGO (on a ring of 4: Ring)
@@ -47,7 +47,7 @@
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
-source ./scripts/config.sh
+source ./scripts/config.sh --validate-tp4-network
 source ./scripts/nodes.sh
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
@@ -126,13 +126,17 @@ if [[ "$ENGINE" == zig ]]; then
     warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, COMM=$COMM)"
   fi
   if (( TP == 4 )); then
-    # four Sparks cabled as a ring (./start-tp4-switchless.sh): unsplit prefill over NCCL, whose ring channels run over
-    # the cables (the ring's graph files); the kernel set holds the TP=4 shapes (16 heads a rank), captured from the
-    # Python engine at TP=4 on a ring. A switch (./start-tp4.sh) is not tested, and the RoCE ring relay is not ported.
-    [[ "${FABRIC_EXPECT:-}" == ring ]] || die "ENGINE=zig at TP=4 runs on a ring of four (./start-tp4-switchless.sh)"
+    # The default path retains the captured ring/NCCL recipe. Registered RDMA
+    # opts into discovery of either the physical ring or a switched mesh.
     [[ "$SPLIT" == 0 ]] || die "ENGINE=zig at TP=4 needs SPLIT=0 (split prefill is two ranks)"
-    [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl (the RoCE ring relay, TF_ROCE_RING, is not ported)"
-    warn "ENGINE=zig: TP=4 is experimental (a ring of four, unsplit prefill, COMM=nccl)"
+    if [[ "$TP4_NETWORK" == upstream ]]; then
+      [[ "${FABRIC_EXPECT:-}" == ring ]] || die "ENGINE=zig at TP=4 runs on a ring of four (./start-tp4-switchless.sh); switched RDMA requires TP4_NETWORK=registered-rdma"
+      [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl unless TP4_NETWORK=registered-rdma"
+    else
+      [[ "$COMM" == roce ]] || die "TP4_NETWORK=registered-rdma requires COMM=roce"
+      warn "TP4_NETWORK=registered-rdma requires a known-working NCCL library for fallback collectives. The tested dual-PCI-domain fleet used separately patched NCCL 2.30.7; version alone cannot establish compatibility. This flag does not install that library."
+    fi
+    warn "ENGINE=zig: TP=4 is experimental (unsplit prefill, COMM=$COMM, TP4_NETWORK=$TP4_NETWORK)"
   fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
     warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
@@ -373,7 +377,7 @@ fi
 zig_env() {
   local v l2=1 name
   [[ "$TF_GLM_L2PF" =~ ^(0|off)$ ]] && l2=0
-  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -v '^TF_GLM_L2PF=' || true)
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -Ev "$_skip" | grep -v '^TF_GLM_L2PF=' || true)
   ENV_ARGS+=(-e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_GLM_L2PF=$l2")
   ENV_ARGS+=(-e "DRAFTER=$DRAFTER")   # the Zig engine's drafter choice (dflash2 | mtp), the same on every rank
   for v in TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S; do
@@ -384,13 +388,14 @@ env_args() {
   local _skip='^$' name
   ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
+  [[ "$TP4_NETWORK" != registered-rdma ]] || _skip='^TF_ROCE_(HCA|RING)='
   if [[ "$ENGINE" == zig ]]; then
     # the Zig engine reads few of them (docs/zig-engine.md): the settings it maps, then any TENSORFOLD_ / TF_ variable you
     # set yourself that it reads, by name; the Python engine's own switches (TF_GLM_*) stay out of its environment
     zig_env
     return
   fi
-  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -Ev "$_skip" || true)
 }
 env_args
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK

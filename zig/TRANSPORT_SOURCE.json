@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "recipe_base_commit": "a6c7e08ae864239125d45fc15146d26ec74c7f6d",
+  "tensorfold_base_commit": "e7c523ebfa16b8094cf9e35e3773a7d25befcc5b",
+  "reconstructed_recipe_baseline_commit": "a628d29e4076e470f25fe40d65c1548f9f6cbfba",
+  "focused_native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+  "patch": "zig/patches/0014-zig-glm-tp4-registered-relay.patch",
+  "patch_sha256": "46111e72fa8432f5477a935a326ab4d8c7122cb7e3d4b29998e5791bb4d6dab2",
+  "patch_scope": "Native zig source only; documentation is maintained in this recipe. Existing upstream executable modes are preserved.",
+  "result_file_sha256": {
+    "zig/build/cuda.zig": "611c0dd313218194d9923334fa2d02cb92db3fb3c0cb09dd8b46f0caff94144e",
+    "zig/src/cuda/roce.zig": "0a070e4e1b387a43fc433ba5700d533b9ee7572a37a832b5d937c7b7ea3a0d8c",
+    "zig/src/cuda/roce_proxy.c": "ed643a446321cfb21fe1cef3a4689b934b3dcfe3574fac1d3ee4e0306f85bde8",
+    "zig/src/cuda/roce_region.zig": "2e8ec426b99c225b7ae7208b8fdd26f00a7fe0106d7bfee696a8db277c890ce3",
+    "zig/src/families/glm_cuda/cuda.zig": "a71f36a1caee448bac97f7db2b501b8831eacfc4762b2d8cbce9e98361b468f6",
+    "zig/src/families/glm_cuda/cuda_comm.zig": "0b3c6707a705bf249ea304094157de2e542288a4a3997af0152bb53542df2bea",
+    "zig/src/families/glm_cuda/cuda_engine.zig": "cc31641fe0a4bc922a407d09979ace9f127d9c6144f10703746574a96bb070fa",
+    "zig/src/families/glm_cuda/cuda_native.zig": "229ac81302c841ab8ca4ddaf7a8bba345bce70f9b75647eacce25749eacf5ecc",
+    "zig/src/families/glm_cuda/cuda_sampler.zig": "f933eff6ad1fd6f5ba80ff54881f42d91f0877fb198d823c64795c4c56569f82",
+    "zig/tests/cuda/glm_transport_probe.zig": "a53bac9a43f487b5465fb4b57ee1920762eb0fb4d78deb4f843c8be949ef36e0"
+  },
+  "prior_patches_sha256": {
+    "zig/patches/0001-zig-shared-engine.patch": "923402e1ec409e43c2d31b59df64559a216b894dc3dfa11eb5f0cc6373f35222",
+    "zig/patches/0002-zig-flashnext-cuda.patch": "3220b61b295745446421e7c7bc5a0146c3c1dcfa653af4afbcd6df6caf770ffb",
+    "zig/patches/0003-zig-glm-kernels.patch": "b6fd1d791dbca19e428186a840ba3973ba0b1d045f30098ade0245b163e78ff2",
+    "zig/patches/0004-zig-glm-engine.patch": "685054c5237f5348f7734a151c86f0073df3e8d1ebbab51c6b122f166763247c",
+    "zig/patches/0005-zig-glm-tests.patch": "9d0e969f4535ab5681ab3ca30945b7ef3ba99fc8a21fa6c250b1b4adf7d4401e",
+    "zig/patches/0006-zig-glm-scores-rows-g128.patch": "b426d1a5cd9009a33abb9dfbc4c3f5d357a47be53b34a51145870d6c65852c51",
+    "zig/patches/0007-zig-flashnext-record-before-long-batch.patch": "f1a7198f4a52c8eff35d75c1119912d5beb18b69b8eb067f1b7c490ec641333f",
+    "zig/patches/0008-zig-aot-log-missing-variant.patch": "cecf342ffbb6453640c5e1e16f5191988df120fe557d39fb9bf70480b1d1136b",
+    "zig/patches/0009-zig-glm-tpn-pool.patch": "33097fb37b714737c327d398e635bf8675bc499f824e2ae02b668dbff2caa4bb",
+    "zig/patches/0010-zig-glm-tpn-roce-probe.patch": "3b50eb61406891aa93ee0dda45f1b522ed5acb912eaa9005b98514133cf061b9",
+    "zig/patches/0011-zig-glm-greedy-draft-probs.patch": "82a65c4b5fdeed13c5ca183c760a72ca0fe5c80de736195ad3340d02734c672b",
+    "zig/patches/0012-zig-glm-cache-reserve.patch": "ff94367831b8c401ea35fdad3ebe2141da9646242a2ecb22dba576c6f71e3432",
+    "zig/patches/0013-zig-glm-round-batching.patch": "7be776fa76a73d9159d867f4e75f62653a35c749925c18cf94c57311e1eb8f96"
+  },
+  "attribution": {
+    "author": "BertholomusAI (Albert Lee)",
+    "repository": "https://github.com/bertholomus/TensorFold",
+    "revision": "b8b115e7ed6c86d81b7575caa6f3d4ade52b323c",
+    "approach": "Anonymous host memory registered with portable/mapped CUDA HostRegister; memory ownership adapted from the credited DeepSeek RDMA work."
+  },
+  "validation_limits": [
+    "49 actual host tests and ARM64 semantic compile passed for this source",
+    "Real NVCC13.0.88 SM121 engine/probe build and embedded-byte proof passed; four-host CPU artifact equality passed",
+    "Four-host two-rail-per-neighbor ring GPU probes, matched NCCL/registered/eager fixtures and final acceptance/LAN audits passed for be94; Grill comparison recorded: registered RDMA improved over the matched NCCL control; see docs/tp4-rdma-focused",
+    "Switched/direct hardware unverified; CPU route planning tests only",
+    "Registered RDMA does not install a new NCCL or fabric configuration"
+  ],
+  "known_reconstruction_mode_differences": {
+    "tools/zig/test_fabric.sh": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    },
+    "tools/zig/test_lanes.sh": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    },
+    "tools/zig/triton_aot_manifest.py": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    },
+    "zig/tests/cuda/nemotron/test_aot_manifest.py": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    },
+    "zig/tests/server/build.sh": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    },
+    "zig/tests/server/zig_test.sh": {
+      "frozen_native": "100644",
+      "recipe_reconstruction": "100755"
+    }
+  },
+  "reconstruction_verification": {
+    "source_files_compared": 2889,
+    "all_source_file_bytes_equal": true,
+    "intentional_document_omission": "GLM_TP4_REGISTERED_RDMA.md",
+    "native_host_tests_passed": 49,
+    "host_probe_build": "passed",
+    "mode_comparison": "Exactly the six known differences above; upstream executable modes preserved",
+    "command": "python3 tests/verify_tp4_native_patch.py --upstream-repo <pinned-TensorFold-checkout> --native-repo <focused-native-checkout> --zig <Zig-0.17.0>",
+    "file_sha256_inventory_digest": "e97a7687b164a35b5322ca4528c1d44a5b4b04999c222c4bb83d16813e452bd9"
+  }
+}

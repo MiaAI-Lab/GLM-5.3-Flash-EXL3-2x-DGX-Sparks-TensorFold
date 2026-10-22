@@ -17,7 +17,7 @@
 # the captured kernel set zig/aot; docs/zig-engine.md), and step 5 reads the checkpoint with tensorfold-native.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."     # the repository root
-source ./scripts/config.sh
+source ./scripts/config.sh --validate-tp4-network
 source ./scripts/nodes.sh
 
 REBUILD=0
