@@ -711,6 +711,55 @@ choices refuse to start and a state is never resumed under other arithmetic. The
 checked bit for bit against the unsplit path at two, three and four ranks on CPU and, with real CUDA streams, on one
 GPU (`scripts/test-gpu.sh`). **Three Sparks and a switch: not tested on hardware**, only those tests at three ranks.
 
+### Prompt switches of patches 0124-0127
+
+Patches 0124-0127 add more prompt switches, all off by default. The largest gains follow designs of
+[RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE)'s TP4 prefill: the FP8 copies of
+the dense projections (`TF_GLM_PROMPT_W8`), the KDA FP8 handoff (`TF_GLM_PROMPT_HANDOFF8`) and the prefill RDMA ring
+(`TF_GLM_PRX`, with its relaying all-gather `_RINGAG`). Others build on TensorFold, b12x's RoCEnante and this kit's
+earlier patches; [`CREDITS.md`](CREDITS.md) has who did what. Each was measured
+on four Sparks cabled as a ring
+(2026-10-21), one patch after the other, through a router, as client prompt tokens a second at 8k / 32k / 64k:
+
+| Step | Switches turned on | Prefill 8k / 32k / 64k (tok/s) | Replies |
+| --- | --- | --- | --- |
+| before | (`TF_GLM_PROMPT_PARTIALS=bf16`, `TF_GLM_MSA=1`) | 2,303 / 2,359 / 2,371 | |
+| 0124 | `TF_GLM_PROMPT_W8`, `TF_GLM_PROMPT_Y16` | 3,220 / 3,389 / 3,388 (with 8,192-row chunks and `NCCL_CHANNELS=2`) | other prompt bits: GSM8K 96% (97% before, 99 of 100 answers equal), needles at 32k and 100k found |
+| 0125 | `TF_GLM_DRAFT_SKIP`, `TF_GLM_PARTIAL16` | 3,387 / 3,590 / 3,596 (3,191 / 3,367 / 3,367 before, re-measured) | the same (five greedy prompts of 5k-13k tokens) |
+| 0126 | `TF_GLM_PROMPT_HANDOFF8`, `TF_GLM_PRX`, `_SHARE`, `_RINGAG`, `_ZC` | 4,028 / 4,340 / 4,335 (a second run 3,971 / 4,221 / 4,266); 128k / 256k 4,252 / 4,058 | the same; GSM8K 97%, both needles found |
+| 0127 | (none: prx's failures end, an idle proxy sleeps) | 4,041 / 4,307 / 4,314 | the same |
+
+That ring ran more than this branch's defaults: NCCL 2.30.7 with RiNGSiDE's switchless dual-PF patches (loaded through
+`TF_NCCL_LIB`), whose ring exchange links used both PCIe functions of each port, `TF_GLM_PREFILL_ROWS=8192`,
+`NCCL_CHANNELS=2` and `KV_POOL_GIB=28` (the larger prompt buffers and W8's copies took ~6 GiB a rank). The steps'
+gains on the stock NCCL of this branch are not measured.
+
+| Setting | What it does | Needs | Bits |
+| --- | --- | --- | --- |
+| `TF_GLM_PROMPT_W8` | a prompt chunk's 4-bit dense projections of at least `TF_GLM_PROMPT_FP8_MIN_ROWS` rows (256) on cuBLASLt's FP8 matmul against an e4m3 copy of the BF16 checkpoint matrix, a scale a row (3.6-3.8% relative error against BF16, closer than the 4-bit path); decode keeps the 4-bit weights | ~1.7 GiB a rank for the copies, which rank 0's startup estimate does not count: leave room in `KV_POOL_GIB` | other prompt bits; **drafted replies differ from serial ones** past ~2K tokens (below) |
+| `TF_GLM_PROMPT_FP8` | the same projections on TensorFold's e4m3 tensor-core prefill matmul against the 4-bit weights (rows rounded to e4m3, the weights exact); 1.8x the bf16 prefill kernel on one GB10, the same prefill as W8 on the ring | | other prompt bits; drafted against serial not checked (W8's 256-row cutoff) |
+| `TF_GLM_PROMPT_Y16` | an EXL3 prompt chunk's routed-expert rows written and combined as bf16: half the combine's traffic | | other prompt bits |
+| `TF_GLM_DRAFT_SKIP` | a prompt's DFlash2 taps committed only within reach of where the drafter's 2,176-row context reads them (the prompt's end and its kept points) | | the same |
+| `TF_GLM_PARTIAL16` | with bf16 partials past two ranks, the attention output projections and the MoE combine write straight into the bf16 send staging | `TF_GLM_PROMPT_PARTIALS=bf16`, `SPLIT=1` | the same (as bf16 partials) |
+| `TF_GLM_PROMPT_HANDOFF8` | before a KDA layer, a micro-batched chunk swaps its normed rows as e4m3 with their scales, half the bytes | `TF_GLM_PROMPT_W8` | the same |
+| `TF_GLM_PRX` | the row split's exchanges RDMA-written by the NICs alone: the copy engines stage each peer's bytes in pinned memory, a proxy thread a channel writes them to both neighbours over both PCIe functions of each cable, the neighbours relay the across rank's halves, the GPU waits with stream memory operations; no NCCL kernel, no SM | four Sparks cabled as a ring (`TF_NCCL_RING=1`), a RoCE v2 IPv4 GID on each of a rank's first four `NCCL_IB_HCA` devices (or `TF_GLM_PRX_HCA`); ~770 MiB of pinned host memory a rank | the same (a transport) |
+| `TF_GLM_PRX_SHARE` / `_RINGAG` / `_ZC` | with `TF_GLM_PRX`: a second channel for the DSA layers' own-row shares; an all-gather's across halves relayed from the neighbour's block (3 blocks on the wire a rank, not 4); the partials written into the send slots and summed where they land | `TF_GLM_PRX` | the same |
+
+With `TF_GLM_PRX`, a failed RDMA write, a dead neighbour (its heartbeat still for `TF_GLM_PRX_PEER_S`, 10 s) or no
+progress for `TF_GLM_PRX_TIMEOUT_S` (300 s) while calls are outstanding fails the exchange round the ring: the GPU
+waits are released, the next call and the samplers raise before a token reaches a client, and the process exits
+(code 70) `TF_GLM_PRX_EXIT_S` (10 s) later so `FOREGROUND` or a router restarts it (patch 0127). An idle proxy sleeps
+after `TF_GLM_PRX_IDLE_MS` (20 ms) instead of polling a core. `/health` shows each channel's calls, longest wait and
+failure. `TF_GLM_PROMPT_W8`, `_FP8` (with `_FP8_MIN_ROWS`) and `_Y16` are in patch 0107's identity.
+
+**`TF_GLM_PROMPT_W8` breaks drafted = serial.** With it on, a drafted reply to a prompt past ~2K tokens differs from
+the same request with `"draft": false` (temperature 0, a fixed seed; four Sparks, 2026-10-23). Each path is
+reproducible: cold and resumed give the same reply, and quality held (GSM8K 96%, needles found). With W8 off and
+every other switch above on, drafted replies equal serial ones at 4k and 12k tokens. The likely cause is that W8's
+256-row cutoff and cuBLASLt's per-shape kernels give a prompt other bits under other chunkings, and drafted and serial
+requests chunk a prompt differently (prompt chunks of 1,024 rows while others decode). `TF_GLM_PROMPT_FP8` has the
+same cutoff and was not checked; `TF_GLM_PROMPT_HANDOFF8` needs W8.
+
 ## Configuration
 
 Every setting lives in [`scripts/config.sh`](scripts/config.sh). Set one for a single run from the environment
@@ -753,6 +802,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `TF_GLM_MSA` / `TF_GLM_SIDE` | `0` / `0` (`TF_GLM_SIDE=1` at `TP=4`) | `msa.cu` for the prompt's sparse attention, other bits (patch 0101); the MoE's shared expert on a decode side stream (patch 0105) |
 | `TF_NCCL_RING_INPLACE` | `1` | with `TF_NCCL_RING=1` (a ring): the exchange's link all-gathers in place (patch 0106); `0`: 0098's steps |
 | `TF_GLM_PROMPT_STOP` | `1` | a prompt whose client left stops at its next chunk (patch 0109); `0`: off |
+| `TF_GLM_PROMPT_W8` / `_FP8` / `_Y16`, `TF_GLM_DRAFT_SKIP`, `TF_GLM_PARTIAL16`, `TF_GLM_PROMPT_HANDOFF8`, `TF_GLM_PRX` / `_SHARE` / `_RINGAG` / `_ZC` | `0` | faster prompt chunks (patches 0124-0127); W8, FP8 and Y16 change the prompt's bits, the rest keep them; with W8 drafted replies differ from serial ones. [Prompt switches of patches 0124-0127](#prompt-switches-of-patches-0124-0127) |
 | `SPLIT` | `1` | prompt chunks' hyper-connection work split between the Sparks, its exchanges overlapped with the next rows' work; when a rank's first NCCL connection fails with it (NCCL error 2, issue #36), `start.sh` tries once more, then starts with `SPLIT=0` and says so |
 | `KDA_CHUNKED` | `1` | KDA prompt chunks in chunked (WY) form, one CUDA kernel |
 | `TF_GLM_L2PF` | `1` | L2 prefetch in decode: the weights the next kernels read brought into L2 during each layer's all-gathers; `0`: off |
@@ -886,6 +936,8 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Prompt, 2-4 Sparks | `0101-glm-prompt-attention-msa`, `0102-glm-prompt-own-front`, `0104-glm-prompt-microbatch` | the prompt sparse attention's 16-head tile on 4 warps, and `msa.cu` (`TF_GLM_MSA`, off); the DSA front on own rows (`TF_GLM_PROMPT_OWN_FRONT`, on at four Sparks); two micro-batches a chunk (`TF_GLM_PROMPT_MICROBATCH`, on at four Sparks) | four Sparks: prefill +12-19% with the side stream ([4 Sparks](#4-sparks-experimental)); kernels on one GB10: [Prompt and decode switches](#prompt-and-decode-switches-for-two-to-four-sparks); the same bits except `msa.cu` |
 | Decode, side stream | `0105-glm-decode-side-stream` | the MoE's shared expert on a second stream in decode windows (`TF_GLM_SIDE`, on at four Sparks) | one MoE layer 281 -> 263 us at one row (two Sparks' shapes); the same bits |
 | Prompt, partials and identity | `0106-glm-prompt-exchange-bf16`, `0107-glm-prompt-arith-identity` | the split's partials as bf16 (`TF_GLM_PROMPT_PARTIALS=bf16`, off) and the ring exchange's in-place link all-gathers (`TF_NCCL_RING_INPLACE`, on); the prompt kernels' choices in the ranks' startup comparison and the kept states' identity | not measured on the Sparks yet; fp32 and the exchange keep the bits |
+| Prompt, e4m3 and bf16 | `0124-glm-prompt-fp8-y16`, `0125-glm-prompt-draft-skip-partial16` | e4m3 prompt projections (`TF_GLM_PROMPT_W8`, `TF_GLM_PROMPT_FP8`), bf16 routed-expert rows (`TF_GLM_PROMPT_Y16`), DFlash2 taps only where they are read (`TF_GLM_DRAFT_SKIP`), bf16 partials written straight into the send staging (`TF_GLM_PARTIAL16`); all off | four Sparks, a ring: prefill +7% (W8 or FP8), +6.7% (Y16), then +6-7% (0125); W8, FP8 and Y16 change the prompt's bits; with W8 drafted replies differ from serial ones past ~2K tokens |
+| Prompt, ring exchange | `0126-glm-prompt-ring-exchange`, `0127-glm-prx-failstop-idle` | the KDA layers' input rows swapped as e4m3 (`TF_GLM_PROMPT_HANDOFF8`); the row split's exchanges moved by the NICs and a proxy thread, no NCCL kernel (`TF_GLM_PRX` and `_SHARE` / `_RINGAG` / `_ZC`); its failures end in bounded time, its proxies sleep when idle; all off | four Sparks, a ring: prefill +17-21% (4,028 / 4,340 / 4,335 tok/s at 8k / 32k / 64k); the same bits |
 | Scheduling | `0109-glm-prompt-stop` | a prompt whose client left stops at its next chunk (`TF_GLM_PROMPT_STOP`, on) | not measured on the Sparks yet; the same replies |
 | Eight requests at once | `0069-glm-eight-streams` | up to 8 concurrent requests (`PARALLEL` 1 to 8): the batched verify window's segment tables (and the segmented kernels' launch grids) sized for the streams, four as before up to four; the multi-stream DFlash2 drafter, scheduler and memory estimate for 5 to 8 streams; the shared verify window's rows set by `TF_GLM_MULTI_WINDOW` (32 as before; 64 by default past 4 requests) and counted at start | 8 at once: +27% prose, +32% code over 4 on two Sparks (+36% / +28% on three); `PARALLEL` 1 to 4 unchanged ([Performance](#performance)) |
 | Serial stop | `0070-glm-serial-stop` | at `PARALLEL=1`, a request whose client left, or that hit a stop string or a gate cut, ends on both ranks after the same round (rank 0's stop rides on the round's sample all-gather; issue #38); `--parallel` above 1 without DFlash2 refused at start with the options | same replies |
@@ -949,7 +1001,7 @@ close to the serial kernel but not its bits.
 
 The CPU tests (`scripts/test-cpu.sh`: Triton's interpreter, 2 / 3 / 4 ranks over gloo) and GPU tests
 (`scripts/test-gpu.sh`: one Spark's GPU, `TEST_GPU_GIB` caps their memory, not while the server runs there) in `tests/`
-check patches 0098-0109 without a server.
+check patches 0098-0109 and 0124's identity without a server.
 
 The checks in `tools/` talk to the running server (`API_URL`, default `http://127.0.0.1:8888`; or just `PORT`),
 from the head or another machine (`API_URL=http://<head-address>:8888 tools/needle.py`). Performance is measured

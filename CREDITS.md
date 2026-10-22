@@ -193,6 +193,27 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `0124-glm-prompt-fp8-y16` to `0127-glm-prx-failstop-idle` (README "Prompt switches of patches 0124-0127"): by
+  [mxfp0](https://github.com/mxfp0), working toward the TP4 prefill of
+  [RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE) by othexmr (Apache 2.0), whose
+  designs the largest gains follow. No code of RiNGSiDE or b12x is copied; each patch's header has the details.
+  - From RiNGSiDE: `TF_GLM_PROMPT_W8` (its dual-path online FP8 for the dense projections, `glm53_dual_fp8_dense.py`),
+    `TF_GLM_PROMPT_HANDOFF8` (its KDA FP8 handoff), and in `TF_GLM_PRX` the prompt collectives as RDMA writes both ways
+    round the ring over both PCIe functions of each cable, `TF_GLM_PRX_RINGAG`'s all-gather relayed from the receive
+    buffer (`src/tp4/glm53_prefill_rdma`), and 0127's watchdog that ends the process for a supervisor (300 s,
+    `GLM53_PRB_TIMEOUT_S`) and idle naps. The four patches were measured on its switchless dual-PF NCCL build.
+  - From b12x's RoCEnante (by Jason Cook, [b12x #295](https://github.com/local-inference-lab/b12x/pull/295); this
+    kit's `0006`): `TF_GLM_PRX`'s pinned region, proxy thread, per-HCA stripes with a flag after each, and its verbs
+    setup.
+  - From TensorFold: `TF_GLM_PROMPT_FP8` is its `--prefill-fp8` path (Qwen3.5) applied to GLM; `TF_GLM_PROMPT_Y16`
+    extends its bf16 routed-expert prompt rows to EXL3; `TF_GLM_DRAFT_SKIP` follows its window-trimmed drafter taps
+    (DeepSeek-V4, the MLX DFlash proposer, Qwen3.5).
+  - From this kit: `TF_GLM_PARTIAL16` builds on `0106`'s bf16 partials; the relay of the across rank's halves is
+    `0098` / `0099`'s too; `0002`'s e4m3 dense weights came before W8's copies.
+  - Ours: the 256-row cutoff; the fills writing straight into the send staging (`TF_GLM_PARTIAL16`, `TF_GLM_PRX_ZC`);
+    `TF_GLM_PRX`'s copy-engine staging, waits as stream memory operations, RDMA-written credits and all-to-all of row
+    blocks; `TF_GLM_PRX_SHARE`; 0127's heartbeats, abort round the ring, held wait words, futex sleep, samplers'
+    check, `/health` figures and `TF_GLM_PRX_FAULT`.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see

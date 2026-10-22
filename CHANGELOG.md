@@ -89,6 +89,28 @@ a switch.
 - **Tests** (`tests/`, new): `scripts/test-cpu.sh` (Triton's interpreter, 2 / 3 / 4 ranks over gloo) and
   `scripts/test-gpu.sh` (one GPU; `TEST_GPU_GIB` caps its memory); `tools/make-patches.sh` writes `patches/` from a
   development tree with a commit a patch and checks that they rebuild it.
+- **Patch `0124-glm-prompt-fp8-y16`** (all off): a prompt chunk's 4-bit dense projections on cuBLASLt's FP8 matmul
+  against e4m3 copies of the BF16 checkpoint matrices (`TF_GLM_PROMPT_W8`, ~1.7 GiB a rank; after RiNGSiDE's
+  dual-path online FP8 for the dense projections) or on TensorFold's e4m3 prefill matmul (`TF_GLM_PROMPT_FP8`), from
+  `TF_GLM_PROMPT_FP8_MIN_ROWS` (256) rows; an EXL3 prompt chunk's routed-expert rows as bf16 (`TF_GLM_PROMPT_Y16`). Other prompt bits, so all three are in 0107's identity. Four
+  Sparks, a ring: prefill +7% (W8) and +6.7% (Y16); GSM8K 96% against 97% (99 of 100 answers equal), needles found.
+  With W8 on, drafted replies differ from serial ones on prompts past ~2K tokens (README "Prompt switches of patches
+  0124-0127"); with Y16 and 0125-0127's switches they stay equal.
+- **Patch `0125-glm-prompt-draft-skip-partial16`** (both off, the same bits): DFlash2 takes a prompt's taps only within
+  reach of where its context reads them (`TF_GLM_DRAFT_SKIP`, +1.5-2%); with bf16 partials, the attention projections
+  and the MoE combine write straight into the send staging (`TF_GLM_PARTIAL16`, +5%). Four Sparks, a ring: prefill
+  8k / 32k / 64k 3,191 / 3,367 / 3,367 -> 3,387 / 3,590 / 3,596 tok/s.
+- **Patch `0126-glm-prompt-ring-exchange`** (all off, the same bits): the KDA layers' input rows swapped as e4m3
+  (`TF_GLM_PROMPT_HANDOFF8`, with W8; after RiNGSiDE's KDA FP8 handoff); on four Sparks cabled as a ring, the row
+  split's exchanges RDMA-written by a proxy thread over both PCIe functions of each cable, with no NCCL kernel or SM
+  (`TF_GLM_PRX`, and `_SHARE` / `_RINGAG` / `_ZC`; after RiNGSiDE's prefill RDMA ring, its proxy after b12x's
+  RoCEnante). Prefill 8k / 32k / 64k 3,387 / 3,590 / 3,596 -> 4,028 / 4,340 / 4,335 tok/s; GSM8K 97%, needles found.
+- **Patch `0127-glm-prx-failstop-idle`**: `TF_GLM_PRX`'s failures (a failed write, a neighbour's heartbeat still for
+  `TF_GLM_PRX_PEER_S`, no progress for `TF_GLM_PRX_TIMEOUT_S`) go round the ring, release the GPU's waits, raise
+  before a token reaches a client and end the process after `TF_GLM_PRX_EXIT_S`; an idle proxy sleeps after
+  `TF_GLM_PRX_IDLE_MS` instead of holding a core. Prefill unchanged (4,041 / 4,307 / 4,314 tok/s).
+  The four patches' numbers come from a ring that also ran RiNGSiDE's switchless NCCL, 8,192-row chunks and
+  `NCCL_CHANNELS=2` (README "Prompt switches of patches 0124-0127").
 
 ### Changed
 - `./start-tp4-switchless.sh` defaults to `COMM=roce` (patch 0099: the small all-gathers to the neighbours, relayed
