@@ -65,6 +65,23 @@ case_() {
   else fails=$((fails + 1)); printf 'FAIL %s (exit %s, wanted %s)\n%s\n' "$name" "$got" "$want" "$(sed 's/^/     /' <<<"$out")"; fi
 }
 
+# ---- spill v2's identity (port_spill_identity): the engine refuses SPILL_V2=1 without it
+ID_STUBS='image_hash() { echo 0123456789ab; }; _cfg_root=$tmp/root; mkdir -p "$tmp/root/zig/patches"; printf x > "$tmp/root/zig/patches/0014-a.patch"
+  ZIG_TF_REF=e7c523ebfa16b8094cf9e35e3773a7d25befcc5b MODEL_ID=m/glm MODEL_REVISION=078455ff DFLASH2_ID=d/df DFLASH2_REVISION=bf582e4e'
+case_ "identity: SPILL_V2=1 passes the engine, series, model and drafter on every rank" 0 "tmp=$tmp; $ID_STUBS"' SPILL_GIB=64 PROMPT_CACHE_GIB=8 SPILL_V2=1 ZIG_HAS="$ALL_HAS"' '
+  port_validate 8 8; port_map; port_spill_identity
+  expect "${PORT_ID_ENV[*]}" "TF_GLM_ENGINE_ID=tensorfold-e7c523ebfa16+0123456789ab TF_GLM_RECIPE_PATCHES=sha256:$(printf x | sha256sum | cut -c1-16) TF_GLM_MODEL_ID=m/glm TF_GLM_MODEL_REVISION=078455ff TF_GLM_DFLASH2_ID=d/df TF_GLM_DFLASH2_REVISION=bf582e4e"
+  [[ "TF_GLM_ENGINE_ID" =~ ^($PORT_MAPPED_RE)$ ]] || { echo "TF_GLM_ENGINE_ID not in PORT_MAPPED_RE"; exit 1; }'
+case_ "identity: none with v1, with the spill off, or with the Python engine" 0 "tmp=$tmp; $ID_STUBS"' ZIG_HAS="$ALL_HAS"' '
+  SPILL_GIB=64 PROMPT_CACHE_GIB=8 SPILL_V2=0; port_validate 8 8; port_map; port_spill_identity; expect "${#PORT_ID_ENV[@]}" 0
+  SPILL_GIB=0 SPILL_V2=1; port_map; port_spill_identity; expect "${#PORT_ID_ENV[@]}" 0
+  ENGINE=python SPILL_GIB=64 SPILL_V2=1; port_spill_identity; expect "${#PORT_ID_ENV[@]}" 0'
+case_ "identity: SPILL_V2=1 refuses an unpinned checkpoint or drafter" 0 "tmp=$tmp; $ID_STUBS"' SPILL_GIB=64 PROMPT_CACHE_GIB=8 SPILL_V2=1 ZIG_HAS="$ALL_HAS"' '
+  port_validate 8 8; port_map
+  MODEL_REVISION= expect_die "pinned MODEL_REVISION" port_spill_identity
+  DFLASH2_REVISION= expect_die "pinned DFLASH2_REVISION" port_spill_identity
+  DRAFTER=mtp DFLASH2_REVISION= port_spill_identity'
+
 # ---- the defaults: everything off
 case_ "defaults: everything off, no flag, variable or label; SPILL_DIR beside the Hugging Face cache" 0 '' '
   expect "$PORT_SPILL_EXPLICIT $PORT_V2_EXPLICIT $PORT_SHARD_EXPLICIT $SPILL_GIB $SPILL_V2 $KV_SHARD" "0 0 0 0 0 0"

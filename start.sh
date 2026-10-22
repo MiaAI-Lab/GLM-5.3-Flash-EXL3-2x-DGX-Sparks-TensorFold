@@ -206,6 +206,7 @@ need_workers
 # then the flags and variables every rank gets for the ported features (scripts/port.sh; none when they are all off)
 port_spill_check
 port_map
+port_spill_identity   # spill v2's identity on every rank (scripts/port.sh)
 SERVE_ARGS+=(${PORT_SERVE[@]+"${PORT_SERVE[@]}"})
 
 # ---------------------------------------------------------------- already running?
@@ -408,6 +409,7 @@ zig_env() {
     [[ -z "${!v:-}" ]] || ENV_ARGS+=(-e "$v=${!v}")
   done
   for v in ${PORT_ENV[@]+"${PORT_ENV[@]}"}; do ENV_ARGS+=(-e "$v"); done   # the ported features' (scripts/port.sh: port_map)
+  for v in ${PORT_ID_ENV[@]+"${PORT_ID_ENV[@]}"}; do ENV_ARGS+=(-e "$v"); done   # spill v2's identity (port_spill_identity)
 }
 env_args() {
   local _skip='^$' name

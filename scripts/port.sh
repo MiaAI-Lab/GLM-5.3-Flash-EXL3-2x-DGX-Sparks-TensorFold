@@ -344,6 +344,27 @@ port_map() {
   return 0
 }
 
+# port_spill_identity: spill v2's identity (glm_cuda/cuda_spill_identity.zig), the same on every rank or the engine
+# refuses to start ("spill v2 never stores state an unidentified engine made"): the engine (TensorFold's pin and this
+# image's hash: zig/patches, the kernel set, the Dockerfile, the pins), the zig/patches series, the checkpoint and
+# DFlash2 by id and pinned revision. Fills PORT_ID_ENV (start.sh passes it with PORT_ENV); nothing unless SPILL_V2=1 on
+# the Zig engine. Called after port_map (it needs config.sh's image_hash).
+PORT_ID_ENV=()
+PORT_ID_NAMES='TF_GLM_ENGINE_ID|TF_GLM_RECIPE_PATCHES|TF_GLM_MODEL_ID|TF_GLM_MODEL_REVISION|TF_GLM_DFLASH2_ID|TF_GLM_DFLASH2_REVISION'
+port_spill_identity() {
+  local series
+  PORT_ID_ENV=()
+  [[ "$ENGINE" == zig ]] && port_v2_on || return 0
+  [[ -n "${MODEL_REVISION:-}" ]] || die "SPILL_V2=1 needs a pinned MODEL_REVISION: spill v2 never stores state that weights it cannot identify made"
+  [[ "$DRAFTER" != dflash2 || -n "${DFLASH2_REVISION:-}" ]] ||
+    die "SPILL_V2=1 with DRAFTER=dflash2 needs a pinned DFLASH2_REVISION: spill v2 never stores state that a drafter it cannot identify made"
+  series=$(cd "$_cfg_root" && cat zig/patches/*.patch 2>/dev/null | sha256sum | cut -c1-16)
+  PORT_ID_ENV=("TF_GLM_ENGINE_ID=tensorfold-${ZIG_TF_REF:0:12}+$(image_hash)" "TF_GLM_RECIPE_PATCHES=sha256:$series"
+               "TF_GLM_MODEL_ID=$MODEL_ID" "TF_GLM_MODEL_REVISION=$MODEL_REVISION")
+  [[ "$DRAFTER" != dflash2 ]] || PORT_ID_ENV+=("TF_GLM_DFLASH2_ID=$DFLASH2_ID" "TF_GLM_DFLASH2_REVISION=$DFLASH2_REVISION")
+  PORT_MAPPED_RE+="|$PORT_ID_NAMES"
+}
+
 # port_identity: what port_map gave the ranks, as one word (the containers' tf.recipe.port label; start.sh compares a
 # running server's with it): "off" when nothing is on, as containers started before the port (no label) read. Else the
 # features and a checksum of every flag, variable and SPILL_DIR (another folder is another set of kept states).
