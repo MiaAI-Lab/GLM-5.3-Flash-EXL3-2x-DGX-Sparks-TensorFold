@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Checks of scripts/port.sh without the Sparks: the defaults (everything off: no flag, variable,
+# Checks of scripts/port.sh and scripts/memavail.sh without the Sparks: the defaults (everything off: no flag, variable,
 # mount or label), a fork's defaults turned on (PT_FORK=1: spill v2 64 GiB, KV sharding) degrading where an explicit
 # setting refuses, the ZIG_HAS gates (spill2, kvshard, spillshard), PROMPT_CACHE_GIB as the spill tier's requirement,
 # the aliases, the mapping to the engine's flags and variables, the refusals (port_validate), the spill folder rules
 # (port_spill_judge on synthetic probe lines, spill_dir_probe and port_spill_check on temporary folders, the worker's
-# probe through its ssh command run locally), and `bash -n` of every script.
+# probe through its ssh command run locally), the parked pages on synthetic /proc files, and `bash -n` of every script.
 # bash 3.2 or later (runs on a Mac); no docker, no ssh, no GPU.
 # Usage: scripts/port_test.sh      (exits 1 when a check fails)
 set -u
@@ -316,6 +316,75 @@ case_ "spill check: a fork's default tier whose worker folder fails goes off eve
   expect_out 'WARN: SPILL TIER OFF for this start: SPILL_DIR .* on w1 overlaps' port_spill_check
   port_spill_check >/dev/null; port_map; expect \"\$SPILL_GIB \${STOP_TIMEOUT:-unset}\" '0 unset'
   expect \"\${PORT_ENV[*]}\" 'TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=1 TF_GLM_KV_SHARD_TWINS=1'"
+
+# ---- scripts/memavail.sh: the start check counts the pages parked on the per-CPU free lists, as the engine's 0119
+# does (native/cuda_memory.zig parkedBytes): its Zig tests' synthetic /proc/zoneinfo cases, as in the DeepSeek recipe
+# zone <node> <name> <high_min or -> [counts...]: one zone's block as the kernel prints it (no counts: no pagesets)
+zone() {
+  local node=$1 name=$2 hm=$3 c n=0; shift 3
+  printf 'Node %s, zone %8s\n  pages free     10\n        managed  1000\n      nr_free_cma  0\n' "$node" "$name"
+  if (( $# )); then
+    printf '  pagesets\n'
+    for c in "$@"; do
+      printf '    cpu: %s\n              count:    %s\n              high:     5000\n              batch:    63\n' "$n" "$c"
+      [[ "$hm" == - ]] || printf '              high_min: %s\n' "$hm"
+      printf '              high_max: 198283\n  vm stats threshold: 110\n'
+      n=$((n + 1))
+    done
+  fi
+  printf '  start_pfn:           4096\n'
+}
+mt=$tmp/mem; mkdir -p "$mt"
+printf 'MemTotal:       %s kB\nMemFree:        1000 kB\nMemAvailable:   %s kB\n' $((128 * 1048576)) $((100 * 1048576)) > "$mt/meminfo"
+printf 'MemTotal:       %s kB\nMemAvailable:   %s kB\n' $((128 * 1048576)) $((125 * 1048576)) > "$mt/meminfo-high"
+printf 'MemTotal:       1 kB\n' > "$mt/meminfo-none"
+{ zone 0 DMA 2146 200000 3143 2332 17; zone 0 DMA32 2146; zone 0 Normal 2146 100000 100000 100000; zone 1 Normal 2146 400000; zone 1 Movable 2146; } > "$mt/z-many"
+six=$(( (6 << 30) / 4096 / 4 + 2146 ))
+zone 0 Normal 2146 $six $six $six $six > "$mt/z-six"
+zone 0 Normal 2146 $(for i in $(seq 20); do printf '%s ' $((2146 + 1440)); done) > "$mt/z-warm"
+zone 0 Normal 2146 $(for i in $(seq 20); do printf '100 '; done) > "$mt/z-below"
+half=$(( ((1 << 30) + (1 << 29)) / 4096 / 2 ))
+zone 0 Normal - $half $half > "$mt/z-old"
+zone 0 Normal - 1000 1000 1000 1000 > "$mt/z-old-small"
+{ printf '  count: 5\n      count: 6\n'; zone 0 Normal 2146 $((2146 + 10))
+  printf '      count:    99999\n      high_min: 7\n'
+  printf 'Node 0, zone Other\n      count:    77777\n  pagesets\n    cpu: 0\n              high:     1\n'; } > "$mt/z-only"
+{ zone 0 Normal 2146 500000; printf '  pagesets\n    cpu: 0\n              count:    abc\n'; } > "$mt/z-bad"
+printf '  pagesets\n    cpu: 0\n              count:    600000\r\n              high_min: 2146\r\n' > "$mt/z-crlf"
+# mc <name> <meminfo> <zoneinfo> <want: avail GiB, parked GiB, parked bytes>
+mc() { case_ "parked pages: $1" 0 "source '$here/memavail.sh'" "expect \"\$(mem_counting '$mt/$2' '$mt/$3' 4096)\" '$4'"; }
+many=$(( (200000 + 3143 + 2332 + 17 + 300000 + 400000 - 8 * 2146) * 4096 ))
+mc "every CPU, zone and node, less each list's resting level (count - high_min)" meminfo z-many "$(awk -v b=$many 'BEGIN {printf "%.1f %.1f %.0f", 100 + b / 2^30, b / 2^30, b}')"
+mc "an image copy's 6 GiB raise the budget by 6 GiB" meminfo z-six "106.0 6.0 6442450944"
+mc "a warm start counts ~nothing (under 0.25 GiB)" meminfo z-warm "$(awk -v b=$((20 * 1440 * 4096)) 'BEGIN {printf "%.1f %.1f %.0f", 100 + b / 2^30, b / 2^30, b}')"
+mc "below the resting level: nothing" meminfo z-below "100.0 0.0 0"
+mc "no high_min (before 6.7) rests the first 512 MiB" meminfo z-old "101.0 1.0 1073741824"
+mc "no high_min, under 512 MiB: nothing" meminfo z-old-small "100.0 0.0 0"
+mc "only the count: and high_min: lines under pagesets" meminfo z-only "100.0 0.0 40960"
+mc "an unparsable count counts nothing" meminfo z-bad "100.0 0.0 0"
+mc "carriage returns are blanks" meminfo z-crlf "$(awk -v b=$(( (600000 - 2146) * 4096 )) 'BEGIN {printf "%.1f %.1f %.0f", 100 + b / 2^30, b / 2^30, b}')"
+mc "capped at MemTotal" meminfo-high z-six "128.0 6.0 6442450944"
+mc "no zoneinfo: MemAvailable alone" meminfo missing "100.0 0.0 0"
+case_ "parked pages: no MemAvailable fails and prints nothing" 0 "source '$here/memavail.sh'" "
+  out=\$(mem_counting '$mt/meminfo-none' '$mt/z-many' 4096) && exit 1; [[ -z \"\$out\" ]]"
+case_ "parked pages: the page size from getconf by default" 0 "source '$here/memavail.sh'" "
+  expect \"\$(mem_counting '$mt/meminfo' '$mt/z-six')\" \"\$(mem_counting '$mt/meminfo' '$mt/z-six' \$(getconf PAGESIZE))\""
+case_ "start check: mem_avail_gb is whole GiB (rounded down) and the parked GiB" 0 "source '$here/memavail.sh'" "
+  mem_counting() { echo '109.9 6.0 6442450944'; }; expect \"\$(mem_avail_gb)\" '109 6.0'"
+case_ "start check: mem_avail_gb on the synthetic Spark (100 GiB available, 6 GiB parked)" 0 "source '$here/memavail.sh'" "
+  eval \"\$(declare -f mem_counting | sed '1s/mem_counting/mem_counting_file/')\"
+  mem_counting() { mem_counting_file '$mt/meminfo' '$mt/z-six' 4096; }
+  expect \"\$(mem_avail_gb)\" '106 6.0'"
+case_ "start check: mem_avail_gb runs on a worker as start.sh sends it (declare -f over ssh, here bash -c and sh -c)" 0 "source '$here/memavail.sh'" "
+  for sh in bash sh; do
+    expect \"\$(\$sh -c \"\$(declare -f mem_counting); mem_counting '$mt/meminfo' '$mt/z-six' 4096\")\" '106.0 6.0 6442450944'
+  done
+  l=\$(bash -c \"\$(declare -f mem_counting mem_avail_gb); mem_avail_gb\")
+  if [[ -r /proc/meminfo ]]; then [[ \"\$l\" =~ ^[0-9]+\\ [0-9]+\\.[0-9]\$ ]] || { echo \"[\$l]\"; exit 1; }; fi"
+if [[ -r /proc/meminfo ]]; then
+  case_ "parked pages: this host's /proc/meminfo and /proc/zoneinfo" 0 "source '$here/memavail.sh'" "
+    read -r a p b <<<\"\$(mem_counting)\"; [[ \"\$a\" =~ ^[0-9]+\\.[0-9]\$ && \"\$b\" =~ ^[0-9]+\$ ]] || { echo \"[\$a \$p \$b]\"; exit 1; }"
+fi
 
 # ---- every script parses (bash -n, with this bash)
 for f in "$root"/start.sh "$root"/start-tp3.sh "$root"/start-tp4.sh "$root"/start-tp4-switchless.sh "$root"/stop.sh "$here"/*.sh; do

@@ -360,15 +360,22 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
 fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
-here_gb=$(free -g | awk '/^Mem:/ {print $7}')
+# Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
+# MemAvailable for a minute or two. The engine counts it (patch 0119's rule), and so does this check: mem_avail_gb
+# (scripts/memavail.sh), here and on each worker.
+parked_note() { awk -v p="${1:-0}" 'BEGIN { if (p + 0 >= 0.1) printf " (%.1f of it parked on the per-CPU free lists)", p }'; }
+read -r here_gb here_parked <<<"$(mem_avail_gb)"
+here_gb=${here_gb:-0}
 low=0; (( here_gb >= 110 )) || low=1
+declare -a there_parked=()
 for i in $(worker_ids); do
-  there_gb[i]=$(worker "$i" "free -g | awk '/^Mem:/ {print \$7}'" 2>/dev/null || echo 0)
+  read -r there_gb[i] there_parked[i] <<<"$(worker "$i" "$(declare -f mem_counting mem_avail_gb); mem_avail_gb" 2>/dev/null || echo 0)"
+  there_gb[i]=${there_gb[i]:-0}
   (( there_gb[i] >= 110 )) || low=1
 done
 if (( ! low )); then
-  if (( TP == 2 )); then log "Arguments OK, port $PORT free, ${here_gb} GiB memory available here, ${there_gb[1]} GiB on the worker"
-  else log "Arguments OK, port $PORT free, ${here_gb} GiB memory available here, $(for i in $(worker_ids); do printf '%s on rank %s, ' "${there_gb[i]}" "$i"; done | sed 's/, $//')"; fi
+  if (( TP == 2 )); then log "Arguments OK, port $PORT free, ${here_gb} GiB memory available here$(parked_note "$here_parked"), ${there_gb[1]} GiB on the worker$(parked_note "${there_parked[1]:-}")"
+  else log "Arguments OK, port $PORT free, ${here_gb} GiB memory available here$(parked_note "$here_parked"), $(for i in $(worker_ids); do printf '%s on rank %s%s, ' "${there_gb[i]}" "$i" "$(parked_note "${there_parked[i]:-}")"; done | sed 's/, $//')"; fi
 else
   (( here_gb >= 110 )) ||
     warn "only ${here_gb} GiB memory available here (the default needs ~110): stop other GPU workloads (docker ps), or lower CONTEXT"

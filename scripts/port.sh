@@ -1,7 +1,7 @@
 # Robert's (wojo's) GLM features on the Zig engine: their settings, their checks, and the ONE place they map to the
 # engine's flags and variables (port_map). The features are the spill tier (v1: cuda_spill.zig, already in zig/patches;
-# v2: his GLM Python fork's patches 0088/0110/0111) and KV sharding (0118). Sourced by scripts/config.sh after the
-# serving settings; start.sh calls the functions.
+# v2: his GLM Python fork's patches 0088/0110/0111), KV sharding (0118) and the parked pages (0119: the start memory
+# check, scripts/memavail.sh). Sourced by scripts/config.sh after the serving settings; start.sh calls the functions.
 # Every feature is OFF by default (PORT_SPILL_DEFAULT_GIB, PORT_SPILL_V2_DEFAULT, PORT_SHARD_DEFAULT below): with them
 # off nothing below adds a flag, a variable, a mount or a label, and every rank runs as before. A fork may turn a default
 # on by changing those values (and PORT_SPILL_QUOTA_DEFAULT); a default that cannot run here is turned off with a
@@ -9,7 +9,7 @@
 # The Zig engine serves the v2 tier and KV sharding only once their ports are in zig/patches; ZIG_HAS (start.sh) then
 # lists them: spill2, kvshard, and spillshard for the two together. Until then an explicit setting refuses and names
 # the missing patch. ENGINE=python (patches/) has the v1 tier (0088) only.
-# Kept to bash 3.2 syntax so that scripts/port_test.sh runs on a Mac too. scripts/config.sh
+# Kept to bash 3.2 syntax (with scripts/memavail.sh) so that scripts/port_test.sh runs on a Mac too. scripts/config.sh
 # and scripts/nodes.sh use `declare -A`, which bash 3.2 lacks; the tests source this file alone.
 
 # ---------------------------------------------------------------- the settings
