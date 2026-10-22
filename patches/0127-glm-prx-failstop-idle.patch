@@ -19,6 +19,16 @@
 # Idle: a proxy caught up with every posted call (nothing outstanding: nothing can happen before the next prx_post)
 #   sleeps on a futex after TF_GLM_PRX_IDLE_MS (20); prx_post and prx_destroy wake it, and it wakes each second for
 #   its heartbeat. An idle server's two proxy threads a Spark no longer hold a core each (0: they poll, as in 0126).
+#
+# Provenance and credit (Apache License 2.0; no code copied):
+# - Ending the process on a transport failure so a supervisor restarts it, and the 300 s timeout, follow RiNGSiDE's
+#   prefill ring watchdog (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/glm53_prefill_rdma/ring.py:
+#   GLM53_PRB_TIMEOUT_S=300, exit 86) and this kit's own 300 s waits (TF_ROCE_WAIT_S, TF_GLM_MULTI_WATCHDOG_S/_EXIT).
+# - Releasing the GPU's waits on a failure follows RiNGSiDE's poison word and b12x's skipped launches; holding the wait
+#   words at posted + 2^30 is ours.
+# - Idle sleep follows RiNGSiDE's and b12x's idle naps; the futex woken by prx_post is ours.
+# - Ours: the heartbeats, the abort round the ring, the queue pairs to the error state, the samplers' check before a
+#   token leaves, /health's prx figures and TF_GLM_PRX_FAULT.
 
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
 index 45ccba2..59d7708 100644
@@ -124,10 +134,10 @@ index 053c17e..20cb9df 100644
  
      def close(self) -> None:
 diff --git tensorfold/cuda/prx_proxy.c tensorfold/cuda/prx_proxy.c
-index 376c7ff..9238c4a 100644
+index 304494c..9a79680 100644
 --- tensorfold/cuda/prx_proxy.c
 +++ tensorfold/cuda/prx_proxy.c
-@@ -13,16 +13,27 @@
+@@ -14,16 +14,27 @@
  //   flags           a 4-byte word on its own line after every stripe of every part (the NIC writes it after the
  //                   data, on the same queue pair, so it is never visible first)
  //   ctrl            ready[s], consumed[s] (GPU -> proxy, stream memory operations), send_done[s] (proxy -> GPU),
@@ -156,7 +166,7 @@ index 376c7ff..9238c4a 100644
  #include <pthread.h>
  #include <sched.h>
  #include <stdatomic.h>
-@@ -30,8 +41,11 @@
+@@ -31,8 +42,11 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
@@ -169,7 +179,7 @@ index 376c7ff..9238c4a 100644
  #define PRX_MAX_HCAS 4
  #define PRX_MAX_STRIPES 2
  #define PRX_MAX_SLOTS 8
-@@ -53,6 +67,14 @@
+@@ -54,6 +68,14 @@
  #define KIND_RELAY_FWD 2
  #define KIND_RELAY_BWD 3
  #define KIND_CREDIT 4
@@ -184,7 +194,7 @@ index 376c7ff..9238c4a 100644
  
  typedef struct {
      uint64_t region_addr;
-@@ -99,8 +121,15 @@ typedef struct {
+@@ -100,8 +122,15 @@ typedef struct {
      int ring_ag;                          // TF_GLM_PRX_RINGAG: an all-gather's across halves relayed from the block
      uint32_t send_pending[PRX_QCAP], relay_pending[2][PRX_QCAP];
      uint64_t send_done, relay_done[2], freed, reported;
@@ -200,7 +210,7 @@ index 376c7ff..9238c4a 100644
      uint64_t stat[8];
      char err[512];
  } prx_ctx_t;
-@@ -111,7 +140,9 @@ typedef struct {
+@@ -112,7 +141,9 @@ typedef struct {
  #define CTRL_SEND_DONE (4 * PRX_MAX_SLOTS)
  #define CTRL_CREDIT (5 * PRX_MAX_SLOTS)   // [2]: credit[NEXT] written by the next rank, credit[PREV] by the previous
  #define CTRL_ERROR (5 * PRX_MAX_SLOTS + 2)
@@ -211,7 +221,7 @@ index 376c7ff..9238c4a 100644
  #define FLAG_PARTS 6                      // 4 recv parts, then relay FWD and BWD
  #define FLAG_RELAY(dir) (4 + (dir))
  
-@@ -156,11 +187,43 @@ static int nbr(prx_ctx_t *c, int L) {
+@@ -157,11 +188,43 @@ static int nbr(prx_ctx_t *c, int L) {
      return L == NEXT ? (c->rank + 1) % c->world : (c->rank + c->world - 1) % c->world;
  }
  
@@ -259,7 +269,7 @@ index 376c7ff..9238c4a 100644
  }
  
  uint64_t prx_blob_bytes(void) { return sizeof(prx_blob_t); }
-@@ -244,6 +307,27 @@ prx_ctx_t *prx_create(int world, int rank, int slots, uint64_t M, const char *co
+@@ -245,6 +308,27 @@ prx_ctx_t *prx_create(int world, int rank, int slots, uint64_t M, const char *co
      for (int h = 0; h < n_hca; h++) c->gid_index[h] = gid_index[h];
      const char *rag = getenv("TF_GLM_PRX_RINGAG");
      c->ring_ag = rag && rag[0] == '1';
@@ -287,7 +297,7 @@ index 376c7ff..9238c4a 100644
      for (int h = 0; h < n_hca; h++)
          if (open_hca(c, h, names[h])) { snprintf(err, err_len, "%s", c->err); free(c); return NULL; }
      const int *p = links;
-@@ -339,7 +423,9 @@ int prx_connect(prx_ctx_t *c, const void *blobs, uint64_t len) {
+@@ -340,7 +424,9 @@ int prx_connect(prx_ctx_t *c, const void *blobs, uint64_t len) {
      return 0;
  }
  
@@ -297,7 +307,7 @@ index 376c7ff..9238c4a 100644
      for (int h = 0; h < c->n_hca; h++) {
          struct ibv_wc wc[64];
          int n = ibv_poll_cq(c->hca[h].cq, 64, wc);
-@@ -350,26 +436,32 @@ static int drain(prx_ctx_t *c) {
+@@ -351,26 +437,32 @@ static int drain(prx_ctx_t *c) {
              int kind = (int)(id & 0xf), L = (int)((id >> 4) & 1), s = (int)((id >> 5) & 3), two = (int)((id >> 7) & 1);
              uint64_t call = id >> 8;
              if (wc[i].status != IBV_WC_SUCCESS) {
@@ -337,7 +347,7 @@ index 376c7ff..9238c4a 100644
          if (!atomic_load_explicit(&c->running, memory_order_relaxed)) return -1;
      }
      return 0;
-@@ -388,17 +480,19 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
+@@ -389,17 +481,19 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
          struct ibv_send_wr wr[2], *bad = NULL;
          struct ibv_sge sge;
          memset(wr, 0, sizeof(wr));
@@ -359,7 +369,7 @@ index 376c7ff..9238c4a 100644
              wr[0].next = &wr[1];
          } else {
              first = 1;
-@@ -408,17 +502,17 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
+@@ -409,17 +503,17 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
          fs.addr = (uint64_t)(uintptr_t)&val;
          fs.length = 4;
          fs.lkey = 0;
@@ -380,7 +390,7 @@ index 376c7ff..9238c4a 100644
          if (kind == KIND_SEND) c->send_pending[call % PRX_QCAP]++;
          else if (kind == KIND_RELAY_FWD) c->relay_pending[FWD][call % PRX_QCAP]++;
          else if (kind == KIND_RELAY_BWD) c->relay_pending[BWD][call % PRX_QCAP]++;
-@@ -565,6 +659,7 @@ static int step_done(prx_ctx_t *c) {
+@@ -566,6 +660,7 @@ static int step_done(prx_ctx_t *c) {
              int rc = ibv_post_send(k->qp[0], &wr, &bad);
              if (rc) { fail(c, "ibv_post_send(credit)", rc); return -1; }
              k->outstanding[0]++;
@@ -388,7 +398,7 @@ index 376c7ff..9238c4a 100644
          }
          c->reported = c->freed;
          did = 1;
-@@ -572,20 +667,187 @@ static int step_done(prx_ctx_t *c) {
+@@ -573,20 +668,187 @@ static int step_done(prx_ctx_t *c) {
      return did;
  }
  
@@ -584,7 +594,7 @@ index 376c7ff..9238c4a 100644
      return NULL;
  }
  
-@@ -596,13 +858,15 @@ int prx_start(prx_ctx_t *c) {
+@@ -597,13 +859,15 @@ int prx_start(prx_ctx_t *c) {
  }
  
  // the next call (its sequence number): M bytes for each peer (a multiple of 16, at most the slot's), shared: one
@@ -603,7 +613,7 @@ index 376c7ff..9238c4a 100644
      return (int64_t)call;
  }
  
-@@ -620,13 +884,19 @@ uint64_t prx_stat(prx_ctx_t *c, int i) {
+@@ -621,13 +885,19 @@ uint64_t prx_stat(prx_ctx_t *c, int i) {
          case 6: return c->send_done;
          case 7: return c->freed;
          case 8: return (uint64_t)c->hca[0].mtu;

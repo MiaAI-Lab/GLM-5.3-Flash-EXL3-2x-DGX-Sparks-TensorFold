@@ -23,10 +23,17 @@
 # ranks started with different switches refuse to start, and a kept state is never resumed under other switches than
 # made it. Tests (CPU): tests/cpu/test_prompt_arith_identity.py.
 #
-# Provenance and credit: TF_GLM_PROMPT_W8 follows RiNGSiDE's dual-path online FP8 for the dense projections
-# (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/vllm/.../glm53_dual_fp8_dense.py, Apache
-# License 2.0): one per-output-channel e4m3 copy (absmax / 448) and W8A8 with per-token scales at prompt sizes. No code
-# of it is copied. TF_GLM_PROMPT_FP8 runs TensorFold's own prefill_matmul8; TF_GLM_PROMPT_Y16 is ours.
+# Provenance and credit (Apache License 2.0 throughout; no code copied unless said):
+# - TF_GLM_PROMPT_W8 follows RiNGSiDE's dual-path online FP8 for the dense projections
+#   (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/vllm/model_executor/layers/quantization/
+#   glm53_dual_fp8_dense.py): one per-output-channel e4m3 copy (absmax / 448), W8A8 with per-token scales at prompt
+#   sizes, the low-precision weights kept for decode. Patch 0002's e4m3 dense weights (TF_GLM_DENSE=fp8, per-row and
+#   per-block scales, every path) are this kit's earlier form of the copy.
+# - TF_GLM_PROMPT_FP8 applies TensorFold's own --prefill-fp8 path (families/qwen3_5/cuda/prefill.py: quantize_rows
+#   and prefill_matmul8) to GLM's 4-bit dense projections.
+# - TF_GLM_PROMPT_Y16 extends TensorFold's GLM prompt buffers, whose routed-expert rows are already bf16 for every
+#   expert format but EXL3 (and its MLX path's bf16 expert outputs), to the EXL3 prompt_down_kernel's store.
+# - The 256-row cutoff (TF_GLM_PROMPT_FP8_MIN_ROWS) is ours.
 
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
 index 1fc3089..ae09a0e 100644

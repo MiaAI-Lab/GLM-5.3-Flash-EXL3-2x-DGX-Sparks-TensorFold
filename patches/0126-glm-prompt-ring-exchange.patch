@@ -17,13 +17,19 @@
 #   failed RDMA write or a dead peer leaves the GPU waiting on a flag: the host raises at its next exchange call
 #   (patch 0127 bounds this).
 #
-# Provenance and credit: RiNGSiDE (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, Apache License 2.0)
-# designed most of this: TF_GLM_PROMPT_HANDOFF8 is its KDA FP8 handoff, and TF_GLM_PRX follows its prefill RDMA ring
-# (src/tp4/glm53_prefill_rdma): the prompt collectives on RDMA writes round the ring instead of NCCL, both directions
-# over both PCIe functions of each cable, and (TF_GLM_PRX_RINGAG) an all-gather that relays the across rank's halves
-# straight from the receive buffer. TF_GLM_PRX_SHARE's second channel and TF_GLM_PRX_ZC's zero-copy partials are ours.
-# prx_proxy.c's verbs setup follows b12x's roce_proxy.c (Apache License 2.0). No code of either is copied beyond the
-# verbs calls' shape.
+# Provenance and credit (Apache License 2.0 throughout; no code of either is copied beyond the verbs calls' shape):
+# - TF_GLM_PROMPT_HANDOFF8 is RiNGSiDE's KDA FP8 handoff (othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE,
+#   GLM53_KDA_FP8_HANDOFF).
+# - TF_GLM_PRX: the prompt collectives as RDMA writes both ways round the ring over both PCIe functions of each cable,
+#   each flag after its data on the same queue pair, follow RiNGSiDE's prefill ring (src/tp4/glm53_prefill_rdma). The
+#   pinned region, the proxy thread, each neighbour's payload striped over the HCAs with a flag after each stripe follow
+#   b12x's RoCEnante (roce_proxy.c, by Jason Cook, b12x PR #295; this kit's patch 0006). Relaying the across rank's
+#   halves through the neighbours is this kit's patches 0098 and 0099 too. Ours: copy-engine staging, the GPU's waits as
+#   stream memory operations (no kernel, no SM), RDMA-written credits and the all-to-all of row blocks.
+# - TF_GLM_PRX_RINGAG is RiNGSiDE's all-gather, relayed straight from the receive buffer.
+# - TF_GLM_PRX_ZC: summing where the partials land follows RiNGSiDE's kernel and b12x's per-sender receive slots; the
+#   fills writing straight into the send slots are ours.
+# - TF_GLM_PRX_SHARE's second channel is ours.
 
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
 index 070329c..45ccba2 100644
@@ -408,15 +414,16 @@ index 0000000..053c17e
 +            self.ctx = None
 diff --git tensorfold/cuda/prx_proxy.c tensorfold/cuda/prx_proxy.c
 new file mode 100644
-index 0000000..376c7ff
+index 0000000..304494c
 --- /dev/null
 +++ tensorfold/cuda/prx_proxy.c
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,641 @@
 +// The host side of the prompt ring exchange (TF_GLM_PRX, tensorfold/cuda/prx.py): an all-to-all of row blocks between
-+// four ranks cabled as a ring in rank order, moved by the NICs alone. Mia's AI Lab, Apache License 2.0. The verbs
-+// setup follows roce_proxy.c (b12x's "RoCEnante", Apache License 2.0); the two-way relay round the ring follows
-+// RiNGSiDE's prefill ring (github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/
-+// glm53_prefill_rdma, Apache License 2.0). No code of either is copied beyond the verbs calls' shape.
++// four ranks cabled as a ring in rank order, moved by the NICs alone. Mia's AI Lab, Apache License 2.0. The region,
++// the proxy thread, the stripes over the HCAs and a flag after each stripe follow roce_proxy.c (b12x's "RoCEnante",
++// by Jason Cook, Apache License 2.0); both directions and the relays round the ring follow RiNGSiDE's prefill ring
++// (github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE, src/tp4/glm53_prefill_rdma, Apache License
++// 2.0). No code of either is copied beyond the verbs calls' shape.
 +//
 +// One pinned host region a rank (the same layout on every rank), per call slot s (call c uses slot c % slots):
 +//   send[s][3][M]   staged by the local GPU's copy engines: the payload for the next rank, the previous, the across

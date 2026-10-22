@@ -716,7 +716,8 @@ GPU (`scripts/test-gpu.sh`). **Three Sparks and a switch: not tested on hardware
 Patches 0124-0127 add more prompt switches, all off by default. The largest gains follow designs of
 [RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE)'s TP4 prefill: the FP8 copies of
 the dense projections (`TF_GLM_PROMPT_W8`), the KDA FP8 handoff (`TF_GLM_PROMPT_HANDOFF8`) and the prefill RDMA ring
-(`TF_GLM_PRX`, with its relaying all-gather `_RINGAG`); [`CREDITS.md`](CREDITS.md) has the details. Each was measured
+(`TF_GLM_PRX`, with its relaying all-gather `_RINGAG`). Others build on TensorFold, b12x's RoCEnante and this kit's
+earlier patches; [`CREDITS.md`](CREDITS.md) has who did what. Each was measured
 on four Sparks cabled as a ring
 (2026-10-21), one patch after the other, through a router, as client prompt tokens a second at 8k / 32k / 64k:
 

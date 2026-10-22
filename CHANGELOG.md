@@ -103,8 +103,8 @@ a switch.
 - **Patch `0126-glm-prompt-ring-exchange`** (all off, the same bits): the KDA layers' input rows swapped as e4m3
   (`TF_GLM_PROMPT_HANDOFF8`, with W8; after RiNGSiDE's KDA FP8 handoff); on four Sparks cabled as a ring, the row
   split's exchanges RDMA-written by a proxy thread over both PCIe functions of each cable, with no NCCL kernel or SM
-  (`TF_GLM_PRX`, and `_SHARE` / `_RINGAG` / `_ZC`; after RiNGSiDE's prefill RDMA ring, its verbs setup after b12x's
-  proxy). Prefill 8k / 32k / 64k 3,387 / 3,590 / 3,596 -> 4,028 / 4,340 / 4,335 tok/s; GSM8K 97%, needles found.
+  (`TF_GLM_PRX`, and `_SHARE` / `_RINGAG` / `_ZC`; after RiNGSiDE's prefill RDMA ring, its proxy after b12x's
+  RoCEnante). Prefill 8k / 32k / 64k 3,387 / 3,590 / 3,596 -> 4,028 / 4,340 / 4,335 tok/s; GSM8K 97%, needles found.
 - **Patch `0127-glm-prx-failstop-idle`**: `TF_GLM_PRX`'s failures (a failed write, a neighbour's heartbeat still for
   `TF_GLM_PRX_PEER_S`, no progress for `TF_GLM_PRX_TIMEOUT_S`) go round the ring, release the GPU's waits, raise
   before a token reaches a client and end the process after `TF_GLM_PRX_EXIT_S`; an idle proxy sleeps after

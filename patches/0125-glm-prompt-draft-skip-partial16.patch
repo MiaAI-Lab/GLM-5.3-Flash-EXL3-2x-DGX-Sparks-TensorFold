@@ -12,6 +12,13 @@
 #   this rank's into its slot of each received block (hcsplit.HcSplit.direct16; the fills take an ``out``). The e4m3
 #   projections' result is bf16 already, so its fp32 widening and the side stream's conversions go; the combine's
 #   fp32 sums are rounded as copy_ rounds them. +5 % prompt.
+#
+# Provenance and credit:
+# - TF_GLM_DRAFT_SKIP follows TensorFold's window-trimmed drafter taps elsewhere (families/deepseek_v4/runtime.py: "only
+#   the last window's worth is read; the rest moves the offset"; drafters/dflash_proposer.py; families/qwen3_5/
+#   dflash_head.py), applied to GLM's DFlash2 ring with its kept points and 128-row commit steps.
+# - TF_GLM_PARTIAL16 builds on patch 0106's bf16 partials and their send staging; the fills writing straight into that
+#   staging are ours.
 
 diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
 index e7b069a..5c2ba66 100644
