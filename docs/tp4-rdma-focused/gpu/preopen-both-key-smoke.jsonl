@@ -1,3 +1,0 @@
-{"key_label": "hermes-api-key", "discovery": "PASS", "text": "PASS", "stream": "PASS", "forced_tools": "PASS", "required_tools": "PASS", "auto_tools": "PASS"}
-{"key_label": "omp-api-key", "discovery": "PASS", "text": "PASS", "stream": "PASS", "forced_tools": "PASS", "required_tools": "PASS", "auto_tools": "PASS"}
-{"model": "GLM-5.3-Flash-EXL3", "authentication_negative": "PASS", "pass": true, "auto_tools_pass": true, "keys": [{"key_label": "hermes-api-key", "discovery": "PASS", "text": "PASS", "stream": "PASS", "forced_tools": "PASS", "required_tools": "PASS", "auto_tools": "PASS"}, {"key_label": "omp-api-key", "discovery": "PASS", "text": "PASS", "stream": "PASS", "forced_tools": "PASS", "required_tools": "PASS", "auto_tools": "PASS"}]}

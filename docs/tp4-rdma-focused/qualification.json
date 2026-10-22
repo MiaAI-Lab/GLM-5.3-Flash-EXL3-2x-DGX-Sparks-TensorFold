@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "kind": "compact-extraction-of-archived-qualification",
+  "archive": {
+    "repository": "https://github.com/swbiggart/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold",
+    "commit": "921ce7e7ba8ce7ad6767fb0d8a99ef5c05a88cf1",
+    "tag": "evidence/tp4-rdma-qualified-20261022",
+    "receipt_root": "docs/tp4-rdma-focused",
+    "path_rule": "source_sha256 keys are relative to receipt_root at archive commit; SHA-256 is over original file bytes",
+    "manifest_sha256": "2fabda633e19c8d739e6836730a14e7f2c4567ac997e64cf26a20cd1a30d9ca3"
+  },
+  "source_schemas": {
+    "embedded": "glm-focused-embedded-v1",
+    "analysis_schema_version": 1,
+    "final_serving_schema": 1
+  },
+  "source_sha256": {
+    "README.md": "872aa130822aa894dfbadc4e21210d48007152924c289729b7551d116d23ce9d",
+    "native-host.log": "fdb8d6be5fa9e9c39730b8bd538ff3d7c021b9ff4ef6491ca8fd286cac75a8eb",
+    "native-test-names.log": "87c0b8e03c8d4e0e269afd8be56e241e8e00dd20a7f8bc60a8c0f803e9258889",
+    "native-linux-semantic.log": "05d4b3e73466d06705b6c01dc0ab9e2c8583a34a7b6b12efe62af6d3ad4499f9",
+    "launcher-bash5.log": "47433c65a4c7f47ec21faf0022917c8c13575f0ef2ef80f0b4640fe80674e000",
+    "reconstruction.log": "8b5e5f9b31b0c4c9d93eb14c8f0f2c6d58ccd43c1cd38ed4d0c0125fef0f3eb7",
+    "build/build-receipt-rdma-be94e91.json": "62b359093643422a1df34f87a55e0d664874c6388962d2c29a062654d078f9bc",
+    "build/build-rdma-be94e91.log": "64fc63ade6c1560cb014f5a99d66f2c34a8d091de53b7e5c59b0fc75c8aa9845",
+    "build/embedded-proof-be94e91.json": "ea55cfd29f62b96646420fbffce6c2686aa104858ca0c3df0ac444555132a229",
+    "build/focused-image-artifacts-be94e91.json": "432a8a5f821e21195a1ad3801667c148b78d2178ec57861c395f2d73bf1d021f",
+    "gpu/probe-result.json": "0a219ecfdae20e2b18b3da0f8819f20d119241d88330d158a099af81e68395d5",
+    "gpu/probe-registered-log-summary.json": "2ac8158696382a874381d610710ea4804cff3b1ff7da137b8855891af7d8a7ef",
+    "gpu/probe-direct-negative-log-summary.json": "76fb36abda1dc075b045d7ffda59e7fa4577bf525d0f1324cfdc818cf85992fb",
+    "gpu/model-final-loaded-library.json": "bf8636c819e32806c55fb897df628f40d602020b68555522d1d3a7cf7a728967",
+    "gpu/analysis.json": "d08df5cef8abe91b6d95cc78ae5fa27d6866b55e08905d910ebe5c8a138b03a7",
+    "gpu/derivation.json": "71074a98e7a904ab0d73eedf4f8cd0b23f7b6b0bb1c9ba87084277de59d7820c",
+    "gpu/final-serving.json": "5092ba5cafa95b31c44eebf3d6460029536e0c0f9b483735eba016d50ca0bb0f",
+    "gpu/eager-graph-effective-mode.json": "06a9622a2b25a893a0473f2c937d7f60d6b9b84479794f94f726a365d52d8bc0",
+    "gpu/deployment-registered.json": "6e3bd6220d297d453ba69b4ddb44ee3310476a6b8871f87e5745aae4f09317a3",
+    "gpu/captures/bench-focused-final-90s/steady-raw.jsonl": "b20e28bf25db7cd6d1a6bf6f3b691805fb3bd53788a5a61d5e8f2aa11348b348",
+    "gpu/captures/bench-focused-final-90s/steady.json": "0fdf70aea2096b274cde72e9c58a1dbbd29fd21f9534f4a090788dc0dc6e20bd",
+    "gpu/captures/nccl-qualification.jsonl": "a41a811502c80bd0ac9cd3531ddf1a6bc37b04b5776104be29916a88bf6190e9",
+    "gpu/captures/registered-qualification.jsonl": "a856818e522a2e765a5040e02eefd979f9f0951f39c52cc4f8bc4aaa6de63477",
+    "gpu/captures/eager-qualification.jsonl": "14df474e158bb394f2f605d0fe1ca30f0840791fa5b37726e730f30865a2bbc2"
+  },
+  "additional_repository_sources_sha256": {
+    "docs/tp4-registered-relay.md": "b73f3eefbe84553cb0331024bed19bdbfcab79d159eea3963b233112552c3355",
+    "zig/TRANSPORT_SOURCE.json": "9824b277b71327e5006cf13e9ccbc10d415479081b17521153af490e5c46121e"
+  },
+  "build": {
+    "recipe_commit": "ec0fc7e0846a165dbda5cd2747c7de2c98ceb99d",
+    "recipe_base_commit": "a6c7e08ae864239125d45fc15146d26ec74c7f6d",
+    "tensorfold_base_commit": "e7c523ebfa16b8094cf9e35e3773a7d25befcc5b",
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "patch0014_sha256": "46111e72fa8432f5477a935a326ab4d8c7122cb7e3d4b29998e5791bb4d6dab2",
+    "patch_count": 14,
+    "engine_sha256": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "probe_sha256": "6db8c1914f6c83b09bf43cd9a0f7f65ce5ffa424c58295d3e4888cec91cf7c65",
+    "image_fingerprint": "a319617ab6f1e29ea51b75f0eb6d9520c66c386fb73bf4c7ce01d14d78fa774b",
+    "source_manifest_sha256": "d974498a5374a5ede7de6481467d960e55fbdc04a41162ac80e477dd1c61b6c7",
+    "aot_archive_sha256": "29ad991945a30f3398ae79ba781cb975f499b752a5b5dbc473d1c152e6bdb681",
+    "aot_inventory_sha256": "ed684888accd1b2f62377e83ecb0da22a350ba9cc4cfb61141af9695156c89c3",
+    "aot_inventory_files": 583,
+    "toolchain": {
+      "zig": "0.17.0",
+      "zig_archive_sha256": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
+      "nvcc": "13.0.88",
+      "sm": 121
+    },
+    "build_jobs": 4,
+    "source_files_checked": 2889,
+    "exported_fatbins": 56,
+    "reachable_engine_embeds_matching_exported_bytes": 51,
+    "probe_fn_roce_matches_exported_bytes": true,
+    "artifact_equal_hosts": 4,
+    "equal_artifact_fields": [
+      "image_fingerprint",
+      "engine",
+      "probe",
+      "aot"
+    ],
+    "image_identity_limit": "Manifest-list and configuration image IDs differ; whole-image fingerprint and artifact hashes agree across the four receipt hosts. Build steps alone do not qualify GPU behavior.",
+    "source_reconstruction": {
+      "source_files_compared": 2889,
+      "all_source_file_bytes_equal": true,
+      "intentional_document_omission": "GLM_TP4_REGISTERED_RDMA.md",
+      "native_host_tests_passed": 49,
+      "host_probe_build": "passed",
+      "mode_comparison": "Exactly the six known differences above; upstream executable modes preserved",
+      "command": "python3 tests/verify_tp4_native_patch.py --upstream-repo <pinned-TensorFold-checkout> --native-repo <focused-native-checkout> --zig <Zig-0.17.0>",
+      "file_sha256_inventory_digest": "e97a7687b164a35b5322ca4528c1d44a5b4b04999c222c4bb83d16813e452bd9"
+    }
+  },
+  "executed_offline_checks": {
+    "native_host_tests_passed": 49,
+    "native_host_build_steps_succeeded": 12,
+    "arm64_semantic_build_steps_succeeded": 9,
+    "bash5_launcher_tests_passed": 15,
+    "semantic_limit": "ARM64 semantic build uses nondeployable placeholders; real NVCC GPU build and byte proof are separate evidence.",
+    "no_new_execution": "These are historical receipt results. No tests, builds, GPU or live checks were run for compact packaging."
+  },
+  "tested_profile": {
+    "model": "GLM-5.3-Flash-EXL3",
+    "model_revision": "Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold@078455ffe6472f9a52fbc1139f58b9db2881b25c",
+    "hardware": "4x GB10, two rails per neighbor, dual PCI domain, physical neighbor ring",
+    "rank_order": [
+      "spark",
+      "spark-peer",
+      "msi-b9dc",
+      "msi-c21f"
+    ],
+    "gid_index": 3,
+    "backend": "native Zig TensorFold; registered host-memory relay for eligible gathers <=524288 bytes per rank; larger/ineligible gathers use NCCL",
+    "kv": "FP8",
+    "settings": {
+      "cache_gib": 32,
+      "context": 131072,
+      "drafter": "DFlash2@bf582e4eacc1810f76656d1811693ff6c6737d2a",
+      "eager": false,
+      "hc_split": 0,
+      "l2pf": 1,
+      "max_tokens": 32768,
+      "memory_reserve_gib": 24,
+      "mtp": 0,
+      "nccl": "2.30.7+fleet-patches",
+      "parallel": 8,
+      "prefill_overlap": 0,
+      "prefill_rows": 2048,
+      "prompt_cache_gib": 3,
+      "ring": "spark,spark-peer,msi-b9dc,msi-c21f",
+      "side": 1,
+      "transport": "relay-registered"
+    },
+    "effective_cli": "--context 131072 --parallel 8 --max-tokens 32768 --prompt-cache-gib 3",
+    "registered_native_env": {
+      "TF_GLM_TP4_REGISTERED_RDMA": "1",
+      "TF_GLM_ROCE": "1",
+      "TF_ROCE_RING": "1",
+      "TF_ROCE_MAX_KB": "512",
+      "TF_GLM_L2PF": "1",
+      "TF_GLM_SIDE": "1",
+      "TF_GLM_CACHE_GIB": "32"
+    },
+    "cache_limit": "3 GiB CLI kept-state prompt cache and 32 GiB environment budget are distinct settings.",
+    "nccl": {
+      "version": "2.30.7 + fleet patches",
+      "loaded_library_sha256": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e",
+      "observed_hosts": 4,
+      "limit": "Separately patched library; opt-in flag neither installs it nor qualifies the stock wheel."
+    }
+  },
+  "transport_probe": {
+    "ring_probes_passed": true,
+    "ranks": 4,
+    "profiles": [
+      "nccl",
+      "registered"
+    ],
+    "pass_checks_per_rank_per_profile": 14,
+    "mixed_graph_replays_per_rank": 64,
+    "checks": "Changing eager bytes, rank placement, guards, NCCL oracle, offset/alias layout, explicit-in-place fallback, mixed custom/NCCL/custom graph replay and slot reuse",
+    "registered_per_rank": {
+      "roce_ops_delta": 128,
+      "relay_stripes_delta": 256,
+      "enqueue_counts_unchanged": true
+    },
+    "registered_raw_log_sha256": {
+      "gpu/probe-registered-spark.log": "dcb4d751448d065c01e2aa9b9b063a79acd96225091d8e3255b3bfc9a244fedb",
+      "gpu/probe-registered-spark-peer.log": "335bd3630a2b068c19a48c3abbde292f9d8bdd332237f3543d6fceefe30f9141",
+      "gpu/probe-registered-msi-b9dc.log": "6fb7a3069755e3cc11bbd31e914ab0dedcff5c26af61df52910d405f418e6138",
+      "gpu/probe-registered-msi-c21f.log": "273c3e0fa2f6c8836e732745f685bcd58aab5b0b2e7eeda3a24112db93e50af1"
+    },
+    "direct_on_ring_negative": {
+      "all_four_ranks_abort": "RequiredRoceUnavailable",
+      "route_diagnostic": "NoSharedSubnet",
+      "diagnostic_limit": "Generic NCCL fallback diagnostic precedes required-mode abort; proves refusal when direct routes are missing, not switched-hardware success.",
+      "raw_log_sha256": {
+        "gpu/probe-direct-negative-spark.log": "b89d033d13cde2601167eb986e3573bf3a5934fcc4176f3c50106a15f1ad59f1",
+        "gpu/probe-direct-negative-spark-peer.log": "96efad4b8eea7d15b05a4b3bf1376f0f09990ff7e76095dc15944ec4f3f252da",
+        "gpu/probe-direct-negative-msi-b9dc.log": "20d070ce30573baa21017722c058f2766e953e58001e8aa7f2112c9195fba20e",
+        "gpu/probe-direct-negative-msi-c21f.log": "9c6f874a3953c8d5bb3df4f1643c5c5dc673675f3fdf8eaf46309bd57a411b28"
+      }
+    }
+  },
+  "exact_fixtures": {
+    "profiles": {
+      "nccl": {
+        "sha256": "a41a811502c80bd0ac9cd3531ddf1a6bc37b04b5776104be29916a88bf6190e9",
+        "rows": 89,
+        "completions": 40,
+        "all_passed": true,
+        "token_and_text_hashes_checked": 40
+      },
+      "registered": {
+        "sha256": "a856818e522a2e765a5040e02eefd979f9f0951f39c52cc4f8bc4aaa6de63477",
+        "rows": 89,
+        "completions": 40,
+        "all_passed": true,
+        "token_and_text_hashes_checked": 40
+      },
+      "eager": {
+        "sha256": "14df474e158bb394f2f605d0fe1ca30f0840791fa5b37726e730f30865a2bbc2",
+        "rows": 89,
+        "completions": 40,
+        "all_passed": true,
+        "token_and_text_hashes_checked": 40
+      }
+    },
+    "completion_output_and_dimensions_parity": true,
+    "rendered_prompt_boundaries": [
+      1023,
+      1024,
+      1025,
+      1535,
+      1536,
+      1537,
+      2050,
+      2051,
+      2052
+    ],
+    "serial_draft_parity": true,
+    "solo_overlap_parity": true,
+    "body_and_seed_verification": "unavailable in qualification receipts",
+    "archive_files": {
+      "nccl": "gpu/captures/nccl-qualification.jsonl",
+      "registered": "gpu/captures/registered-qualification.jsonl",
+      "eager": "gpu/captures/eager-qualification.jsonl"
+    },
+    "projection": "Only top-level backend presentation label removed; remaining values and row order preserved (gpu/derivation.json)."
+  },
+  "final_acceptance": {
+    "source": "gpu/final-serving.json#/supplemental_acceptance",
+    "settled_cases": 31,
+    "exact_output_pairs": 12,
+    "needle_prompt_tokens": [
+      32752,
+      32752
+    ],
+    "needle_value_present_in_all_four_outputs": true,
+    "cached_tokens_on_two_reuse_calls": [
+      32704,
+      32704
+    ],
+    "cancellation": {
+      "backend_retirement_independently_verified": false,
+      "closed_after_first_content": true,
+      "following_short_pair_exact": true
+    },
+    "limit": "40-fixture runs qualify earlier graph/eager/NCCL containers of this profile; final containers received fresh supplemental acceptance/load. Needle checks presence/parity and has visible role/thinking markers; client overlap does not attest backend overlap."
+  },
+  "final_four_client_load": {
+    "source": "gpu/final-serving.json#/sustained_load",
+    "parameters": {
+      "seconds": 90,
+      "set": "a",
+      "streams": "4",
+      "tokens": 256
+    },
+    "requests": 57,
+    "completion_tokens": 14592,
+    "worker_errors": [],
+    "validation_errors": [],
+    "reported_clipped_window_tokens_per_second": 156.51,
+    "approx_clipped_window_reconstruction_tps": 156.51357496662203,
+    "clipped_metric_definition": "Pinned cmd_sustained spreads each reply token count evenly across its client decode span, clips contributions to the fixed 90-second dispatch window, then divides by90. This is a modeled client window rate, not direct token-arrival counting or guaranteed steady capacity.",
+    "raw_first_start_to_last_completion_s": 93.45532836392522,
+    "raw_full_drain_tokens_per_s": 156.13876977861727,
+    "ttft_s_p50": 0.182,
+    "ttft_s_p95": 0.302,
+    "collector_source_sha256": "f5f24b1e105e6d073e26b780983be3f4654219b986290e1f6a106c1955232bc5",
+    "analyzer_source_sha256": "adc78ebbf9394e8065a56f105a0c5b5e8af91e3122db95171759ae2e4e8a4412",
+    "acceptance_client_source_sha256": "bbae3c2a5086c27207445b07e306a8f5a72cfebffcfc7ba925da46a2676349bc",
+    "limit": "Retained historical observations from hash-pinned collector/analyzer; those source files are not included in this evidence tree or executed here. Exact scheduled window start is absent from raw JSONL; approximate reconstruction uses earliest observed start and reproduces rounded 156.51."
+  },
+  "proof_limits": [
+    "Historical qualification only; no assertion of current serving state.",
+    "Switched hardware and single-rail ring hardware unverified; switched/direct route code tests do not qualify hardware.",
+    "GPU mixed-profile rejection, allocated relay, TP1/2/3, Flash Next and production peer-loss injection unqualified.",
+    "Full-window quality, vision, long-duration reliability, reboot recovery, tailnet inference and private-assistant role unqualified.",
+    "Eager mode evidence is immutable configuration plus pinned source semantics, not an independent kernel trace.",
+    "Fixture receipts omit full request bodies and seed; prompt hashes do not enable exact request reconstruction.",
+    "Rendered prompt boundary coverage does not attest internal prefill widths.",
+    "MiaAI unpublished 17/4/428/56-request fixtures unavailable; no Python-versus-Zig or absolute-speed reproduction claim.",
+    "Same-operation/same-boot observations do not qualify reboot recovery."
+  ]
+}
