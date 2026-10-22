@@ -25,7 +25,7 @@ Window: cold cases past the window (--context, CONTEXT, 131,072 by default; chec
 meta.over_window, and compare notes a case one record left out that way instead of calling it a mismatch (at the
 default every case fits). It needs the Sparks to record (the image before and after a change); compare runs anywhere,
 and tools/selftest.py runs both here against tools/fake_server.py. From the DeepSeek recipe (MiaAI-Lab's exact.py, with
-wojo's eight-stream cases), for GLM-5.3-Flash on the Zig engine.
+the eight-stream cases of Robert Wojciechowski (GitHub @wojo, X @rwojo)), for GLM-5.3-Flash on the Zig engine.
 Stdlib only. API key: checklib's rule (API_KEY, else TENSORFOLD_API_KEY, else --api-key-file). Proxies are never used.
 """
 import argparse
