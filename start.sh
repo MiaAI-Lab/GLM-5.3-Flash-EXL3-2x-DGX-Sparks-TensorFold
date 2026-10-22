@@ -283,10 +283,12 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
 fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
-here_gb=$(free -g | awk '/^Mem:/ {print $7}')
+# Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
+# MemAvailable. It counts as available below, as in TensorFold's budget (patch 0119); see _avail_gb in scripts/nodes.sh.
+here_gb=$(_avail_gb)
 low=0; (( here_gb >= 110 )) || low=1
 for i in $(worker_ids); do
-  there_gb[i]=$(worker "$i" "free -g | awk '/^Mem:/ {print \$7}'" 2>/dev/null || echo 0)
+  there_gb[i]=$(worker "$i" "$(declare -f _parked_zone _mem_avail _avail_gb); _avail_gb" 2>/dev/null || echo 0)
   (( there_gb[i] >= 110 )) || low=1
 done
 if (( ! low )); then

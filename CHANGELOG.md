@@ -5,6 +5,22 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The first start of a new image no longer gets a smaller pool** (patch `0119-cuda-budget-parked-pages`, by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)). TensorFold
+  budgets each rank from `MemAvailable` at start; the first start of an
+  image the worker lacked read 89.44 GiB "within" on rank 0 against 94.86 for a warm restart of the same image, and
+  kept 2 prompt states, not 32. On kernel 6.7+ a bulk free leaves GiBs of free pages on the per-CPU lists (`pagesets`
+  `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`: the image copy in `prepare.sh` (`docker save`
+  / `docker load`) parks 5-9 GiB there, which comes back at ~0.05-0.1 GiB/s over 1-2 minutes, and the first start of a new
+  image compiles `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, which parks 2.4 GiB
+  more. `capacity.admit` now reads `/proc/meminfo` and, right after it, the lists once at start-up (every zone and CPU,
+  less their `high_min:` resting level, so a warm start's idle 0.28 GiB, 0.11 GiB over it, does not move the budget; 0
+  when `/proc/zoneinfo` is unreadable) and adds the excess to that one `MemAvailable` reading (capped at `MemTotal`) for
+  both `available_bytes` and `page_room`, so pages that drain in between are undercounted, never counted twice. The
+  start-up log says how many it counted, from 0.25 GiB. Only that start-up read counts them: the Qwen families' live memory gate
+  keeps its figure, and the GLM family reads `MemAvailable` nowhere else. `start.sh`'s own "memory available" check
+  (and its warning below ~110 GiB) counts the same excess. Cold first start of a new image, TP=2: 94.58 GiB "within"
+  on rank 0 (rank 1 95.20) against 89.44 with nothing counted; a warm restart 94.86. CPU check on synthetic zoneinfo / meminfo files, admit() included: `tools/parked_pages_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
@@ -156,7 +172,8 @@ Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad
 50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
 29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
 
-- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)):
   a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
   skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
   unless `SPILL_GIB` is set.
@@ -259,8 +276,9 @@ contributors' measurements are in the PRs.
   restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
   CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
   content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
-  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  through a kernel, as the pool's own moves there do). Authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), PR #78;
+  credits in `NOTICE` and `CREDITS.md`.
   Numbers: README, "Spill tier".
 - **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
   default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's
