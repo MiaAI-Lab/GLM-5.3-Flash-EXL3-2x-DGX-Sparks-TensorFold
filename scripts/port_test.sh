@@ -4,7 +4,8 @@
 # setting refuses, the ZIG_HAS gates (spill2, kvshard, spillshard), PROMPT_CACHE_GIB as the spill tier's requirement,
 # the aliases, the mapping to the engine's flags and variables, the refusals (port_validate), the spill folder rules
 # (port_spill_judge on synthetic probe lines, spill_dir_probe and port_spill_check on temporary folders, the worker's
-# probe through its ssh command run locally), the parked pages on synthetic /proc files, and `bash -n` of every script.
+# probe through its ssh command run locally), the parked pages on synthetic /proc files, scripts/port-patches.sh's
+# README rewrite and helpers (its runs against the engine: scripts/port_patches_test.sh), and `bash -n` of every script.
 # bash 3.2 or later (runs on a Mac); no docker, no ssh, no GPU.
 # Usage: scripts/port_test.sh      (exits 1 when a check fails)
 set -u
@@ -385,6 +386,43 @@ if [[ -r /proc/meminfo ]]; then
   case_ "parked pages: this host's /proc/meminfo and /proc/zoneinfo" 0 "source '$here/memavail.sh'" "
     read -r a p b <<<\"\$(mem_counting)\"; [[ \"\$a\" =~ ^[0-9]+\\.[0-9]\$ && \"\$b\" =~ ^[0-9]+\$ ]] || { echo \"[\$a \$p \$b]\"; exit 1; }"
 fi
+
+# ---- scripts/port-patches.sh's helpers (its runs against the engine repository: scripts/port_patches_test.sh)
+# check_ <name> <script>: the script in a subshell; exit 0 passes
+check_() {
+  local name=$1 out got
+  n=$((n + 1))
+  out=$( ( eval "$2" ) 2>&1 ); got=$?
+  if [[ "$got" == 0 ]]; then printf 'ok   %s\n' "$name"
+  else fails=$((fails + 1)); printf 'FAIL %s (exit %s)\n%s\n' "$name" "$got" "$(sed 's/^/     /' <<<"$out")"; fi
+}
+check_ "port-patches: newreadme keeps the prose and is idempotent, its rows after the last hand-written row" '
+  PORT_PATCHES_LIB=1; source "$here/port-patches.sh"
+  t=$(mktemp -d "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -rf -- \"$t\"" EXIT
+  readme="$here/../zig/patches/README.md"
+  prose=$(grep -F "<!-- port-patches -->" "$readme" | grep -v "^|" | head -1)
+  [[ -n "$prose" ]] || { echo "the README has no prose line naming the marker: the test needs one"; exit 1; }
+  printf "| \`0014-zig-glm-port.patch\` | x | y <!-- port-patches --> |\n" > "$t/rows"
+  newreadme "$readme" "$t/rows" > "$t/a"; newreadme "$t/a" "$t/rows" > "$t/b"
+  cmp -s "$t/a" "$t/b" || { echo "a second run changed the README:"; diff "$t/a" "$t/b"; exit 1; }
+  grep -qxF "$prose" "$t/a" || { echo "the prose line was dropped: $prose"; exit 1; }
+  [[ "$(grep -cE "$ROW_RE" "$t/a")" == 1 ]] || { echo "not exactly one generated row"; exit 1; }
+  [[ "$(grep -vE "$ROW_RE" "$t/a")" == "$(grep -vE "$ROW_RE" "$readme")" ]] || { echo "hand-written lines changed"; exit 1; }
+  last=$(grep -nE "^[|] \`[0-9]+-" "$t/a" | grep -v "port-patches" | tail -1 | cut -d: -f1)
+  [[ "$(sed -n "$((last + 1))p" "$t/a")" == "$(cat "$t/rows")" ]] || { echo "the row is not after the last hand-written row"; exit 1; }'
+check_ "port-patches: slug and patchlike" '
+  PORT_PATCHES_LIB=1; source "$here/port-patches.sh"
+  [[ "$(slug "glm_cuda: the startup budgets count the pages parked on the per-CPU free lists (port of GLM 0119)")" == \
+     glm-cuda-the-startup-budgets-count-the-pages ]] || { slug "glm_cuda: the startup budgets count the pages parked"; exit 1; }
+  [[ "$(slug "ZIG: Parked pages!")" == parked-pages ]] || exit 1
+  w4="abcdefghij abcdefghij abcdefghij abcdefghij"; d4=abcdefghij-abcdefghij-abcdefghij-abcdefghij
+  [[ "$(slug "$w4 abcd tail")" == "$d4-abcd" && "$(slug "$w4 abcdefg tail")" == "$d4" ]] || { slug "$w4 abcdefg tail"; exit 1; }
+  [[ "$(slug "$(printf "x%.0s" {1..60})")" == "$(printf "x%.0s" {1..48})" ]] || exit 1
+  t=$(mktemp "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -f -- \"$t\"" EXIT
+  printf "what it does\n  --- indented is fine\n- a list item\n" > "$t"; ! patchlike "$t" >/dev/null || exit 1
+  for l in "diff --git a/x b/x" "--- a/x" "+++ b/x" "@@ -1 +1 @@" "GIT binary patch"; do
+    printf "text\n%s\n" "$l" > "$t"; patchlike "$t" >/dev/null || { echo "not caught: $l"; exit 1; }
+  done'
 
 # ---- every script parses (bash -n, with this bash)
 for f in "$root"/start.sh "$root"/start-tp3.sh "$root"/start-tp4.sh "$root"/start-tp4-switchless.sh "$root"/stop.sh "$here"/*.sh; do
