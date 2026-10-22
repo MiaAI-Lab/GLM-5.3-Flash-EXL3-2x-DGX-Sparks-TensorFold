@@ -1,9 +1,10 @@
-# Recipe: settings for Robert's GLM features on the Zig engine (step A)
+# Recipe: settings, patch delivery and tools for Robert's GLM features on the Zig engine
 
 Branch `zig-port` of Mia's GLM recipe (from `zig-engine` a6c7e08). What the recipe needs before the engine pieces land:
 the prompt cache as a setting, one place that maps the ported features to the ranks, refusals where a feature cannot
-run (instead of the silent no-ops before), and the parked pages in the start memory check. Step B (the patch export
-and the fork's defaults once the engine patches exist) comes later in this worktree.
+run (instead of the silent no-ops before), and the parked pages in the start memory check. Step B (the patch export,
+the guard on `tools/make-zig-patches.sh`, `zig/patches/README.md` and the client tools) is at the end; the fork's
+defaults and the `ZIG_HAS` tokens wait for the engine patches.
 
 ## What was ported from where
 
@@ -93,3 +94,108 @@ before and after this branch, is the end-to-end check of the off path (it stops 
 6. KV sharding with the display reserve (owner planes first on it) has no recipe rule yet.
 7. bash 3.2: `scripts/config.sh` (its local.sh path) and `scripts/nodes.sh` use `declare -A`; not made worse (the new
    files are 3.2-safe), not fixed either.
+
+# Step B: patch delivery and client tools
+
+How the port's engine patches reach `zig/patches` (none yet: the engine pieces are being written on `glm/*` in
+`~/GitHub/tensorfold-glm`), a guard on the tool that would delete them, the patches' README, and the DeepSeek port's
+client tools adapted to GLM.
+
+## What was ported from where
+
+| Piece | From | Here |
+| --- | --- | --- |
+| `scripts/port-patches.sh` | R's `scripts/port-patches.sh` (bdfc9e4): build the patches in a temporary folder, check them on a clean `TF_REF` with the hand-written patches first, write only then; `newreadme` (rows marked `<!-- port-patches -->`); `PORT_PATCHES_LIB=1` for the tests | GLM pins (`ZIG_TF_REF`, read with leading whitespace: it sits inside config.sh's zig block), engine `~/GitHub/tensorfold-glm`, base `glm/zig-engine-base`, branch `glm/integration`; per-commit patches by default; GLM-style headers; the kernel set excluded and guarded (below) |
+| `scripts/port_patches_test.sh` | new (R tests only `newreadme`) | 13 cases against the engine repository in a throwaway `git clone --shared` (no commit on its branches): base alone, one commit, two, a merge, squash, five refusals, writes on a copy of the recipe |
+| `scripts/port_test.sh` | R's `newreadme` case | `newreadme` (prose kept, idempotent, rows after the last hand-written row), `slug`, `patchlike` |
+| `tools/make-zig-patches.sh` guard | new | refuses while `zig/patches` holds a patch numbered above 0005 (it `rm -f`s every patch, then writes 0001-0005); `--force` (first argument) keeps the old behaviour |
+| `zig/patches/README.md` | new; R's README for the generated-row convention | a row per 0001-0013 (from their headers, the recipe's log and its merged PRs: #170, #174, #181, #190, #192/#194, #191, #202), how 0014+ are made, ordering rules |
+| `tools/checklib.py`, `exact.py`, `spill_check.py`, `resume_bench.py`, `prefix_fanout.py`, `selftest.py`, `fake_server.py`, `test_checklib_credentials.py` | R's `tools/` (bdfc9e4) | adapted (below); not taken: `kv_shard_check_e2e.py`, `pair_check.py`, `gpu_validate.sh`, `bench.py`, `smoke.py`, `validate.py` (DeepSeek-engine checks or runbooks). No clash with this recipe's tools (`client.py`, `needle.py`, `prompt_reuse.py`, ... stay as they are) |
+
+## port-patches.sh: how it differs from DeepSeek's
+
+- `--mode commits` is the default (R: squash): one patch a first-parent commit of `BASE..BRANCH`, named
+  `NNNN-zig-<slug>.patch` (`--name REV=SLUG`, else the subject's slug), numbered after the last hand-written patch. A
+  merge is one patch (its diff against its first parent) whose header lists the commits it brings in. Squash stays.
+- The header is the commit's message as written (GLM's 0012/0013 style: plain text, not R's `# ` lines), after a first
+  line `# port-patches.sh: <branch> @ <sha> over <base> @ <sha> (<mode> <from>..<to>)` that marks it as exported, then a
+  `Credits:` line (the commits' authors, `Robert Wojciechowski (wojo, ...)` for Robert; BadAd84's block store design,
+  #118, when the patch's paths or its message say spill; none added when the message has its own `Credits:` line) and
+  GLM's `Apply from the checkout root with: git apply <file>` line. `git apply` reads from the first line that looks
+  like a patch, so a message with such a line (`diff `, `--- `, `+++ `, `@@ `, ...) is refused, not silently mangled.
+- Excluded from the patches and the comparisons: `zig/tests/cuda/glm_p1/aot` (the baseline carries the captured kernel
+  set there; it ships as `zig/aot/glm-aot-sm121.tar.xz`) and `docs/glm-port/` (these notes). A branch that changes the
+  kernel set is refused (checked after the base, so a wrong base is named as such): the image would lack those kernels.
+- Nothing to export is not an error: `--branch glm/zig-engine-base` checks the base alone and exits 0, and so does a
+  range that touches only the excluded paths; earlier exports are then left as they are (said).
+- README rows: `| patch | By | What it does |` (author markdown, subject, engine ref and sha), where R generated its
+  switch and default columns from `scripts/port.sh`: GLM's patches carry their switches and defaults in the header.
+
+## The tools: how they differ from DeepSeek's
+
+- `checklib.py`: `DEFAULT_MODEL` `GLM-5.3-Flash-EXL3` (`SERVED_NAME`); the API key from `API_KEY`, else the first of
+  `TENSORFOLD_API_KEY`'s comma-separated keys (what this recipe passes to the server; it writes no key file), else
+  `--api-key-file` (still no default path, no `API_KEY_FILE`); `default_context()` (`CONTEXT`, else 131,072, the
+  Zig default), `fit(context, reply)` (90 % of the window less the reply), `capped`, `over_window`; `SPILL_FIELDS`
+  without the picture points' two; no DeepSeek KV-shard field lists (`kv_shard{...}` and `kv_shard_*` are flattened as
+  they come); `SPILL_MARKER` `.glm53-tensorfold-spill` (no marker is written yet, open issue 6).
+- `spill_check.py`: no picture items or checks (GLM's lane host keeps no picture prompts); GLM's store numbers (6,204 B
+  a position, a 64-token keep grid with tails, `estimate` counts whole blocks and the tail); the small state is a 1 MiB
+  lower bound (low is the floor phase's safe side); `record --context`, the long items (`--cancel-tokens`,
+  `--kill-tokens`, `--floor-tokens`: R's 500,000 / 200,000 / 200,000) default to the most the window allows, and any
+  item past it is refused before a request.
+- `exact.py`: checklib's key rule and headers (R read `~/.local/state/dsv41-tensorfold/api-key` by default); `--context`
+  leaves out cold cases past the window, listed in `meta.over_window`, which `compare` notes instead of calling a
+  mismatch (at 131,072 every case fits).
+- `resume_bench.py`: sizes 32,000 / 64,000 / 100,000 (R: 100,000-250,000), `--context`, sizes past the window refused.
+- `prefix_fanout.py`: `--grid 64` (GLM's keep grid; R 2048), `--context`; its docstring says what it proves here: the
+  Zig engine fills one prompt at a time, so a shared prefix is computed once, which is why the prefix wait is not ported.
+- `fake_server.py`: no KV-shard simulation, `/fake/kill-rank1` or picture points; GLM's name and a 131,072 window.
+- `selftest.py`: `compile`, `creds` (runs `test_checklib_credentials.py`), `kinds`, `counters`, `exact` (plus a record
+  at a smaller window), `spill` (no pictures), `resume` (new: seed, restart, resume, report, and `restore-wrong`
+  caught), `prefix` (the fake's 2048 grid); no `kv`, `pair` or `runbook`.
+
+## Tests (step B)
+
+- `/bin/bash scripts/port_test.sh`: 96 of 96 (bash 3.2.57, this Mac).
+- `/bin/bash scripts/port_patches_test.sh`: 13 of 13 (~18 s, against `~/GitHub/tensorfold-glm`); a mutation pass of
+  `port-patches.sh` (the tree comparison always true, the hand-written patches not applied, earlier exports kept, no
+  credits line, no kernel-set refusal, numbering from 0) failed it each time.
+- `scripts/port-patches.sh --dry-run --branch glm/zig-engine-base`: `ZIG_TF_REF` + 0001-0013 = `0db3e2f6` outside the
+  kernel set (583 files there) and the notes, nothing to export. In a throwaway clone with one trivial commit on the
+  base: `0014-zig-glm-trivial.patch` written, applies, gives the branch's tree.
+- `tools/make-zig-patches.sh`: refuses on this tree (0006-0013 listed), nothing changed; in a temporary copy with only
+  0001-0005 and with `--force` it goes past the guard (both then stop at the missing checkout).
+- `python3 -I tools/selftest.py`: PASS, 83 expectations (~85 s, Python 3.15); `tools/test_checklib_credentials.py`
+  7 of 7.
+- No engine code changed in this step: no cross-build or Zig host tests.
+
+## Which checks need the Sparks
+
+On any machine: `scripts/port_test.sh`, `scripts/port_patches_test.sh` (needs the engine repository),
+`scripts/port-patches.sh --dry-run`, `tools/selftest.py`, `tools/test_checklib_credentials.py`, `exact.py compare`,
+`spill_check.py estimate`, `resume_bench.py report`. On the Sparks (a GPU run, Robert's go): `exact.py record` on the
+image before and after a change; `prefix_fanout.py --expect-one-fill` on today's image with `PROMPT_CACHE_GIB` above 0
+(the check that the prefix wait is not needed); `spill_check.py record / run / drop` and `resume_bench.py seed /
+resume` once the spill v2 patches are in `zig/patches` (`SPILL_V2=1`, `ZIG_HAS` with `spill2`).
+
+## Open issues (step B)
+
+1. Counter names. The tools read the DeepSeek port's cache-tier names (`prompt_cache.memory_hits`,
+   `disk_hits_committed`, `restored_tokens`, `entries`, `restores_*`, `parked`, and `spill` as an array of per-rank
+   objects). The GLM Zig server today reports `prompt_cache{hits, misses, evicted, restored_from_disk}`, `kept_*` at the
+   top and v1's `spill{entries, bytes, writes, write_bytes, reads, read_bytes, skipped, failed}` as one object
+   (`status_routes.zig keptFields`). `glm/cache-core` decides the v2 names: either it reports cache-tier's or
+   `checklib` maps them. Until then `spill_check.py` and `resume_bench.py` have nothing to read; `exact.py` and
+   `prefix_fanout.py` work against today's server (`tensorfold.token_sha`, `usage...cached_tokens`, `/health live`
+   are in v1.0.7's server).
+2. `spill_check.py`'s small-state size and keep window are estimates until round 2's packer fixes them.
+3. `TOKENS_PER_WORD` (1.15) is DeepSeek's tokenizer's; GLM's is not measured (`fit` leaves 10 % of the window).
+4. The engine commits' messages are the patches' headers: round 3 has to write them as such (what, switches and
+   defaults, measured, credits) and give `--name`s. Exported from `glm/integration`, each merge of a piece is one patch;
+   a series branch with one commit a feature (as DeepSeek's `port/series-370daf0`) gives cleaner patches.
+5. Numbering: 0014 and later assume no one else takes 0014 first (open PR #186 already collides on 0008); a new
+   hand-written patch moves the export after it on the next run (tested), but the numbers should be agreed with Mia and
+   hecisaza.
+6. `SPILL_MARKER`: this recipe writes no marker at the spill root (step A's issue 4, `spill_fix_owner`).
+7. `tools/make-zig-patches.sh` needs bash 4 (`mapfile`) and GNU tar: only its guard was run here.

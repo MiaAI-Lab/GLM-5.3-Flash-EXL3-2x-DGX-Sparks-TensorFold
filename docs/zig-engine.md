@@ -13,13 +13,16 @@ yet. The Zig engine's greedy replies equal the Python engine's on two prompts at
 
 | Part | Source |
 | --- | --- |
-| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/0001-0005`, built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
+| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/` (`0001`-`0013`), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
 | captured Triton kernel set | `zig/aot/glm-aot-sm121.tar.xz` (aot.json and 311 cubins, captured from the Python engine on a GB10; pinned by its sha256), at `TENSORFOLD_CUDA_KERNELS` |
 | runtime libraries | `nvidia/cuda:13.0.2-runtime-ubuntu24.04` (cuBLAS, cuBLASLt), NCCL 2.30.7 (the pip wheel; the Python image runs the same), libibverbs and the mlx5 provider |
 
-`zig/patches/` is the Zig port against TensorFold v1.0.7, in five patches: the shared engine changes (lane host, native
+`zig/patches/` is the Zig port against TensorFold v1.0.7: five patches (the shared engine changes (lane host, native
 CUDA registry, server), the Flash Next Zig CUDA engine the GLM engine builds on, the GLM kernels, the GLM engine, and its
-tests. `tools/make-zig-patches.sh <Zig port checkout>` writes them and checks that they reproduce the branch exactly.
+tests), which `tools/make-zig-patches.sh <Zig port checkout>` writes and checks against the branch, then the hand-written
+patches `0006`-`0013`; Robert's spill v2 / KV-shard port will follow as `0014` and later, exported by
+`scripts/port-patches.sh` (none yet). [`zig/patches/README.md`](../zig/patches/README.md) lists them and the ordering
+rules; `tools/make-zig-patches.sh` refuses while patches after `0005` are there (`--force` deletes them).
 The image tag is `zig-v1.0.7-<hash>` of the patches, the kernel set, the Dockerfile and the pins (`IMAGE_TAG`,
 `IMAGE_DIGEST` pin a published one; none yet, so `prepare.sh` builds it, about 10 minutes the first time).
 
@@ -171,7 +174,10 @@ engine on a ring).
 ## Build and test the Zig side
 
 ```sh
-tools/make-zig-patches.sh <Zig port checkout> [branch] [base]   # refresh zig/patches and zig/aot
+tools/make-zig-patches.sh <Zig port checkout> [branch] [base]   # refresh zig/patches/0001-0005 and zig/aot
+scripts/port-patches.sh --dry-run                                # check 0014+ from the port's engine branch (no write)
+scripts/port_patches_test.sh; scripts/port_test.sh               # the recipe's port checks (a Mac is enough)
+python3 -I tools/selftest.py                                     # the client tools against a fake server
 ENGINE=zig scripts/prepare.sh                                    # build (or pull) the image on both Sparks
 ENGINE=zig DRY_RUN=1 ./start.sh                                  # print every rank's docker command
 ENGINE=zig ./start.sh                                            # start it

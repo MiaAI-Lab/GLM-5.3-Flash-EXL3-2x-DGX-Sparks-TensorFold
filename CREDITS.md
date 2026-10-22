@@ -47,6 +47,20 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
   `tensorfold-native` serving CUDA families through one registry, which the Zig engine here runs on.
+- **The port of Robert Wojciechowski's GLM features to the Zig engine** (planned, in progress for `ENGINE=zig`:
+  `zig/patches/0014` and later, none here yet): spill v2 (`0088`/`0110`,
+  [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78) and
+  [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)), continued chats (`0111`,
+  [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)), KV sharding (`0118`,
+  [#152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)) and the parked pages
+  (`0119`, [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149)), authored by
+  **Robert Wojciechowski ([wojo](https://github.com/wojo))** for the Python engine and being ported by him to the GLM
+  Zig engine, after his port of the same features to the DeepSeek-V4.1-Flash Zig engine. Spill v2's block store (the
+  2,048-token block layout, lineage, the write-at-keep ring, release and fsync order) is
+  **[BadAd84](https://github.com/BadAd84)**'s block-tier design (#118). The recipe side (`scripts/port.sh`,
+  `scripts/memavail.sh`, `scripts/port-patches.sh` and their tests) and the client tools `tools/checklib.py`,
+  `spill_check.py`, `resume_bench.py`, `prefix_fanout.py`, `selftest.py` and `fake_server.py` are wojo's, from his
+  DeepSeek recipe port; `tools/exact.py` is the DeepSeek recipe's (MiaAI-Lab), with wojo's eight-stream cases.
 - **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE
   all-gather of the Zig engine implements the RoCEnante protocol of b12x by local-inference-lab, as `0006-cuda-roce-allgather`
   does for the Python engine (below).
