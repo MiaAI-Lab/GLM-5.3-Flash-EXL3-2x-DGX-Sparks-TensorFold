@@ -36,6 +36,42 @@ FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is r
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-}"  # the worker's Hugging Face cache when it is not its HF_HOME (absolute path)
 WORKER2="${WORKER2:-}"; FABRIC_PEER2="${FABRIC_PEER2:-}"; WORKER_HF_CACHE2="${WORKER_HF_CACHE2:-}"   # rank 2, as WORKER / FABRIC_PEER / WORKER_HF_CACHE
 WORKER3="${WORKER3:-}"; FABRIC_PEER3="${FABRIC_PEER3:-}"; WORKER_HF_CACHE3="${WORKER_HF_CACHE3:-}"   # rank 3, the same
+# One public selector for optional registered-host-memory TP4 RDMA: neighbour
+# relay on a ring, direct all-peer collectives on a switched mesh. Launch entry
+# points validate before discovery/live operations; stop.sh skips launch validation.
+TP4_NETWORK="${TP4_NETWORK-upstream}"
+_tp4_registered=0
+[[ "$TP4_NETWORK" != registered-rdma ]] || _tp4_registered=1
+if [[ "${1:-}" == --validate-tp4-network ]]; then
+  _tp4_network_error() { echo "config.sh: TP4_NETWORK: $*" >&2; exit 1; }
+  case "$TP4_NETWORK" in
+    upstream) _tp4_registered=0 ;;
+    registered-rdma)
+      _tp4_registered=1
+      [[ "${ENGINE:-zig}" == zig && "$TP" == 4 && "${SPLIT:-1}" == 0 ]] ||
+        _tp4_network_error "registered-rdma requires ENGINE=zig TP=4 SPLIT=0"
+      [[ "${FABRIC_EXPECT:-}" =~ ^(mesh|ring)?$ ]] ||
+        _tp4_network_error "registered-rdma requires FABRIC_EXPECT=mesh, ring, or unset for discovery"
+      [[ "${COMM:-roce}" == roce ]] || _tp4_network_error "registered-rdma requires COMM=roce (or unset), not $COMM"
+      [[ "${TF_GLM_ROCE-1}" == 1 ]] || _tp4_network_error "registered-rdma conflicts with TF_GLM_ROCE=$TF_GLM_ROCE"
+      [[ "${TF_ROCE_RING-0}" =~ ^[01]$ ]] || _tp4_network_error "TF_ROCE_RING must be 0, 1, or unset"
+      if [[ -n "${TF_ROCE_RING+set}" && -n "${FABRIC_EXPECT:-}" ]]; then
+        _tp4_ring=0; [[ "$FABRIC_EXPECT" != ring ]] || _tp4_ring=1
+        [[ "$TF_ROCE_RING" == "$_tp4_ring" ]] ||
+          _tp4_network_error "TF_ROCE_RING=$TF_ROCE_RING conflicts with FABRIC_EXPECT=$FABRIC_EXPECT"
+        unset _tp4_ring
+      fi
+      [[ "${TF_ROCE_MAX_KB-512}" == 512 ]] || _tp4_network_error "registered-rdma requires TF_ROCE_MAX_KB=512 (or unset)"
+      ;;
+    *) _tp4_network_error "expected upstream or registered-rdma, not $TP4_NETWORK" ;;
+  esac
+  [[ "${TF_GLM_TP4_REGISTERED_RDMA-$_tp4_registered}" == "$_tp4_registered" ]] ||
+    _tp4_network_error "TF_GLM_TP4_REGISTERED_RDMA conflicts with TP4_NETWORK=$TP4_NETWORK; use the public setting"
+  unset -f _tp4_network_error
+fi
+export TP4_NETWORK TF_GLM_TP4_REGISTERED_RDMA="$_tp4_registered"
+unset _tp4_registered
+
 MASTER_PORT="${MASTER_PORT:-29551}"  # TensorFold's rendezvous port between the ranks (keep it on the private link)
 # The rendezvous address (rank 0's, --master): at TP=2 the head's address on the link to the worker; at TP>2 this
 # node's LAN address (what its hostname resolves to), which every worker reaches. SOCKET_IFNAME (TP>2): the netdev of
@@ -190,7 +226,7 @@ export TF_GLM_DENSE="$DENSE"
 # two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1); decode at one stream prose 85.7 -> 96.2
 # tok/s, code 131.3 -> 145.3, four streams +11-15%, prefill unchanged (one boot each, 2026-10-08). Same bits.
 # TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the queue pairs' ACK timeout.
-_comm=nccl; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) ]] && _comm=roce
+_comm=nccl; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) || "$TP4_NETWORK" == registered-rdma ]] && _comm=roce
 COMM="${COMM:-$_comm}"
 export TF_GLM_COMM="$COMM"
 # The largest all-gather in KiB that goes over RoCE (patch 0006 reads it; a setting, no patch of its own): 512 (default;
@@ -279,7 +315,8 @@ export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
 # with it (64 rows: 1024) unless you set it. Exact at any size; 64 rows add ~250 MiB a Spark to the estimate.
 if (( PARALLEL > 4 )); then _win=64; else _win=32; fi
 export TF_GLM_MULTI_WINDOW="${TF_GLM_MULTI_WINDOW:-$_win}"
-if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 ]]; then
+# The opt-in native relay is fixed at 512 KiB; larger gathers stay on NCCL.
+if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 && "$TP4_NETWORK" == upstream ]]; then
   export TF_ROCE_MAX_KB=$(( TF_GLM_MULTI_WINDOW * 16 ))
 fi
 # Kept prompt states (TensorFold's TF_GLM_CACHE_ENTRIES, 8 by default): the oldest is dropped past this count, however

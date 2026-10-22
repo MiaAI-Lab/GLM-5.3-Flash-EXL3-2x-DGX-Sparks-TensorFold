@@ -1,0 +1,36 @@
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "GL"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "M_AFTER_CANCEL_924F\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "A checksum is"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " a value"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " computed from data"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " to detect"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " errors or"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " verify"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " integrity"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": ".<|user|>"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "What"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " is label"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " GL"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "M_AFTER_CANCEL"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "exact_mode": "exact", "tensorfold": {"enable_thinking": false, "reasoning_effort": "none", "engine": "lanes", "tokens_per_second": 87.30800318809399, "seconds": 0.355064815, "prefill_seconds": 0.104467237, "prefill_widths": [], "prefill_raised": [], "time_to_first_token": 0.105604325, "sampling": "greedy", "drafts": true, "token_sha": "fc868059db6c", "min_rows": 2, "token_ids": [3825, 44, 71784, 47167, 62, 24, 99590, 37, 198, 32, 32382, 374, 264, 897, 24113, 504, 821, 311, 11135, 5975, 476, 10141, 16598, 13, 154827, 3838, 374, 2383, 5588, 44, 71784, 47167]}, "speculative": {"rounds": 13, "drafted": 24, "accepted": 18, "acceptance_rate": 0.75, "tokens_per_round": 2.4615384615384617}}
+
+data: {"id": "chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741", "object": "chat.completion.chunk", "created": 1792681546, "model": "GLM-5.3-Flash-EXL3", "choices": [], "usage": {"prompt_tokens": 29, "completion_tokens": 32, "total_tokens": 61, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}}}
+
+data: [DONE]
+

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "index": 0,
+  "first_wave": 0,
+  "plan_sha256": "34600198dc132d45df72d3058b6cc41d50433537320628b1cea0c9114c4d55ef",
+  "collector_sha256": "2b48429f5b97cc949a221b8fcef20cbcbb583432ceb766a18d8b1bf3a10b9310",
+  "started_unix_ms": 1792680610985
+}

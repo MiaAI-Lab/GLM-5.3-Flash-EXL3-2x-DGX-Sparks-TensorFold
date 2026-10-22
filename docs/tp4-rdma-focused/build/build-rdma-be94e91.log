@@ -1,0 +1,285 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.focused-rdma-be94e91
+#1 transferring dockerfile: 6.27kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/nvidia/cuda@sha256:6a0e31b59e70890446f2c17356d6efc0d54260090a8c63d6ca7c2ad049db95d2
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/nvidia/cuda@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 2B done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [build  1/18] FROM docker.io/nvidia/cuda@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+#6 resolve docker.io/nvidia/cuda@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6 0.0s done
+#6 DONE 0.0s
+
+#7 [stage-1 1/6] FROM docker.io/nvidia/cuda@sha256:6a0e31b59e70890446f2c17356d6efc0d54260090a8c63d6ca7c2ad049db95d2
+#7 resolve docker.io/nvidia/cuda@sha256:6a0e31b59e70890446f2c17356d6efc0d54260090a8c63d6ca7c2ad049db95d2
+#7 resolve docker.io/nvidia/cuda@sha256:6a0e31b59e70890446f2c17356d6efc0d54260090a8c63d6ca7c2ad049db95d2 0.0s done
+#7 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 20.81MB 0.0s done
+#5 DONE 0.1s
+
+#8 [build  2/18] RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends       ca-certificates curl git xz-utils python3-pip python3-venv libibverbs-dev && rm -rf /var/lib/apt/lists/*
+#8 CACHED
+
+#9 [build  3/18] RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz" &&     echo "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8  /tmp/zig.tar.xz" | sha256sum -c - &&     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz &&     /opt/zig/zig version
+#9 CACHED
+
+#10 [build  4/18] RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "https://github.com/ashhart/TensorFold.git" &&     git fetch -q --depth 1 origin "e7c523ebfa16b8094cf9e35e3773a7d25befcc5b" && git checkout -q --detach FETCH_HEAD &&     test "$(git rev-parse HEAD)" = "e7c523ebfa16b8094cf9e35e3773a7d25befcc5b"
+#10 CACHED
+
+#11 [build  5/18] COPY zig/patches /opt/tf-patches
+#11 DONE 0.1s
+
+#12 [build  6/18] RUN cd /tensorfold &&     for p in /opt/tf-patches/*.patch; do echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
+#12 0.153 applying /opt/tf-patches/0001-zig-shared-engine.patch
+#12 0.194 applying /opt/tf-patches/0002-zig-flashnext-cuda.patch
+#12 0.263 applying /opt/tf-patches/0003-zig-glm-kernels.patch
+#12 0.269 /opt/tf-patches/0003-zig-glm-kernels.patch:3673: new blank line at EOF.
+#12 0.269 +
+#12 0.270 warning: 1 line adds whitespace errors.
+#12 0.270 applying /opt/tf-patches/0004-zig-glm-engine.patch
+#12 0.296 applying /opt/tf-patches/0005-zig-glm-tests.patch
+#12 0.334 /opt/tf-patches/0005-zig-glm-tests.patch:6453: trailing whitespace.
+#12 0.334 // 
+#12 0.351 /opt/tf-patches/0005-zig-glm-tests.patch:21620: new blank line at EOF.
+#12 0.351 +
+#12 0.383 warning: 2 lines add whitespace errors.
+#12 0.384 applying /opt/tf-patches/0006-zig-glm-scores-rows-g128.patch
+#12 0.387 applying /opt/tf-patches/0007-zig-flashnext-record-before-long-batch.patch
+#12 0.389 applying /opt/tf-patches/0008-zig-aot-log-missing-variant.patch
+#12 0.390 applying /opt/tf-patches/0009-zig-glm-tpn-pool.patch
+#12 0.391 applying /opt/tf-patches/0010-zig-glm-tpn-roce-probe.patch
+#12 0.393 applying /opt/tf-patches/0011-zig-glm-greedy-draft-probs.patch
+#12 0.394 applying /opt/tf-patches/0012-zig-glm-cache-reserve.patch
+#12 0.397 applying /opt/tf-patches/0013-zig-glm-round-batching.patch
+#12 0.400 applying /opt/tf-patches/0014-zig-glm-tp4-registered-relay.patch
+#12 DONE 0.4s
+
+#13 [build  7/18] COPY expected-fatbins-be94e91.json /tmp/expected-fatbins-be94e91.json
+#13 DONE 0.1s
+
+#14 [build  8/18] COPY native-source-blobs-be94e91.json /tmp/native-source-blobs-be94e91.json
+#14 DONE 0.1s
+
+#15 [build  9/18] COPY verify-focused-fatbins-be94e91.py /tmp/verify-focused-fatbins-be94e91.py
+#15 DONE 0.1s
+
+#16 [build 10/18] COPY verify-focused-source-be94e91.py /tmp/verify-focused-source-be94e91.py
+#16 DONE 0.1s
+
+#17 [build 11/18] RUN python3 /tmp/verify-focused-source-be94e91.py && /usr/local/cuda/bin/nvcc --version
+#17 0.287 {"native_commit": "be94e919e35c628261bd38364b1743a2e4353a26", "focused_source_bytes_passed": true, "files": 2889, "manifest_sha256": "d974498a5374a5ede7de6481467d960e55fbdc04a41162ac80e477dd1c61b6c7", "real_verbs_headers": true, "clean_source_before_compile": true}
+#17 0.294 nvcc: NVIDIA (R) Cuda compiler driver
+#17 0.294 Copyright (c) 2005-2025 NVIDIA Corporation
+#17 0.294 Built on Wed_Aug_20_01:57:39_PM_PDT_2025
+#17 0.294 Cuda compilation tools, release 13.0, V13.0.88
+#17 0.294 Build cuda_13.0.r13.0/compiler.36424714_0
+#17 DONE 0.3s
+
+#18 [build 12/18] RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=fast --prefix /opt/tensorfold       -j4 install native glm-transport-probe fatbins &&     test -x /opt/tensorfold/native/bin/tensorfold-native && test -x /opt/tensorfold/bin/tensorfold
+#18 58.17 glm-transport-probe
+#18 58.17 +- install tf-glm-transport-probe
+#18 58.17    +- compile exe tf-glm-transport-probe fast native
+#18 58.17       +- run /usr/local/cuda/bin/nvcc (prefill_attention.fatbin) w
+#18 58.17 ./zig/kernels/cuda/prefill_attention.cu(18): warning #177-D: variable "tf_prefill_attention::SMEM_MAX" was declared but never referenced
+#18 58.17   constexpr int SMEM_MAX = 96 * 1024;
+#18 58.17                 ^
+#18 58.17 
+#18 58.17 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#18 58.17 
+#18 58.17 
+#18 64.51 glm-transport-probe
+#18 64.51 +- install tf-glm-transport-probe
+#18 64.51    +- compile exe tf-glm-transport-probe fast native
+#18 64.51       +- run /usr/local/cuda/bin/nvcc (fp8_experts.fatbin) w
+#18 64.51 ./zig/kernels/cuda/fp8_experts.cu(153): warning #177-D: variable "RW" was declared but never referenced
+#18 64.51     constexpr int RW = PromptCfg<M, RT, CW>::RW;
+#18 64.51                   ^
+#18 64.51 
+#18 64.51 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#18 64.51 
+#18 64.51 
+#18 65.42 glm-transport-probe
+#18 65.42 +- install tf-glm-transport-probe
+#18 65.42    +- compile exe tf-glm-transport-probe fast native
+#18 65.42       +- run /usr/local/cuda/bin/nvcc (glm_kda_chunk.fatbin) w
+#18 65.42 ./zig/kernels/cuda/glm_kda_chunk.cu(22): warning #177-D: variable "tf_glm_kda_chunk::NW" was declared but never referenced
+#18 65.42   constexpr int NT = 256, NW = NT / 32;
+#18 65.42                           ^
+#18 65.42 
+#18 65.42 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#18 65.42 
+#18 65.42 ./zig/kernels/cuda/glm_kda_chunk.cu(29): warning #177-D: variable "tf_glm_kda_chunk::PF_P" was declared but never referenced
+#18 65.42   constexpr int PF_P = ((BT + HALO) * PCH / 8 + NT - 1) / NT;
+#18 65.42                 ^
+#18 65.42 
+#18 65.42 
+#18 70.41 glm-transport-probe
+#18 70.41 +- install tf-glm-transport-probe
+#18 70.41    +- compile exe tf-glm-transport-probe fast native
+#18 70.41       +- run /usr/local/cuda/bin/nvcc (glm_qmm.fatbin) w
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(409): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(618): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(827): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(1036): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(1245): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(1454): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(1663): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(1872): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(2081): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(2290): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(2499): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(2708): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(2917): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(3126): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(3335): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(3544): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(3753): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(3962): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(4171): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 ./zig/kernels/cuda/glm_qmm.cu(4380): warning #177-D: variable "E" was declared but never referenced
+#18 70.41               constexpr int E = T::MT * T::NT * 4;
+#18 70.41                             ^
+#18 70.41 
+#18 70.41 
+#18 DONE 178.7s
+
+#19 [build 13/18] RUN cd /tensorfold && /opt/zig/zig run zig/build/check_fatbins.zig -- 121 /opt/tensorfold/fatbin/*.fatbin && python3 /tmp/verify-focused-fatbins-be94e91.py && test -x /opt/tensorfold/bin/tf-glm-transport-probe
+#19 2.080 {"real_nvcc_fatbins": 56, "exact_inventory": true, "sm": 121}
+#19 DONE 2.1s
+
+#20 [build 14/18] RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold &&     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
+#20 DONE 0.2s
+
+#21 [build 15/18] RUN git clone -q --depth 1 --branch v0.2.8 --recurse-submodules --shallow-submodules https://github.com/mlc-ai/xgrammar /xgrammar &&     test "$(git -C /xgrammar rev-parse HEAD)" = "97787376faee5ed8466cfad57c99855e4ce2f6aa" &&     cd /tensorfold && /opt/zig/zig build grammar -Dxgrammar=/xgrammar -Doptimize=fast --prefix /opt/tensorfold -j4 &&     mkdir -p /opt/tensorfold/native/lib && cp /opt/tensorfold/lib/libtfgrammar.so /opt/tensorfold/native/lib/ &&     mkdir -p /opt/tensorfold/share/doc/tensorfold/LICENSES &&     cp /xgrammar/LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSES/xgrammar-Apache-2.0.txt &&     cp /xgrammar/NOTICE /opt/tensorfold/share/doc/tensorfold/LICENSES/xgrammar-NOTICE.txt
+#21 1.139 Note: switching to '97787376faee5ed8466cfad57c99855e4ce2f6aa'.
+#21 1.139 
+#21 1.139 You are in 'detached HEAD' state. You can look around, make experimental
+#21 1.139 changes and commit them, and you can discard any commits you make in this
+#21 1.139 state without impacting any branches by switching back to a branch.
+#21 1.139 
+#21 1.139 If you want to create a new branch to retain commits you create, you may
+#21 1.139 do so (now or later) by using -c with the switch command. Example:
+#21 1.139 
+#21 1.139   git switch -c <new-branch-name>
+#21 1.139 
+#21 1.139 Or undo this operation with:
+#21 1.139 
+#21 1.139   git switch -
+#21 1.139 
+#21 1.139 Turn off this advice by setting config variable advice.detachedHead to false
+#21 1.139 
+#21 DONE 72.4s
+
+#22 [build 16/18] COPY zig/aot/glm-aot-sm121.tar.xz /tmp/glm-aot-sm121.tar.xz
+#22 DONE 0.1s
+
+#23 [build 17/18] RUN echo "29ad991945a30f3398ae79ba781cb975f499b752a5b5dbc473d1c152e6bdb681  /tmp/glm-aot-sm121.tar.xz" | sha256sum -c - &&     mkdir -p /opt/tensorfold/share/tensorfold/cuda/sm121 &&     tar -xJf /tmp/glm-aot-sm121.tar.xz -C /opt/tensorfold/share/tensorfold/cuda/sm121 &&     test -f /opt/tensorfold/share/tensorfold/cuda/sm121/aot.json
+#23 0.139 /tmp/glm-aot-sm121.tar.xz: OK
+#23 DONE 0.3s
+
+#24 [build 18/18] RUN python3 -m venv /tmp/nv && /tmp/nv/bin/pip install -q --no-cache-dir "nvidia-nccl-cu13==2.30.7" &&     mkdir -p /opt/nccl && cp -a "$(find /tmp/nv -name 'libnccl.so.2' | head -1)" /opt/nccl/ && ls -l /opt/nccl
+#24 4.358 total 247820
+#24 4.358 -rw-r--r-- 1 root root 253766464 Oct 22 14:28 libnccl.so.2
+#24 DONE 4.4s
+
+#25 [stage-1 2/6] RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends       libibverbs1 ibverbs-providers rdma-core libcudnn9-cuda-13 && rm -rf /var/lib/apt/lists/*
+#25 CACHED
+
+#26 [stage-1 3/6] COPY --from=build /opt/nccl/libnccl.so.2 /tmp/libnccl.so.new
+#26 CACHED
+
+#27 [stage-1 4/6] COPY --from=build /opt/tensorfold /opt/tensorfold
+#27 DONE 0.1s
+
+#28 [stage-1 5/6] RUN cd /lib/aarch64-linux-gnu && rm -f libnccl.so.2 libnccl.so.2.[0-9]*.[0-9]* && mv /tmp/libnccl.so.new libnccl.so.2.30.7 &&     ln -s libnccl.so.2.30.7 libnccl.so.2 &&     ldconfig && ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native &&     ln -s /opt/tensorfold/bin/tensorfold /usr/local/bin/tensorfold && tensorfold-native --version
+#28 0.285 tensorfold-native 1.0.7
+#28 DONE 0.3s
+
+#29 [stage-1 6/6] WORKDIR /workspace
+#29 DONE 0.0s
+
+#30 exporting to image
+#30 exporting layers
+#30 exporting layers 5.6s done
+#30 exporting manifest sha256:908ac9711d7ceac2ba2eca6aa9126cbee2163f0963304dd5ca3eb99ea49ef4ed 0.0s done
+#30 exporting config sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804 0.0s done
+#30 exporting attestation manifest sha256:43cd33120d544eddaa6f786b104982145cb31218bd68e5080632c3e7b9635dbb 0.0s done
+#30 exporting manifest list sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5
+#30 exporting manifest list sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5 0.0s done
+#30 naming to docker.io/spark/glm-tp4:focused-rdma-be94e91 done
+#30 unpacking to docker.io/spark/glm-tp4:focused-rdma-be94e91
+#30 unpacking to docker.io/spark/glm-tp4:focused-rdma-be94e91 1.4s done
+#30 DONE 7.1s
+FOCUSED_RDMA_IMAGE_READY sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5

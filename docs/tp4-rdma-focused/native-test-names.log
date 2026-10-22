@@ -1,0 +1,58 @@
+/tmp/glm-focused-first-install-host-cache/o/37533ac10e7d26c985fa402b5e36ce1f/test
+1/6 glm_transport_probe.test.graph counters require relay progress and no host enqueue during replay...OK
+2/6 glm_transport_probe.test.graph counter drain waits for trailing completion polls and all relay stripes...OK
+3/6 glm_transport_probe.test.graph counter capture gate rejects execution and propagates a closed peer barrier...OK
+4/6 glm_transport_probe.test.graph counter size plan has fixed relay cutoff and NCCL middle...OK
+5/6 glm_transport_probe.test.graph counter direct registered RDMA requires own operations and zero relay stripes...OK
+6/6 glm_transport_probe.test.graph counter NCCL control replay requires unchanged custom counters...OK
+All 6 tests passed.
+
+/tmp/glm-focused-first-install-host-cache/o/7f45ca2b5903af271206a50b9adfee5e/test
+1/8 root.test_0...OK
+2/8 roce.test_0...OK
+3/8 roce.test.routes of a ring of four: neighbours only, the rank across gets none...OK
+4/8 roce.test.registered relay routes cover one and two rails per neighbor with shuffled HCAs and CIDRs...OK
+5/8 roce.test.registered RoCE four-rank direct routes cover 1 2 4 rails same and multiple subnets with shuffled HCAs...OK
+6/8 roce.test.registered RoCE a missing diagonal is allowed only in ring topology...OK
+7/8 roce_region.test.registered RoCE length rounds without overflow...OK
+8/8 roce_region.test.both region allocation paths compile without opening CUDA...OK
+All 8 tests passed.
+
+/tmp/glm-focused-first-install-host-cache/o/ead878066c347a52a20629c332da5a68/test
+1/35 cuda.test_0...OK
+2/35 cuda.test_1...OK
+3/35 cuda.test_2...OK
+4/35 cuda.test_3...OK
+5/35 cuda.test_4...OK
+6/35 cuda.test_5...OK
+7/35 cuda.test_6...OK
+8/35 cuda.test_7...OK
+9/35 cuda.test_8...OK
+10/35 cuda.test_9...OK
+11/35 cuda.test_10...OK
+12/35 cuda.test_11...OK
+13/35 cuda.test_12...OK
+14/35 cuda.test_13...OK
+15/35 cuda.test_14...OK
+16/35 cuda.test_15...OK
+17/35 cuda.test_16...OK
+18/35 cuda.test_17...OK
+19/35 cuda.test_18...OK
+20/35 cuda.test_19...OK
+21/35 cuda.test_20...OK
+22/35 cuda.test_21...OK
+23/35 cuda.test_22...OK
+24/35 cuda.test_23...OK
+25/35 cuda.test_24...OK
+26/35 cuda.test_25...OK
+27/35 cuda.test_26...OK
+28/35 cuda_comm.test.transport profile defaults retain optional allocated TP2/3/4...OK
+29/35 cuda_comm.test.transport profile opt-in scope and current options are strict...OK
+30/35 cuda_comm.test.transport profile errors and mismatches are collective before NCCL...OK
+31/35 cuda_comm.test.transport backend selection retains NCCL for large or ineligible byte counts...OK
+32/35 cuda_comm.test.transport profile registered RDMA accepts direct default or explicit zero and ring explicit one...OK
+33/35 cuda_matmuls.test_0...OK
+34/35 cuda_matmuls.test_1...OK
+35/35 glm_cuda.test_0...OK
+All 35 tests passed.
+

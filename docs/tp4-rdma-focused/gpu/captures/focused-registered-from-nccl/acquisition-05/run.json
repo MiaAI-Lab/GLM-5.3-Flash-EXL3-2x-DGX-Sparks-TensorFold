@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "session": 0,
+  "first_wave": 0,
+  "status": "completed",
+  "planned_waves": 4,
+  "published_waves": 4,
+  "measured_waves": 3,
+  "eligible_measured_waves": 3,
+  "wave_publication_us": 82123,
+  "wave_preparation_us": 16054,
+  "reservation_publication_us": 15993,
+  "ineligible_warmup_waves": 0,
+  "claim": "client-observed-fixed-wave-performance-not-attested-execution-or-steady-state-capacity"
+}

@@ -1,0 +1,978 @@
+{
+  "spark": {
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "build_receipt_sha256": "62b359093643422a1df34f87a55e0d664874c6388962d2c29a062654d078f9bc",
+    "embedded_proof_sha256": "ea55cfd29f62b96646420fbffce6c2686aa104858ca0c3df0ac444555132a229",
+    "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+    "image_fingerprint": "a319617ab6f1e29ea51b75f0eb6d9520c66c386fb73bf4c7ce01d14d78fa774b",
+    "engine": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "probe": "6db8c1914f6c83b09bf43cd9a0f7f65ce5ffa424c58295d3e4888cec91cf7c65",
+    "aot": "ed684888accd1b2f62377e83ecb0da22a350ba9cc4cfb61141af9695156c89c3",
+    "aot_files": 583,
+    "nvcc_fatbins": {
+      "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+      "sm": 121,
+      "count": 56,
+      "sass_checked_by": "zig/build/check_fatbins.zig",
+      "files": {
+        "affine4_pack.fatbin": {
+          "bytes": 16176,
+          "sha256": "f5e97cd458a1cf8bc7fc9bc5ffcb54c422a264e7b3fcfca80725836de8d1869e"
+        },
+        "experts.fatbin": {
+          "bytes": 106504,
+          "sha256": "649c6256e9dcf0cbffe7a3e8443a66cb1f6ef20c91b3b4169665cddb8238342d"
+        },
+        "experts_pack.fatbin": {
+          "bytes": 7872,
+          "sha256": "35d72252c1cd633d1c39a22cb67302d9e5b9dd1d84d456008a894038b8acdbe6"
+        },
+        "experts_prefill.fatbin": {
+          "bytes": 68560,
+          "sha256": "731a2acd7713390acb424e1404e5363dd28602c57583369ed416caa2b4e4a08a"
+        },
+        "fn_experts_prompt.fatbin": {
+          "bytes": 411336,
+          "sha256": "af751f3c478a8b5f38c832c938a9d9c124903d2329e49052a474e647df4eeeb4"
+        },
+        "fn_gdn.fatbin": {
+          "bytes": 139792,
+          "sha256": "7d70bb9520bbe8ac86ba489877e417336905e6eb209ac74c2a938caa5d1f1c40"
+        },
+        "fn_gdn_io.fatbin": {
+          "bytes": 62592,
+          "sha256": "8dc49598d052b2190ea5ac38a87bf9e71a0289db0b73008c6362b97b129aec86"
+        },
+        "fn_gdn_prefill.fatbin": {
+          "bytes": 77352,
+          "sha256": "cfcc737060bb541c5a8f8d331e682c6145b396d2b827fbec6790f2df0b062eae"
+        },
+        "fn_gdn_tree.fatbin": {
+          "bytes": 250760,
+          "sha256": "b028105b6bf1b6f59c588d05115c369338967a19a6d69a0eaeaad72b558d4f12"
+        },
+        "fn_int4.fatbin": {
+          "bytes": 933960,
+          "sha256": "60183afd351570f7bd334c766245efb0715a379cb191f5682206fec4983ca0e4"
+        },
+        "fn_nvfp4_experts.fatbin": {
+          "bytes": 76992,
+          "sha256": "ab066da7e10e0e571bc7240af625a858af0609ba4e5927237796e06d595ad54c"
+        },
+        "fn_nvfp4_shape.fatbin": {
+          "bytes": 99344,
+          "sha256": "4df807f4fa4a5867e5813961fd629b6d5c3424df6ba993cd547f0735d8110aff"
+        },
+        "fn_pack.fatbin": {
+          "bytes": 18592,
+          "sha256": "576571c43be0a5f5e88efe6c67633e4dba84dbcadc5fedc06b7baf94300ba2cb"
+        },
+        "fn_qmm.fatbin": {
+          "bytes": 128520,
+          "sha256": "0a3b7ec054d700c5f71505040850234432c8234b4ba3df76611b022bff9c4c0e"
+        },
+        "fn_qmm_cluster.fatbin": {
+          "bytes": 265200,
+          "sha256": "f934663b2e6c4df73f54cf3aaf76e25602ebe985b6c4b03224306f3fc34f4be4"
+        },
+        "fn_qmm_prefill.fatbin": {
+          "bytes": 55752,
+          "sha256": "a644f47629a423901de072f6c9b1f0d2aea3496c1db7ef330194cb6125add601"
+        },
+        "fn_qmmf.fatbin": {
+          "bytes": 362400,
+          "sha256": "d73fb41e1826dee59b634e14f4ee9d244b4a442c4cf60a2614df22e0d1ce6f91"
+        },
+        "fn_roce.fatbin": {
+          "bytes": 38040,
+          "sha256": "a1f3ae706fd51f68a527722828419b3c82265f5643a56e246e67e818189a9958"
+        },
+        "fp8_experts.fatbin": {
+          "bytes": 170912,
+          "sha256": "349ddd2294c7bc6ebf061c4c9f0beba480870c1b17918ebbc5a7c209b8c74d9f"
+        },
+        "gdn.fatbin": {
+          "bytes": 276552,
+          "sha256": "18db21dc56f61053f690f97206b750e4078d03e138592c57df6805e5eab5dd51"
+        },
+        "glm_exl3.fatbin": {
+          "bytes": 637256,
+          "sha256": "27c4d6af077de7b97d66051efe5b6ea928f961eee5792e210173bd0c081d7292"
+        },
+        "glm_foundations.fatbin": {
+          "bytes": 5776,
+          "sha256": "575023eb2ac28360e5682746b10a3974fcecd4887f61b4ade246a540c528687b"
+        },
+        "glm_hc.fatbin": {
+          "bytes": 20992,
+          "sha256": "0fadf8dc7f3507b53525127021841db630ca1fb011849e9f2594644a6be9e8b9"
+        },
+        "glm_kda.fatbin": {
+          "bytes": 147704,
+          "sha256": "1df4a18274441aa008415fa5a8de7d95d18cb4c724583b97bf324e2a7173c829"
+        },
+        "glm_kda_chunk.fatbin": {
+          "bytes": 150400,
+          "sha256": "b165bfa2e43d9f30890752dbe962dbd0061a2df72f78a06e1a077895b73dc69a"
+        },
+        "glm_msa.fatbin": {
+          "bytes": 220440,
+          "sha256": "9c7543dad31e03862e8af7e7918645a322583d528787d5591809c9f4dcca2e68"
+        },
+        "glm_ops.fatbin": {
+          "bytes": 102472,
+          "sha256": "c5e3f32daddfaf31083d54c9ee213d26b69e2139922c7619e6767c61ff032561"
+        },
+        "glm_qmm.fatbin": {
+          "bytes": 447912,
+          "sha256": "db40b6eb0896c0f5f0b3828f7287178d8398d42539058f70de3ce7acff046ba9"
+        },
+        "glm_qmm_prefill.fatbin": {
+          "bytes": 91408,
+          "sha256": "f2fd9e028f9f8cb732f873678218964f2589d694d7afdaf6d18d71e0b0ed26a3"
+        },
+        "glm_vision.fatbin": {
+          "bytes": 327312,
+          "sha256": "c1f1da8959cd7657427dddf722f118e57b56352d44a5f81dee00c98e435eabf3"
+        },
+        "lane_gemv.fatbin": {
+          "bytes": 66360,
+          "sha256": "63542ff55426b37061ffe6b8df0c72be2b1cf3b723965854483b1cd84c6b1d3c"
+        },
+        "modelopt_pack.fatbin": {
+          "bytes": 27224,
+          "sha256": "c00fa7997262bf7d03ba7a7e52f11c7d6895d71faace9aa019e30bb26c76c7e4"
+        },
+        "nemotron_attention.fatbin": {
+          "bytes": 38000,
+          "sha256": "94d071a06d11049fe820ae1ffbc24414aed10f9b7e4149ee04cf521a4aae84de"
+        },
+        "nemotron_keyed.fatbin": {
+          "bytes": 17072,
+          "sha256": "680fde4cbc425bd5cc8459234ae9f13fce05e967b76172d587d0d0c8fda8c65d"
+        },
+        "nemotron_mamba.fatbin": {
+          "bytes": 45616,
+          "sha256": "265a0e3f0080189df459daf675183ec69914872d9884637ead42b5a59d3af1d6"
+        },
+        "nemotron_norms.fatbin": {
+          "bytes": 229168,
+          "sha256": "da9cc9b3a381f98d0313e738d9a47988823918fe919cc05f1570ef598ef8ba3c"
+        },
+        "nemotron_ops.fatbin": {
+          "bytes": 89872,
+          "sha256": "9ba005e4dfe9f4c3b4dd8af0d01ab2abcb88be31ee046c8e68172697a7fda54f"
+        },
+        "nemotron_route.fatbin": {
+          "bytes": 84088,
+          "sha256": "218f56e6676702e37f8f649242b65ce8e3e693f57acfcc2a3bc31cfe670e652f"
+        },
+        "nvfp4_experts.fatbin": {
+          "bytes": 285024,
+          "sha256": "847a03d62f4924daa6084c15ee509a665598e422ee331f1949e2f0c5036c571e"
+        },
+        "prefill_attention.fatbin": {
+          "bytes": 52584,
+          "sha256": "7b0f09f6bae452a361b06a62cd824fcb5f7d3dacb3e5bc9fb5c5d21ae121dab9"
+        },
+        "probe.fatbin": {
+          "bytes": 24176,
+          "sha256": "aa74c92ebc0e5bbe845169892acd034de68e870021d5782ddd467198aa0b022c"
+        },
+        "prompt16.fatbin": {
+          "bytes": 123184,
+          "sha256": "e4715d9e81096da4236b7e28a373136b982ba2b2ab4920e6ed2cd733bb10aaa0"
+        },
+        "qmm_group.fatbin": {
+          "bytes": 27696,
+          "sha256": "cc608c9ba61aecc3f96453e92ecaf647e6b0292cfe26b83b7bbd0ce1ca43417a"
+        },
+        "qmm_prefill.fatbin": {
+          "bytes": 35912,
+          "sha256": "f7b935dd1e3367e6b57851f2bbfd443e7d59ac9f698906fcd4775bc36cb1ad36"
+        },
+        "qmmf.fatbin": {
+          "bytes": 717264,
+          "sha256": "e5b8fcf0c929f6e24f351a16b3ce5bf744a7f39a3936a49292ac51434af271f7"
+        },
+        "sample.fatbin": {
+          "bytes": 358648,
+          "sha256": "0a393b572e8a442f7a0e1f4f3ca003713ab9a751a4ec6c57a31b262a1851af07"
+        },
+        "scan_rows.fatbin": {
+          "bytes": 20808,
+          "sha256": "f850e860ebd4404e50ad97d7f1d8b1a7db19c3f965c03852c959ca373fe2ebca"
+        },
+        "torch_argmax.fatbin": {
+          "bytes": 68256,
+          "sha256": "0f5223a21cc7cd41b4b1a9b6c473d28c068f151f2355c53b49c6be9d58c9158c"
+        },
+        "torch_fn_logsumexp.fatbin": {
+          "bytes": 21096,
+          "sha256": "b6939ccd90dffd915f5c009c310190f6f44049c314d1e00ccf3cc371b4823b05"
+        },
+        "torch_fn_ops.fatbin": {
+          "bytes": 59752,
+          "sha256": "eb532aad18136eadd07ce666346ebb6a0f5645b7f577914ed327964de96e89af"
+        },
+        "torch_indexing.fatbin": {
+          "bytes": 19640,
+          "sha256": "45c97bb3b9bc26bc6393d12ff03e170b4e47c4e1c1cbeeebc90004800bd4c3ed"
+        },
+        "torch_movement.fatbin": {
+          "bytes": 16728,
+          "sha256": "33a8312a4183b1adfabe35ac2b0dabcac279a2dbe6a18e27cdb47d38224e214a"
+        },
+        "torch_nemotron_constants.fatbin": {
+          "bytes": 6208,
+          "sha256": "837396b79d96298c45587a3d2fe1c30d9017d582e6d99413dbca23707440f8b9"
+        },
+        "torch_pointwise.fatbin": {
+          "bytes": 12352,
+          "sha256": "d93593ea6f2cde140c7cbcb8d9b88e9e1c2bd08bf68939743924b620e2f95340"
+        },
+        "torch_topk.fatbin": {
+          "bytes": 48240,
+          "sha256": "e2b0fac2d7d913267e035a672a2a071e72410f135d2678c58899e9df9711e35d"
+        },
+        "train.fatbin": {
+          "bytes": 393544,
+          "sha256": "32c0d4e6de64afa661f14731375949246cca042d67c0f9ad4f0998e5c4c6050a"
+        }
+      }
+    },
+    "no_gpu_execution": true
+  },
+  "spark-peer": {
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "build_receipt_sha256": "62b359093643422a1df34f87a55e0d664874c6388962d2c29a062654d078f9bc",
+    "embedded_proof_sha256": "ea55cfd29f62b96646420fbffce6c2686aa104858ca0c3df0ac444555132a229",
+    "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+    "image_fingerprint": "a319617ab6f1e29ea51b75f0eb6d9520c66c386fb73bf4c7ce01d14d78fa774b",
+    "engine": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "probe": "6db8c1914f6c83b09bf43cd9a0f7f65ce5ffa424c58295d3e4888cec91cf7c65",
+    "aot": "ed684888accd1b2f62377e83ecb0da22a350ba9cc4cfb61141af9695156c89c3",
+    "aot_files": 583,
+    "nvcc_fatbins": {
+      "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+      "sm": 121,
+      "count": 56,
+      "sass_checked_by": "zig/build/check_fatbins.zig",
+      "files": {
+        "affine4_pack.fatbin": {
+          "bytes": 16176,
+          "sha256": "f5e97cd458a1cf8bc7fc9bc5ffcb54c422a264e7b3fcfca80725836de8d1869e"
+        },
+        "experts.fatbin": {
+          "bytes": 106504,
+          "sha256": "649c6256e9dcf0cbffe7a3e8443a66cb1f6ef20c91b3b4169665cddb8238342d"
+        },
+        "experts_pack.fatbin": {
+          "bytes": 7872,
+          "sha256": "35d72252c1cd633d1c39a22cb67302d9e5b9dd1d84d456008a894038b8acdbe6"
+        },
+        "experts_prefill.fatbin": {
+          "bytes": 68560,
+          "sha256": "731a2acd7713390acb424e1404e5363dd28602c57583369ed416caa2b4e4a08a"
+        },
+        "fn_experts_prompt.fatbin": {
+          "bytes": 411336,
+          "sha256": "af751f3c478a8b5f38c832c938a9d9c124903d2329e49052a474e647df4eeeb4"
+        },
+        "fn_gdn.fatbin": {
+          "bytes": 139792,
+          "sha256": "7d70bb9520bbe8ac86ba489877e417336905e6eb209ac74c2a938caa5d1f1c40"
+        },
+        "fn_gdn_io.fatbin": {
+          "bytes": 62592,
+          "sha256": "8dc49598d052b2190ea5ac38a87bf9e71a0289db0b73008c6362b97b129aec86"
+        },
+        "fn_gdn_prefill.fatbin": {
+          "bytes": 77352,
+          "sha256": "cfcc737060bb541c5a8f8d331e682c6145b396d2b827fbec6790f2df0b062eae"
+        },
+        "fn_gdn_tree.fatbin": {
+          "bytes": 250760,
+          "sha256": "b028105b6bf1b6f59c588d05115c369338967a19a6d69a0eaeaad72b558d4f12"
+        },
+        "fn_int4.fatbin": {
+          "bytes": 933960,
+          "sha256": "60183afd351570f7bd334c766245efb0715a379cb191f5682206fec4983ca0e4"
+        },
+        "fn_nvfp4_experts.fatbin": {
+          "bytes": 76992,
+          "sha256": "ab066da7e10e0e571bc7240af625a858af0609ba4e5927237796e06d595ad54c"
+        },
+        "fn_nvfp4_shape.fatbin": {
+          "bytes": 99344,
+          "sha256": "4df807f4fa4a5867e5813961fd629b6d5c3424df6ba993cd547f0735d8110aff"
+        },
+        "fn_pack.fatbin": {
+          "bytes": 18592,
+          "sha256": "576571c43be0a5f5e88efe6c67633e4dba84dbcadc5fedc06b7baf94300ba2cb"
+        },
+        "fn_qmm.fatbin": {
+          "bytes": 128520,
+          "sha256": "0a3b7ec054d700c5f71505040850234432c8234b4ba3df76611b022bff9c4c0e"
+        },
+        "fn_qmm_cluster.fatbin": {
+          "bytes": 265200,
+          "sha256": "f934663b2e6c4df73f54cf3aaf76e25602ebe985b6c4b03224306f3fc34f4be4"
+        },
+        "fn_qmm_prefill.fatbin": {
+          "bytes": 55752,
+          "sha256": "a644f47629a423901de072f6c9b1f0d2aea3496c1db7ef330194cb6125add601"
+        },
+        "fn_qmmf.fatbin": {
+          "bytes": 362400,
+          "sha256": "d73fb41e1826dee59b634e14f4ee9d244b4a442c4cf60a2614df22e0d1ce6f91"
+        },
+        "fn_roce.fatbin": {
+          "bytes": 38040,
+          "sha256": "a1f3ae706fd51f68a527722828419b3c82265f5643a56e246e67e818189a9958"
+        },
+        "fp8_experts.fatbin": {
+          "bytes": 170912,
+          "sha256": "349ddd2294c7bc6ebf061c4c9f0beba480870c1b17918ebbc5a7c209b8c74d9f"
+        },
+        "gdn.fatbin": {
+          "bytes": 276552,
+          "sha256": "18db21dc56f61053f690f97206b750e4078d03e138592c57df6805e5eab5dd51"
+        },
+        "glm_exl3.fatbin": {
+          "bytes": 637256,
+          "sha256": "27c4d6af077de7b97d66051efe5b6ea928f961eee5792e210173bd0c081d7292"
+        },
+        "glm_foundations.fatbin": {
+          "bytes": 5776,
+          "sha256": "575023eb2ac28360e5682746b10a3974fcecd4887f61b4ade246a540c528687b"
+        },
+        "glm_hc.fatbin": {
+          "bytes": 20992,
+          "sha256": "0fadf8dc7f3507b53525127021841db630ca1fb011849e9f2594644a6be9e8b9"
+        },
+        "glm_kda.fatbin": {
+          "bytes": 147704,
+          "sha256": "1df4a18274441aa008415fa5a8de7d95d18cb4c724583b97bf324e2a7173c829"
+        },
+        "glm_kda_chunk.fatbin": {
+          "bytes": 150400,
+          "sha256": "b165bfa2e43d9f30890752dbe962dbd0061a2df72f78a06e1a077895b73dc69a"
+        },
+        "glm_msa.fatbin": {
+          "bytes": 220440,
+          "sha256": "9c7543dad31e03862e8af7e7918645a322583d528787d5591809c9f4dcca2e68"
+        },
+        "glm_ops.fatbin": {
+          "bytes": 102472,
+          "sha256": "c5e3f32daddfaf31083d54c9ee213d26b69e2139922c7619e6767c61ff032561"
+        },
+        "glm_qmm.fatbin": {
+          "bytes": 447912,
+          "sha256": "db40b6eb0896c0f5f0b3828f7287178d8398d42539058f70de3ce7acff046ba9"
+        },
+        "glm_qmm_prefill.fatbin": {
+          "bytes": 91408,
+          "sha256": "f2fd9e028f9f8cb732f873678218964f2589d694d7afdaf6d18d71e0b0ed26a3"
+        },
+        "glm_vision.fatbin": {
+          "bytes": 327312,
+          "sha256": "c1f1da8959cd7657427dddf722f118e57b56352d44a5f81dee00c98e435eabf3"
+        },
+        "lane_gemv.fatbin": {
+          "bytes": 66360,
+          "sha256": "63542ff55426b37061ffe6b8df0c72be2b1cf3b723965854483b1cd84c6b1d3c"
+        },
+        "modelopt_pack.fatbin": {
+          "bytes": 27224,
+          "sha256": "c00fa7997262bf7d03ba7a7e52f11c7d6895d71faace9aa019e30bb26c76c7e4"
+        },
+        "nemotron_attention.fatbin": {
+          "bytes": 38000,
+          "sha256": "94d071a06d11049fe820ae1ffbc24414aed10f9b7e4149ee04cf521a4aae84de"
+        },
+        "nemotron_keyed.fatbin": {
+          "bytes": 17072,
+          "sha256": "680fde4cbc425bd5cc8459234ae9f13fce05e967b76172d587d0d0c8fda8c65d"
+        },
+        "nemotron_mamba.fatbin": {
+          "bytes": 45616,
+          "sha256": "265a0e3f0080189df459daf675183ec69914872d9884637ead42b5a59d3af1d6"
+        },
+        "nemotron_norms.fatbin": {
+          "bytes": 229168,
+          "sha256": "da9cc9b3a381f98d0313e738d9a47988823918fe919cc05f1570ef598ef8ba3c"
+        },
+        "nemotron_ops.fatbin": {
+          "bytes": 89872,
+          "sha256": "9ba005e4dfe9f4c3b4dd8af0d01ab2abcb88be31ee046c8e68172697a7fda54f"
+        },
+        "nemotron_route.fatbin": {
+          "bytes": 84088,
+          "sha256": "218f56e6676702e37f8f649242b65ce8e3e693f57acfcc2a3bc31cfe670e652f"
+        },
+        "nvfp4_experts.fatbin": {
+          "bytes": 285024,
+          "sha256": "847a03d62f4924daa6084c15ee509a665598e422ee331f1949e2f0c5036c571e"
+        },
+        "prefill_attention.fatbin": {
+          "bytes": 52584,
+          "sha256": "7b0f09f6bae452a361b06a62cd824fcb5f7d3dacb3e5bc9fb5c5d21ae121dab9"
+        },
+        "probe.fatbin": {
+          "bytes": 24176,
+          "sha256": "aa74c92ebc0e5bbe845169892acd034de68e870021d5782ddd467198aa0b022c"
+        },
+        "prompt16.fatbin": {
+          "bytes": 123184,
+          "sha256": "e4715d9e81096da4236b7e28a373136b982ba2b2ab4920e6ed2cd733bb10aaa0"
+        },
+        "qmm_group.fatbin": {
+          "bytes": 27696,
+          "sha256": "cc608c9ba61aecc3f96453e92ecaf647e6b0292cfe26b83b7bbd0ce1ca43417a"
+        },
+        "qmm_prefill.fatbin": {
+          "bytes": 35912,
+          "sha256": "f7b935dd1e3367e6b57851f2bbfd443e7d59ac9f698906fcd4775bc36cb1ad36"
+        },
+        "qmmf.fatbin": {
+          "bytes": 717264,
+          "sha256": "e5b8fcf0c929f6e24f351a16b3ce5bf744a7f39a3936a49292ac51434af271f7"
+        },
+        "sample.fatbin": {
+          "bytes": 358648,
+          "sha256": "0a393b572e8a442f7a0e1f4f3ca003713ab9a751a4ec6c57a31b262a1851af07"
+        },
+        "scan_rows.fatbin": {
+          "bytes": 20808,
+          "sha256": "f850e860ebd4404e50ad97d7f1d8b1a7db19c3f965c03852c959ca373fe2ebca"
+        },
+        "torch_argmax.fatbin": {
+          "bytes": 68256,
+          "sha256": "0f5223a21cc7cd41b4b1a9b6c473d28c068f151f2355c53b49c6be9d58c9158c"
+        },
+        "torch_fn_logsumexp.fatbin": {
+          "bytes": 21096,
+          "sha256": "b6939ccd90dffd915f5c009c310190f6f44049c314d1e00ccf3cc371b4823b05"
+        },
+        "torch_fn_ops.fatbin": {
+          "bytes": 59752,
+          "sha256": "eb532aad18136eadd07ce666346ebb6a0f5645b7f577914ed327964de96e89af"
+        },
+        "torch_indexing.fatbin": {
+          "bytes": 19640,
+          "sha256": "45c97bb3b9bc26bc6393d12ff03e170b4e47c4e1c1cbeeebc90004800bd4c3ed"
+        },
+        "torch_movement.fatbin": {
+          "bytes": 16728,
+          "sha256": "33a8312a4183b1adfabe35ac2b0dabcac279a2dbe6a18e27cdb47d38224e214a"
+        },
+        "torch_nemotron_constants.fatbin": {
+          "bytes": 6208,
+          "sha256": "837396b79d96298c45587a3d2fe1c30d9017d582e6d99413dbca23707440f8b9"
+        },
+        "torch_pointwise.fatbin": {
+          "bytes": 12352,
+          "sha256": "d93593ea6f2cde140c7cbcb8d9b88e9e1c2bd08bf68939743924b620e2f95340"
+        },
+        "torch_topk.fatbin": {
+          "bytes": 48240,
+          "sha256": "e2b0fac2d7d913267e035a672a2a071e72410f135d2678c58899e9df9711e35d"
+        },
+        "train.fatbin": {
+          "bytes": 393544,
+          "sha256": "32c0d4e6de64afa661f14731375949246cca042d67c0f9ad4f0998e5c4c6050a"
+        }
+      }
+    },
+    "no_gpu_execution": true
+  },
+  "msi-b9dc": {
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "build_receipt_sha256": "62b359093643422a1df34f87a55e0d664874c6388962d2c29a062654d078f9bc",
+    "embedded_proof_sha256": "ea55cfd29f62b96646420fbffce6c2686aa104858ca0c3df0ac444555132a229",
+    "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+    "image_fingerprint": "a319617ab6f1e29ea51b75f0eb6d9520c66c386fb73bf4c7ce01d14d78fa774b",
+    "engine": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "probe": "6db8c1914f6c83b09bf43cd9a0f7f65ce5ffa424c58295d3e4888cec91cf7c65",
+    "aot": "ed684888accd1b2f62377e83ecb0da22a350ba9cc4cfb61141af9695156c89c3",
+    "aot_files": 583,
+    "nvcc_fatbins": {
+      "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+      "sm": 121,
+      "count": 56,
+      "sass_checked_by": "zig/build/check_fatbins.zig",
+      "files": {
+        "affine4_pack.fatbin": {
+          "bytes": 16176,
+          "sha256": "f5e97cd458a1cf8bc7fc9bc5ffcb54c422a264e7b3fcfca80725836de8d1869e"
+        },
+        "experts.fatbin": {
+          "bytes": 106504,
+          "sha256": "649c6256e9dcf0cbffe7a3e8443a66cb1f6ef20c91b3b4169665cddb8238342d"
+        },
+        "experts_pack.fatbin": {
+          "bytes": 7872,
+          "sha256": "35d72252c1cd633d1c39a22cb67302d9e5b9dd1d84d456008a894038b8acdbe6"
+        },
+        "experts_prefill.fatbin": {
+          "bytes": 68560,
+          "sha256": "731a2acd7713390acb424e1404e5363dd28602c57583369ed416caa2b4e4a08a"
+        },
+        "fn_experts_prompt.fatbin": {
+          "bytes": 411336,
+          "sha256": "af751f3c478a8b5f38c832c938a9d9c124903d2329e49052a474e647df4eeeb4"
+        },
+        "fn_gdn.fatbin": {
+          "bytes": 139792,
+          "sha256": "7d70bb9520bbe8ac86ba489877e417336905e6eb209ac74c2a938caa5d1f1c40"
+        },
+        "fn_gdn_io.fatbin": {
+          "bytes": 62592,
+          "sha256": "8dc49598d052b2190ea5ac38a87bf9e71a0289db0b73008c6362b97b129aec86"
+        },
+        "fn_gdn_prefill.fatbin": {
+          "bytes": 77352,
+          "sha256": "cfcc737060bb541c5a8f8d331e682c6145b396d2b827fbec6790f2df0b062eae"
+        },
+        "fn_gdn_tree.fatbin": {
+          "bytes": 250760,
+          "sha256": "b028105b6bf1b6f59c588d05115c369338967a19a6d69a0eaeaad72b558d4f12"
+        },
+        "fn_int4.fatbin": {
+          "bytes": 933960,
+          "sha256": "60183afd351570f7bd334c766245efb0715a379cb191f5682206fec4983ca0e4"
+        },
+        "fn_nvfp4_experts.fatbin": {
+          "bytes": 76992,
+          "sha256": "ab066da7e10e0e571bc7240af625a858af0609ba4e5927237796e06d595ad54c"
+        },
+        "fn_nvfp4_shape.fatbin": {
+          "bytes": 99344,
+          "sha256": "4df807f4fa4a5867e5813961fd629b6d5c3424df6ba993cd547f0735d8110aff"
+        },
+        "fn_pack.fatbin": {
+          "bytes": 18592,
+          "sha256": "576571c43be0a5f5e88efe6c67633e4dba84dbcadc5fedc06b7baf94300ba2cb"
+        },
+        "fn_qmm.fatbin": {
+          "bytes": 128520,
+          "sha256": "0a3b7ec054d700c5f71505040850234432c8234b4ba3df76611b022bff9c4c0e"
+        },
+        "fn_qmm_cluster.fatbin": {
+          "bytes": 265200,
+          "sha256": "f934663b2e6c4df73f54cf3aaf76e25602ebe985b6c4b03224306f3fc34f4be4"
+        },
+        "fn_qmm_prefill.fatbin": {
+          "bytes": 55752,
+          "sha256": "a644f47629a423901de072f6c9b1f0d2aea3496c1db7ef330194cb6125add601"
+        },
+        "fn_qmmf.fatbin": {
+          "bytes": 362400,
+          "sha256": "d73fb41e1826dee59b634e14f4ee9d244b4a442c4cf60a2614df22e0d1ce6f91"
+        },
+        "fn_roce.fatbin": {
+          "bytes": 38040,
+          "sha256": "a1f3ae706fd51f68a527722828419b3c82265f5643a56e246e67e818189a9958"
+        },
+        "fp8_experts.fatbin": {
+          "bytes": 170912,
+          "sha256": "349ddd2294c7bc6ebf061c4c9f0beba480870c1b17918ebbc5a7c209b8c74d9f"
+        },
+        "gdn.fatbin": {
+          "bytes": 276552,
+          "sha256": "18db21dc56f61053f690f97206b750e4078d03e138592c57df6805e5eab5dd51"
+        },
+        "glm_exl3.fatbin": {
+          "bytes": 637256,
+          "sha256": "27c4d6af077de7b97d66051efe5b6ea928f961eee5792e210173bd0c081d7292"
+        },
+        "glm_foundations.fatbin": {
+          "bytes": 5776,
+          "sha256": "575023eb2ac28360e5682746b10a3974fcecd4887f61b4ade246a540c528687b"
+        },
+        "glm_hc.fatbin": {
+          "bytes": 20992,
+          "sha256": "0fadf8dc7f3507b53525127021841db630ca1fb011849e9f2594644a6be9e8b9"
+        },
+        "glm_kda.fatbin": {
+          "bytes": 147704,
+          "sha256": "1df4a18274441aa008415fa5a8de7d95d18cb4c724583b97bf324e2a7173c829"
+        },
+        "glm_kda_chunk.fatbin": {
+          "bytes": 150400,
+          "sha256": "b165bfa2e43d9f30890752dbe962dbd0061a2df72f78a06e1a077895b73dc69a"
+        },
+        "glm_msa.fatbin": {
+          "bytes": 220440,
+          "sha256": "9c7543dad31e03862e8af7e7918645a322583d528787d5591809c9f4dcca2e68"
+        },
+        "glm_ops.fatbin": {
+          "bytes": 102472,
+          "sha256": "c5e3f32daddfaf31083d54c9ee213d26b69e2139922c7619e6767c61ff032561"
+        },
+        "glm_qmm.fatbin": {
+          "bytes": 447912,
+          "sha256": "db40b6eb0896c0f5f0b3828f7287178d8398d42539058f70de3ce7acff046ba9"
+        },
+        "glm_qmm_prefill.fatbin": {
+          "bytes": 91408,
+          "sha256": "f2fd9e028f9f8cb732f873678218964f2589d694d7afdaf6d18d71e0b0ed26a3"
+        },
+        "glm_vision.fatbin": {
+          "bytes": 327312,
+          "sha256": "c1f1da8959cd7657427dddf722f118e57b56352d44a5f81dee00c98e435eabf3"
+        },
+        "lane_gemv.fatbin": {
+          "bytes": 66360,
+          "sha256": "63542ff55426b37061ffe6b8df0c72be2b1cf3b723965854483b1cd84c6b1d3c"
+        },
+        "modelopt_pack.fatbin": {
+          "bytes": 27224,
+          "sha256": "c00fa7997262bf7d03ba7a7e52f11c7d6895d71faace9aa019e30bb26c76c7e4"
+        },
+        "nemotron_attention.fatbin": {
+          "bytes": 38000,
+          "sha256": "94d071a06d11049fe820ae1ffbc24414aed10f9b7e4149ee04cf521a4aae84de"
+        },
+        "nemotron_keyed.fatbin": {
+          "bytes": 17072,
+          "sha256": "680fde4cbc425bd5cc8459234ae9f13fce05e967b76172d587d0d0c8fda8c65d"
+        },
+        "nemotron_mamba.fatbin": {
+          "bytes": 45616,
+          "sha256": "265a0e3f0080189df459daf675183ec69914872d9884637ead42b5a59d3af1d6"
+        },
+        "nemotron_norms.fatbin": {
+          "bytes": 229168,
+          "sha256": "da9cc9b3a381f98d0313e738d9a47988823918fe919cc05f1570ef598ef8ba3c"
+        },
+        "nemotron_ops.fatbin": {
+          "bytes": 89872,
+          "sha256": "9ba005e4dfe9f4c3b4dd8af0d01ab2abcb88be31ee046c8e68172697a7fda54f"
+        },
+        "nemotron_route.fatbin": {
+          "bytes": 84088,
+          "sha256": "218f56e6676702e37f8f649242b65ce8e3e693f57acfcc2a3bc31cfe670e652f"
+        },
+        "nvfp4_experts.fatbin": {
+          "bytes": 285024,
+          "sha256": "847a03d62f4924daa6084c15ee509a665598e422ee331f1949e2f0c5036c571e"
+        },
+        "prefill_attention.fatbin": {
+          "bytes": 52584,
+          "sha256": "7b0f09f6bae452a361b06a62cd824fcb5f7d3dacb3e5bc9fb5c5d21ae121dab9"
+        },
+        "probe.fatbin": {
+          "bytes": 24176,
+          "sha256": "aa74c92ebc0e5bbe845169892acd034de68e870021d5782ddd467198aa0b022c"
+        },
+        "prompt16.fatbin": {
+          "bytes": 123184,
+          "sha256": "e4715d9e81096da4236b7e28a373136b982ba2b2ab4920e6ed2cd733bb10aaa0"
+        },
+        "qmm_group.fatbin": {
+          "bytes": 27696,
+          "sha256": "cc608c9ba61aecc3f96453e92ecaf647e6b0292cfe26b83b7bbd0ce1ca43417a"
+        },
+        "qmm_prefill.fatbin": {
+          "bytes": 35912,
+          "sha256": "f7b935dd1e3367e6b57851f2bbfd443e7d59ac9f698906fcd4775bc36cb1ad36"
+        },
+        "qmmf.fatbin": {
+          "bytes": 717264,
+          "sha256": "e5b8fcf0c929f6e24f351a16b3ce5bf744a7f39a3936a49292ac51434af271f7"
+        },
+        "sample.fatbin": {
+          "bytes": 358648,
+          "sha256": "0a393b572e8a442f7a0e1f4f3ca003713ab9a751a4ec6c57a31b262a1851af07"
+        },
+        "scan_rows.fatbin": {
+          "bytes": 20808,
+          "sha256": "f850e860ebd4404e50ad97d7f1d8b1a7db19c3f965c03852c959ca373fe2ebca"
+        },
+        "torch_argmax.fatbin": {
+          "bytes": 68256,
+          "sha256": "0f5223a21cc7cd41b4b1a9b6c473d28c068f151f2355c53b49c6be9d58c9158c"
+        },
+        "torch_fn_logsumexp.fatbin": {
+          "bytes": 21096,
+          "sha256": "b6939ccd90dffd915f5c009c310190f6f44049c314d1e00ccf3cc371b4823b05"
+        },
+        "torch_fn_ops.fatbin": {
+          "bytes": 59752,
+          "sha256": "eb532aad18136eadd07ce666346ebb6a0f5645b7f577914ed327964de96e89af"
+        },
+        "torch_indexing.fatbin": {
+          "bytes": 19640,
+          "sha256": "45c97bb3b9bc26bc6393d12ff03e170b4e47c4e1c1cbeeebc90004800bd4c3ed"
+        },
+        "torch_movement.fatbin": {
+          "bytes": 16728,
+          "sha256": "33a8312a4183b1adfabe35ac2b0dabcac279a2dbe6a18e27cdb47d38224e214a"
+        },
+        "torch_nemotron_constants.fatbin": {
+          "bytes": 6208,
+          "sha256": "837396b79d96298c45587a3d2fe1c30d9017d582e6d99413dbca23707440f8b9"
+        },
+        "torch_pointwise.fatbin": {
+          "bytes": 12352,
+          "sha256": "d93593ea6f2cde140c7cbcb8d9b88e9e1c2bd08bf68939743924b620e2f95340"
+        },
+        "torch_topk.fatbin": {
+          "bytes": 48240,
+          "sha256": "e2b0fac2d7d913267e035a672a2a071e72410f135d2678c58899e9df9711e35d"
+        },
+        "train.fatbin": {
+          "bytes": 393544,
+          "sha256": "32c0d4e6de64afa661f14731375949246cca042d67c0f9ad4f0998e5c4c6050a"
+        }
+      }
+    },
+    "no_gpu_execution": true
+  },
+  "msi-c21f": {
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "build_receipt_sha256": "62b359093643422a1df34f87a55e0d664874c6388962d2c29a062654d078f9bc",
+    "embedded_proof_sha256": "ea55cfd29f62b96646420fbffce6c2686aa104858ca0c3df0ac444555132a229",
+    "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+    "image_fingerprint": "a319617ab6f1e29ea51b75f0eb6d9520c66c386fb73bf4c7ce01d14d78fa774b",
+    "engine": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "probe": "6db8c1914f6c83b09bf43cd9a0f7f65ce5ffa424c58295d3e4888cec91cf7c65",
+    "aot": "ed684888accd1b2f62377e83ecb0da22a350ba9cc4cfb61141af9695156c89c3",
+    "aot_files": 583,
+    "nvcc_fatbins": {
+      "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+      "sm": 121,
+      "count": 56,
+      "sass_checked_by": "zig/build/check_fatbins.zig",
+      "files": {
+        "affine4_pack.fatbin": {
+          "bytes": 16176,
+          "sha256": "f5e97cd458a1cf8bc7fc9bc5ffcb54c422a264e7b3fcfca80725836de8d1869e"
+        },
+        "experts.fatbin": {
+          "bytes": 106504,
+          "sha256": "649c6256e9dcf0cbffe7a3e8443a66cb1f6ef20c91b3b4169665cddb8238342d"
+        },
+        "experts_pack.fatbin": {
+          "bytes": 7872,
+          "sha256": "35d72252c1cd633d1c39a22cb67302d9e5b9dd1d84d456008a894038b8acdbe6"
+        },
+        "experts_prefill.fatbin": {
+          "bytes": 68560,
+          "sha256": "731a2acd7713390acb424e1404e5363dd28602c57583369ed416caa2b4e4a08a"
+        },
+        "fn_experts_prompt.fatbin": {
+          "bytes": 411336,
+          "sha256": "af751f3c478a8b5f38c832c938a9d9c124903d2329e49052a474e647df4eeeb4"
+        },
+        "fn_gdn.fatbin": {
+          "bytes": 139792,
+          "sha256": "7d70bb9520bbe8ac86ba489877e417336905e6eb209ac74c2a938caa5d1f1c40"
+        },
+        "fn_gdn_io.fatbin": {
+          "bytes": 62592,
+          "sha256": "8dc49598d052b2190ea5ac38a87bf9e71a0289db0b73008c6362b97b129aec86"
+        },
+        "fn_gdn_prefill.fatbin": {
+          "bytes": 77352,
+          "sha256": "cfcc737060bb541c5a8f8d331e682c6145b396d2b827fbec6790f2df0b062eae"
+        },
+        "fn_gdn_tree.fatbin": {
+          "bytes": 250760,
+          "sha256": "b028105b6bf1b6f59c588d05115c369338967a19a6d69a0eaeaad72b558d4f12"
+        },
+        "fn_int4.fatbin": {
+          "bytes": 933960,
+          "sha256": "60183afd351570f7bd334c766245efb0715a379cb191f5682206fec4983ca0e4"
+        },
+        "fn_nvfp4_experts.fatbin": {
+          "bytes": 76992,
+          "sha256": "ab066da7e10e0e571bc7240af625a858af0609ba4e5927237796e06d595ad54c"
+        },
+        "fn_nvfp4_shape.fatbin": {
+          "bytes": 99344,
+          "sha256": "4df807f4fa4a5867e5813961fd629b6d5c3424df6ba993cd547f0735d8110aff"
+        },
+        "fn_pack.fatbin": {
+          "bytes": 18592,
+          "sha256": "576571c43be0a5f5e88efe6c67633e4dba84dbcadc5fedc06b7baf94300ba2cb"
+        },
+        "fn_qmm.fatbin": {
+          "bytes": 128520,
+          "sha256": "0a3b7ec054d700c5f71505040850234432c8234b4ba3df76611b022bff9c4c0e"
+        },
+        "fn_qmm_cluster.fatbin": {
+          "bytes": 265200,
+          "sha256": "f934663b2e6c4df73f54cf3aaf76e25602ebe985b6c4b03224306f3fc34f4be4"
+        },
+        "fn_qmm_prefill.fatbin": {
+          "bytes": 55752,
+          "sha256": "a644f47629a423901de072f6c9b1f0d2aea3496c1db7ef330194cb6125add601"
+        },
+        "fn_qmmf.fatbin": {
+          "bytes": 362400,
+          "sha256": "d73fb41e1826dee59b634e14f4ee9d244b4a442c4cf60a2614df22e0d1ce6f91"
+        },
+        "fn_roce.fatbin": {
+          "bytes": 38040,
+          "sha256": "a1f3ae706fd51f68a527722828419b3c82265f5643a56e246e67e818189a9958"
+        },
+        "fp8_experts.fatbin": {
+          "bytes": 170912,
+          "sha256": "349ddd2294c7bc6ebf061c4c9f0beba480870c1b17918ebbc5a7c209b8c74d9f"
+        },
+        "gdn.fatbin": {
+          "bytes": 276552,
+          "sha256": "18db21dc56f61053f690f97206b750e4078d03e138592c57df6805e5eab5dd51"
+        },
+        "glm_exl3.fatbin": {
+          "bytes": 637256,
+          "sha256": "27c4d6af077de7b97d66051efe5b6ea928f961eee5792e210173bd0c081d7292"
+        },
+        "glm_foundations.fatbin": {
+          "bytes": 5776,
+          "sha256": "575023eb2ac28360e5682746b10a3974fcecd4887f61b4ade246a540c528687b"
+        },
+        "glm_hc.fatbin": {
+          "bytes": 20992,
+          "sha256": "0fadf8dc7f3507b53525127021841db630ca1fb011849e9f2594644a6be9e8b9"
+        },
+        "glm_kda.fatbin": {
+          "bytes": 147704,
+          "sha256": "1df4a18274441aa008415fa5a8de7d95d18cb4c724583b97bf324e2a7173c829"
+        },
+        "glm_kda_chunk.fatbin": {
+          "bytes": 150400,
+          "sha256": "b165bfa2e43d9f30890752dbe962dbd0061a2df72f78a06e1a077895b73dc69a"
+        },
+        "glm_msa.fatbin": {
+          "bytes": 220440,
+          "sha256": "9c7543dad31e03862e8af7e7918645a322583d528787d5591809c9f4dcca2e68"
+        },
+        "glm_ops.fatbin": {
+          "bytes": 102472,
+          "sha256": "c5e3f32daddfaf31083d54c9ee213d26b69e2139922c7619e6767c61ff032561"
+        },
+        "glm_qmm.fatbin": {
+          "bytes": 447912,
+          "sha256": "db40b6eb0896c0f5f0b3828f7287178d8398d42539058f70de3ce7acff046ba9"
+        },
+        "glm_qmm_prefill.fatbin": {
+          "bytes": 91408,
+          "sha256": "f2fd9e028f9f8cb732f873678218964f2589d694d7afdaf6d18d71e0b0ed26a3"
+        },
+        "glm_vision.fatbin": {
+          "bytes": 327312,
+          "sha256": "c1f1da8959cd7657427dddf722f118e57b56352d44a5f81dee00c98e435eabf3"
+        },
+        "lane_gemv.fatbin": {
+          "bytes": 66360,
+          "sha256": "63542ff55426b37061ffe6b8df0c72be2b1cf3b723965854483b1cd84c6b1d3c"
+        },
+        "modelopt_pack.fatbin": {
+          "bytes": 27224,
+          "sha256": "c00fa7997262bf7d03ba7a7e52f11c7d6895d71faace9aa019e30bb26c76c7e4"
+        },
+        "nemotron_attention.fatbin": {
+          "bytes": 38000,
+          "sha256": "94d071a06d11049fe820ae1ffbc24414aed10f9b7e4149ee04cf521a4aae84de"
+        },
+        "nemotron_keyed.fatbin": {
+          "bytes": 17072,
+          "sha256": "680fde4cbc425bd5cc8459234ae9f13fce05e967b76172d587d0d0c8fda8c65d"
+        },
+        "nemotron_mamba.fatbin": {
+          "bytes": 45616,
+          "sha256": "265a0e3f0080189df459daf675183ec69914872d9884637ead42b5a59d3af1d6"
+        },
+        "nemotron_norms.fatbin": {
+          "bytes": 229168,
+          "sha256": "da9cc9b3a381f98d0313e738d9a47988823918fe919cc05f1570ef598ef8ba3c"
+        },
+        "nemotron_ops.fatbin": {
+          "bytes": 89872,
+          "sha256": "9ba005e4dfe9f4c3b4dd8af0d01ab2abcb88be31ee046c8e68172697a7fda54f"
+        },
+        "nemotron_route.fatbin": {
+          "bytes": 84088,
+          "sha256": "218f56e6676702e37f8f649242b65ce8e3e693f57acfcc2a3bc31cfe670e652f"
+        },
+        "nvfp4_experts.fatbin": {
+          "bytes": 285024,
+          "sha256": "847a03d62f4924daa6084c15ee509a665598e422ee331f1949e2f0c5036c571e"
+        },
+        "prefill_attention.fatbin": {
+          "bytes": 52584,
+          "sha256": "7b0f09f6bae452a361b06a62cd824fcb5f7d3dacb3e5bc9fb5c5d21ae121dab9"
+        },
+        "probe.fatbin": {
+          "bytes": 24176,
+          "sha256": "aa74c92ebc0e5bbe845169892acd034de68e870021d5782ddd467198aa0b022c"
+        },
+        "prompt16.fatbin": {
+          "bytes": 123184,
+          "sha256": "e4715d9e81096da4236b7e28a373136b982ba2b2ab4920e6ed2cd733bb10aaa0"
+        },
+        "qmm_group.fatbin": {
+          "bytes": 27696,
+          "sha256": "cc608c9ba61aecc3f96453e92ecaf647e6b0292cfe26b83b7bbd0ce1ca43417a"
+        },
+        "qmm_prefill.fatbin": {
+          "bytes": 35912,
+          "sha256": "f7b935dd1e3367e6b57851f2bbfd443e7d59ac9f698906fcd4775bc36cb1ad36"
+        },
+        "qmmf.fatbin": {
+          "bytes": 717264,
+          "sha256": "e5b8fcf0c929f6e24f351a16b3ce5bf744a7f39a3936a49292ac51434af271f7"
+        },
+        "sample.fatbin": {
+          "bytes": 358648,
+          "sha256": "0a393b572e8a442f7a0e1f4f3ca003713ab9a751a4ec6c57a31b262a1851af07"
+        },
+        "scan_rows.fatbin": {
+          "bytes": 20808,
+          "sha256": "f850e860ebd4404e50ad97d7f1d8b1a7db19c3f965c03852c959ca373fe2ebca"
+        },
+        "torch_argmax.fatbin": {
+          "bytes": 68256,
+          "sha256": "0f5223a21cc7cd41b4b1a9b6c473d28c068f151f2355c53b49c6be9d58c9158c"
+        },
+        "torch_fn_logsumexp.fatbin": {
+          "bytes": 21096,
+          "sha256": "b6939ccd90dffd915f5c009c310190f6f44049c314d1e00ccf3cc371b4823b05"
+        },
+        "torch_fn_ops.fatbin": {
+          "bytes": 59752,
+          "sha256": "eb532aad18136eadd07ce666346ebb6a0f5645b7f577914ed327964de96e89af"
+        },
+        "torch_indexing.fatbin": {
+          "bytes": 19640,
+          "sha256": "45c97bb3b9bc26bc6393d12ff03e170b4e47c4e1c1cbeeebc90004800bd4c3ed"
+        },
+        "torch_movement.fatbin": {
+          "bytes": 16728,
+          "sha256": "33a8312a4183b1adfabe35ac2b0dabcac279a2dbe6a18e27cdb47d38224e214a"
+        },
+        "torch_nemotron_constants.fatbin": {
+          "bytes": 6208,
+          "sha256": "837396b79d96298c45587a3d2fe1c30d9017d582e6d99413dbca23707440f8b9"
+        },
+        "torch_pointwise.fatbin": {
+          "bytes": 12352,
+          "sha256": "d93593ea6f2cde140c7cbcb8d9b88e9e1c2bd08bf68939743924b620e2f95340"
+        },
+        "torch_topk.fatbin": {
+          "bytes": 48240,
+          "sha256": "e2b0fac2d7d913267e035a672a2a071e72410f135d2678c58899e9df9711e35d"
+        },
+        "train.fatbin": {
+          "bytes": 393544,
+          "sha256": "32c0d4e6de64afa661f14731375949246cca042d67c0f9ad4f0998e5c4c6050a"
+        }
+      }
+    },
+    "no_gpu_execution": true
+  }
+}

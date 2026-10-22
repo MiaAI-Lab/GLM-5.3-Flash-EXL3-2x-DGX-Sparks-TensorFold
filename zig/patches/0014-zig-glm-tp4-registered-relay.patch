@@ -1,0 +1,1311 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 3cdcb16..a56b215 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -190,6 +190,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("nemotron", mods.nemotron);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.glm_cuda, mods.tokenizer, build_options, true).root_module.strip = strip;
++    transportProbe(b, target, optimize, cuda, mods.glm_cuda, "glm-transport-probe");
+     // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
+     const comm_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
+     b.step("flashnext-comm", "tf-flashnext-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-comm", .root_module = comm_test }), .{}).step);
+@@ -258,10 +259,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
+     const cuda = runtime(b, host, .debug, &.{});
+     const mods = family(b, host, .debug, cuda, draft_ids);
++    transportProbe(b, host, .debug, cuda, mods.glm_cuda, "glm-transport-probe-host-build");
+     const layer_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_layer_check.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm_cuda", .module = mods.glm_cuda }} });
+     b.step("glm-layer-check", "Build tf-glm-layer-check REFERENCE_DIR ACTUAL_DIR (CPU byte oracle)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-layer-check", .root_module = layer_tool }), .{}).step);
+     const prefill_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_prefill_check.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm_cuda", .module = mods.glm_cuda }} });
+     b.step("glm-prefill-check", "Build tf-glm-prefill-check REFERENCE_DIR ACTUAL_DIR (prompt chunk byte oracle)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-prefill-check", .root_module = prefill_tool }), .{}).step);
++    const transport_tests = b.step("test-glm-transport-host", "Focused transport startup, routing and ownership tests; no GPU");
++    transport_tests.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.glm_cuda, .filters = &.{ "transport profile", "backend selection" } })).step);
++    transport_tests.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "registered relay", "registered RoCE", "region allocation", "routes of a ring" } })).step);
+     const glm_test = b.addRunArtifact(b.addTest(.{ .root_module = mods.glm_cuda }));
+     b.step("test-glm-cuda-host", "GLM CUDA CPU contracts (foundations, packed sampling, rounds, lanes)").dependOn(&glm_test.step);
+     const serve_test = b.step("test-glm-serve", "GLM serving and drafted-versus-serial CPU contracts");
+@@ -371,3 +376,9 @@ fn exists(b: *std.Build, path: []const u8) bool {
+     std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+     return true;
+ }
++
++fn transportProbe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, glm: *std.Build.Module, step_name: []const u8) void {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_transport_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = glm } } });
++    if (std.mem.eql(u8, step_name, "glm-transport-probe-host-build")) b.step("test-glm-transport-probe-host", "Probe graph counter acceptance tests without GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m, .filters = &.{"graph counter"} })).step);
++    b.step(step_name, "Build weight-free four-rank GLM production transport qualifier").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-transport-probe", .root_module = m }), .{}).step);
++}
+diff --git a/zig/src/cuda/roce.zig b/zig/src/cuda/roce.zig
+index 1287133..8701fdf 100644
+--- a/zig/src/cuda/roce.zig
++++ b/zig/src/cuda/roce.zig
+@@ -15,6 +15,10 @@ const abi = @import("abi.zig");
+ const Driver = @import("driver.zig").Driver;
+ const Error = @import("driver.zig").Error;
+ const memory = @import("memory.zig");
++pub const region = @import("roce_region.zig");
++test {
++    _ = region;
++}
+ const module = @import("module.zig");
+ const launch = @import("launch.zig");
+ const Stream = @import("stream.zig").Stream;
+@@ -41,7 +45,6 @@ extern fn tf_roce_close(r: *Proxy) void;
+ pub const max_ports = 4;
+ pub const max_world = 4;
+ 
+-
+ /// Read-only bytes to pull into the L2 while a gather waits (decode plan D2): the next kernels' weights.
+ pub const Prefetch = struct { ptr: abi.DevicePtr = 0, bytes: usize = 0 };
+ 
+@@ -99,12 +102,13 @@ pub const Settings = struct {
+     slot_bytes: u64 = 512 << 10,
+     /// how long a kernel waits for the peer before it stops the stream (a trap: the peer is gone or its proxy failed)
+     timeout_s: u64 = 600,
++    memory_mode: region.Mode = .allocated,
+ };
+ 
+ pub const Roce = struct {
+     d: *const Driver,
+     proxy: *Proxy,
+-    region: memory.HostBuffer,
++    region: region.Region,
+     region_dev: abi.DevicePtr,
+     state: memory.DeviceBuffer,
+     mod: module.Module,
+@@ -118,6 +122,8 @@ pub const Roce = struct {
+     n_flag: u32,
+     slot_bytes: u64,
+     timeout_ns: u64,
++    /// Actual proxy topology: true only after setRing succeeds.
++    ring: bool = false,
+ 
+     pub fn blobBytes() usize {
+         return @intCast(tf_roce_blob_bytes());
+@@ -136,10 +142,9 @@ pub const Roce = struct {
+         if (tf_roce_abi() != 7) return error.Invalid;
+         var lay: [5]u64 = undefined;
+         if (tf_roce_layout(@intCast(world), s.slot_bytes, &lay) != 0) return error.Invalid;
+-        var region = try memory.HostBuffer.allocMapped(d, @intCast(lay[4]));
+-        errdefer region.free();
+-        @memset(region.bytes, 0);
+-        const dev = try region.device();
++        var host_region = try region.Region.alloc(d, @intCast(lay[4]), s.memory_mode);
++        errdefer host_region.free();
++        const dev = host_region.dev;
+         var names: [max_ports][256:0]u8 = undefined;
+         var ptrs: [max_ports][*:0]const u8 = undefined;
+         for (s.ports, 0..) |p, i| {
+@@ -151,7 +156,7 @@ pub const Roce = struct {
+         var err: [512]u8 = @splat(0);
+         var gids: [max_ports]c_int = undefined;
+         for (0..s.ports.len) |i| gids[i] = if (s.gids.len != 0) s.gids[i] else s.gid_index;
+-        const proxy = tf_roce_open(@intCast(world), @intCast(rank), &ptrs, @intCast(s.ports.len), &gids, s.traffic_class, region.bytes.ptr, lay[4], s.slot_bytes, &err, err.len) orelse {
++        const proxy = tf_roce_open(@intCast(world), @intCast(rank), &ptrs, @intCast(s.ports.len), &gids, s.traffic_class, host_region.bytes.ptr, lay[4], s.slot_bytes, &err, err.len) orelse {
+             std.log.err("RoCE: {s}", .{std.mem.sliceTo(&err, 0)});
+             return error.RoceUnavailable;
+         };
+@@ -163,7 +168,7 @@ pub const Roce = struct {
+         errdefer mod.unload();
+         var fns: [2]module.Function = undefined;
+         for (symbols, &fns) |name, *f| f.* = try mod.function(name);
+-        return .{ .d = d, .proxy = proxy, .region = region, .region_dev = dev, .state = state, .mod = mod, .fns = fns, .layout = lay, .rank = rank, .world = world, .ports = @intCast(s.ports.len), .n_flag = @intCast(s.ports.len), .slot_bytes = s.slot_bytes, .timeout_ns = s.timeout_s * std.time.ns_per_s };
++        return .{ .d = d, .proxy = proxy, .region = host_region, .region_dev = dev, .state = state, .mod = mod, .fns = fns, .layout = lay, .rank = rank, .world = world, .ports = @intCast(s.ports.len), .n_flag = @intCast(s.ports.len), .slot_bytes = s.slot_bytes, .timeout_ns = s.timeout_s * std.time.ns_per_s };
+     }
+ 
+     pub fn deinit(r: *Roce) void {
+@@ -195,6 +200,7 @@ pub const Roce = struct {
+             std.log.err("RoCE ring: {s}", .{std.mem.span(tf_roce_error(r.proxy))});
+             return error.RoceUnavailable;
+         }
++        r.ring = true;
+     }
+ 
+     /// Two ranks (Flash Next's form): the peer's blob; this rank's own is made here.
+@@ -511,3 +517,112 @@ test "the region layout: receive slots, flags, send slots, control" {
+ test "the blob is what the stub and the proxy both say" {
+     try std.testing.expectEqual(@as(usize, 176), Roce.blobBytes());
+ }
++
++// Physical device names/domains are deliberately absent: discovered addresses
++// determine connectivity, while each array index is that rank's local HCA order.
++test "registered relay routes cover one and two rails per neighbor with shuffled HCAs and CIDRs" {
++    const mk = struct {
++        fn addr(edge: usize, rail: usize, host: usize) Addr {
++            const net: u32 = @as(u32, 172) << 24 | @as(u32, @intCast(20 + edge * 2 + rail)) << 16;
++            return .{ .ip = net | @as(u32, @intCast(host)), .prefix = if (rail == 0) 24 else 28 };
++        }
++    }.addr;
++    const orders = [4][4]usize{ .{ 2, 0, 3, 1 }, .{ 1, 3, 0, 2 }, .{ 3, 2, 1, 0 }, .{ 0, 2, 1, 3 } };
++    for ([_]usize{ 1, 2 }) |rails| {
++        var addrs: [4][max_ports]?Addr = @splat(@splat(null));
++        for (0..4) |rank| {
++            const prev = (rank + 3) % 4;
++            var raw: [4]?Addr = @splat(null);
++            for (0..rails) |rail| {
++                raw[rail] = mk(prev, rail, 2);
++                raw[rails + rail] = mk(rank, rail, 1);
++            }
++            for (orders[rank], 0..) |source, local| addrs[rank][local] = raw[source];
++        }
++        const plan = try planRoutes(&addrs, true);
++        try std.testing.expectEqual(@as(u8, @intCast(rails)), plan.n_flag);
++        for (0..4) |rank| for (0..4) |peer| {
++            const route = plan.routes[rank][peer];
++            if (rank == peer or (peer + 4 - rank) % 4 == 2) {
++                try std.testing.expectEqual(@as(u8, 0), route.n);
++                continue;
++            }
++            try std.testing.expectEqual(@as(u8, @intCast(rails)), route.n);
++            const reverse = plan.routes[peer][rank];
++            for (0..route.n) |stripe| {
++                const a = subnet(addrs[rank][route.local[stripe]]).?;
++                const b = subnet(addrs[peer][route.remote[stripe]]).?;
++                try std.testing.expectEqual(a, b);
++                // QPs connect mirrored local/remote HCAs. Stripe payload offsets
++                // are written explicitly; reverse traffic may enumerate them differently.
++                var mirrored: usize = 0;
++                for (0..reverse.n) |other| {
++                    if (route.local[stripe] == reverse.remote[other] and route.remote[stripe] == reverse.local[other]) mirrored += 1;
++                }
++                try std.testing.expectEqual(@as(usize, 1), mirrored);
++            }
++        };
++        // Remove a rank's only next-neighbor path(s): no direct diagonal path
++        // may be invented to repair a physically incomplete ring.
++        const next_route = plan.routes[0][1];
++        for (0..next_route.n) |i| addrs[0][next_route.local[i]] = null;
++        try std.testing.expectError(error.NoSharedSubnet, planRoutes(&addrs, true));
++    }
++}
++
++// Switched setup needs every peer reachable; these are route-plan tests, not
++// evidence of NIC/switch, CUDA, registered-memory or end-to-end compatibility.
++test "registered RoCE four-rank direct routes cover 1 2 4 rails same and multiple subnets with shuffled HCAs" {
++    const orders = [4][4]usize{ .{ 2, 0, 3, 1 }, .{ 1, 3, 0, 2 }, .{ 3, 2, 1, 0 }, .{ 0, 2, 1, 3 } };
++    for ([_]usize{ 1, 2, 4 }) |rails| for ([_]bool{ false, true }) |separate_subnets| {
++        var addrs: [4][max_ports]?Addr = @splat(@splat(null));
++        for (0..4) |rank| {
++            var raw: [max_ports]?Addr = @splat(null);
++            for (0..rails) |rail| {
++                // Shared /20, or distinct /20, /21, /22, /23 networks.
++                const prefix: u8 = if (separate_subnets) @intCast(20 + rail) else 20;
++                const network: u32 = (@as(u32, 10) << 24) | (@as(u32, @intCast(if (separate_subnets) rail else 0)) << 16);
++                raw[rail] = .{ .ip = network | @as(u32, @intCast(1 + rank * 8 + rail)), .prefix = prefix };
++            }
++            for (orders[rank], 0..) |source, local| addrs[rank][local] = raw[source];
++        }
++        const plan = try planRoutes(&addrs, false);
++        try std.testing.expectEqual(@as(u8, @intCast(rails)), plan.n_flag);
++        for (0..4) |rank| {
++            var peers: usize = 0;
++            for (0..4) |peer| {
++                const route = plan.routes[rank][peer];
++                if (peer == rank) {
++                    try std.testing.expectEqual(@as(u8, 0), route.n);
++                    continue;
++                }
++                peers += 1;
++                try std.testing.expectEqual(@as(u8, @intCast(rails)), route.n);
++                const reverse = plan.routes[peer][rank];
++                for (0..route.n) |stripe| {
++                    try std.testing.expectEqual(subnet(addrs[rank][route.local[stripe]]).?, subnet(addrs[peer][route.remote[stripe]]).?);
++                    var mirrored: usize = 0;
++                    for (0..reverse.n) |other| {
++                        if (route.local[stripe] == reverse.remote[other] and route.remote[stripe] == reverse.local[other]) mirrored += 1;
++                    }
++                    try std.testing.expectEqual(@as(usize, 1), mirrored);
++                }
++            }
++            try std.testing.expectEqual(@as(usize, 3), peers);
++        }
++        addrs[2] = @splat(null);
++        try std.testing.expectError(error.NoSharedSubnet, planRoutes(&addrs, false));
++    };
++}
++
++test "registered RoCE a missing diagonal is allowed only in ring topology" {
++    var addrs: [4][max_ports]?Addr = @splat(@splat(null));
++    for (0..4) |rank| {
++        // One physical rail per edge, /29 CIDRs; no rank can directly reach its diagonal.
++        addrs[rank][0] = .{ .ip = 0xac140000 | @as(u32, @intCast(rank * 8 + 1)), .prefix = 29 };
++        addrs[rank][1] = .{ .ip = 0xac140000 | @as(u32, @intCast(((rank + 3) % 4) * 8 + 2)), .prefix = 29 };
++    }
++    const ring = try planRoutes(&addrs, true);
++    for (0..4) |rank| try std.testing.expectEqual(@as(u8, 0), ring.routes[rank][(rank + 2) % 4].n);
++    try std.testing.expectError(error.NoSharedSubnet, planRoutes(&addrs, false));
++}
+diff --git a/zig/src/cuda/roce_proxy.c b/zig/src/cuda/roce_proxy.c
+index 87f101e..38fafa8 100644
+--- a/zig/src/cuda/roce_proxy.c
++++ b/zig/src/cuda/roce_proxy.c
+@@ -121,7 +121,8 @@ typedef struct tf_roce {
+   int ring, relayed[ROCE_WORLD_MAX], n_relay;
+   int relay_src[ROCE_HCAS_MAX], relay_stripe[ROCE_HCAS_MAX], relay_dst[ROCE_HCAS_MAX];
+   uint32_t relay_last[ROCE_HCAS_MAX];
+-  uint64_t fwd_outstanding, fwd_posted;
++  uint64_t fwd_outstanding;
++  _Atomic uint64_t fwd_posted;
+   uint8_t *region;
+   uint64_t region_bytes, slot_bytes;
+   uint64_t recv_off, flag_off, send_off, ctrl_off;
+@@ -704,7 +705,7 @@ static int forward(tf_roce *r, int e, uint32_t seq) {
+   hca->outstanding[dst]++;
+   hca->bytes += bytes;
+   r->fwd_outstanding++;
+-  r->fwd_posted++;
++  atomic_fetch_add_explicit(&r->fwd_posted, 1, memory_order_relaxed);
+   return 0;
+ }
+ 
+@@ -826,7 +827,7 @@ int tf_roce_start(tf_roce *r) {
+ int tf_roce_failed(tf_roce *r) { return atomic_load(&r->failed); }
+ const char *tf_roce_error(tf_roce *r) { return r->err; }
+ uint64_t tf_roce_ops(tf_roce *r) { return atomic_load_explicit(&r->ops, memory_order_relaxed); }
+-uint64_t tf_roce_relayed(tf_roce *r) { return r->fwd_posted; }
++uint64_t tf_roce_relayed(tf_roce *r) { return atomic_load_explicit(&r->fwd_posted, memory_order_relaxed); }
+ 
+ void tf_roce_close(tf_roce *r) {
+   if (!r) return;
+diff --git a/zig/src/cuda/roce_region.zig b/zig/src/cuda/roce_region.zig
+new file mode 100644
+index 0000000..9089374
+--- /dev/null
++++ b/zig/src/cuda/roce_region.zig
+@@ -0,0 +1,93 @@
++//! RoCE-only host-region ownership. The default retains CUDA allocated mapped memory.
++//! Registered-memory approach credited to BertholomusAI (Albert Lee),
++//! bertholomus/TensorFold b8b115e7, dsv41/rdma.zig (mmap + HostRegister).
++//! neither variant changes the RoCE wire protocol or any model arithmetic.
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const memory = @import("memory.zig");
++
++pub const Mode = enum(u8) {
++    allocated = 0,
++    registered = 1,
++};
++
++const host_register_portable: c_uint = 1;
++
++pub const Region = struct {
++    bytes: []align(16) u8,
++    dev: abi.DevicePtr,
++    owner: union(Mode) {
++        allocated: memory.HostBuffer,
++        registered: struct { mem: []align(std.heap.page_size_min) u8, d: *const Driver },
++    },
++
++    pub fn alloc(d: *const Driver, len: usize, mode: Mode) !Region {
++        if (len == 0) return error.Invalid;
++        switch (mode) {
++            .allocated => {
++                var b = try memory.HostBuffer.allocMapped(d, len);
++                errdefer b.free();
++                const dev = try b.device();
++                @memset(b.bytes, 0);
++                return .{ .bytes = b.bytes, .dev = dev, .owner = .{ .allocated = b } };
++            },
++            .registered => {
++                // Round the allocation length to 64 KiB; mmap supplies a system-page
++                // aligned address. CUDA pins it; close MRs before unregistering.
++                const size = try roundedBytes(len);
++                const mem = try std.posix.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
++                var registered = false;
++                errdefer {
++                    if (!registered or d.api.cuMemHostUnregister(mem.ptr) == abi.success) std.posix.munmap(mem);
++                }
++                @memset(mem, 0);
++                try d.check(d.api.cuMemHostRegister_v2(mem.ptr, mem.len, host_register_portable | abi.host_register_devicemap), "RoCE cuMemHostRegister");
++                registered = true;
++                var dev: abi.DevicePtr = 0;
++                try d.check(d.api.cuMemHostGetDevicePointer_v2(&dev, mem.ptr, 0), "RoCE cuMemHostGetDevicePointer");
++                return .{ .bytes = @alignCast(mem[0..len]), .dev = dev, .owner = .{ .registered = .{ .mem = mem, .d = d } } };
++            },
++        }
++    }
++
++    pub fn free(r: *Region) void {
++        switch (r.owner) {
++            .allocated => |*b| b.free(),
++            .registered => |*v| {
++                // An unregister failure must not unmap pages CUDA may still own.
++                // Shutdown cannot return an error; leak until process exit instead.
++                if (v.d.api.cuMemHostUnregister(v.mem.ptr) == abi.success) std.posix.munmap(v.mem);
++            },
++        }
++        r.* = undefined;
++    }
++};
++
++fn roundedBytes(len: usize) !usize {
++    if (len == 0) return error.Invalid;
++    return (try std.math.add(usize, len, 65535)) & ~@as(usize, 65535);
++}
++
++test "registered RoCE length rounds without overflow" {
++    try std.testing.expectEqual(@as(usize, 65536), try roundedBytes(1));
++    try std.testing.expectEqual(@as(usize, 65536), try roundedBytes(65536));
++    try std.testing.expectEqual(@as(usize, 131072), try roundedBytes(65537));
++    try std.testing.expectError(error.Invalid, roundedBytes(0));
++    try std.testing.expectError(error.Overflow, roundedBytes(std.math.maxInt(usize)));
++}
++
++test "both region allocation paths compile without opening CUDA" {
++    // A runtime condition keeps both ownership paths semantically checked.
++    // The standalone host test never supplies a driver or touches a GPU.
++    const Probe = struct {
++        fn run(d: ?*const Driver, mode: Mode) !void {
++            if (d) |driver| {
++                var r = try Region.alloc(driver, 65537, mode);
++                r.free();
++            }
++        }
++    };
++    try Probe.run(null, .allocated);
++    try Probe.run(null, .registered);
++}
+diff --git a/zig/src/families/glm_cuda/cuda.zig b/zig/src/families/glm_cuda/cuda.zig
+index 2236625..942c79d 100644
+--- a/zig/src/families/glm_cuda/cuda.zig
++++ b/zig/src/families/glm_cuda/cuda.zig
+@@ -212,3 +212,10 @@ pub const vision_cudnn = @import("cuda_vision_cudnn.zig");
+ test {
+     _ = vision_cudnn;
+ }
++
++// Production transport entry points shared with the weight-free qualifier.
++pub const comm = @import("cuda_comm.zig");
++pub const link = @import("cuda_link.zig");
++test {
++    _ = comm;
++}
+diff --git a/zig/src/families/glm_cuda/cuda_comm.zig b/zig/src/families/glm_cuda/cuda_comm.zig
+index 1b6517b..3752693 100644
+--- a/zig/src/families/glm_cuda/cuda_comm.zig
++++ b/zig/src/families/glm_cuda/cuda_comm.zig
+@@ -16,7 +16,10 @@
+ //! TF_GLM_ROCE (default on; 0 off) (decode plan D1) adds the one-shot RoCE all-gather (cuda/roce.zig, b12x's RoCEnante protocol)
+ //! for every all-gather of up to 512 KiB a rank, on the ports TF_ROCE_HCA / NCCL_IB_HCA name with NCCL_IB_GID_INDEX;
+ //! larger gathers and the broadcasts stay on NCCL. The ranks use it only when every one opened and connected it (they
+-//! say so over the link), a rank that cannot (no NCCL_IB_HCA, no RDMA device, no route) leaves all on NCCL. The choice
++//! say so over the link). TF_GLM_TP4_REGISTERED_RDMA=1 requires world=4,
++//! TF_GLM_ROCE=1, with a fixed 512 KiB slot and registered
++//! host memory. TF_ROCE_RING=1 uses neighbor relay; 0/unset connects every peer directly.
++//! Unset/0 retains optional allocated RoCE; opt-in setup failure is fatal. Mixed/invalid settings are rejected collectively before NCCL setup (one binary on all ranks). The choice
+ //! per gather is by its byte count alone, so every rank makes it alike (a buffer RoCE cannot take is an error, never
+ //! a silent switch to NCCL on one rank). TF_GLM_L2PF (default on; 0
+ //! off) (decode plan D2) prefetches the weights a gather's
+@@ -32,6 +35,11 @@ const Allocator = std.mem.Allocator;
+ 
+ pub const Prefetch = roce.Prefetch;
+ 
++/// A standalone engine has no collective startup; reject TP4-only settings locally.
++pub fn validateStandalone() !void {
++    _ = try Startup.read(1);
++}
++
+ /// The most ranks: the Python engine's tensor-parallel sizes are 2, 3 and 4.
+ pub const max_world: u32 = 4;
+ 
+@@ -41,6 +49,10 @@ const row_head: usize = 8 + 8 * roce.max_ports;
+ const roce_tag: link_mod.Tag = @fromBackingInt(@intCast(0x524f4345));
+ 
+ /// The RoCE all-gather, the L2 prefetch and the driver they were opened with (heap: Comm is copied by value).
++const GatherCounters = struct {
++    nccl: std.atomic.Value(u64) = .init(0),
++    roce: std.atomic.Value(u64) = .init(0),
++};
+ const Extra = struct { driver: cuda.Driver, r: ?roce.Roce = null, l2: ?roce.L2 = null, prefetch: bool = false };
+ 
+ fn envIs(name: [:0]const u8, value: []const u8) bool {
+@@ -53,11 +65,59 @@ pub const Comm = struct {
+     rank: u32,
+     world: u32,
+     extra: ?*Extra = null,
++    counters: ?*GatherCounters = null,
++
++    pub const Stats = struct { nccl_enqueues: u64 = 0, roce_enqueues: u64 = 0, roce_ops: u64 = 0, relayed_stripes: u64 = 0, registered_host_bytes: usize = 0, roce_stripes: u32 = 0, roce_ring: bool = false };
++    /// Enqueue counters include capture, not replay. Proxy counters reflect GPU
++    /// execution, including replay. Query after synchronization for qualification.
++    pub fn stats(c: *const Comm) Stats {
++        var out: Stats = .{};
++        if (c.counters) |v| {
++            out.nccl_enqueues = v.nccl.load(.monotonic);
++            out.roce_enqueues = v.roce.load(.monotonic);
++        }
++        if (c.extra) |x| {
++            if (x.r) |*r| {
++                out.roce_ops = r.ops();
++                out.roce_stripes = r.n_flag;
++                out.roce_ring = r.ring;
++                out.relayed_stripes = r.relayed();
++                out.registered_host_bytes = switch (r.region.owner) {
++                    .registered => |v| v.mem.len,
++                    .allocated => 0,
++                };
++            }
++        }
++        return out;
++    }
++    fn recordEnqueue(c: *const Comm, backend: GatherBackend) void {
++        if (c.counters) |v| switch (backend) {
++            .nccl => {
++                _ = v.nccl.fetchAdd(1, .monotonic);
++            },
++            .roce => {
++                _ = v.roce.fetchAdd(1, .monotonic);
++            },
++        };
++    }
+ 
+     /// Join the communicator on the current CUDA context. Rank 0 sends the id first (to every follower), the others
+     /// wait for it. `link` is rank 0's fan-out to ranks 1..world-1, or a follower's one link to rank 0.
+     pub fn init(gpa: Allocator, link: Link, rank: u32, world: u32) !Comm {
+         if (world < 2 or world > max_world or rank >= world) return error.UnsupportedWorld;
++        // Parse and exchange validity BEFORE opening NCCL. A malformed setting
++        // on one rank must not strand peers in a control read / ncclCommDestroy.
++        const local: ?Startup = Startup.read(world) catch |e| blk: {
++            std.log.err("invalid GLM transport profile rank {d}: {t}", .{ rank, e });
++            break :blk null;
++        };
++        const profile: [8]u8 = if (local) |v| v.row() else @splat(0);
++        const agreed = try gatherToAll(gpa, link, rank, world, &profile);
++        defer gpa.free(agreed);
++        try validateStartupRows(agreed[1..], world);
++        const settings = local.?;
++        if (settings.required and !settings.ring)
++            std.log.warn("GLM registered RDMA direct mode: code-tested only; switched hardware not verified", .{});
+         var lib = nccl.Library.open() catch |e| {
+             std.log.err("cannot open libnccl.so.2 ({s}): the image's NCCL is needed for two ranks", .{@errorName(e)});
+             return e;
+@@ -73,14 +133,18 @@ pub const Comm = struct {
+             if (bytes.len != id.internal.len) return error.BadNcclId;
+             @memcpy(&id.internal, bytes);
+         }
++        const counters = try std.heap.c_allocator.create(GatherCounters);
++        counters.* = .{};
++        errdefer std.heap.c_allocator.destroy(counters);
+         var comm: nccl.Comm = null;
+         try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(world), id, @intCast(rank)), "ncclCommInitRank");
+-        var c: Comm = .{ .lib = lib, .comm = comm, .rank = rank, .world = world };
++        var c: Comm = .{ .lib = lib, .comm = comm, .rank = rank, .world = world, .counters = counters };
+         errdefer _ = lib.api.ncclCommDestroy(comm);
+         errdefer if (c.extra) |x| freeExtra(x);
+-        // on by default (decode D1, D2); "0" turns either off. RoCE is the two-rank protocol only (see above).
+-        const want_roce = !envIs("TF_GLM_ROCE", "0");
+-        const want_pf = !envIs("TF_GLM_L2PF", "0");
++        const want_roce = settings.mode == .roce;
++        const memory_mode = settings.memory;
++        const required = settings.required;
++        const want_pf = settings.prefetch;
+         var driver: ?cuda.Driver = null;
+         if (want_roce or want_pf) driver = cuda.Driver.open() catch |e| blk: {
+             std.log.warn("RoCE / L2 prefetch: no CUDA driver handle ({t}); NCCL alone", .{e});
+@@ -91,9 +155,9 @@ pub const Comm = struct {
+             x.* = .{ .driver = d };
+             c.extra = x;
+         }
+-        // both ranks always say whether they opened RoCE (one rank's setting alone never leaves the other waiting);
+-        // beyond two ranks nobody does, so there is nothing to say
+-        const r = try handshake(gpa, link, rank, world, if (want_roce) (if (c.extra) |x| &x.driver else null) else null);
++        const r = try handshake(gpa, link, rank, world, if (want_roce) (if (c.extra) |x| &x.driver else null) else null, memory_mode, required);
++        if (r == null and required) return error.RequiredRoceUnavailable;
++        std.log.info("GLM transport rank {d}: backend={s} memory={s} required={} cutoff={d} bytes", .{ rank, if (r != null) (if (world == 4 and settings.ring) "roce-relay" else "roce") else "nccl", if (r != null) @tagName(memory_mode) else "none", required, if (r) |rr| rr.slot_bytes else @as(u64, 0) });
+         if (c.extra) |x| {
+             x.r = r;
+             if (want_pf) {
+@@ -115,9 +179,9 @@ pub const Comm = struct {
+     /// TF_ROCE_RING=1: a ring of four cabled to the neighbours, who relay to the rank across), connects and starts the
+     /// proxy, and agrees that every rank did. Null when any rank did not (every rank then keeps NCCL for every
+     /// gather: the choice is the same on all of them). Every rank takes this path whether or not it opened RoCE.
+-    fn handshake(gpa: Allocator, link: Link, rank: u32, world: u32, d: ?*const cuda.Driver) !?roce.Roce {
++    fn handshake(gpa: Allocator, link: Link, rank: u32, world: u32, d: ?*const cuda.Driver, memory_mode: roce.region.Mode, required: bool) !?roce.Roce {
+         var found: [roce.max_ports]?roce.Addr = @splat(null);
+-        var r: ?roce.Roce = if (d) |dd| openRoce(dd, rank, world, &found) else null;
++        var r: ?roce.Roce = if (d) |dd| openRoce(dd, rank, world, &found, memory_mode) else null;
+         var keep = false;
+         defer if (!keep) if (r) |*x| x.deinit();
+         const n = roce.Roce.blobBytes();
+@@ -125,6 +189,8 @@ pub const Comm = struct {
+         const mine = try gpa.alloc(u8, row_bytes);
+         defer gpa.free(mine);
+         @memset(mine, 0);
++        mine[2] = @backingInt(memory_mode);
++        mine[3] = @as(u8, @intFromBool(required)) | (@as(u8, @intFromBool(envIs("TF_ROCE_RING", "1"))) << 1) | (@as(u8, @intFromBool(!envIs("TF_GLM_ROCE", "0"))) << 2);
+         if (r) |*x| {
+             mine[0] = 1;
+             mine[1] = @intCast(x.ports);
+@@ -140,6 +206,7 @@ pub const Comm = struct {
+         const all = try gatherToAll(gpa, link, rank, world, mine);
+         defer gpa.free(all);
+         const rows = all[1..];
++        try sameMemoryProfile(rows, row_bytes, world);
+         const peers_ok = all[0] == 1;
+         if (mine[0] != 1 or !peers_ok) {
+             std.log.warn("RoCE all-gather off: this rank {s}; some rank could not open it; NCCL carries every gather", .{if (mine[0] == 1) "opened it" else if (d == null) "has it off (TF_GLM_ROCE=0)" else "could not open it"});
+@@ -206,6 +273,13 @@ pub const Comm = struct {
+         return res;
+     }
+ 
++    /// Must be checked after result-producing synchronization, including captured replay.
++    pub fn check(c: *const Comm) !void {
++        if (c.extra) |x| {
++            if (x.r) |*r| if (r.failure() != null or r.timedOut() != null) return error.RoceTransportFailed;
++        }
++    }
++
+     /// The last agreement: every rank says whether it connected and started; all go on only when all did.
+     fn verdict(gpa: Allocator, link: Link, rank: u32, world: u32, r: ?*roce.Roce, ok: bool) !?roce.Roce {
+         const all = try gatherToAll(gpa, link, rank, world, &.{@intFromBool(ok)});
+@@ -249,7 +323,7 @@ pub const Comm = struct {
+     /// rail is TF_ROCE_GID_INDEX / NCCL_IB_GID_INDEX (3) at two ranks or when set, else each rail's own RoCE v2 IPv4
+     /// GID. Beyond two ranks every rail is probed; its address and prefix go into `found` for the routes unless a fixed
+     /// index names another GID (railAddr).
+-    fn openRoce(d: *const cuda.Driver, rank: u32, world: u32, found: *[roce.max_ports]?roce.Addr) ?roce.Roce {
++    fn openRoce(d: *const cuda.Driver, rank: u32, world: u32, found: *[roce.max_ports]?roce.Addr, memory_mode: roce.region.Mode) ?roce.Roce {
+         const hca_env = std.c.getenv("TF_ROCE_HCA") orelse std.c.getenv("NCCL_IB_HCA") orelse {
+             std.log.warn("RoCE: NCCL_IB_HCA is not set", .{});
+             return null;
+@@ -281,8 +355,8 @@ pub const Comm = struct {
+         };
+         const tc: c_int = if (std.c.getenv("NCCL_IB_TC")) |t| std.fmt.parseInt(c_int, std.mem.span(t), 0) catch 0 else 0;
+         // TF_ROCE_MAX_KB: the largest shard a rank RoCE takes (default 512 KiB; a multiple of 4096)
+-        const max: u64 = if (std.c.getenv("TF_ROCE_MAX_KB")) |m| std.fmt.parseInt(u64, std.mem.span(m), 10) catch 512 else 512;
+-        return roce.Roce.openRanks(d, rank, world, .{ .ports = ports, .gids = gids[0..ports.len], .traffic_class = tc, .slot_bytes = max * 1024, .timeout_s = roceTimeoutS() }) catch |e| {
++        const max: u64 = if (memory_mode == .registered) 512 else if (std.c.getenv("TF_ROCE_MAX_KB")) |m| std.fmt.parseInt(u64, std.mem.span(m), 10) catch 512 else 512;
++        return roce.Roce.openRanks(d, rank, world, .{ .ports = ports, .gids = gids[0..ports.len], .traffic_class = tc, .slot_bytes = max * 1024, .timeout_s = roceTimeoutS(), .memory_mode = memory_mode }) catch |e| {
+             std.log.warn("RoCE: {t}", .{e});
+             return null;
+         };
+@@ -300,6 +374,8 @@ pub const Comm = struct {
+         c.lib.close();
+         if (c.extra) |x| freeExtra(x);
+         c.extra = null;
++        if (c.counters) |v| std.heap.c_allocator.destroy(v);
++        c.counters = null;
+     }
+ 
+     fn freeExtra(x: *Extra) void {
+@@ -334,26 +410,43 @@ pub const Comm = struct {
+     }
+ 
+     /// allGather, and with TF_GLM_L2PF=1 `next` (the next kernels' weights) prefetched into the L2 meanwhile.
+-    pub fn allGatherThen(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType, stream: cuda.abi.Stream, next: Prefetch) !void {
++    pub const GatherBackend = enum { nccl, roce };
++
++    /// Shared by production enqueue and the weight-free qualification probe.
++    /// Every rank must supply the same count/layout class, as for NCCL itself.
++    pub fn gatherBackend(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType) !GatherBackend {
++        const bytes = try std.math.mul(usize, count, size(dtype));
+         if (c.extra) |x| {
+-            const pf: Prefetch = if (x.prefetch) next else .{};
+-            const bytes = count * size(dtype);
+-            // RoCE takes every size it fits whose layout it can (aligned; out of place or NCCL's in-place form), else
+-            // NCCL. Both ranks run the same calls on buffers carved the same way (the same allocation sequence,
+-            // offsets and in-place choices), so the layout test answers alike on both: no rank picks the other path.
+             if (x.r) |*r| if (r.fits(bytes)) {
+                 if (!r.takes(send, recv, bytes)) return error.RoceBuffers;
+-                return r.allGather(send, recv, bytes, stream, pf);
++                return .roce;
+             };
++        }
++        return .nccl;
++    }
++
++    pub fn allGatherThen(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType, stream: cuda.abi.Stream, next: Prefetch) !void {
++        const backend = try c.gatherBackend(send, recv, count, dtype);
++        if (c.extra) |x| {
++            const pf: Prefetch = if (x.prefetch) next else .{};
++            const bytes = try std.math.mul(usize, count, size(dtype));
++            if (backend == .roce) {
++                try x.r.?.allGather(send, recv, bytes, stream, pf);
++                c.recordEnqueue(.roce);
++                return;
++            }
+             if (x.l2) |*l| if (pf.bytes > 0) try l.run(pf, stream);
+         }
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream), "ncclAllGather");
++        c.recordEnqueue(.nccl);
+     }
+ 
+     /// NCCL's in-place all-gather (`send` = `recv` + rank * count elements): the prompt glue's row halves. Never RoCE,
+     /// which takes no overlapping buffers; NCCL on both ranks whatever the size (the same choice on both).
+     pub fn allGatherInPlace(c: *const Comm, send: cuda.abi.DevicePtr, recv: cuda.abi.DevicePtr, count: usize, dtype: nccl.DataType, stream: cuda.abi.Stream) !void {
++        try c.check();
+         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream), "ncclAllGather");
++        c.recordEnqueue(.nccl);
+     }
+ 
+     /// `bytes` bytes of `buf` from `root` to every rank, in place, on `stream` (the mirror's per-round records).
+@@ -560,3 +653,156 @@ test "a fixed GID index on a triangle: a mismatched rail is left out; the plan h
+     // (every rank keeps NCCL)
+     try std.testing.expectError(error.NoSharedSubnet, roce.planRoutes(&rows(&rails, .{ .rank = 2, .rail = 0 }), false));
+ }
++
++fn envText(name: [:0]const u8) ?[]const u8 {
++    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
++}
++const Transport = enum(u8) { nccl, roce };
++const Startup = struct {
++    mode: Transport,
++    memory: roce.region.Mode,
++    required: bool,
++    prefetch: bool,
++    ring: bool,
++    roce_enabled: bool,
++
++    const Input = struct {
++        registered_rdma: ?[]const u8 = null,
++        roce_enabled: ?[]const u8 = null,
++        ring: ?[]const u8 = null,
++        max_kb: ?[]const u8 = null,
++        prefetch: ?[]const u8 = null,
++    };
++    fn parse(world: u32, in: Input) !Startup {
++        const enabled = if (in.registered_rdma) |v| blk: {
++            if (std.mem.eql(u8, v, "1")) break :blk true;
++            if (std.mem.eql(u8, v, "0")) break :blk false;
++            return error.BadGlmTp4RegisteredRdma;
++        } else false;
++        const roce_enabled = !std.mem.eql(u8, in.roce_enabled orelse "1", "0");
++        const ring = std.mem.eql(u8, in.ring orelse "0", "1");
++        if (enabled) {
++            if (world != 4) return error.RegisteredRdmaRequiresTp4;
++            if (in.ring) |v| {
++                if (!std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "1")) return error.BadRoceRing;
++            }
++            if (!std.mem.eql(u8, in.roce_enabled orelse "", "1")) return error.RegisteredRdmaRequiresRoce;
++            if (!std.mem.eql(u8, in.max_kb orelse "512", "512")) return error.RegisteredRdmaRequires512KiB;
++        }
++        return .{
++            .mode = if (enabled or roce_enabled) .roce else .nccl,
++            .memory = if (enabled) .registered else .allocated,
++            .required = enabled,
++            .prefetch = !std.mem.eql(u8, in.prefetch orelse "1", "0"),
++            .ring = ring,
++            .roce_enabled = roce_enabled,
++        };
++    }
++    fn read(world: u32) !Startup {
++        return parse(world, .{
++            .registered_rdma = envText("TF_GLM_TP4_REGISTERED_RDMA"),
++            .roce_enabled = envText("TF_GLM_ROCE"),
++            .ring = envText("TF_ROCE_RING"),
++            .max_kb = envText("TF_ROCE_MAX_KB"),
++            .prefetch = envText("TF_GLM_L2PF"),
++        });
++    }
++    fn row(s: Startup) [8]u8 {
++        return .{ 1, 2, @backingInt(s.mode), @backingInt(s.memory), @intFromBool(s.required), @intFromBool(s.prefetch), @intFromBool(s.ring), @intFromBool(s.roce_enabled) };
++    }
++};
++fn sameMemoryProfile(rows: []const u8, stride: usize, world: usize) !void {
++    if (stride < 4 or world == 0 or rows.len != stride * world) return error.BadRoceRow;
++    for (0..world) |p| if (!std.mem.eql(u8, rows[2..4], rows[p * stride + 2 ..][0..2])) return error.MixedRoceProfile;
++}
++fn validateStartupRows(rows: []const u8, world: u32) !void {
++    if (world == 0 or rows.len != world * 8) return error.BadTransportProfileRow;
++    for (0..world) |p| if (rows[8 * p] != 1) return error.InvalidTransportProfile;
++    for (0..world) |p| if (!std.mem.eql(u8, rows[0..8], rows[8 * p ..][0..8])) return error.MixedTransportProfile;
++}
++test "transport profile defaults retain optional allocated TP2/3/4" {
++    for ([_]u32{ 2, 3, 4 }) |world| {
++        const s = try Startup.parse(world, .{});
++        try std.testing.expectEqual(Transport.roce, s.mode);
++        try std.testing.expectEqual(roce.region.Mode.allocated, s.memory);
++        try std.testing.expect(!s.required);
++        try std.testing.expect(s.prefetch);
++        try std.testing.expectEqual(Transport.nccl, (try Startup.parse(world, .{ .roce_enabled = "0" })).mode);
++        try std.testing.expectEqual(s, try Startup.parse(world, .{ .registered_rdma = "0" }));
++    }
++}
++test "transport profile opt-in scope and current options are strict" {
++    const good: Startup.Input = .{ .registered_rdma = "1", .roce_enabled = "1", .ring = "1" };
++    const s = try Startup.parse(4, good);
++    try std.testing.expect(s.required and s.memory == .registered and s.mode == .roce);
++    for ([_]u32{ 1, 2, 3, 5 }) |world| try std.testing.expectError(error.RegisteredRdmaRequiresTp4, Startup.parse(world, good));
++    var in = good;
++    in.ring = null;
++    try std.testing.expect(!(try Startup.parse(4, in)).ring);
++    in.ring = "0";
++    try std.testing.expect(!(try Startup.parse(4, in)).ring);
++    for ([_][]const u8{ "", "true", "01", "2" }) |v| {
++        in.ring = v;
++        try std.testing.expectError(error.BadRoceRing, Startup.parse(4, in));
++    }
++    in = good;
++    in.roce_enabled = null;
++    try std.testing.expectError(error.RegisteredRdmaRequiresRoce, Startup.parse(4, in));
++    in.roce_enabled = "0";
++    try std.testing.expectError(error.RegisteredRdmaRequiresRoce, Startup.parse(4, in));
++    in = good;
++    in.max_kb = "1024";
++    try std.testing.expectError(error.RegisteredRdmaRequires512KiB, Startup.parse(4, in));
++    for ([_][]const u8{ "", "true", "registered", "01" }) |v|
++        try std.testing.expectError(error.BadGlmTp4RegisteredRdma, Startup.parse(4, .{ .registered_rdma = v }));
++}
++test "transport profile errors and mismatches are collective before NCCL" {
++    const row = (try Startup.parse(4, .{ .registered_rdma = "1", .roce_enabled = "1", .ring = "1" })).row();
++    var rows = row ++ row ++ row ++ row;
++    try validateStartupRows(&rows, 4);
++    for (0..4) |rank| {
++        rows[8 * rank] = 0;
++        try std.testing.expectError(error.InvalidTransportProfile, validateStartupRows(&rows, 4));
++        rows[8 * rank] = 1;
++    }
++    for (1..8) |field| {
++        rows[8 + field] ^= 1;
++        try std.testing.expectError(error.MixedTransportProfile, validateStartupRows(&rows, 4));
++        rows[8 + field] ^= 1;
++    }
++}
++test "transport backend selection retains NCCL for large or ineligible byte counts" {
++    var r: roce.Roce = undefined;
++    r.slot_bytes = 512 << 10;
++    r.rank = 0;
++    r.world = 4;
++    var extra: Extra = undefined;
++    extra.r = r;
++    var c: Comm = undefined;
++    c.extra = &extra;
++    try std.testing.expectEqual(Comm.GatherBackend.roce, try c.gatherBackend(0x100000, 0x200000, 512 << 10, .u8));
++    for ([_]usize{ 0, 3, (512 << 10) + 4 }) |bytes|
++        try std.testing.expectEqual(Comm.GatherBackend.nccl, try c.gatherBackend(0x100000, 0x200000, bytes, .u8));
++    try std.testing.expectError(error.RoceBuffers, c.gatherBackend(0x100001, 0x200000, 16, .u8));
++    c.extra = null;
++    try std.testing.expectEqual(Comm.GatherBackend.nccl, try c.gatherBackend(0x100000, 0x200000, 16, .u8));
++}
++
++test "transport profile registered RDMA accepts direct default or explicit zero and ring explicit one" {
++    const direct = try Startup.parse(4, .{ .registered_rdma = "1", .roce_enabled = "1" });
++    const explicit = try Startup.parse(4, .{ .registered_rdma = "1", .roce_enabled = "1", .ring = "0" });
++    const ring = try Startup.parse(4, .{ .registered_rdma = "1", .roce_enabled = "1", .ring = "1" });
++    try std.testing.expectEqual(direct, explicit);
++    try std.testing.expect(direct.required and direct.memory == .registered and !direct.ring);
++    try std.testing.expect(ring.required and ring.memory == .registered and ring.ring);
++    const direct_row = direct.row();
++    const ring_row = ring.row();
++    const rows = direct_row ++ direct_row ++ ring_row ++ direct_row;
++    try std.testing.expectError(error.MixedTransportProfile, validateStartupRows(&rows, 4));
++    for ([_][]const u8{ "", "true", "01", "2" }) |v|
++        try std.testing.expectError(error.RegisteredRdmaRequiresRoce, Startup.parse(4, .{ .registered_rdma = "1", .roce_enabled = v }));
++    var other_version_row = direct_row;
++    other_version_row[1] ^= 1;
++    const mixed_binary = direct_row ++ direct_row ++ other_version_row ++ direct_row;
++    try std.testing.expectError(error.MixedTransportProfile, validateStartupRows(&mixed_binary, 4));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 0b313dc..1cb1396 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -641,6 +641,7 @@ pub const Engine = struct {
+ 
+     /// The bound sequence's state after `at` tokens (its position), copied into a new buffer.
+     pub fn takeSnap(e: *Engine, s: *Seq, at: usize) !*Snap {
++        if (e.comm) |c| try c.check();
+         if (at == 0 or at != s.st.pos or at % 64 != 0) return error.BadKeepPoint;
+         const sec = e.sectionsFor(at);
+         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
+@@ -652,6 +653,7 @@ pub const Engine = struct {
+         if (draft != null) if (e.drafter.?.multi.contexts[s.slot].end != at) return error.BadDraftCommit;
+         try snapshot.save(e.copier(), e.g, sec, buf.ptr, &s.st, draft);
+         try e.stream.synchronize();
++        if (e.comm) |c| try c.check();
+         e.snap_next += 1;
+         snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec };
+         s.tag = snap.id;
+@@ -779,6 +781,7 @@ pub const Engine = struct {
+     /// the state off the device and into its file while the lane thread goes on. A refusal (short, stored, over the cap or
+     /// the disk floor) or a failure leaves the state where it is; nothing here is fatal.
+     pub fn spillOut(e: *Engine, snap: *Snap, tokens: []const u32, at: u32) void {
++        if (e.comm) |c| c.check() catch return;
+         const t = e.spill orelse return;
+         if (snap.buf == null or snap.pos != at or tokens.len != at) return;
+         if (!t.wants(tokens, snap.sec.total)) return;
+@@ -827,6 +830,7 @@ pub const Engine = struct {
+     }
+ 
+     fn spillWrite(e: *Engine, j: SpillJob) void {
++        if (e.comm) |c| c.check() catch return;
+         const t = e.spill orelse return;
+         const buf = j.snap.buf orelse return;
+         var w = t.begin(j.tokens, j.at, j.snap.sec.total) catch |err| {
+@@ -839,9 +843,11 @@ pub const Engine = struct {
+         while (off < j.snap.sec.total) {
+             const n = @min(stage.len, j.snap.sec.total - off);
+             buf.download(off, stage[0..n]) catch |err| return abortWith(&w, "copying off the device", err);
++            if (e.comm) |c| c.check() catch |err| return abortWith(&w, "transport failure", err);
+             w.put(stage[0..n]) catch |err| return abortWith(&w, "writing", err);
+             off += n;
+         }
++        if (e.comm) |c| c.check() catch |err| return abortWith(&w, "transport failure", err);
+         w.finish() catch |err| return std.log.warn("spill: finishing {d} tokens failed ({s})", .{ j.at, @errorName(err) });
+         if (!@import("builtin").is_test) std.log.info("spill: wrote {d} tokens ({d} MiB)", .{ j.at, j.snap.sec.total >> 20 });
+     }
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index 00398cd..0eb206c 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -69,6 +69,7 @@ const link_timeout_ms: u32 = 10 * 60 * 1000;
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
+     if (!validTp(o.tp)) return error.UnsupportedTp;
+     if (o.rank >= o.tp) return error.BadRank;
++    if (o.tp == 1) try comm.validateStandalone();
+     const draft_dir = o.draft_dir orelse if (std.c.getenv("TF_GLM_DFLASH2_DIR")) |v| std.mem.span(v) else null;
+     const choice = try choice_mod.environment();
+     if (o.drafts and choice == .mtp and o.parallel != 1) return error.MtpRequiresSingleStream;
+diff --git a/zig/src/families/glm_cuda/cuda_sampler.zig b/zig/src/families/glm_cuda/cuda_sampler.zig
+index 508134c..92aadbf 100644
+--- a/zig/src/families/glm_cuda/cuda_sampler.zig
++++ b/zig/src/families/glm_cuda/cuda_sampler.zig
+@@ -163,6 +163,7 @@ pub const Sampler = struct {
+         const n = bytes * s.world();
+         try recv.downloadAsync(0, x.host.?.bytes[0..n], s.th.s.handle);
+         try s.th.s.synchronize();
++        if (s.comm) |cm| try cm.check();
+         return x.host.?.slice(f32)[0 .. n / 4];
+     }
+     fn checkGreedy(s: *Sampler, i: usize, p: Part, q: Plan, dst: u64) !void {
+diff --git a/zig/tests/cuda/glm_transport_probe.zig b/zig/tests/cuda/glm_transport_probe.zig
+new file mode 100644
+index 0000000..5fc3286
+--- /dev/null
++++ b/zig/tests/cuda/glm_transport_probe.zig
+@@ -0,0 +1,435 @@
++//! Weight-free production GLM Comm qualifier. One process on each of four hosts.
++//! tf-glm-transport-probe RANK MASTER_IP PORT [REPLAYS=64]
++//! TF_GLM_TP4_REGISTERED_RDMA=1 selects registered RDMA (ring relay or direct peers); otherwise set
++//! TF_GLM_ROCE=0 for the NCCL reference run. Optional allocated RoCE is not a probe profile.
++//! Run behind an external fleet-wide deadline. No model/checkpoint or Torch.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const Comm = glm.comm.Comm;
++const guard: usize = 64;
++const sentinel: u8 = 0xa7;
++
++pub fn main(init: std.process.Init) !u8 {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 4 or args.len > 5) return error.ExpectedRankMasterPortReplays;
++    const rank = try std.fmt.parseInt(u32, args[1], 10);
++    const master = try std.Io.net.IpAddress.parse(args[2], try std.fmt.parseInt(u16, args[3], 10));
++    const replays = if (args.len == 5) try std.fmt.parseInt(usize, args[4], 10) else 64;
++    if (rank >= 4 or replays < 8) return error.BadProbeArguments;
++    run(init.gpa, init.io, rank, master, replays) catch |e| {
++        std.debug.print("FAIL rank={d} error={t}\n", .{ rank, e });
++        // Do not unwind transport/graph resources after a failed CUDA operation:
++        // a failed peer can leave a stream pending. The supervisor stops the fleet.
++        std.c._exit(1);
++    };
++    return 0;
++}
++
++fn run(gpa: std.mem.Allocator, io: std.Io, rank: u32, master: std.Io.net.IpAddress, replays: usize) !void {
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    var server: ?glm.link.Server = null;
++    defer if (server) |s| s.close();
++    const link = if (rank == 0) blk: {
++        server = try glm.link.Server.open(master); // exact named interface
++        break :blk try server.?.acceptRanks(gpa, 4, 180_000);
++    } else blk: {
++        const l = try glm.link.Link.join(io, master, 180_000);
++        try l.hello(rank);
++        break :blk l;
++    };
++    defer link.close();
++    const agreement = try std.fmt.allocPrint(gpa, "glm-registered-rdma-probe-v2 replays={d}", .{replays});
++    defer gpa.free(agreement);
++    try link.agreeRanks(gpa, rank, agreement);
++    var comm = try Comm.init(gpa, link, rank, 4);
++    defer comm.deinit();
++    var stream = try cuda.Stream.init(&driver, true);
++    defer stream.deinit();
++    const registered = if (std.c.getenv("TF_GLM_TP4_REGISTERED_RDMA")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++    const backend: Comm.GatherBackend = if (registered) .roce else .nccl;
++    const ring = comm.stats().roce_ring; // Actual successful proxy setup, not requested env.
++    const requested_profile = @tagName(backend);
++    const plan = checked(rank, SizePlan.init(backend, activeCutoff(&comm)));
++    const plan_text = checked(rank, std.fmt.allocPrint(gpa, "glm-probe-size-plan backend={s} ring={} cutoff={d} graph={d},{d},{d}", .{ requested_profile, ring, plan.cutoff, plan.mixed[0], plan.mixed[1], plan.mixed[2] }));
++    defer gpa.free(plan_text);
++    checked(rank, link.agreeRanks(gpa, rank, plan_text));
++    std.debug.print("PLAN rank={d} {s} eager_cases={d}\n", .{ rank, plan_text, plan.eager_len });
++    for (plan.eager[0..plan.eager_len]) |bytes| {
++        var c = checked(rank, Case.init(&driver, bytes, 0, false, rank));
++        defer c.deinit();
++        for (0..3) |seed| {
++            checked(rank, c.prepare(gpa, rank, @intCast(seed)));
++            checked(rank, c.enqueue(&comm, stream));
++            c.check(gpa, &comm, stream, rank, @intCast(seed)) catch |e| die(e, rank);
++        }
++        std.debug.print("PASS rank={d} eager bytes={d} backend={s} guard=true oracle=nccl changing=3\n", .{ rank, bytes, @tagName(checked(rank, comm.gatherBackend(c.src(), c.dst(), bytes, .u8))) });
++    }
++    // Four-byte alignment and in-place rank slices exercise the RoCE general API.
++    for ([_]bool{ false, true }) |alias| {
++        var c = checked(rank, Case.init(&driver, 16384, if (alias) 0 else 4, alias, rank));
++        defer c.deinit();
++        checked(rank, c.prepare(gpa, rank, 17));
++        checked(rank, c.enqueue(&comm, stream));
++        c.check(gpa, &comm, stream, rank, 17) catch |e| die(e, rank);
++        std.debug.print("PASS rank={d} layout alias={} offset={d} backend={s}\n", .{ rank, alias, c.offset, @tagName(checked(rank, comm.gatherBackend(c.src(), c.dst(), c.bytes, .u8))) });
++        if (alias) {
++            checked(rank, c.prepare(gpa, rank, 18));
++            checked(rank, comm.allGatherInPlace(c.src(), c.dst(), c.bytes, .u8, stream.handle));
++            c.check(gpa, &comm, stream, rank, 18) catch |e| die(e, rank);
++            std.debug.print("PASS rank={d} explicit-in-place backend=nccl\n", .{rank});
++        }
++    }
++    var mixed: [3]Case = undefined;
++    var opened: usize = 0;
++    defer for (mixed[0..opened]) |*c| c.deinit();
++    for (plan.mixed, 0..) |bytes, i| {
++        mixed[i] = checked(rank, Case.init(&driver, bytes, 0, false, rank));
++        opened += 1;
++        checked(rank, mixed[i].prepare(gpa, rank, 0));
++        // Warm all collective shapes before entering capture.
++        checked(rank, mixed[i].enqueue(&comm, stream));
++    }
++    checked(rank, stream.synchronize());
++    checked(rank, comm.check());
++    const first_backend = checked(rank, comm.gatherBackend(mixed[0].src(), mixed[0].dst(), mixed[0].bytes, .u8));
++    const middle_backend = checked(rank, comm.gatherBackend(mixed[1].src(), mixed[1].dst(), mixed[1].bytes, .u8));
++    const last_backend = checked(rank, comm.gatherBackend(mixed[2].src(), mixed[2].dst(), mixed[2].bytes, .u8));
++    if (middle_backend != .nccl) die(error.ProbeRequiresFallbackMiddle, rank);
++    if (first_backend != backend or last_backend != backend) die(error.ProbeRequiresRequestedGraphBackend, rank);
++    std.debug.print("GRAPH rank={d} backends={s},{s},{s} bytes={d},{d},{d}\n", .{ rank, @tagName(first_backend), @tagName(middle_backend), @tagName(last_backend), plan.mixed[0], plan.mixed[1], plan.mixed[2] });
++    // Every GPU is done with eager work, then wait for the proxies' trailing
++    // completion polls. Counts for captured calls are deliberately excluded.
++    phase(rank, "eager_barrier");
++    checked(rank, link.agreeRanks(gpa, rank, "glm-transport-probe eager synchronized"));
++    phase(rank, "eager_counter_drain");
++    const drained = waitCounters(&comm, io, checked(rank, eagerTarget(comm.stats(), ring))) catch |e| die(e, rank);
++    snapshot(rank, "eager_drained", drained);
++    phase(rank, "capture_begin");
++    checked(rank, cuda.graph.beginCapture(stream, .global));
++    for (&mixed) |*c| checked(rank, c.enqueue(&comm, stream));
++    phase(rank, "capture_end");
++    var graph = checked(rank, cuda.graph.endCapture(stream));
++    defer graph.deinit();
++    phase(rank, "graph_instantiate");
++    var exec = checked(rank, graph.instantiate());
++    defer exec.deinit(); // graphs die before buffers, stream and Comm
++    const before_replay = comm.stats(); // includes capture enqueues, no replay
++    checked(rank, captureReady(gpa, link, rank, drained, before_replay));
++    phase(rank, "replay_begin");
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    for (0..replays) |iteration| {
++        if (iteration % 8 == 0) std.debug.print("PHASE rank={d} stage=replay iteration={d}/{d}\n", .{ rank, iteration, replays });
++        const seed: u32 = @intCast(iteration + 100);
++        for (&mixed) |*c| checked(rank, c.prepare(gpa, rank, seed));
++        checked(rank, exec.launchOn(stream));
++        for (&mixed) |*c| c.check(gpa, &comm, stream, rank, seed) catch |e| die(e, rank);
++    }
++    const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - t0;
++    phase(rank, "replay_barrier");
++    checked(rank, link.agreeRanks(gpa, rank, "glm-transport-probe graph synchronized"));
++    phase(rank, "replay_counter_drain");
++    const counts = waitCounters(&comm, io, checked(rank, replayTarget(before_replay, first_backend, replays, ring))) catch |e| die(e, rank);
++    snapshot(rank, "replay_drained", counts);
++    validateReplayCounts(before_replay, counts, first_backend, replays, ring) catch |e| die(e, rank);
++    std.debug.print("GRAPH_COUNTERS rank={d} replays={d} roce_ops_delta={d} relay_stripes_delta={d} enqueue_counts_unchanged=true\n", .{ rank, replays, counts.roce_ops - before_replay.roce_ops, counts.relayed_stripes - before_replay.relayed_stripes });
++    std.debug.print("COUNTERS rank={d} nccl_enqueues={d} roce_enqueues={d} roce_gpu_ops={d} relayed_stripes={d} registered_host_bytes={d}\n", .{ rank, counts.nccl_enqueues, counts.roce_enqueues, counts.roce_ops, counts.relayed_stripes, counts.registered_host_bytes });
++    if (registered and counts.registered_host_bytes == 0) die(error.NoRegisteredRegion, rank);
++    const profile = requested_profile;
++    if (std.mem.eql(u8, profile, "roce") and (counts.roce_ops == 0 or counts.roce_enqueues == 0)) die(error.NoRoceExecution, rank);
++    if (std.mem.eql(u8, profile, "roce") and ring and counts.relayed_stripes == 0) die(error.NoRelayExecution, rank);
++    if (!ring and counts.relayed_stripes != 0) die(error.UnexpectedDirectRelay, rank);
++    checked(rank, link.agreeRanks(gpa, rank, "glm-registered-rdma-probe-v2 passed"));
++    std.debug.print("PASS rank={d} mixed-graph=true replays={d} slot-reuse=true guards=true exact=true elapsed_ns={d} (includes host checks; not a benchmark)\n", .{ rank, replays, elapsed });
++}
++
++// Probe support is intentionally bounded. Read the live transport's agreed slot size,
++// not an environment default. The registered RDMA cutoff is fixed at 512 KiB.
++const max_probe_bytes: usize = (1024 << 10) + 16;
++fn activeCutoff(comm: *const Comm) u64 {
++    if (comm.extra) |x| {
++        if (x.r) |r| return r.slot_bytes;
++    }
++    return 0;
++}
++const SizePlan = struct {
++    cutoff: u64,
++    eager: [10]usize = .{ 8, 16, 68, 4096, 16384, 98304, 262144, 524288, 524304, 1048576 },
++    eager_len: usize = 10,
++    mixed: [3]usize = .{ 16384, 524304, 32768 },
++    fn init(backend: Comm.GatherBackend, cutoff: u64) !SizePlan {
++        switch (backend) {
++            .nccl => if (cutoff != 0) return error.ProbeProfileMismatch,
++            .roce => if (cutoff != 512 << 10) return error.UnsupportedProbeCutoff,
++        }
++        return .{ .cutoff = cutoff };
++    }
++};
++const CaseSizes = struct { send: usize, recv: usize, oracle: usize };
++fn caseSizes(bytes: usize, offset: usize) !CaseSizes {
++    if (bytes == 0 or bytes > max_probe_bytes or (offset != 0 and offset != 4)) return error.UnsupportedProbeCase;
++    const payload = try std.math.mul(usize, 4, bytes);
++    const edges = try std.math.add(usize, 2 * guard, offset);
++    return .{ .send = try std.math.add(usize, bytes, edges), .recv = try std.math.add(usize, payload, edges), .oracle = payload };
++}
++
++const Case = struct {
++    send: cuda.DeviceBuffer,
++    recv: cuda.DeviceBuffer,
++    oracle: cuda.DeviceBuffer,
++    bytes: usize,
++    offset: usize,
++    alias: bool,
++    rank: u32,
++    fn init(d: *const cuda.Driver, bytes: usize, offset: usize, alias: bool, rank: u32) !Case {
++        if (rank >= 4) return error.BadCaseRank;
++        const sizes = try caseSizes(bytes, offset);
++        var send = try cuda.DeviceBuffer.alloc(d, sizes.send);
++        errdefer send.free();
++        var recv = try cuda.DeviceBuffer.alloc(d, sizes.recv);
++        errdefer recv.free();
++        return .{ .send = send, .recv = recv, .oracle = try cuda.DeviceBuffer.alloc(d, sizes.oracle), .bytes = bytes, .offset = offset, .alias = alias, .rank = rank };
++    }
++    fn deinit(c: *Case) void {
++        c.oracle.free();
++        c.recv.free();
++        c.send.free();
++    }
++    fn src(c: *const Case) u64 {
++        return if (c.alias) c.dst() + c.rank * c.bytes else c.send.ptr + guard + c.offset;
++    }
++    fn dst(c: *const Case) u64 {
++        return c.recv.ptr + guard + c.offset;
++    }
++    fn prepare(c: *Case, gpa: std.mem.Allocator, rank: u32, seed: u32) !void {
++        const input = try gpa.alloc(u8, c.bytes);
++        defer gpa.free(input);
++        pattern(input, rank, seed);
++        try c.send.fill8(sentinel, null);
++        try c.recv.fill8(sentinel, null);
++        try c.oracle.fill8(0, null);
++        if (c.alias) try c.recv.upload(guard + c.offset + rank * c.bytes, input) else try c.send.upload(guard + c.offset, input);
++    }
++    fn enqueue(c: *Case, comm: *Comm, stream: cuda.Stream) !void {
++        try comm.allGatherThen(c.src(), c.dst(), c.bytes, .u8, stream.handle, .{});
++    }
++    fn check(c: *Case, gpa: std.mem.Allocator, comm: *Comm, stream: cuda.Stream, rank: u32, seed: u32) !void {
++        try stream.synchronize();
++        try comm.check(); // proxy/abort failures cannot masquerade as returned bytes
++        try comm.lib.check(comm.lib.api.ncclAllGather(c.src(), c.oracle.ptr, c.bytes, .u8, comm.comm, stream.handle), "probe NCCL oracle");
++        try stream.synchronize();
++        try comm.check();
++        const actual = try gpa.alloc(u8, c.recv.len);
++        defer gpa.free(actual);
++        try c.recv.download(0, actual);
++        const expected = try gpa.alloc(u8, 4 * c.bytes);
++        defer gpa.free(expected);
++        for (0..4) |p| pattern(expected[p * c.bytes ..][0..c.bytes], @intCast(p), seed);
++        const payload = actual[guard + c.offset ..][0 .. 4 * c.bytes];
++        if (!std.mem.eql(u8, expected, payload)) return error.WrongRankBytes;
++        for (actual[0 .. guard + c.offset]) |b| if (b != sentinel) return error.GuardBefore;
++        for (actual[guard + c.offset + 4 * c.bytes ..]) |b| if (b != sentinel) return error.GuardAfter;
++        try c.oracle.download(0, expected);
++        if (!std.mem.eql(u8, expected, payload)) return error.NcclOracleMismatch;
++        if (!c.alias) {
++            const source = try gpa.alloc(u8, c.send.len);
++            defer gpa.free(source);
++            try c.send.download(0, source);
++            pattern(expected[0..c.bytes], rank, seed);
++            if (!std.mem.eql(u8, expected[0..c.bytes], source[guard + c.offset ..][0..c.bytes])) return error.SourceChanged;
++            for (source[0 .. guard + c.offset]) |b| if (b != sentinel) return error.SourceGuardBefore;
++            for (source[guard + c.offset + c.bytes ..]) |b| if (b != sentinel) return error.SourceGuardAfter;
++        }
++    }
++};
++fn pattern(out: []u8, rank: u32, seed: u32) void {
++    for (out, 0..) |*b, i| b.* = @truncate((@as(u64, seed) *% 104729) ^ (@as(u64, rank + 1) *% 65497) ^ (@as(u64, i) *% 251) ^ (i >> 7));
++    // These are bytes, not arithmetic: preserve signed zero/NaN payloads/subnormals.
++    if (out.len >= 64) for ([_]u32{ 0, 0x80000000, 0x7fc01234 | rank, 1, 0x7f800000, 0xff800000 }, 0..) |word, i| {
++        std.mem.writeInt(u32, out[4 * i ..][0..4], word, .little);
++    };
++}
++
++// Fail at the call site, before any CUDA/transport resource defers can block.
++// Keep the original error; Zig 0.17 does not support errdefer error capture.
++fn checked(rank: u32, result: anytype) @typeInfo(@TypeOf(result)).error_union.payload {
++    return result catch |e| die(e, rank);
++}
++
++fn die(e: anyerror, rank: u32) noreturn {
++    std.debug.print("FAIL rank={d} error={t} (fleet supervisor must stop peers)\n", .{ rank, e });
++    std.c._exit(1);
++}
++
++fn phase(rank: u32, name: []const u8) void {
++    if (@import("builtin").is_test) return;
++    std.debug.print("PHASE rank={d} stage={s}\n", .{ rank, name });
++}
++fn snapshot(rank: u32, name: []const u8, s: Comm.Stats) void {
++    if (@import("builtin").is_test) return;
++    std.debug.print("SNAPSHOT rank={d} stage={s} nccl_enqueues={d} roce_enqueues={d} roce_ops={d} relay_stripes={d}\n", .{ rank, name, s.nccl_enqueues, s.roce_enqueues, s.roce_ops, s.relayed_stripes });
++}
++
++// Snapshot BEFORE the barrier: a fast rank must not replay until every peer has
++// sampled its counters. A peer's relay proxy can forward remote stripes before
++// its own GPU launches anything, so a barrier before sampling is insufficient.
++fn captureReady(gpa: std.mem.Allocator, link: anytype, rank: u32, drained: Comm.Stats, before: Comm.Stats) !void {
++    snapshot(rank, "capture_snapshot", before);
++    if (!sameExecutionCounts(drained, before)) {
++        snapshot(rank, "capture_expected", drained);
++        return error.CaptureExecutedTransport;
++    }
++    phase(rank, "capture_snapshot_barrier");
++    try link.agreeRanks(gpa, rank, "glm-transport-probe capture snapshots complete");
++}
++
++// Proxy polls can lag GPU synchronization. Bound each drain independently, and
++// include transport failure checks rather than accepting partial abort output.
++fn waitCounters(comm: *const Comm, io: std.Io, target: Comm.Stats) !Comm.Stats {
++    const deadline = std.Io.Clock.awake.now(io).toNanoseconds() + 5 * std.time.ns_per_s;
++    while (true) {
++        try comm.check();
++        const current = comm.stats();
++        if (reachedCounters(current, target)) return current;
++        if (std.Io.Clock.awake.now(io).toNanoseconds() >= deadline) {
++            std.debug.print("COUNTER_DRAIN_TIMEOUT rank={d} roce={d}/{d} stripes={d}/{d}\n", .{ comm.rank, current.roce_ops, target.roce_ops, current.relayed_stripes, target.relayed_stripes });
++            return error.ProxyCounterDrainTimeout;
++        }
++        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
++    }
++}
++fn reachedCounters(current: Comm.Stats, target: Comm.Stats) bool {
++    return current.roce_ops >= target.roce_ops and current.relayed_stripes >= target.relayed_stripes;
++}
++fn eagerTarget(current: Comm.Stats, ring: bool) !Comm.Stats {
++    if (current.roce_ring != ring) return error.ProbeTopologyMismatch;
++    if (!ring and current.relayed_stripes != 0) return error.UnexpectedDirectRelay;
++    var target = current;
++    target.roce_ops = current.roce_enqueues;
++    // tf_roce_set_ring sets n_relay=n_flag. Every gather forwards each stripe,
++    // including empty payload stripes' flags, so this also drains relay posts.
++    if (ring) target.relayed_stripes = try std.math.mul(u64, current.roce_enqueues, current.roce_stripes);
++    return target;
++}
++fn replayTarget(before: Comm.Stats, backend: Comm.GatherBackend, replays: usize, ring: bool) !Comm.Stats {
++    if (before.roce_ring != ring) return error.ProbeTopologyMismatch;
++    if (!ring and before.relayed_stripes != 0) return error.UnexpectedDirectRelay;
++    var target = before;
++    const calls = try std.math.mul(u64, replays, 2);
++    switch (backend) {
++        .roce => {
++            target.roce_ops = try std.math.add(u64, before.roce_ops, calls);
++            if (ring) target.relayed_stripes = try std.math.add(u64, before.relayed_stripes, try std.math.mul(u64, calls, before.roce_stripes));
++        },
++        .nccl => {},
++    }
++    return target;
++}
++fn sameExecutionCounts(a: Comm.Stats, b: Comm.Stats) bool {
++    return a.roce_ops == b.roce_ops and a.relayed_stripes == b.relayed_stripes;
++}
++fn validateReplayCounts(before: Comm.Stats, after: Comm.Stats, backend: Comm.GatherBackend, replays: usize, ring: bool) !void {
++    if (before.roce_ring != after.roce_ring or after.roce_ring != ring) return error.ProbeTopologyMismatch;
++    if (!ring and after.relayed_stripes != 0) return error.UnexpectedDirectRelay;
++    if (before.nccl_enqueues != after.nccl_enqueues or before.roce_enqueues != after.roce_enqueues) return error.HostEnqueueDuringReplay;
++    const target = try replayTarget(before, backend, replays, ring);
++    switch (backend) {
++        .roce => {
++            if (after.roce_ops < target.roce_ops) return error.RoceReplayCounterMismatch;
++            if (ring and after.relayed_stripes < target.relayed_stripes) return error.RelayReplayCounterMismatch;
++        },
++        .nccl => if (!sameExecutionCounts(before, after)) return error.UnexpectedCustomReplay,
++    }
++}
++
++test "graph counters require relay progress and no host enqueue during replay" {
++    const before: Comm.Stats = .{ .nccl_enqueues = 4, .roce_enqueues = 32, .roce_ops = 30, .relayed_stripes = 120, .roce_stripes = 4, .roce_ring = true };
++    var after = try replayTarget(before, .roce, 64, true);
++    try std.testing.expectEqual(@as(u64, 158), after.roce_ops);
++    try std.testing.expectEqual(@as(u64, 632), after.relayed_stripes);
++    try validateReplayCounts(before, after, .roce, 64, true);
++    after.relayed_stripes = before.relayed_stripes;
++    try std.testing.expectError(error.RelayReplayCounterMismatch, validateReplayCounts(before, after, .roce, 64, true));
++    after = try replayTarget(before, .roce, 64, true);
++    after.roce_enqueues += 1;
++    try std.testing.expectError(error.HostEnqueueDuringReplay, validateReplayCounts(before, after, .roce, 64, true));
++}
++test "graph counter drain waits for trailing completion polls and all relay stripes" {
++    const current: Comm.Stats = .{ .roce_enqueues = 5, .roce_ops = 5, .relayed_stripes = 19, .roce_stripes = 4, .roce_ring = true };
++    const target = try eagerTarget(current, true);
++    try std.testing.expect(!reachedCounters(current, target));
++    var trailing = current;
++    trailing.relayed_stripes = 20;
++    try std.testing.expect(reachedCounters(trailing, target));
++}
++
++test "graph counter capture gate rejects execution and propagates a closed peer barrier" {
++    const Gate = struct {
++        calls: usize = 0,
++        closed: bool = true,
++        fn agreeRanks(self: *@This(), _: std.mem.Allocator, _: u32, text: []const u8) !void {
++            try std.testing.expectEqualStrings("glm-transport-probe capture snapshots complete", text);
++            self.calls += 1;
++            if (self.closed) return error.TestPeerStillCapturing;
++        }
++    };
++    const drained: Comm.Stats = .{ .roce_enqueues = 28, .roce_ops = 28, .relayed_stripes = 112 };
++    var captured = drained;
++    captured.roce_enqueues += 2; // Capture records host enqueues, not GPU execution.
++    captured.nccl_enqueues += 1;
++    var gate: Gate = .{};
++    try std.testing.expectError(error.TestPeerStillCapturing, captureReady(std.testing.allocator, &gate, 3, drained, captured));
++    try std.testing.expectEqual(@as(usize, 1), gate.calls);
++    gate.closed = false;
++    try captureReady(std.testing.allocator, &gate, 3, drained, captured);
++    try std.testing.expectEqual(@as(usize, 2), gate.calls);
++    captured.relayed_stripes += 1; // Remote progress is not evidence of local capture execution.
++    try std.testing.expectError(error.CaptureExecutedTransport, captureReady(std.testing.allocator, &gate, 3, drained, captured));
++    try std.testing.expectEqual(@as(usize, 2), gate.calls); // A mismatched rank never releases peers.
++}
++
++test "graph counter size plan has fixed relay cutoff and NCCL middle" {
++    for ([_]SizePlan{ try SizePlan.init(.nccl, 0), try SizePlan.init(.roce, 512 << 10) }) |plan| {
++        try std.testing.expectEqualSlices(usize, &.{ 16384, 524304, 32768 }, &plan.mixed);
++        try std.testing.expectEqual(@as(usize, 10), plan.eager_len);
++    }
++    for ([_]u64{ 0, 128 << 10, 1024 << 10 }) |cutoff|
++        try std.testing.expectError(error.UnsupportedProbeCutoff, SizePlan.init(.roce, cutoff));
++    try std.testing.expectError(error.ProbeProfileMismatch, SizePlan.init(.nccl, 512 << 10));
++    for ([_]usize{ 0, max_probe_bytes + 1, std.math.maxInt(usize) }) |bytes|
++        try std.testing.expectError(error.UnsupportedProbeCase, caseSizes(bytes, 0));
++    try std.testing.expectError(error.UnsupportedProbeCase, caseSizes(16, std.math.maxInt(usize)));
++}
++
++test "graph counter direct registered RDMA requires own operations and zero relay stripes" {
++    const before: Comm.Stats = .{ .nccl_enqueues = 4, .roce_enqueues = 32, .roce_ops = 30, .roce_stripes = 4, .registered_host_bytes = 1024 };
++    var after = try replayTarget(before, .roce, 64, false);
++    try std.testing.expectEqual(@as(u64, 158), after.roce_ops);
++    try std.testing.expectEqual(@as(u64, 0), after.relayed_stripes);
++    try validateReplayCounts(before, after, .roce, 64, false);
++    after.roce_ops -= 1;
++    try std.testing.expectError(error.RoceReplayCounterMismatch, validateReplayCounts(before, after, .roce, 64, false));
++    after = try replayTarget(before, .roce, 64, false);
++    after.relayed_stripes = 1;
++    try std.testing.expectError(error.UnexpectedDirectRelay, validateReplayCounts(before, after, .roce, 64, false));
++    try std.testing.expectError(error.UnexpectedDirectRelay, eagerTarget(after, false));
++    try std.testing.expectError(error.UnexpectedDirectRelay, replayTarget(after, .roce, 64, false));
++    try std.testing.expectError(error.ProbeTopologyMismatch, replayTarget(before, .roce, 64, true));
++    after = before;
++    after.roce_ring = true;
++    try std.testing.expectError(error.ProbeTopologyMismatch, validateReplayCounts(before, after, .roce, 64, false));
++}
++
++test "graph counter NCCL control replay requires unchanged custom counters" {
++    const before: Comm.Stats = .{ .nccl_enqueues = 36 };
++    var after = try replayTarget(before, .nccl, 64, false);
++    try validateReplayCounts(before, after, .nccl, 64, false);
++    after.roce_ops = 1;
++    try std.testing.expectError(error.UnexpectedCustomReplay, validateReplayCounts(before, after, .nccl, 64, false));
++    after = before;
++    after.nccl_enqueues += 1;
++    try std.testing.expectError(error.HostEnqueueDuringReplay, validateReplayCounts(before, after, .nccl, 64, false));
++}

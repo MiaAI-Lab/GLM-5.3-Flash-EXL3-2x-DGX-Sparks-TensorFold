@@ -1,0 +1,12 @@
+Build Summary: 9/9 steps succeeded
+glm-transport-probe success
++- install tf-glm-transport-probe success
+   +- compile exe tf-glm-transport-probe fast aarch64-linux-gnu success 10s MaxRSS:519M
+      +- options cached
+native success
++- install tensorfold-native success
+   +- compile exe tensorfold-native safe aarch64-linux-gnu success 1m MaxRSS:3G
+      +- options cached
+      +- options (reused)
+      +- WriteFile draft_ids.txt cached
+

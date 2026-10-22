@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "kind": "performance-capture-comparison-v1",
+  "result": "IMPROVED",
+  "result_scope": "between these capture periods; not causal attribution",
+  "model": "GLM-5.3-Flash-EXL3",
+  "baseline_path": "/home/spark/lab/glm-tp4-focused-20261022/focused-nccl",
+  "candidate_path": "/home/spark/lab/glm-tp4-focused-20261022/focused-registered-from-nccl",
+  "declared_change": "settings",
+  "baseline_accounting": {
+    "dispatched_requests": 32,
+    "complete_requests": 32,
+    "known_reported_completion_tokens": 12800,
+    "missing_completion_usage_requests": 0,
+    "reported_completion_tokens": 12800,
+    "request_ceiling": 32,
+    "output_token_ceiling": 12800,
+    "allowance_seconds": 300,
+    "minimum_full_capture_tokens_per_second": 42.666666666666664
+  },
+  "candidate_accounting": {
+    "dispatched_requests": 32,
+    "complete_requests": 32,
+    "known_reported_completion_tokens": 12800,
+    "missing_completion_usage_requests": 0,
+    "reported_completion_tokens": 12800,
+    "request_ceiling": 32,
+    "output_token_ceiling": 12800,
+    "allowance_seconds": 300,
+    "minimum_full_capture_tokens_per_second": 42.666666666666664
+  },
+  "baseline_ready": false,
+  "baseline_complete_acquisitions": 8,
+  "candidate_complete_acquisitions": 8,
+  "baseline_acquisition_medians": [
+    159.20245935959218,
+    157.14937322936854,
+    156.82529152841536,
+    157.4891814775399,
+    157.02401800123343,
+    156.61811374625438,
+    157.75134916841375,
+    154.35463362962992
+  ],
+  "candidate_acquisition_medians": [
+    185.26409396594846,
+    184.6141633216888,
+    185.2641797729495,
+    184.63478547053484,
+    184.21388337142722,
+    183.27479994410118,
+    181.35235356817557,
+    181.31174514821103
+  ],
+  "observed_change_percent": 16.993888963417135,
+  "model_based_interval_percent": [
+    15.792841142782402,
+    18.20739451333128
+  ],
+  "model_based_confidence_level": 0.95,
+  "log_mean_difference": 0.15695151636366944,
+  "heteroscedastic_standard_error": 0.004363889947235191,
+  "critical_value": 2.364624251,
+  "conservative_degrees_of_freedom": 7,
+  "baseline_capture_sha256": "671ae1d5360ee60ca3ea7b5e11b5f4e55a4f262d448abf3f1118550f6bb963d1",
+  "candidate_capture_sha256": "fa66cf3de7ddc514260af8c53a07a8af155414a0de93686c58ad03e38deff8bc",
+  "report_path": "/home/spark/lab/glm-tp4-focused-20261022/focused-registered-from-nccl/report.json",
+  "reasons": [],
+  "stop_reason": null,
+  "first_failure": null,
+  "assumptions": "Model-based interval assumes stable, independent acquisition-level variation and an adequate log-scale mean model. Resetting a client does not prove independence. Positive autocorrelation can make the interval narrower than justified, increasing false directional conclusions. Sequential captures cannot remove time or carryover confounding; no causal attribution, equivalence, noninferiority, or guaranteed precision/power is established.",
+  "scope": "One short synthetic structured C1/exact400 workload; not general concurrency, long-context, model quality, tail SLOs, or full serving qualification. Deployment values are operator declarations, not server attestation. A settings fingerprint cannot prove only one internal knob changed."
+}

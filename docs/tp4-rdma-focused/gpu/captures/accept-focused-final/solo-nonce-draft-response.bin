@@ -1,0 +1,74 @@
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "GL"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "M_NONCE_B79D"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "26\n\nHere"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "'s how to verify a"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " file checksum using Python's standard library:\n\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "## Basic"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " Approach\n\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "Python's"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " `hashlib` module handles"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " checksums"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " The"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " key detail"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " for"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " large files is reading"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " in"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " chunks rather than loading everything"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " into memory:\n\n```python\nimport hashlib"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "\n\ndef compute_checksum"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "(filepath"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": ", algorithm"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "=\"sha256\"):\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "    hasher"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " = hashlib.new"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "(algorithm)\n    with"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " open(filepath, \"rb\") as f"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": ":\n        # Read"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " in 64"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "KB chunks\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "        for chunk in iter(lambda: f"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": ".read(65536), b\""}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": "\"):\n            hasher.update(chunk)\n    return"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {"content": " hasher.hexdigest()\n\nchecksum"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "exact_mode": "exact", "tensorfold": {"enable_thinking": false, "reasoning_effort": "none", "engine": "lanes", "tokens_per_second": 115.9706123601358, "seconds": 1.095105022, "prefill_seconds": 0.125687701, "prefill_widths": [], "prefill_raised": [], "time_to_first_token": 0.126291301, "sampling": "greedy", "drafts": true, "token_sha": "d87a1c7109a7", "min_rows": 2, "token_ids": [3825, 44, 22073, 2104, 1668, 102626, 35, 99916, 271, 8419, 594, 1246, 311, 10141, 264, 1034, 32382, 1667, 13020, 594, 5297, 6733, 1447, 565, 14615, 52732, 271, 30163, 594, 1565, 8295, 2740, 63, 4688, 13460, 32382, 82, 13, 576, 1376, 7716, 369, 3460, 3542, 374, 5290, 304, 26671, 4751, 1091, 8276, 4297, 1119, 4938, 1447, 73022, 12663, 198, 474, 54132, 271, 750, 12558, 63580, 34621, 11, 12105, 428, 15235, 116265, 15134, 262, 90067, 284, 54132, 4618, 17618, 7095, 340, 262, 448, 1787, 34621, 11, 330, 10676, 899, 438, 282, 510, 286, 671, 4457, 304, 220, 102636, 29746, 26671, 198, 286, 369, 11873, 304, 5367, 18176, 25, 282, 4125, 7, 21, 101130, 100632, 701, 293, 1, 15134, 310, 90067, 5317, 41342, 340, 262, 470, 90067, 45369, 36155, 2822, 70210]}, "speculative": {"rounds": 32, "drafted": 118, "accepted": 95, "acceptance_rate": 0.8050847457627118, "tokens_per_round": 4.0}}
+
+data: {"id": "chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98", "object": "chat.completion.chunk", "created": 1792681540, "model": "GLM-5.3-Flash-EXL3", "choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 128, "total_tokens": 168, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}}}
+
+data: [DONE]
+

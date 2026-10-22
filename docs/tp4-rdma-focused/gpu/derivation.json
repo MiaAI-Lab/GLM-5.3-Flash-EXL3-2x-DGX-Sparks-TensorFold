@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "operation": "Remove only the top-level backend field from each JSONL object; preserve row order and every other field value.",
+  "profiles": {
+    "nccl": {
+      "original_sha256": "d19b280f6abc9431d1625c2502630a88d9539cdf7757a9be5bea1cc25a88c29e",
+      "output_path": "captures/nccl-qualification.jsonl",
+      "output_sha256": "a41a811502c80bd0ac9cd3531ddf1a6bc37b04b5776104be29916a88bf6190e9",
+      "rows": 89,
+      "removed_field": "backend",
+      "all_other_fields_exact": true
+    },
+    "eager": {
+      "original_sha256": "10d8e129d2e5d32c3fde1481e9e338a6792bfa1e0ab03aa32b10533c3a9ee8b9",
+      "output_path": "captures/eager-qualification.jsonl",
+      "output_sha256": "14df474e158bb394f2f605d0fe1ca30f0840791fa5b37726e730f30865a2bbc2",
+      "rows": 89,
+      "removed_field": "backend",
+      "all_other_fields_exact": true
+    },
+    "registered": {
+      "original_sha256": "0c3922c9dec7a7efb5233fb218e86e4fc415d15140c787414f33fb64b0f99bf7",
+      "output_path": "captures/registered-qualification.jsonl",
+      "output_sha256": "a856818e522a2e765a5040e02eefd979f9f0951f39c52cc4f8bc4aaa6de63477",
+      "rows": 89,
+      "removed_field": "backend",
+      "all_other_fields_exact": true
+    }
+  }
+}

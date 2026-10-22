@@ -1,0 +1,46 @@
+{
+  "hosts": {
+    "spark": {
+      "observed": true,
+      "candidate_id": "600806e7618b5ddf272d3f5441ac4b5838fce5053506d52ea7b8ed451892e3c0",
+      "pid": 3204879,
+      "libraries": {
+        "/fleet-nccl/libnccl.so.2": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e"
+      },
+      "time": 1792680658.5090795,
+      "read_only": true
+    },
+    "spark-peer": {
+      "observed": true,
+      "candidate_id": "7ef7bcd6977ebfd4c7a1e3209478add70ae373f44d2a0b31c81ae958d64f5712",
+      "pid": 3076126,
+      "libraries": {
+        "/fleet-nccl/libnccl.so.2": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e"
+      },
+      "time": 1792680658.7353075,
+      "read_only": true
+    },
+    "msi-b9dc": {
+      "observed": true,
+      "candidate_id": "9a10f64e5a2e5a574d5917f86d1c2429ef49c02970a0c5e0b65a02f964abca5f",
+      "pid": 643349,
+      "libraries": {
+        "/fleet-nccl/libnccl.so.2": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e"
+      },
+      "time": 1792680658.9105644,
+      "read_only": true
+    },
+    "msi-c21f": {
+      "observed": true,
+      "candidate_id": "4607e2df1d2e92310f1abf9248369466771ba8d7c92d5b6164d7c4a0d5052844",
+      "pid": 392332,
+      "libraries": {
+        "/fleet-nccl/libnccl.so.2": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e"
+      },
+      "time": 1792680658.8571844,
+      "read_only": true
+    }
+  },
+  "all_observed": true,
+  "no_gpu_execution": true
+}

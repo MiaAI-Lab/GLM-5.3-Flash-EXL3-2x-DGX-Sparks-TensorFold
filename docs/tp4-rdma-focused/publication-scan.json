@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "files_scanned": 469,
+  "findings": [],
+  "patterns": [
+    "private_key",
+    "github_token",
+    "huggingface_token",
+    "literal_bearer"
+  ],
+  "limits": [
+    "Pattern scan only; cannot prove absence of arbitrary unrecognized secret values.",
+    "Only selected synthetic/current validation artifacts are published. Nonsecret labels, paths, hostnames and addresses may appear."
+  ]
+}

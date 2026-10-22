@@ -1,0 +1,20 @@
+test_actual_forwarding_functions_keep_all_rank_flags_and_local_rails (test_tp4_network.NetworkProfile) ... ok
+test_cutoff_growth_is_skipped_only_for_opt_in (test_tp4_network.NetworkProfile) ... ok
+test_explicit_fabric_ring_mismatch_fails_before_all_host_calls (test_tp4_network.NetworkProfile) ... ok
+test_invalid_profiles_fail_before_discovery (test_tp4_network.NetworkProfile) ... ok
+test_local_file_and_environment_precedence (test_tp4_network.NetworkProfile) ... ok
+test_opt_in_defaults_and_explicit_tuning (test_tp4_network.NetworkProfile) ... ok
+test_prepare_rejects_invalid_profile_before_host_calls (test_tp4_network.NetworkProfile) ... ok
+test_start_guard_preserves_default_and_accepts_opt_in (test_tp4_network.NetworkProfile) ... ok
+test_start_restart_and_prepare_reject_static_conflicts_before_host_calls (test_tp4_network.NetworkProfile) ... ok
+test_stop_remains_usable_with_stale_or_missing_profile_settings (test_tp4_network.NetworkProfile) ... ok
+test_unreachable_dry_run_inventory_cannot_qualify_opt_in (test_tp4_network.NetworkProfile) ... ok
+test_unset_expect_discovers_both_fabrics_and_checks_ring_before_stop (test_tp4_network.NetworkProfile) ... ok
+test_upstream_config_matches_pinned_recipe (test_tp4_network.NetworkProfile) ... ok
+test_wrappers_discover_and_forward_mesh_and_ring_two_or_four_hcas (test_tp4_network.NetworkProfile) ... ok
+test_wrong_wrapper_missing_peer_and_wrong_ring_order_fail_closed (test_tp4_network.NetworkProfile) ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 6.113s
+
+OK

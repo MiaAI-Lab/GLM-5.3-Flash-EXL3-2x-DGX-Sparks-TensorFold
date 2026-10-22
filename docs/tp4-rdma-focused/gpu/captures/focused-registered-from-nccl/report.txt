@@ -1,0 +1,16 @@
+MEASURED FASTER: higher throughput in these capture periods
+Scope: structured C1 (one concurrent request), exactly 400 output tokens per request.
+Complete acquisitions: baseline 8/8; candidate 8/8
+Model: GLM-5.3-Flash-EXL3
+Baseline: /home/spark/lab/glm-tp4-focused-20261022/focused-nccl
+  Requests: 32 dispatched, 32 complete; reported output: 12800 tokens
+  Ceiling: 32 requests / 12800 output tokens; allowance 300s. Full completion needs >42.7 reported output tokens/s including overhead; use --seconds for a larger allowance.
+Candidate: /home/spark/lab/glm-tp4-focused-20261022/focused-registered-from-nccl
+  Requests: 32 dispatched, 32 complete; reported output: 12800 tokens
+  Ceiling: 32 requests / 12800 output tokens; allowance 300s. Full completion needs >42.7 reported output tokens/s including overhead; use --seconds for a larger allowance.
+Selected declaration change: Settings
+Observed throughput change between capture periods: +16.99%
+Uncertainty range (model-based, nominal 95%) for the measured change: [+15.79%, +18.21%]
+Limits: a measured direction does not establish its cause or practical importance. These sequential measurements may be correlated or drift over time, making the uncertainty range too narrow. No guaranteed precision.
+Serving identity is declared, not attested.
+Report: /home/spark/lab/glm-tp4-focused-20261022/focused-registered-from-nccl/report.json

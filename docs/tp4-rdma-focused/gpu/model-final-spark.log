@@ -1,0 +1,1584 @@
+info: rank 0: waiting for 3 other rank(s) on 192.168.245.33:40060
+spark-4e04:1:1 [0] NCCL INFO ncclOsDlopen(libnccl-env.so) failed: libnccl-env.so: cannot open shared object file: No such file or directory
+spark-4e04:1:1 [0] NCCL INFO ENV/Plugin: Could not find: libnccl-env.so
+spark-4e04:1:1 [0] NCCL INFO NCCL_SOCKET_IFNAME set to =enP7s7
+spark-4e04:1:1 [0] NCCL INFO cudaDriverVersion 13000
+spark-4e04:1:1 [0] NCCL INFO NCCL version 2.30.7+cuda13.0
+spark-4e04:1:1 [0] NCCL INFO NCCL git version unknown unknown
+spark-4e04:1:1 [0] NCCL INFO ncclOsDlopen(libnccl-net.so) failed: libnccl-net.so: cannot open shared object file: No such file or directory
+spark-4e04:1:1 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so
+spark-4e04:1:1 [0] NCCL INFO Count not open libibverbs.so
+spark-4e04:1:1 [0] NCCL INFO dlvsym failed on mlx5dv_get_data_direct_sysfs_path - /lib/aarch64-linux-gnu/libmlx5.so.1: undefined symbol: mlx5dv_get_data_direct_sysfs_path, version MLX5_1.25 version MLX5_1.25
+spark-4e04:1:1 [0] NCCL INFO dlvsym failed on mlx5dv_reg_dmabuf_mr - /lib/aarch64-linux-gnu/libmlx5.so.1: undefined symbol: mlx5dv_reg_dmabuf_mr, version MLX5_1.25 version MLX5_1.25
+spark-4e04:1:1 [0] NCCL INFO NCCL_IB_HCA set to =rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1
+spark-4e04:1:1 [0] NCCL INFO NET/IB: [0] rocep1s0f0:uverbs0:1/RoCE provider=Mlx5 speed=200000 context=0x26c4ee80 pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 ar=0 oooRqSize=0
+spark-4e04:1:1 [0] NCCL INFO NET/IB: [1] rocep1s0f1:uverbs1:1/RoCE provider=Mlx5 speed=200000 context=0x26c90580 pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 ar=0 oooRqSize=0
+spark-4e04:1:1 [0] NCCL INFO NET/IB: [2] roceP2p1s0f0:uverbs2:1/RoCE provider=Mlx5 speed=200000 context=0x26cd1c80 pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 ar=0 oooRqSize=0
+spark-4e04:1:1 [0] NCCL INFO NET/IB: [3] roceP2p1s0f1:uverbs3:1/RoCE provider=Mlx5 speed=200000 context=0x26d13380 pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 ar=0 oooRqSize=0
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Made virtual device [0] name=rocep1s0f0 speed=200000 ndevs=1 rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Made virtual device [1] name=rocep1s0f1 speed=200000 ndevs=1 rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Made virtual device [2] name=roceP2p1s0f0 speed=200000 ndevs=1 rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Made virtual device [3] name=roceP2p1s0f1 speed=200000 ndevs=1 rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Using [0]rocep1s0f0:1/RoCE [1]rocep1s0f1:1/RoCE [2]roceP2p1s0f0:1/RoCE [3]roceP2p1s0f1:1/RoCE [RO]; OOB enP7s7:192.168.245.33<0>
+spark-4e04:1:1 [0] NCCL INFO Initialized NET plugin IB
+spark-4e04:1:1 [0] NCCL INFO Assigned NET plugin IB to comm
+spark-4e04:1:1 [0] NCCL INFO ncclOsDlopen(libnccl-rma.so) failed: libnccl-rma.so: cannot open shared object file: No such file or directory
+spark-4e04:1:1 [0] NCCL INFO RMA/Plugin: Could not find: libnccl-rma.so
+spark-4e04:1:1 [0] NCCL INFO RMA/Plugin: Failed to load external plugin libnccl-rma.so, dlHandle: (nil), ncclRma: (nil)
+spark-4e04:1:1 [0] NCCL INFO RMA/Plugin: Assigned plugin RMA_IB_PROXY to comm
+spark-4e04:1:1 [0] NCCL INFO ncclOsDlopen(libnccl-gin.so) failed: libnccl-gin.so: cannot open shared object file: No such file or directory
+spark-4e04:1:1 [0] NCCL INFO GIN/Plugin: Could not find: libnccl-gin.so
+spark-4e04:1:1 [0] NCCL INFO GIN/Plugin: Failed to load external plugin libnccl-gin.so, dlHandle: (nil), ncclGin: (nil)
+spark-4e04:1:1 [0] NCCL INFO GIN/Plugin: Assigned plugin GIN_IB_GDAKI type 3 to comm
+spark-4e04:1:1 [0] NCCL INFO Using network IB
+spark-4e04:1:1 [0] NCCL INFO Loaded NVML from libnvidia-ml.so.1
+spark-4e04:1:1 [0] NCCL INFO [Rank 0] ncclCommInitRank comm 0x2465b100 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId f01000 commId 0x97f8779605d47430 - Init START
+spark-4e04:1:1 [0] NCCL INFO RAS client listening socket at 127.0.0.1<28028>
+spark-4e04:1:1 [0] NCCL INFO NCCL_P2P_DISABLE set by environment to 1
+spark-4e04:1:1 [0] NCCL INFO Topology detection: could not read /sys/devices/system/node/node4294967295/cpumap, using empty affinity
+spark-4e04:1:1 [0] NCCL INFO TOPO/NET : Importing network plugins to topology
+spark-4e04:1:1 [0] NCCL INFO NET/GIN_IB_GDAKI : GPU Direct RDMA Disabled for HCA 0 'rocep1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f0 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=0 gin=1 rma=(null) keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/GIN_IB_GDAKI : GPU Direct RDMA Disabled for HCA 1 'rocep1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f1 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=0 gin=1 rma=(null) keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/GIN_IB_GDAKI : GPU Direct RDMA Disabled for HCA 2 'roceP2p1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f0 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=0 gin=1 rma=(null) keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/GIN_IB_GDAKI : GPU Direct RDMA Disabled for HCA 3 'roceP2p1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f1 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=0 gin=1 rma=(null) keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/RMA_IB_PROXY : GPU Direct RDMA Disabled for HCA 0 'rocep1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f0 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=0 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/RMA_IB_PROXY : GPU Direct RDMA Disabled for HCA 1 'rocep1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f1 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=0 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/RMA_IB_PROXY : GPU Direct RDMA Disabled for HCA 2 'roceP2p1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f0 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=0 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/RMA_IB_PROXY : GPU Direct RDMA Disabled for HCA 3 'roceP2p1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f1 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=0 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 0 'rocep1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f0 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=1 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 1 'rocep1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled rocep1s0f1 in topo with pciPath=/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0 net=1 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 2 'roceP2p1s0f0'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f0 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=1 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : GPU Direct RDMA Disabled for HCA 3 'roceP2p1s0f1'
+spark-4e04:1:1 [0] NCCL INFO ncclTopoPopulateNics : Filled roceP2p1s0f1 in topo with pciPath=/sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0 net=1 gin=1 rma=1 keep=1 coll=(null) rail=-1 plane=-1
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0
+spark-4e04:1:1 [0] NCCL INFO TOPO/NET : Tried merging multiple devices together and failed. vProps={ndevs=2, devs=[0 1 0 0]}. Set NCCL_NET_MERGE_LEVEL=LOC to disable NIC fusion.
+spark-4e04:1:1 [0] NCCL INFO Marking physical devices as unplaced, increasing distance and restarting search.
+spark-4e04:1:1 [0] NCCL INFO NET/IB : Skipping makeVDevice, NCCL_IB_MERGE_NICS=0
+spark-4e04:1:1 [0] NCCL INFO TOPO/NET : Tried merging multiple devices together and failed. vProps={ndevs=2, devs=[2 3 0 0]}. Set NCCL_NET_MERGE_LEVEL=LOC to disable NIC fusion.
+spark-4e04:1:1 [0] NCCL INFO Marking physical devices as unplaced, increasing distance and restarting search.
+spark-4e04:1:1 [0] NCCL INFO === System : maxBw 12.0 totalBw 0.2 ===
+spark-4e04:1:1 [0] NCCL INFO CPU/0-ffffffffffffff (3/-1/-1)
+spark-4e04:1:1 [0] NCCL INFO + C2C[345.0] - DEV/0-f01000
+spark-4e04:1:1 [0] NCCL INFO + PCI[12.0] - NIC/0-1000
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - NET/0-0 (0/54e2e000347bb4c/1/25.000000)
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - GIN/0-0
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - RMA/0-0
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - NET/0-1 (0/54e2e000347bb4c/2/25.000000)
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - GIN/0-1
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - RMA/0-1
+spark-4e04:1:1 [0] NCCL INFO + PCI[12.0] - NIC/0-201000
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - NET/0-2 (0/54e2e000347bb4c/1/25.000000)
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - GIN/0-2
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - RMA/0-2
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - NET/0-3 (0/54e2e000347bb4c/2/25.000000)
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - GIN/0-3
+spark-4e04:1:1 [0] NCCL INFO               + NET[25.0] - RMA/0-3
+spark-4e04:1:1 [0] NCCL INFO + PCI[0.2] - DEV/0-f01000 (10de2e1210de0000)
+spark-4e04:1:1 [0] NCCL INFO              + LOC[5000.0] - GPU/0-f01000
+spark-4e04:1:1 [0] NCCL INFO              + C2C[345.0] - CPU/0-ffffffffffffff
+spark-4e04:1:1 [0] NCCL INFO ==========================================
+spark-4e04:1:1 [0] NCCL INFO GPU/0-f01000 :GPU/0-f01000 (0/5000.0/LOC) CPU/0-ffffffffffffff (2/345.0/C2C) NET/0-0 (4/12.0/P2C) NET/0-1 (4/12.0/P2C) NET/0-2 (4/12.0/P2C) NET/0-3 (4/12.0/P2C) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (1/5000.0/LOC) 
+spark-4e04:1:1 [0] NCCL INFO NET/0-0 :GPU/0-f01000 (4/12.0/P2C) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (0/5000.0/LOC) NET/0-1 (2/25.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (2/25.0/LOC) GIN/0-1 (2/25.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (2/25.0/LOC) RMA/0-1 (2/25.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO NET/0-1 :GPU/0-f01000 (4/12.0/P2C) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (2/25.0/LOC) NET/0-1 (0/5000.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (2/25.0/LOC) GIN/0-1 (2/25.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (2/25.0/LOC) RMA/0-1 (2/25.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO NET/0-2 :GPU/0-f01000 (4/12.0/P2C) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (0/5000.0/LOC) NET/0-3 (2/25.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (2/25.0/LOC) GIN/0-3 (2/25.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (2/25.0/LOC) RMA/0-3 (2/25.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO NET/0-3 :GPU/0-f01000 (4/12.0/P2C) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (2/25.0/LOC) NET/0-3 (0/5000.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (2/25.0/LOC) GIN/0-3 (2/25.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (2/25.0/LOC) RMA/0-3 (2/25.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO GIN/0-0 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (2/25.0/LOC) NET/0-1 (2/25.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (0/5000.0/LOC) GIN/0-1 (2/25.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (2/25.0/LOC) RMA/0-1 (2/25.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO GIN/0-1 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (2/25.0/LOC) NET/0-1 (2/25.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (2/25.0/LOC) GIN/0-1 (0/5000.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (2/25.0/LOC) RMA/0-1 (2/25.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO GIN/0-2 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (2/25.0/LOC) NET/0-3 (2/25.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (0/5000.0/LOC) GIN/0-3 (2/25.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (2/25.0/LOC) RMA/0-3 (2/25.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO GIN/0-3 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (2/25.0/LOC) NET/0-3 (2/25.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (2/25.0/LOC) GIN/0-3 (0/5000.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (2/25.0/LOC) RMA/0-3 (2/25.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO RMA/0-0 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (2/25.0/LOC) NET/0-1 (2/25.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (2/25.0/LOC) GIN/0-1 (2/25.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (0/5000.0/LOC) RMA/0-1 (2/25.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO RMA/0-1 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (2/25.0/LOC) NET/0-1 (2/25.0/LOC) NET/0-2 (4/12.0/PHB) NET/0-3 (4/12.0/PHB) GIN/0-0 (2/25.0/LOC) GIN/0-1 (2/25.0/LOC) GIN/0-2 (4/12.0/PHB) GIN/0-3 (4/12.0/PHB) RMA/0-0 (2/25.0/LOC) RMA/0-1 (0/5000.0/LOC) RMA/0-2 (4/12.0/PHB) RMA/0-3 (4/12.0/PHB) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO RMA/0-2 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (2/25.0/LOC) NET/0-3 (2/25.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (2/25.0/LOC) GIN/0-3 (2/25.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (0/5000.0/LOC) RMA/0-3 (2/25.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO RMA/0-3 :GPU/0-f01000 (4/12.0/PHB) CPU/0-ffffffffffffff (2/12.0/PHB) NET/0-0 (4/12.0/PHB) NET/0-1 (4/12.0/PHB) NET/0-2 (2/25.0/LOC) NET/0-3 (2/25.0/LOC) GIN/0-0 (4/12.0/PHB) GIN/0-1 (4/12.0/PHB) GIN/0-2 (2/25.0/LOC) GIN/0-3 (2/25.0/LOC) RMA/0-0 (4/12.0/PHB) RMA/0-1 (4/12.0/PHB) RMA/0-2 (2/25.0/LOC) RMA/0-3 (0/5000.0/LOC) DEV/0-f01000 (3/12.0/PHB) 
+spark-4e04:1:1 [0] NCCL INFO ncclTopoGetCpuAffinity: Affinity for GPU 0 is empty, ignoring. (GPU affinity =  ; CPU affinity = 0-19).
+spark-4e04:1:1 [0] NCCL INFO Loading graphs
+spark-4e04:1:1 [0] NCCL INFO Search 0 : 4 channels loaded from XML graph
+spark-4e04:1:1 [0] NCCL INFO Pattern 4, crossNic 1, nChannels 4, bw 12.000000/12.000000, type LOC/P2C, sameChannels 1
+spark-4e04:1:1 [0] NCCL INFO  0 : NET/0-1 GPU/0-f01000 NET/0-1
+spark-4e04:1:1 [0] NCCL INFO  1 : NET/0-3 GPU/0-f01000 NET/0-3
+spark-4e04:1:1 [0] NCCL INFO  2 : NET/0-1 GPU/0-f01000 NET/0-1
+spark-4e04:1:1 [0] NCCL INFO  3 : NET/0-3 GPU/0-f01000 NET/0-3
+spark-4e04:1:1 [0] NCCL INFO Loading graphs
+spark-4e04:1:1 [0] NCCL INFO Search 1 : 4 channels loaded from XML graph
+spark-4e04:1:1 [0] NCCL INFO Pattern 3, crossNic 1, nChannels 4, bw 12.000000/12.000000, type LOC/P2C, sameChannels 1
+spark-4e04:1:1 [0] NCCL INFO  0 : NET/0-1 GPU/0-f01000 NET/0-1
+spark-4e04:1:1 [0] NCCL INFO  1 : NET/0-3 GPU/0-f01000 NET/0-3
+spark-4e04:1:1 [0] NCCL INFO  2 : NET/0-1 GPU/0-f01000 NET/0-1
+spark-4e04:1:1 [0] NCCL INFO  3 : NET/0-3 GPU/0-f01000 NET/0-3
+spark-4e04:1:1 [0] NCCL INFO Rank 0: 4 Net devices
+spark-4e04:1:1 [0] NCCL INFO Rank 0: 0 CollNet devices
+spark-4e04:1:1 [0] NCCL INFO Local Net device counts across ranks: min 4 max 4
+spark-4e04:1:1 [0] NCCL INFO Local CollNet device counts across ranks: min 0 max 0
+spark-4e04:1:1 [0] NCCL INFO comm 0x2465b100 rank 0 nRanks 4 nNodes 4 localRanks 1 localRank 0 MNNVL 0
+spark-4e04:1:1 [0] NCCL INFO Tree 0 : -1 -> 0 -> 2/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 4 : 1 -> 0 -> -1/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 1 : -1 -> 0 -> 2/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 5 : 1 -> 0 -> -1/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 2 : -1 -> 0 -> 2/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 6 : 1 -> 0 -> -1/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 3 : -1 -> 0 -> 2/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Tree 7 : 1 -> 0 -> -1/-1/-1
+spark-4e04:1:1 [0] NCCL INFO Channel 00/04 : 0 1 2 3
+spark-4e04:1:1 [0] NCCL INFO Channel 01/04 : 0 1 2 3
+spark-4e04:1:1 [0] NCCL INFO Channel 02/04 : 0 1 2 3
+spark-4e04:1:1 [0] NCCL INFO Channel 03/04 : 0 1 2 3
+spark-4e04:1:1 [0] NCCL INFO Ring 00 : 3 -> 0 -> 1
+spark-4e04:1:1 [0] NCCL INFO Ring 01 : 3 -> 0 -> 1
+spark-4e04:1:1 [0] NCCL INFO Ring 02 : 3 -> 0 -> 1
+spark-4e04:1:1 [0] NCCL INFO Ring 03 : 3 -> 0 -> 1
+spark-4e04:1:1 [0] NCCL INFO Trees [0] 2/-1/-1->0->-1 [1] 2/-1/-1->0->-1 [2] 2/-1/-1->0->-1 [3] 2/-1/-1->0->-1
+spark-4e04:1:1 [0] NCCL INFO P2P Chunksize set to 131072
+spark-4e04:1:1 [0] NCCL INFO Tuning P2P operations with maxP2pPeers = 4
+spark-4e04:1:1 [0] NCCL INFO ncclOsDlopen(libnccl-profiler.so) failed: libnccl-profiler.so: cannot open shared object file: No such file or directory
+spark-4e04:1:1 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so
+spark-4e04:1:1 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0 isAllCudaP2p 1
+spark-4e04:1:1 [0] NCCL INFO ncclP2pSchedule: group size used is 1
+spark-4e04:1:66 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 6
+spark-4e04:1:65 [0] NCCL INFO [Proxy Service] Device 0 CPU core 7
+spark-4e04:1:65 [0] NCCL INFO proxy listening socket at 192.168.245.33<36413>
+spark-4e04:1:65 [0] NCCL INFO NET/IB ListenerRouting format=ipv4-v1 advertised=4 observed=4
+spark-4e04:1:1 [0] NCCL INFO Channel 00/0 : 3[0] -> 0[0] [receive] via NET/IB/1
+spark-4e04:1:65 [0] NCCL INFO NET/IB ListenerRouting format=ipv4-v1 advertised=4 observed=4
+spark-4e04:1:1 [0] NCCL INFO Channel 01/0 : 3[0] -> 0[0] [receive] via NET/IB/3
+spark-4e04:1:65 [0] NCCL INFO NET/IB ListenerRouting format=ipv4-v1 advertised=4 observed=4
+spark-4e04:1:1 [0] NCCL INFO Channel 02/0 : 3[0] -> 0[0] [receive] via NET/IB/1
+spark-4e04:1:65 [0] NCCL INFO NET/IB ListenerRouting format=ipv4-v1 advertised=4 observed=4
+spark-4e04:1:1 [0] NCCL INFO Channel 03/0 : 3[0] -> 0[0] [receive] via NET/IB/3
+spark-4e04:1:1 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[0] [send] via NET/IB/1
+spark-4e04:1:1 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[0] [send] via NET/IB/3
+spark-4e04:1:1 [0] NCCL INFO Channel 02/0 : 0[0] -> 1[0] [send] via NET/IB/1
+spark-4e04:1:1 [0] NCCL INFO Channel 03/0 : 0[0] -> 1[0] [send] via NET/IB/3
+spark-4e04:1:67 [0] NCCL INFO [Proxy Progress] Device 0 CPU core 7
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the send communicator (comm=0xf7a2d8010000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the recv communicator (comm=0xf7a2d8054000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be posted on-demand
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the send communicator (comm=0xf7a2d809c000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=0 devName=rocep1s0f0 ndevs=4 nmdevs=4 qp_num=2539 pkey=0 pd=0xf7a2d800fc30 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: NCCL Dev 0 IbDev 0 Port 1 qp_num 2539 mtu 5 GID 3 (0/A00540AFFFF0000) ctsFifoRkey=0x1807c4 ctsFifoLkey=0x1807c4
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: IbDev 0 Port 1 qp_num 2539 query_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=2 devName=roceP2p1s0f0 ndevs=4 nmdevs=4 qp_num=1026 pkey=0 pd=0xf7a2d8053c50 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: NCCL Dev 2 IbDev 2 Port 1 qp_num 1026 mtu 5 GID 3 (0/A04540AFFFF0000) ctsFifoRkey=0x199a99 ctsFifoLkey=0x199a99
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: IbDev 2 Port 1 qp_num 1026 query_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the recv communicator (comm=0xf7a2d8158000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be posted on-demand
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the send communicator (comm=0xf7a2d81a0000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the recv communicator (comm=0xf7a2d81e4000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be posted on-demand
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the send communicator (comm=0xf7a2d822c000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbResiliencyInit: Resiliency is disabled on the recv communicator (comm=0xf7a2d8270000)
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbRecvCommInit: Receive work requests will be posted on-demand
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=1 devName=rocep1s0f1 ndevs=4 nmdevs=4 qp_num=1299 pkey=0 pd=0xf7a2d812ec80 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=1 devName=rocep1s0f1 ndevs=4 nmdevs=4 qp_num=1300 pkey=0 pd=0xf7a2d812ec80
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 0 Port 1 qp_num 2539 set_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB RouteFinal side=send comm=0xf7a2d8010000 mergedDev=0 qpIndex=0 qpNum=2539 devIndex=0 ibDev=0 hca=rocep1s0f0 port=1 localGid=00000000000000000000ffff0a54000a remoteGid=00000000000000000000ffff0a54000b remoteQpNum=1371
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 2 Port 1 qp_num 1026 set_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB RouteFinal side=send comm=0xf7a2d809c000 mergedDev=2 qpIndex=0 qpNum=1026 devIndex=0 ibDev=2 hca=roceP2p1s0f0 port=1 localGid=00000000000000000000ffff0a54040a remoteGid=00000000000000000000ffff0a54040b remoteQpNum=1498
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=3 devName=roceP2p1s0f1 ndevs=4 nmdevs=4 qp_num=1426 pkey=0 pd=0xf7a2d80e87c0 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=3 devName=roceP2p1s0f1 ndevs=4 nmdevs=4 qp_num=1427 pkey=0 pd=0xf7a2d80e87c0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=0 devName=rocep1s0f0 ndevs=4 nmdevs=4 qp_num=2540 pkey=0 pd=0xf7a2d800fc30 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: NCCL Dev 0 IbDev 0 Port 1 qp_num 2540 mtu 5 GID 3 (0/A00540AFFFF0000) ctsFifoRkey=0x180dca ctsFifoLkey=0x180dca
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: IbDev 0 Port 1 qp_num 2540 query_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=1 devName=rocep1s0f1 ndevs=4 nmdevs=4 qp_num=1301 pkey=0 pd=0xf7a2d812ec80 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=1 devName=rocep1s0f1 ndevs=4 nmdevs=4 qp_num=1302 pkey=0 pd=0xf7a2d812ec80
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsCreate: QP created: port=1 dev=2 devName=roceP2p1s0f0 ndevs=4 nmdevs=4 qp_num=1027 pkey=0 pd=0xf7a2d8053c50 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: NCCL Dev 2 IbDev 2 Port 1 qp_num 1027 mtu 5 GID 3 (0/A04540AFFFF0000) ctsFifoRkey=0x19aeab ctsFifoLkey=0x19aeab
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbConnectImpl: IbDev 2 Port 1 qp_num 1027 query_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: QP created: port=1 dev=3 devName=roceP2p1s0f1 ndevs=4 nmdevs=4 qp_num=1428 pkey=0 pd=0xf7a2d80e87c0 oooRq=0
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbReceiverQpsCreateToRts: Flush QP created: port=1 dev=3 devName=roceP2p1s0f1 ndevs=4 nmdevs=4 qp_num=1429 pkey=0 pd=0xf7a2d80e87c0
+spark-4e04:1:65 [0] NCCL INFO NET/IB RouteFinal side=recv comm=0xf7a2d8054000 mergedDev=1 qpIndex=0 qpNum=1299 devIndex=0 ibDev=1 hca=rocep1s0f1 port=1 localGid=00000000000000000000ffff0a54030b remoteGid=00000000000000000000ffff0a54030a remoteQpNum=730
+spark-4e04:1:65 [0] NCCL INFO NET/IB RouteFinal side=recv comm=0xf7a2d8158000 mergedDev=3 qpIndex=0 qpNum=1426 devIndex=0 ibDev=3 hca=roceP2p1s0f1 port=1 localGid=00000000000000000000ffff0a54070b remoteGid=00000000000000000000ffff0a54070a remoteQpNum=856
+spark-4e04:1:65 [0] NCCL INFO NET/IB: Subnet-aware routing: overriding dev 1 with dev 0 preserving PCI root pci0000:00
+spark-4e04:1:65 [0] NCCL INFO NET/IB: ncclIbSenderQpsToRts: Set ECE: IbDev 0 Port 1 qp_num 2540 set_ece={supported=1, vendor_id=0x15b3, options=0x30000002, comp_mask=0x0}
+info: RoCE all-gather on 4 rail(s), 2 stripe(s) a peer, ring with relays for gathers up to 512 KiB a rank
+info: GLM transport rank 0: backend=roce-relay memory=registered required=true cutoff=524288 bytes
+info: rank 0: settings agreed, NCCL joined
+warning: GLM EXL3 upload uses candidateMse; clipping parity against ATen CUDA is unproven
+warning: lm_head uses quant.makeF8; block-FP8 load parity is the P2/P3 qualification limit
+info: experts rotate each row's input once (shared gate/up scale) in 42 MoE layers
+info: weights loaded in 41214 ms (dense MSE quantize 186555 ms, expert stacks 336517 ms, dense reads 227109 ms, pack 449 ms, head 461 ms)
+info: TF_GLM_SIDE=1: the MoE shared expert runs on a second stream in decode windows
+info: L2 prefetch in decode windows (bulk, up to 8.0 MiB a site): a 45 sites 6.5 MiB, f 45 sites 8.0 MiB, o 45 sites 5.4 MiB
+info: GLM KV pool: 5619712 tokens, display 0 MiB (drm)
+spark-4e04:1:65 [0] NCCL INFO NET/IB RouteFinal side=send comm=0xf7a2d81a0000 mergedDev=0 qpIndex=0 qpNum=2540 devIndex=0 ibDev=0 hca=rocep1s0f0 port=1 localGid=00000000000000000000ffff0a54000a [tensorfold] serving GLM-5.3-Flash-EXL3 at http://127.0.0.1:40053/v1 (sampling: temperature 1.0, top_p 0.95; drafts: on; context: 131072; loaded in 69.2s)
+info: prompt cache: 3.0 GiB for kept states, at most 8 (fixed 57 MiB each); per chat 0, bytes cap 0 MiB, shared prefix 0; 24.0 GiB reserved, 2.0 GiB headroom for the prompts' buffers
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 0, kept 1; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 0, misses 1, evicted 0, refused 0, failed 0)
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 0, misses 4, evicted 0, refused 0, failed 0)
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 0, misses 4, evicted 0, refused 0, failed 0)
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 0, misses 4, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /slots HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-3884b622fcee01d8d94a6c92e6a10d6c prompt=75 cached=0 thinking=False effort=none tokens=256 sha=21486c402814 finish=length rounds=45 accepted=210/251
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 0, misses 5, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-42d8a8f66237f477aaa251fde87de62d prompt=48 cached=0 thinking=False effort=none tokens=256 sha=a481604c61e2 finish=length rounds=85 accepted=170/231
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 1, misses 5, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-5536e451299610303154b84b560f5dcc prompt=48 cached=0 thinking=False effort=none tokens=256 sha=6b907d880774 finish=length rounds=98 accepted=157/231
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 1, misses 6, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-9cfe0ab83fdad8cd9c734444c1e09289 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=cb39bcfdf4a8 finish=length rounds=134 accepted=122/219
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 1, misses 7, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-b0e35cda64b69e5731513656d05ba036 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=6d977dd5fbf6 finish=length rounds=50 accepted=206/296
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 2, misses 7, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-afe82ccc0571af379eef7eda9dacbfca prompt=50 cached=0 thinking=False effort=none tokens=256 sha=47b3734a4462 finish=length rounds=124 accepted=131/213
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 2, misses 8, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-960e6c8bbbc5d40a5dab30ea1d3b3478 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=a8add0e184a5 finish=length rounds=46 accepted=209/261
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 2, misses 9, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-717212cbda6a4cb7424cfa168da77570 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=1b874cfba978 finish=length rounds=90 accepted=166/260
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 3, misses 9, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-802492f5011ed130d4960566d7ddf059 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=2af599a4c0d8 finish=length rounds=49 accepted=207/286
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 3, misses 10, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-047d13d7570fdf82731ad95bb1de679c prompt=50 cached=0 thinking=False effort=none tokens=256 sha=c3bf7bbcdcf5 finish=length rounds=120 accepted=135/230
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-ce36ef7fbb1790f750e920f40c94ac0e prompt=48 cached=0 thinking=False effort=none tokens=256 sha=d1e50af0720c finish=length rounds=85 accepted=170/229
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 3, misses 11, evicted 0, refused 0, failed 0)
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 4, misses 11, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-3617e6090b5875ef2aa3f0bf2fd99036 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=0f12275b6874 finish=length rounds=48 accepted=207/275
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 4, misses 12, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-f6aab09c055c16fda757afe1484ab6e3 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=d657885e96ec finish=length rounds=132 accepted=124/204
+[tensorfold] done chatcmpl-6e7287f255b2358bfd0134d2f33ea083 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=c6bb898a1359 finish=length rounds=76 accepted=179/236
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 5, misses 13, evicted 0, refused 0, failed 0)
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 5, misses 13, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-d5f1f2fefe5474f8ed84ac54599e3e91 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=4e767129ee63 finish=length rounds=52 accepted=203/288
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 5, misses 14, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-33bb0f05bec62c740a138cb22ef877e5 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=2b1fff362c86 finish=length rounds=122 accepted=133/214
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 5, misses 15, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-eed5ba08b31aab55cf09513943433ea1 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=767001afe0fc finish=length rounds=89 accepted=167/233
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 6, misses 15, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-87e62af64340209752c872a12bd205d0 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=cfb8e39c79a1 finish=length rounds=121 accepted=134/201
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 6, misses 16, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-f07f99d8cf2bd62ebc80dc965e765587 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=ec20f47727fd finish=length rounds=76 accepted=179/238
+[tensorfold] done chatcmpl-788067812696a3b3dd712145c7b0ba45 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=bc2b0132accc finish=length rounds=50 accepted=205/306
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 7, misses 16, evicted 0, refused 0, failed 0)
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 7, misses 17, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-c4910f9fbc26ff0004e933445b7920cd prompt=75 cached=64 thinking=False effort=none tokens=256 sha=6c673ac084ae finish=length rounds=46 accepted=209/265
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 7, misses 18, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-0625ebfc758d08708ddf9d283ce339a9 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=c6d64e7fd5e9 finish=length rounds=131 accepted=124/215
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 7, misses 19, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-5c9d1f247efdec81cfb767eb17d0b06b prompt=48 cached=0 thinking=False effort=none tokens=256 sha=4a86ff764686 finish=length rounds=95 accepted=160/207
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 8, misses 19, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-cb3f3c0c0a283ce5116bd0bbc7eef4aa prompt=50 cached=0 thinking=False effort=none tokens=256 sha=0cf6be79288f finish=length rounds=133 accepted=123/222
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 8, misses 20, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-089c7a49817e4f3eee12a8b180608f7b prompt=48 cached=0 thinking=False effort=none tokens=256 sha=0c28f5701354 finish=length rounds=89 accepted=167/266
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-949527bcf63d5255e08222a25e652fae prompt=75 cached=64 thinking=False effort=none tokens=256 sha=9bb80c20f7f5 finish=length rounds=49 accepted=206/297
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 8, misses 21, evicted 0, refused 0, failed 0)
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 9, misses 21, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-5e1a58dce1a1e7c25d38a2d205235e4b prompt=75 cached=64 thinking=False effort=none tokens=256 sha=1aefc9651052 finish=length rounds=43 accepted=212/260
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 9, misses 22, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-6f4a267563721811e0aadb7c2ab72b3b prompt=50 cached=0 thinking=False effort=none tokens=256 sha=aada742c170e finish=length rounds=125 accepted=130/211
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 9, misses 23, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-26a1b9585bb6b271c81b3d4e8b784db3 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=fd065aa37edd finish=length rounds=95 accepted=160/237
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 10, misses 23, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-dd9b52e7945d39677095d3f6c037ab24 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=21cd5d50c745 finish=length rounds=82 accepted=173/231
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 10, misses 24, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-4f2e793b02bdfd3168db8071dab42530 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=09a1f121bbf5 finish=length rounds=135 accepted=120/210
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 10, misses 25, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-c58b8d6e4579fe20f83634e20671f9db prompt=75 cached=64 thinking=False effort=none tokens=256 sha=6b90e93954c6 finish=length rounds=44 accepted=211/282
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 11, misses 25, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-4f6cc308fe3c811feafcd96becb5d972 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=9d4be8e19d2c finish=length rounds=129 accepted=127/232
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 11, misses 26, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-097aaad04f2184b1f1ae420d17a4b323 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=dafb4fdf2b74 finish=length rounds=46 accepted=209/267
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 11, misses 27, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-3200ffdd49d0a9e1ed2199f836bd70a8 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=7682c07691cc finish=length rounds=88 accepted=168/232
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 12, misses 27, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-15b5d24005b3f8f7c4584b4b8f33ba3b prompt=50 cached=0 thinking=False effort=none tokens=256 sha=c0c31f5fb7aa finish=length rounds=116 accepted=139/201
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 12, misses 28, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-b56e2b5f0ba8c236fad38b7784dfd8d3 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=5faa8c876ef0 finish=length rounds=47 accepted=208/267
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 12, misses 29, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-f8c95646e7685390c5adad0faa718958 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=4d65fa2ef8e9 finish=length rounds=84 accepted=171/245
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 13, misses 29, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-b6b0b7ddd13d14ad8323d1707b8aa98a prompt=50 cached=0 thinking=False effort=none tokens=256 sha=b5573bc51e2e finish=length rounds=118 accepted=137/201
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 13, misses 30, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-c7888a245021e63be3f857d173db507a prompt=75 cached=64 thinking=False effort=none tokens=256 sha=b4c7e6702d2d finish=length rounds=45 accepted=210/304
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 13, misses 31, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-8eb72cd6b58f4801926ee07c7fb74042 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=d66f0b54ef44 finish=length rounds=79 accepted=176/244
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 14, misses 31, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-6bce1893e18d7a295be8064d8e8b4441 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=6c673ac084ae finish=length rounds=46 accepted=209/257
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 14, misses 32, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-e01cfb220c72d9d5416867d997b622f3 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=f8063cf666b8 finish=length rounds=119 accepted=136/213
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 14, misses 33, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-6bdb8f2da5b808e79ddefa12b2540d75 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=d6d95c7496a8 finish=length rounds=94 accepted=161/248
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 15, misses 33, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-8582362483b4fb4bb4738165ff0b3f18 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=7aa27fc60a41 finish=length rounds=120 accepted=135/205
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 15, misses 34, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-6ac8768364177ab18f17ec4e9b288b0a prompt=75 cached=64 thinking=False effort=none tokens=256 sha=8a3e1705e474 finish=length rounds=47 accepted=208/301
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 15, misses 35, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-491ed6eeb1e8c6913be31ca8c509ca93 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=b98914d14015 finish=length rounds=84 accepted=171/230
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 16, misses 35, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-41c89e67e6be40d243ed608dc18bda46 prompt=48 cached=0 thinking=False effort=none tokens=256 sha=bd3c904559dd finish=length rounds=72 accepted=183/232
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 16, misses 36, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-fc1e77b36e3ca6e0b8ff65dc85a12a07 prompt=50 cached=0 thinking=False effort=none tokens=256 sha=74c4a8dd5c25 finish=length rounds=124 accepted=132/212
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 16, misses 37, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-b2d2624c54313bba0bdf09b2f32ffe09 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=7498e89dc664 finish=length rounds=46 accepted=209/266
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 17, misses 37, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-a453b993941ce1d8b44e03e52ce3ad18 prompt=75 cached=64 thinking=False effort=none tokens=256 sha=782c250f87dd finish=length rounds=48 accepted=207/275
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 48 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 17, misses 38, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-51f044fff214821219b9f2de8ea90dfb prompt=50 cached=0 thinking=False effort=none tokens=256 sha=9df0ed3f1f69 finish=length rounds=123 accepted=132/215
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 50 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 17, misses 39, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-c2899e95754867089da23b89733ad7db prompt=48 cached=0 thinking=False effort=none tokens=256 sha=d109bdb5c12d finish=length rounds=104 accepted=151/233
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 75 tokens, resumed at 64, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 39, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-b2c0e2cd5ee1d885fd06089fc505d03c prompt=50 cached=0 thinking=False effort=none tokens=256 sha=46ead7a794cc finish=length rounds=119 accepted=136/207
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-8524c8f91a12052e2ff0990fa608442b prompt=48 cached=0 thinking=False effort=none tokens=256 sha=ef61fb461af1 finish=length rounds=95 accepted=161/238
+[tensorfold] done chatcmpl-56c5749e9b0e68e614e5ecfe728f5f5f prompt=75 cached=64 thinking=False effort=none tokens=256 sha=b02081b4948d finish=length rounds=48 accepted=207/267
+[tensorfold] done chatcmpl-0e6b941463940b428887ebaa741fd1bd prompt=50 cached=0 thinking=False effort=none tokens=256 sha=7d1c22662d7b finish=length rounds=114 accepted=141/205
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 32 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 40, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-db97664730849e3f9bf67dad7a9a4bc1 prompt=32 cached=0 thinking=False effort=none tokens=128 sha=190ee409fc07 finish=length rounds=127 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 32 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 41, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-8b07723ef5e9e34fb2c91ef96b2e07c7 prompt=32 cached=0 thinking=False effort=none tokens=128 sha=190ee409fc07 finish=length rounds=44 accepted=83/104
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 30 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 42, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-02b9bc9881b016cc623202182a23e3c7 prompt=30 cached=0 thinking=False effort=none tokens=128 sha=363b5c5afae8 finish=length rounds=127 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 30 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 43, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-079fc3f373653d6e9c19db52699facdb prompt=30 cached=0 thinking=False effort=none tokens=128 sha=363b5c5afae8 finish=length rounds=56 accepted=71/113
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 44, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-f5a68d3de06d70f1bfe8d11b2c4b4fb7 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=c10762198457 finish=length rounds=127 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 45, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-18c4348093c5aeb03f7cbc088a1360d3 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=c10762198457 finish=length rounds=32 accepted=95/128
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 46, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-e5c92e3e8721a4889823953d4eabdfe4 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=d87a1c7109a7 finish=length rounds=127 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 47, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-b76411ab7d55a7b4a13f2cde0384cc98 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=d87a1c7109a7 finish=length rounds=32 accepted=95/118
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 48, evicted 0, refused 0, failed 0)
+info: prompt cache: 40 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 51, evicted 0, refused 0, failed 0)
+info: prompt cache: 32 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 51, evicted 0, refused 0, failed 0)
+info: prompt cache: 30 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 51, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-28f52d9d7517f2035f6a6b78108dcae0 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=c10762198457 finish=length rounds=32 accepted=95/128
+[tensorfold] done chatcmpl-c3ca0fa1b94728b39b2843f93ad56f41 prompt=40 cached=0 thinking=False effort=none tokens=128 sha=d87a1c7109a7 finish=length rounds=32 accepted=95/118
+[tensorfold] done chatcmpl-73a874e987833b77ed3039d5b40766be prompt=32 cached=0 thinking=False effort=none tokens=128 sha=190ee409fc07 finish=length rounds=44 accepted=83/104
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-498f7b81cd49af7fff4e9b5f515cef93 prompt=30 cached=0 thinking=False effort=none tokens=128 sha=363b5c5afae8 finish=length rounds=56 accepted=71/113
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 25 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 52, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 29 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 53, evicted 0, refused 0, failed 0)
+[tensorfold] ended chatcmpl-dea0e950526e3597698ff5543a7de8c9 reason=client-left prompt=25 tokens=1 after=0.28s
+[tensorfold] done chatcmpl-84d36f890a553a835e8525fde3740c7e prompt=29 cached=0 thinking=False effort=none tokens=32 sha=fc868059db6c finish=length rounds=31 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 29 tokens, resumed at 0, kept 0; 1 states, 57 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 54, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-aa164b21f6b51b9dd788d52ec1aa3741 prompt=29 cached=0 thinking=False effort=none tokens=32 sha=fc868059db6c finish=length rounds=13 accepted=18/24
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /tokenize HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 32752 tokens, resumed at 0, kept 1; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 18, misses 55, evicted 0, refused 0, failed 0)
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] done chatcmpl-209263101beec34cf44743b4c2470010 prompt=32752 cached=0 thinking=False effort=none tokens=128 sha=82a4fa156032 finish=length rounds=127 accepted=0/0
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 32752 tokens, resumed at 32704, kept 0; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 19, misses 55, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-377740e9f47a8b1bc10bfd63c63b2a5a prompt=32752 cached=32704 thinking=False effort=none tokens=128 sha=82a4fa156032 finish=length rounds=37 accepted=90/129
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 32752 tokens, resumed at 32704, kept 0; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 20, misses 55, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-86b328418cb1a07e08dc3a9004f3c9b1 prompt=32752 cached=32704 thinking=False effort=none tokens=128 sha=82a4fa156032 finish=length rounds=37 accepted=90/129
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 32752 tokens, resumed at 32704, kept 0; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 21, misses 55, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-1a1b0a4f35ee3db9adb41a839c5e98af prompt=32752 cached=32704 thinking=False effort=none tokens=128 sha=82a4fa156032 finish=length rounds=37 accepted=90/129
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+info: prompt cache: 11 tokens, resumed at 0, kept 0; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 21, misses 56, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-bc66747f02da4edef2f1cd2fc2d5fd26 prompt=11 cached=0 thinking=False effort=none tokens=2 sha=568c5dc36654 finish=stop rounds=1 accepted=1/1
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 11 tokens, resumed at 0, kept 0; 2 states, 308 MiB and 0 MiB spare of 3072 MiB (hits 21, misses 57, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-1e9e9d5b57645204c41952976f62d4f3 prompt=11 cached=0 thinking=False effort=none tokens=2 sha=568c5dc36654 finish=stop rounds=1 accepted=1/1
+info: prompt cache: 155 tokens, resumed at 0, kept 1; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 21, misses 58, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-c44402083d832005aba9f1e8750bbe72 prompt=155 cached=0 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 155 tokens, resumed at 128, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 22, misses 58, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-198c9fdc2226f0c9f63f3e531b8a7fe5 prompt=155 cached=128 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 155 tokens, resumed at 128, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 23, misses 58, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-9d0d7adfdbf61051517f2667442a4314 prompt=155 cached=128 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+info: prompt cache: 11 tokens, resumed at 0, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 23, misses 59, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-a74878a0ebb216468be84cd5c73508db prompt=11 cached=0 thinking=False effort=none tokens=2 sha=568c5dc36654 finish=stop rounds=1 accepted=1/1
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 11 tokens, resumed at 0, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 23, misses 60, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-cf060dbb9962a238521b4f2ff6a0e8cb prompt=11 cached=0 thinking=False effort=none tokens=2 sha=568c5dc36654 finish=stop rounds=1 accepted=1/1
+info: prompt cache: 155 tokens, resumed at 128, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 24, misses 60, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-87b496b7ad92df4d0d3c7d9469586019 prompt=155 cached=128 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 155 tokens, resumed at 128, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 25, misses 60, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-e4c99001baefc1e2e92822879145f230 prompt=155 cached=128 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+info: prompt cache: 155 tokens, resumed at 128, kept 0; 3 states, 366 MiB and 0 MiB spare of 3072 MiB (hits 26, misses 60, evicted 0, refused 0, failed 0)
+[tensorfold] done chatcmpl-888b11ba180dcdfabfd98c7ca8fd488a prompt=155 cached=128 thinking=False effort=none tokens=12 sha=56b98506c5b5 finish=stop rounds=2 accepted=10/11
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/v0/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /api/tags HTTP/1.1" 404 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "GET /health HTTP/1.1" 200 -

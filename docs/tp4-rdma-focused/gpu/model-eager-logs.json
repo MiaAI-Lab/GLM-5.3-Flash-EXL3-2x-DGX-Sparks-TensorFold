@@ -1,0 +1,42 @@
+{
+  "spark": {
+    "file": "model-eager-spark.log",
+    "sha256": "d987a329061435e1d7ba26c98b15fa5c6cdb72704373f736832730bec031c82e",
+    "bytes": 182501,
+    "startup": [
+      "info: GLM transport rank 0: backend=roce-relay memory=registered required=true cutoff=524288 bytes"
+    ],
+    "pass_lines": [],
+    "failure_lines": []
+  },
+  "spark-peer": {
+    "file": "model-eager-spark-peer.log",
+    "sha256": "9e69061505bfe33bade39e134647b50bed6a32366b2ea8b20253db9e76f9c26d",
+    "bytes": 516962,
+    "startup": [
+      "info: GLM transport rank 1: backend=roce-relay memory=registered required=true cutoff=524288 bytes"
+    ],
+    "pass_lines": [],
+    "failure_lines": []
+  },
+  "msi-b9dc": {
+    "file": "model-eager-msi-b9dc.log",
+    "sha256": "cc249f9c55934d995e627506b25c604904f6cd1040ccc560d1a7ab5bc1a623af",
+    "bytes": 99217,
+    "startup": [
+      "info: GLM transport rank 2: backend=roce-relay memory=registered required=true cutoff=524288 bytes"
+    ],
+    "pass_lines": [],
+    "failure_lines": []
+  },
+  "msi-c21f": {
+    "file": "model-eager-msi-c21f.log",
+    "sha256": "9f4d258b53e4e4a798d09d0238b1a6800c159dcbc996e4ccf93f2cb31eabdf74",
+    "bytes": 295865,
+    "startup": [
+      "info: GLM transport rank 3: backend=roce-relay memory=registered required=true cutoff=524288 bytes"
+    ],
+    "pass_lines": [],
+    "failure_lines": []
+  }
+}

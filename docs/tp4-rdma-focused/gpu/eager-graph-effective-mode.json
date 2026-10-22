@@ -1,0 +1,75 @@
+{
+  "profiles": {
+    "eager": {
+      "spark": {
+        "container_id": "cca7b8e61b8f25dfa9ad588d5147633e986901381dd55d891ba7f6382a235a8f",
+        "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+        "command_sha256": "71563997d077602c5e472c04c0b1bbde5e6ee1b5a9438b222f8c755baa505a9b",
+        "TF_GLM_EAGER": [
+          "TF_GLM_EAGER=1"
+        ],
+        "matched": true
+      },
+      "spark-peer": {
+        "container_id": "086b9185d0efc9a37d2076a4492104f2d1b6fa7e875add8961a689c00b3d4422",
+        "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+        "command_sha256": "fbddaac4a44e526c15cfc77b2d1f713f12efef2f3d19afcebf5d51bc4050d5e1",
+        "TF_GLM_EAGER": [
+          "TF_GLM_EAGER=1"
+        ],
+        "matched": true
+      },
+      "msi-b9dc": {
+        "container_id": "eb07a0e444459b03e7c0a7cd50d42c05e29b9bc797f31dc928f9a4a1a9f09014",
+        "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+        "command_sha256": "0c4c2f7dfbfd750363aca1e7df55e599c2abf6a0ec68684b45dd28bc9a3dd262",
+        "TF_GLM_EAGER": [
+          "TF_GLM_EAGER=1"
+        ],
+        "matched": true
+      },
+      "msi-c21f": {
+        "container_id": "b7a065a58df90aae82b2c9f88a4e16875a4bea5363aa559f4b08ed8280abe4ac",
+        "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+        "command_sha256": "bf6310313f6dd91b286df16f4a09841c0c58f80551162426e82f4b22cc311ab2",
+        "TF_GLM_EAGER": [
+          "TF_GLM_EAGER=1"
+        ],
+        "matched": true
+      }
+    },
+    "graph": {
+      "spark": {
+        "container_id": "6742dadaab84a2fd9864f9acf54d65f8706c49ffd5854bdc7d062a56bd331bb7",
+        "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+        "command_sha256": "71563997d077602c5e472c04c0b1bbde5e6ee1b5a9438b222f8c755baa505a9b",
+        "TF_GLM_EAGER": [],
+        "matched": true
+      },
+      "spark-peer": {
+        "container_id": "3180dc4033eff2b215a474f79e0d558e797ba0227cca5b0526ed6f2d0895c9ef",
+        "image_id": "sha256:f7fda009bd9c791cd42bd028f7c9d325a2a83d181d41f60d2f3f8ce4a641d804",
+        "command_sha256": "fbddaac4a44e526c15cfc77b2d1f713f12efef2f3d19afcebf5d51bc4050d5e1",
+        "TF_GLM_EAGER": [],
+        "matched": true
+      },
+      "msi-b9dc": {
+        "container_id": "23b5c192db1835dae3875a525a40fdbaee683f1e807396ee069644e1ce68698d",
+        "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+        "command_sha256": "0c4c2f7dfbfd750363aca1e7df55e599c2abf6a0ec68684b45dd28bc9a3dd262",
+        "TF_GLM_EAGER": [],
+        "matched": true
+      },
+      "msi-c21f": {
+        "container_id": "8b27a891fc9c362a426700676a34d5c035d5358cc667775e9303f22f0e23cd8e",
+        "image_id": "sha256:6f06d4fc40c35a79aa3a24be76361e2ef04c5d804293dac7f845e01e7e84adf5",
+        "command_sha256": "bf6310313f6dd91b286df16f4a09841c0c58f80551162426e82f4b22cc311ab2",
+        "TF_GLM_EAGER": [],
+        "matched": true
+      }
+    }
+  },
+  "observed_after_run": true,
+  "scope": "Immutable container configuration and pinned direct executable; no independent kernel execution trace",
+  "passed": true
+}

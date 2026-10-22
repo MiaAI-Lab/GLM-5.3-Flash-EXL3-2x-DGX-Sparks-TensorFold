@@ -1,0 +1,6 @@
+{
+  "model_revision": "Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold@078455ffe6472f9a52fbc1139f58b9db2881b25c",
+  "runtime": "Mia zig-engine a6c7e08 + focused native be94e919e35c628261bd38364b1743a2e4353a26; engine sha256:42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+  "hardware": "spark,spark-peer,msi-b9dc,msi-c21f; 4xGB10; unchanged dual-domain neighbor ring; GID3",
+  "settings": "{\"cache_gib\":32,\"context\":131072,\"drafter\":\"DFlash2@bf582e4eacc1810f76656d1811693ff6c6737d2a\",\"eager\":false,\"hc_split\":0,\"l2pf\":1,\"max_tokens\":32768,\"memory_reserve_gib\":24,\"mtp\":0,\"nccl\":\"2.30.7+fleet-patches\",\"parallel\":8,\"prefill_overlap\":0,\"prefill_rows\":2048,\"prompt_cache_gib\":3,\"ring\":\"spark,spark-peer,msi-b9dc,msi-c21f\",\"side\":1,\"transport\":\"nccl\"}"
+}
