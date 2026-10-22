@@ -8,7 +8,8 @@
 # warning, while the same setting given explicitly refuses.
 # The Zig engine serves the v2 tier and KV sharding only once their ports are in zig/patches; ZIG_HAS (start.sh) then
 # lists them: spill2, kvshard, and spillshard for the two together. Until then an explicit setting refuses and names
-# the missing patch. ENGINE=python (patches/) has the v1 tier (0088) only.
+# the missing patch. ENGINE=python (patches/) has the v1 tier (0088) only. Likewise the start memory check counts the
+# parked pages only once the engine does (port_parked: ZIG_HAS parked, or patches/'s 0119).
 # Kept to bash 3.2 syntax (with scripts/memavail.sh) so that scripts/port_test.sh runs on a Mac too. scripts/config.sh
 # and scripts/nodes.sh use `declare -A`, which bash 3.2 lacks; the tests source this file alone.
 
@@ -17,9 +18,12 @@
 # a clean restart (README: Spill tier). ENGINE=zig spills the prompt cache's kept states, so it needs PROMPT_CACHE_GIB
 # above 0 (scripts/config.sh) and DFlash2 drafts (MTP drafts turn the Zig prompt cache off).
 #   SPILL_GIB          the cap a Spark (GiB; 0: off, the default)
-#   SPILL_DIR          the same absolute path on every Spark, mounted at /spill (files owned by you): a folder you can
-#                      write, on a local disk, outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves
-#                      HF_CACHE to the workers); start.sh checks it on every Spark and creates it when missing
+#   SPILL_DIR          the same absolute path on every Spark, mounted at /spill: a folder you can write, on a local disk,
+#                      outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves HF_CACHE to the workers);
+#                      start.sh checks it on every Spark and creates it (as you) when missing. The ranks run as root: the
+#                      Zig engine's tier (cuda_spill.zig) writes its tfspill-<hash> folders and files as root, readable by
+#                      root only (0700 / 0600), so removing them takes sudo (tools/spill_check.py: --sudo); the Python
+#                      engine's (0088) hands its files to SPILL_DIR's owner
 #   SPILL_MIN_TOKENS   shorter kept states are not written (8192)
 #   SPILL_MIN_FREE_GIB free disk the tier leaves on SPILL_DIR's file system: past it writes are refused (50)
 #   SPILL_FLUSH_S      what a clean stop gives the tier to write what still waits (60; the ranks' TF_SPILL_FLUSH_S);
@@ -77,8 +81,16 @@ port_num()  { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 port_gt0()  { awk -v x="$1" 'BEGIN {exit !(x + 0 > 0)}'; }
 port_spill_on() { port_num "$SPILL_GIB" && port_gt0 "$SPILL_GIB"; }
 port_v2_on() { port_spill_on && [[ "$SPILL_V2" == 1 ]]; }
-# port_has <feature>: the Zig engine in this image serves it (ZIG_HAS, start.sh: spill2, kvshard, spillshard)
+# port_has <feature>: the Zig engine in this image serves it (ZIG_HAS, start.sh: spill2, kvshard, spillshard, parked)
 port_has() { [[ "$ENGINE" == zig && " ${ZIG_HAS:-} " == *" $1 "* ]]; }
+# port_parked: the engine in this image counts the pages parked on the per-CPU free lists in its startup budget (wojo's
+# patch 0119): ENGINE=zig once its port is in zig/patches (ZIG_HAS parked), ENGINE=python with patches/'s
+# 0119-cuda-budget-parked-pages.patch (PR #149). start.sh's memory check counts them only then, so that it never
+# expects more memory than the engine will budget (scripts/memavail.sh: mem_avail_gb)
+port_parked() {
+  if [[ "$ENGINE" == zig ]]; then port_has parked
+  else [[ -e "${_cfg_root:-.}/patches/0119-cuda-budget-parked-pages.patch" ]]; fi
+}
 # port_missing <feature>: what is missing for it, for a refusal or a warning
 port_missing() {
   local what
@@ -88,9 +100,9 @@ port_missing() {
     spillshard) what="the port of spill v2 and KV sharding together" ;;
   esac
   if [[ "$ENGINE" == zig ]]; then
-    echo "this image's tensorfold-native has no $what: it is not in zig/patches yet (ZIG_HAS lists spill2, kvshard and spillshard once it is; now: ${ZIG_HAS:-empty})"
+    echo "this image's tensorfold-native lacks $what: it is not in zig/patches yet (ZIG_HAS lists spill2, kvshard and spillshard once it is; now: ${ZIG_HAS:-empty})"
   else
-    echo "the Python engine's patches/ have no $what (Robert's fork, wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, has them for ENGINE=python)"
+    echo "the Python engine's patches/ lack $what (Robert's fork, wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, has them for ENGINE=python)"
   fi
 }
 # A clean stop writes what still waits within SPILL_FLUSH_S: give the ranks that long and 30 s (the stop without the
@@ -236,28 +248,55 @@ port_validate() {
   return 0
 }
 
-# port_check_extra ARGS...: the command line's extra serve arguments (./start.sh [restart] ARGS) may not set the spill
-# tier: its folder is checked and mounted only through the settings (SPILL_GIB, SPILL_DIR, ...), so a --spill-gib given
-# here would write inside the container, and be lost with it
+# port_check_extra ARGS...: the command line's extra serve arguments (./start.sh [restart] ARGS) may not turn the spill
+# tier on: its folder is checked and mounted only through the settings (SPILL_GIB, SPILL_DIR), so a --spill-gib given
+# here would write inside the container, and be lost with it. With the tier on, the flags port_map passes come after the
+# extra arguments and win, so one given here too would be ignored: refused, naming its setting. Other flags pass as
+# before (--snapshot-dir with the tier off is TensorFold's own snapshot folder; 0088's --spill-keep-builds has no setting).
 port_check_extra() {
-  local a
+  local a f s
   for a in "$@"; do
-    case "$a" in
-      --spill-*|--snapshot-dir|--snapshot-dir=*)
-        die "the extra argument $a: the spill tier's settings go through SPILL_GIB, SPILL_DIR, SPILL_MIN_TOKENS, SPILL_MIN_FREE_GIB, SPILL_HIGHWATER, SPILL_FLUSH_S (scripts/port.sh), which check and mount its folder on every Spark" ;;
+    f=${a%%=*}
+    case "$f" in
+      --spill-gib)
+        die "the extra argument $a: the spill tier goes on through SPILL_GIB (with SPILL_DIR; scripts/port.sh), which checks and mounts its folder on every Spark" ;;
+      --snapshot-dir) s="SPILL_DIR (mounted at $PORT_SPILL_MOUNT on every rank)" ;;
+      --spill-highwater) [[ "$SPILL_V2" != 1 ]] || continue; s=SPILL_HIGHWATER ;;   # v1's: not passed under v2
+      --spill-min-tokens) s=SPILL_MIN_TOKENS ;;
+      --spill-min-free-gib) s=SPILL_MIN_FREE_GIB ;;
+      *) continue ;;
     esac
+    ! port_spill_on ||
+      die "the extra argument $a: with the spill tier on (SPILL_GIB=$SPILL_GIB) start.sh passes $f itself, after the extra arguments, so this one would be ignored. Set $s instead"
   done
   return 0
 }
 
-# port_check_started <rank 0's log>: with the spill tier on (ENGINE=zig), rank 0 must have opened a prompt cache, which
-# the tier writes from. Its budget is what MemAvailable leaves above the reserve once the pool is up, so it can come
-# out 0 at start even with PROMPT_CACHE_GIB above 0 (Mia PR #187): the tier then never opens. Warns; the server runs on.
+# port_check_started <rank 0's log> [<rank 1's log>...]: with the spill tier on (ENGINE=zig), every rank must have opened
+# it (each log: its "prompt cache:", "spill tier:" and "spill: cannot open" lines; "(unread)" when it could not be read).
+# Rank 0 first needs a prompt cache, which the tier writes from: its budget is what MemAvailable leaves above the reserve
+# once the pool is up, so it can come out 0 even with PROMPT_CACHE_GIB above 0 (Mia PR #187), and no tier opens. Each
+# rank opens its tier from its own budget (cuda_native.zig cacheFor), with no agreement between the ranks: a Spark with
+# a little less memory free can come out with none while rank 0 writes and restores states it cannot follow. Warns; the
+# server runs on.
 port_check_started() {
   [[ "$ENGINE" == zig ]] && port_spill_on || return 0
-  local line
+  local line l r=0
   line=$(grep -m1 -o 'prompt cache: off[^"]*' <<<"$1" || true)
-  [[ -z "$line" ]] || warn "the spill tier is not open: rank 0 logged \"$line\", and the tier writes only kept prompt states. Lower KV_POOL_GIB (the pool takes that memory first) or MEMORY_RESERVE_GIB, then ./start.sh restart"
+  if [[ -n "$line" ]]; then
+    warn "the spill tier is not open: rank 0 logged \"$line\", and the tier writes only kept prompt states. Lower KV_POOL_GIB (the pool takes that memory first) or MEMORY_RESERVE_GIB, then ./start.sh restart"
+    return 0
+  fi
+  for l in "$@"; do
+    if [[ "$l" == '(unread)' ]]; then warn "could not read rank $r's log: whether its spill tier opened is not checked"
+    elif ! grep -q 'spill tier: ' <<<"$l"; then
+      line=$(grep -m1 -o 'spill: cannot open.*' <<<"$l" || true)
+      if (( r == 0 )); then warn "rank 0 opened no spill tier${line:+ (it logged \"$line\")}: no kept state is written to disk"
+      else warn "rank $r opened no spill tier${line:+ (it logged \"$line\")}: rank 0 writes and restores kept states that rank $r cannot follow (a restore from disk fails there). Each rank's prompt cache budget is its own: free memory on that Spark (or lower KV_POOL_GIB), then ./start.sh restart"; fi
+    fi
+    r=$((r + 1))
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------- the mapping (the one place)
@@ -327,10 +366,14 @@ port_summary() {
 # spill_dir_probe <create 0|1> <dir> [<path it must not overlap>...]: one line about <dir> on this node, self-contained
 # (start.sh sends it to the workers over ssh; bash or sh, Linux or a Mac). With create=1 a missing directory is made (as
 # you, so docker never creates it as root); with 0 (DRY_RUN) the nearest existing parent is described. Prints
-# "OK|NEW <writable 0|1> <fs type> <free bytes> <exported 0|1> <overlapped path or -> <home-or-root 0|1> <canonical path>",
-# or "ERR <reason>". Exported: under a path that /var/lib/nfs/etab, /etc/exports or /etc/exports.d/*.exports lists.
+# "OK|NEW <writable 0|1> <fs type> <free bytes> <tier bytes> <tier unread 0|1> <exported 0|1> <overlapped path or ->
+# <home-or-root 0|1> <canonical path>", or "ERR <reason>". Exported: under a path that /var/lib/nfs/etab, /etc/exports or
+# /etc/exports.d/*.exports lists. Tier bytes: the disk the spill tiers' own folders in <dir> take (du), which the engine
+# frees itself (it drops its oldest files to keep the floor, and removes other builds' folders at open): tfspill-<hash>
+# (the Zig v1 tier), native-spill-<hash> (v2, core/spill) and spill-<hash> (the Python engine's 0088); not symlinks. Tier
+# unread 1: one of them could not be read through (the Zig engine writes them as root, 0700), so it counts short.
 spill_dir_probe() {
-  local create=$1 d=$2 st=OK p real rest w=0 fs="" avail exp=0 e x f fr over=- top=0 home
+  local create=$1 d=$2 st=OK p real rest w=0 fs="" avail exp=0 e x f fr over=- top=0 home tb=0 tu=0 k
   shift 2
   if [ ! -d "$d" ]; then
     if [ "$create" = 1 ]; then mkdir -p -- "$d" 2>/dev/null || { echo "ERR cannot create $d"; return 0; }
@@ -343,6 +386,14 @@ spill_dir_probe() {
   if command -v findmnt >/dev/null 2>&1; then fs=$(findmnt -n -o FSTYPE -T "$p" 2>/dev/null | head -1); fi
   [ -n "$fs" ] || fs=$(stat -f -c %T "$p" 2>/dev/null) || fs=""
   avail=$(df -Pk "$p" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 * 1024 }')
+  if [ "$st" = OK ]; then
+    for x in "$d"/tfspill-* "$d"/native-spill-* "$d"/spill-*; do
+      [ -d "$x" ] && [ ! -L "$x" ] || continue
+      k=$(du -sk -- "$x" 2>/dev/null) || tu=1
+      k=${k%%[!0-9]*}
+      tb=$((tb + ${k:-0}))
+    done
+  fi
   for x in /var/lib/nfs/etab /etc/exports /etc/exports.d/*.exports; do
     [ -r "$x" ] || continue
     while read -r e _; do
@@ -359,15 +410,17 @@ spill_dir_probe() {
   done
   home=$(cd -P -- "$HOME" 2>/dev/null && pwd -P) || home=$HOME
   [ "$real" != / ] && [ "$real" != "$home" ] || top=1
-  echo "$st $w ${fs:-unknown} ${avail:-0} $exp $(printf '%s' "$over" | tr ' \t' '__') $top $real"
+  echo "$st $w ${fs:-unknown} ${avail:-0} $((tb * 1024)) $tu $exp $(printf '%s' "$over" | tr ' \t' '__') $top $real"
 }
 
 # port_spill_judge <where> <probe line>: refuse a spill directory that is not a writable folder of its own on this
-# Spark's local disk, outside the shared model files, with SPILL_MIN_FREE_GIB free. Each refusal goes through
-# port_spill_refuse: with SPILL_GIB explicit it dies; with the default it returns 1 and PORT_SPILL_WHY says why.
+# Spark's local disk, outside the shared model files, with SPILL_MIN_FREE_GIB free. Free counts the tiers' own folders
+# too (the engine frees them itself; an estimate on the generous side, as 0088 and v2 keep the newest other build); when
+# one of them cannot be read (root's), a shortfall only warns. Each refusal goes through port_spill_refuse: with
+# SPILL_GIB explicit it dies; with the default it returns 1 and PORT_SPILL_WHY says why.
 port_spill_judge() {
-  local where=$1 st w fs avail exp over top real floor_b want_b
-  read -r st w fs avail exp over top real <<<"$2"
+  local where=$1 st w fs avail tier tu exp over top real floor_b want_b room has
+  read -r st w fs avail tier tu exp over top real <<<"$2"
   [[ "$st" == OK || "$st" == NEW ]] || { port_spill_refuse "SPILL_DIR on $where: ${2#ERR }"; return 1; }
   case "$fs" in
     nfs|nfs4|cifs|smb|smb2|smb3|smbfs|fuse.sshfs|sshfs|9p|ceph|fuse.ceph*|glusterfs|fuse.glusterfs|lustre|afs|davfs|fuse.rclone|fuse.s3fs|fuse.juicefs)
@@ -385,10 +438,17 @@ port_spill_judge() {
   fi
   floor_b=$(awk -v g="$SPILL_MIN_FREE_GIB" 'BEGIN {printf "%.0f", g * 1073741824}')
   want_b=$(awk -v g="$SPILL_GIB" -v f="$floor_b" 'BEGIN {printf "%.0f", g * 1073741824 + f}')
-  awk -v a="$avail" -v f="$floor_b" 'BEGIN {exit !(a + 0 >= f + 0)}' ||
-    { port_spill_refuse "SPILL_DIR $real on $where has $(awk -v a="$avail" 'BEGIN {printf "%d", a / 1073741824}') GiB free, under SPILL_MIN_FREE_GIB ($SPILL_MIN_FREE_GIB): the tier would refuse every write. Free the disk or lower SPILL_MIN_FREE_GIB"; return 1; }
-  ! awk -v a="$avail" -v w="$want_b" 'BEGIN {exit !(a + 0 < w + 0)}' ||
-    warn "SPILL_DIR $real on $where has $(awk -v a="$avail" 'BEGIN {printf "%d", a / 1073741824}') GiB free, less than SPILL_GIB ($SPILL_GIB) + SPILL_MIN_FREE_GIB ($SPILL_MIN_FREE_GIB): the tier stops writing at the floor before it reaches its cap"
+  room=$(awk -v a="$avail" -v t="$tier" 'BEGIN {printf "%.0f", a + t}')
+  has=$(awk -v a="$avail" -v t="$tier" 'BEGIN {printf "%d GiB free", a / 1073741824; if (t + 0 > 0) printf " (and %.1f GiB in the spill tiers\047 own folders, which the tier frees itself)", t / 1073741824}')
+  if ! awk -v r="$room" -v f="$floor_b" 'BEGIN {exit !(r + 0 >= f + 0)}'; then
+    if [[ "$tu" == 1 ]]; then
+      warn "SPILL_DIR $real on $where has $(awk -v a="$avail" 'BEGIN {printf "%d", a / 1073741824}') GiB free, under SPILL_MIN_FREE_GIB ($SPILL_MIN_FREE_GIB), and holds spill folders this check cannot read (the Zig engine writes them as root): the tier frees its own files to keep the floor, and skips a write when they are not enough (spill: skipped in /health)"
+    else
+      port_spill_refuse "SPILL_DIR $real on $where has $has, under SPILL_MIN_FREE_GIB ($SPILL_MIN_FREE_GIB): the tier would refuse every write. Free the disk or lower SPILL_MIN_FREE_GIB"; return 1
+    fi
+  elif [[ "$tu" == 0 ]] && awk -v r="$room" -v w="$want_b" 'BEGIN {exit !(r + 0 < w + 0)}'; then
+    warn "SPILL_DIR $real on $where has $has, less than SPILL_GIB ($SPILL_GIB) + SPILL_MIN_FREE_GIB ($SPILL_MIN_FREE_GIB): the tier stops writing at the floor before it reaches its cap"
+  fi
   [[ "$st" != NEW ]] || log "SPILL_DIR $real on $where does not exist yet: start.sh creates it (as you)"
   return 0
 }
@@ -414,7 +474,7 @@ port_spill_check() {
     fi
     port_spill_judge "$(worker_host "$i")" "$line" || { port_spill_default_off "$PORT_SPILL_WHY"; return 0; }
   done
-  log "Spill tier: $( [[ "$SPILL_V2" == 1 ]] && echo v2 || echo v1), up to $SPILL_GIB GiB a Spark in $SPILL_DIR (on every Spark), keeping $SPILL_MIN_FREE_GIB GiB of disk free"
+  log "Spill tier: $( [[ "$SPILL_V2" == 1 ]] && echo v2 || echo v1), up to $SPILL_GIB GiB a Spark in $SPILL_DIR (on every Spark), keeping $SPILL_MIN_FREE_GIB GiB of disk free$( [[ "$ENGINE" != zig ]] || echo "; the engine writes its files there as root (removing them takes sudo)")"
 }
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)
 port_nfs_path() { [[ "${NFS_PATH:-/}" == / ]] || echo "$NFS_PATH"; }

@@ -21,24 +21,29 @@ defaults and the `ZIG_HAS` tokens wait for the engine patches.
 - `scripts/config.sh` sources `scripts/port.sh` where the spill block was (the `SPILL_*` defaults moved there).
 - Zig branch: `--prompt-cache-gib "$PROMPT_CACHE_GIB"` replaces the hard-coded 0; both engines' copies of the spill flags
   are gone (port_map makes them). The `ZIG_HAS` comment names the three new tokens; the default stays `mtp displaykv`.
-- `port_check_extra "$@"` before the extra arguments join `SERVE_ARGS` (`--spill-*` / `--snapshot-dir` as extras would
-  write inside the container: refused).
+- `port_check_extra "$@"` before the extra arguments join `SERVE_ARGS`: `--spill-gib` as an extra would turn on a tier
+  writing inside the container (refused); with the tier on, `--snapshot-dir`, `--spill-highwater` (v1),
+  `--spill-min-tokens` and `--spill-min-free-gib` are refused too, since `port_map`'s copies come after the extras and
+  win. Every other flag passes as before (review R4).
 - `port_validate "$(arg_value --parallel)" "$(arg_value --prompt-cache-gib)"` right after `arg_value`: the effective
   values, so `./start.sh --prompt-cache-gib 8` (documented) satisfies the spill check. All the gates are in it.
 - After `need_workers`: `port_spill_check` (every Spark, before anything is stopped), `port_map`, `PORT_SERVE` appended
   to `SERVE_ARGS`. Before the "already running" test, so a degraded default is already reflected in the label.
 - "Already running": each rank's `tf.recipe.port` label (none = `off`) must equal `port_identity`, else refuse and say
   `./start.sh restart`.
-- Memory check: `mem_avail_gb` here and on each worker (`declare -f mem_counting mem_avail_gb` over ssh), the parked
-  GiB noted in the log line when there are any.
+- Memory check: `mem_avail_gb "$PARKED"` here and on each worker (`declare -f mem_counting mem_avail_gb` over ssh), the
+  parked GiB noted in the log line when there are any. `PARKED` is 1 only when `port_parked` says the engine's budget
+  counts them (`ZIG_HAS` with `parked`, or `patches/0119-cuda-budget-parked-pages.patch`); 0 reads `free -g` as before
+  (review R3).
 - `zig_env` / `env_args`: the passthrough drops `PORT_MAPPED_RE` names, then adds `PORT_ENV` (re-run by the SPLIT retry).
 - `RUN_ARGS`: the `/spill` mount when the tier is on; `--label tf.recipe.port=...` only when something is on.
-- After "Server answered": `port_check_started` (spill on only).
+- After the smoke test (every rank followed a request, so each has set up its prompt cache): `port_check_started` with
+  each rank's `prompt cache:` / `spill tier:` / `spill: cannot open` lines (spill on only; review R5).
 
 Off is byte-identical: with nothing set, `port_map` returns empty arrays, `port_identity` is `off` (no label), the
 passthrough filter drops only `TF_GLM_KV_SHARD` / `TF_GLM_SPILL_V2` (unset by default), `--prompt-cache-gib 0` as
-before. Behaviour that does change with nothing set: the memory check's figure (parked pages counted: no switch, by
-the contract), one `docker inspect` per worker when the server already runs, and `--spill-*` extras refused.
+before, and the memory check reads `free -g` as before (no `ZIG_HAS parked`). Behaviour that does change with nothing
+set: one `docker inspect` per worker when the server already runs, and a `--spill-gib` extra refused.
 
 ## How it differs
 
@@ -48,7 +53,10 @@ From the DeepSeek recipe's `port.sh`:
 - No spill identity variables (`TF_DS_ENGINE_ID`, `TF_DS_RECIPE_PATCHES`, `TF_DS_MODEL_REVISION`, rank weight digests):
   the GLM v2 fingerprint is round 2's (glm-spill); whether the recipe must supply such names is open (below).
 - No `WORKER_SPILL_DIR`: this recipe has always used one `SPILL_DIR` on every Spark (mounted at `/spill`).
-- No `spill_fix_owner` (handing root-owned spill files back), no `RANK1_EXTRA_ENV`, no display-reserve default.
+- No `spill_fix_owner` (handing root-owned spill files back; why: review R2 below), no `RANK1_EXTRA_ENV`, no
+  display-reserve default.
+- The free-disk floor check counts the tiers' own folders as room (`du` of `tfspill-*`, `native-spill-*`, `spill-*`),
+  and a shortfall it cannot measure (root's folders) only warns; DeepSeek's compares `df` alone (review R1).
 - Gating by `ZIG_HAS` tokens (the GLM recipe's mechanism), not by an engine branch name.
 - The fork's default KV shard is conditional and silent outside its conditions (the Python fork's `_kvs` rule), where
   DeepSeek warns at TP!=2; a missing capability does warn.
@@ -87,8 +95,8 @@ before and after this branch, is the end-to-end check of the off path (it stops 
 2. `ZIG_HAS` gains `spill2`, `kvshard`, `spillshard` only when the patches are in `zig/patches` (step B / round 3).
 3. A `PROMPT_CACHE_GIB` above 0 can still get a budget of 0 at runtime (the pool is sized first; #187's measurement at
    the defaults): only the post-start warning; `KV_POOL_GIB`'s default is unchanged.
-4. Spill files are written by root in the containers; this recipe's comment says they take `SPILL_DIR`'s owner (the
-   Python engine's 0088 behaviour). Check the Zig v1/v2 tiers do the same, else port DeepSeek's `spill_fix_owner`.
+4. Settled by the review (R2): the Zig v1 tier does not hand its files to `SPILL_DIR`'s owner (root, 0700 / 0600);
+   the comments and docs now say so. Handing them back is not done yet (see the review section).
 5. `tf.recipe.port` covers the ported features only: a running server with another `PROMPT_CACHE_GIB` (or any other
    setting) is still "already running", as before.
 6. KV sharding with the display reserve (owner planes first on it) has no recipe rule yet.
@@ -199,3 +207,21 @@ resume` once the spill v2 patches are in `zig/patches` (`SPILL_V2=1`, `ZIG_HAS` 
    hecisaza.
 6. `SPILL_MARKER`: this recipe writes no marker at the spill root (step A's issue 4, `spill_fix_owner`).
 7. `tools/make-zig-patches.sh` needs bash 4 (`mapfile`) and GNU tar: only its guard was run here.
+
+# Review (round 1): findings and outcomes
+
+The independent review of a2271bf..ea0d00d found one major issue and five smaller ones; the fixes are one commit on
+`zig-port` (after ea0d00d). Tests after it, on this Mac (bash 3.2.57): `scripts/port_test.sh` 108 of 108 (96 before;
+written first, 15 cases failed on the unfixed code, each for its finding's reason, and the 2 judge cases added after
+use the new probe line; a mutation pass of 8 single-line reversals of the fixes failed it each time),
+`scripts/port_patches_test.sh` 13 of 13, `bash -n` of every script. No engine code changed and the recipe has no
+`build.zig`: no cross-build. `tools/` did not change: `tools/selftest.py` not re-run.
+
+| Finding | Outcome |
+| --- | --- |
+| R1 (major): the free-disk floor check counts the tier's own files as used, so a full tier, or an old build's folder the engine prunes at open, refuses the start (or turns a fork's default tier off for good) | **Fixed.** `spill_dir_probe` measures the tiers' own folders in `SPILL_DIR` with `du -sk` as you (`tfspill-*` Zig v1, `native-spill-*` v2/core-spill, `spill-*` Python 0088; not symlinks) and says whether one could not be read; `port_spill_judge` adds them to the free space for the floor and for the cap warning. A folder it cannot read (the Zig tier's are root's 0700, so on Zig every start after the first) makes a shortfall a warning, not a refusal, and skips the cap warning. The count is generous on purpose (0088 and core/spill keep the newest other build): a start the tier could run is worse refused than let through, and the tier reports its skipped writes. A running server's folders are unreadable, so `./start.sh` on it now says "nothing to do" again. |
+| R2 (minor): comments and docs say the spill files are yours | **Partly fixed.** `port.sh`, `start.sh`, README, `docs/zig-engine.md`, CHANGELOG and the "Spill tier:" log line (ENGINE=zig) now say the Zig tier's folders and files are root's (0700 / 0600; removing them takes `sudo`, `tools/spill_check.py --sudo`), the Python 0088 tier's SPILL_DIR's owner's. **Not ported:** DeepSeek's `spill_fix_owner`. It runs a root container with `CAP_CHOWN` on every start and stop; the better fix is the one 0088 made in the engine itself (each folder and file given the spill root's owner: no privileged container), and the files that matter from round 2 on are the v2 tier's, which the glm-spill piece writes. Flagged for glm-spill; if it declines, port `spill_fix_owner` (maintainer-reviewed on Mia's DeepSeek repo, #30) in round 3 together with the marker (`checklib.SPILL_MARKER`, step B issue 6). With the files handed back, R1's count becomes exact on Zig too. |
+| R3 (minor): the memory check counts parked pages that neither shipped engine budgets yet | **Fixed.** `mem_avail_gb <parked 0|1>`: 0 (the default) is `free -g`'s available column, exactly as before the port; 1 is `mem_counting`. `start.sh` passes 1 only when `port_parked` says the engine counts them: `ZIG_HAS` with `parked` (added to the default when the 0119 port is exported into `zig/patches`), or `patches/0119-cuda-budget-parked-pages.patch` for ENGINE=python (PR #149). Comments, `docs/zig-engine.md` and the CHANGELOG corrected. f4db50d's message still says the engine counts them; this commit's message corrects it (history not rewritten). |
+| R4 (minor): every `--spill-*` / `--snapshot-dir` extra argument refused | **Fixed.** Refused: `--spill-gib` always (it would turn on a tier with no checked or mounted folder); with the tier on, `--snapshot-dir`, `--spill-highwater` (v1 only), `--spill-min-tokens`, `--spill-min-free-gib`, which `port_map` passes after the extras (so the extra would be silently ignored), naming the setting to use. Everything else passes as before: `--spill-keep-builds` (0088's, no setting), `--snapshot-dir` with the tier off (TensorFold's own snapshot folder). `=`-forms handled. |
+| R5 (nit): only rank 0's log is read after the start | **Fixed in the recipe, flagged for the engine.** `port_check_started` takes every rank's `prompt cache:` / `spill tier:` / `spill: cannot open` lines (workers over ssh; `(unread)` when ssh fails) and warns for each rank with no `spill tier:` line, quoting the engine's reason. It now runs after the smoke test: `cacheFor` is the last step of each rank's setup, and rank 0 can answer `/v1/models` before rank 1 has reached it; the smoke test needs every rank. The engine gap stays: `cacheFor` opens each rank's tier from its own budget with no agreement, and a rank without one answers a disk restore with `error.NoSpillTier`. The fix (agree the budget across ranks, or open the tier on every rank when rank 0's budget is above 0) belongs to cache-core / glm-spill. |
+| R6 (nit): "has no the spill v2 port" | **Fixed:** "lacks the spill v2 port" (and "patches/ lack ..."); the tests' patterns follow. |

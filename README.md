@@ -391,7 +391,9 @@ under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` 
 
 The measurements above are the Python engine's. With `ENGINE=zig` (the default) the tier writes the prompt cache's kept
 states, so it also needs `PROMPT_CACHE_GIB` above 0 and DFlash2 drafts: `./start.sh` refuses `SPILL_GIB` without them,
-and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)).
+and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)). Its files
+are root's, not yours: the ranks run as root and the Zig tier keeps them readable by root only, so removing them takes
+`sudo`.
 
 ## Worker weights over NFS
 

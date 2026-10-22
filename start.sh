@@ -116,7 +116,8 @@ if [[ "$ENGINE" == zig ]]; then
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
   # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. spill2, kvshard
   # and spillshard (Robert's spill v2 and KV sharding, and the two together) join it once their ports are in zig/patches;
-  # until then port_validate (scripts/port.sh, below) refuses SPILL_V2=1 and KV_SHARD=1.
+  # until then port_validate (scripts/port.sh, below) refuses SPILL_V2=1 and KV_SHARD=1. parked joins it with the port of
+  # 0119 (the engine's budget counts the parked pages; the memory check below counts them only then).
   ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
@@ -361,15 +362,17 @@ fi
 # TensorFold budgets each Spark's free memory minus MEMORY_RESERVE_GIB (14.5); the defaults want ~110 GiB free at start on each.
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
 # Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
-# MemAvailable for a minute or two. The engine counts it (patch 0119's rule), and so does this check: mem_avail_gb
-# (scripts/memavail.sh), here and on each worker.
+# MemAvailable for a minute or two. An engine with patch 0119 counts it in its budget, and then so does this check
+# (scripts/port.sh: port_parked, ZIG_HAS parked or patches/'s 0119; neither engine here has it yet): mem_avail_gb
+# (scripts/memavail.sh), here and on each worker. Without 0119 both read MemAvailable alone, as `free -g` shows it.
 parked_note() { awk -v p="${1:-0}" 'BEGIN { if (p + 0 >= 0.1) printf " (%.1f of it parked on the per-CPU free lists)", p }'; }
-read -r here_gb here_parked <<<"$(mem_avail_gb)"
+PARKED=0; ! port_parked || PARKED=1
+read -r here_gb here_parked <<<"$(mem_avail_gb "$PARKED")"
 here_gb=${here_gb:-0}
 low=0; (( here_gb >= 110 )) || low=1
 declare -a there_parked=()
 for i in $(worker_ids); do
-  read -r there_gb[i] there_parked[i] <<<"$(worker "$i" "$(declare -f mem_counting mem_avail_gb); mem_avail_gb" 2>/dev/null || echo 0)"
+  read -r there_gb[i] there_parked[i] <<<"$(worker "$i" "$(declare -f mem_counting mem_avail_gb); mem_avail_gb $PARKED" 2>/dev/null || echo 0)"
   there_gb[i]=${there_gb[i]:-0}
   (( there_gb[i] >= 110 )) || low=1
 done
@@ -426,9 +429,10 @@ RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infi
 if (( DISPLAY_KV_MIB )) && [[ "$DISPLAY_KV_BACKEND" == dispram ]]; then
   RUN_ARGS+=(-v /run/dispram:/run/dispram -v /opt/kindling/dispram/python:/opt/dispram:ro -e PYTHONPATH=/opt/dispram)
 fi
-if port_spill_on; then          # the spill tier's directory on every rank (port_spill_check made it), files owned by you
-  # (files take the owner of SPILL_DIR on each Spark. No --init on these containers: a rank past 0 runs as PID 1
-  # without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
+if port_spill_on; then          # the spill tier's directory on every rank (port_spill_check made it, as you)
+  # (the ranks run as root: the Zig engine's tier writes its folders and files there as root, readable by root only;
+  # the Python engine's 0088 gives its files SPILL_DIR's owner. No --init on these containers: a rank past 0 runs as
+  # PID 1 without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
   RUN_ARGS+=(-v "$SPILL_DIR":"$PORT_SPILL_MOUNT")
 fi
 # The ported features' settings on every rank's container (scripts/port.sh: port_identity; no label while they are all
@@ -599,8 +603,6 @@ for attempt in 1 2 3 4; do
   ./stop.sh >/dev/null
 done
 log "Server answered after $((SECONDS - start))s"
-# the spill tier opened (scripts/port.sh): rank 0's prompt cache can come out with no budget at all
-! port_spill_on || port_check_started "$(docker logs "$CONTAINER_NAME" 2>&1 | grep 'prompt cache:' || true)"
 
 # ---------------------------------------------------------------- 5. smoke test
 # Thinking off and greedy, so that a short reply has text (the model thinks first otherwise); no text, or one character repeated (a collapsed model: issues #76, #81, #86), fails the start.
@@ -612,6 +614,15 @@ if smoke=$(curl -s --max-time 180 "$URL/v1/chat/completions" -H 'Content-Type: a
   log "OK: $smoke"
 else
   fail "the smoke test request failed (no reply text, or one character repeated: the weights load but the model does not answer; see the README's Ablit weights); the ranks are still running"
+fi
+# the spill tier opened on every rank (scripts/port.sh): each rank's prompt cache budget is its own, and can come out 0.
+# After the smoke test, which every rank followed, so each has set up its prompt cache (rank 0 may answer before)
+if port_spill_on; then
+  PORT_LOGS=("$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open' || true)")
+  for i in $(worker_ids); do
+    PORT_LOGS+=("$(worker "$i" "docker logs '$CONTAINER_NAME' 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open'; true" 2>/dev/null || echo '(unread)')")
+  done
+  port_check_started "${PORT_LOGS[@]}"
 fi
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')

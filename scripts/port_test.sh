@@ -2,10 +2,12 @@
 # Checks of scripts/port.sh and scripts/memavail.sh without the Sparks: the defaults (everything off: no flag, variable,
 # mount or label), a fork's defaults turned on (PT_FORK=1: spill v2 64 GiB, KV sharding) degrading where an explicit
 # setting refuses, the ZIG_HAS gates (spill2, kvshard, spillshard), PROMPT_CACHE_GIB as the spill tier's requirement,
-# the aliases, the mapping to the engine's flags and variables, the refusals (port_validate), the spill folder rules
-# (port_spill_judge on synthetic probe lines, spill_dir_probe and port_spill_check on temporary folders, the worker's
-# probe through its ssh command run locally), the parked pages on synthetic /proc files, scripts/port-patches.sh's
-# README rewrite and helpers (its runs against the engine: scripts/port_patches_test.sh), and `bash -n` of every script.
+# the aliases, the mapping to the engine's flags and variables, the refusals (port_validate), the extra serve arguments
+# (port_check_extra), the spill folder rules (port_spill_judge on synthetic probe lines, spill_dir_probe and
+# port_spill_check on temporary folders, the worker's probe through its ssh command run locally, the free-disk floor with
+# the tiers' own folders counted, df stubbed), every rank's tier after the start (port_check_started), the parked pages
+# on synthetic /proc files and their gate (port_parked, mem_avail_gb), scripts/port-patches.sh's README rewrite and
+# helpers (its runs against the engine: scripts/port_patches_test.sh), and `bash -n` of every script.
 # bash 3.2 or later (runs on a Mac); no docker, no ssh, no GPU.
 # Usage: scripts/port_test.sh      (exits 1 when a check fails)
 set -u
@@ -110,19 +112,29 @@ case_ "refuse: a relative SPILL_DIR, SPILL_HIGHWATER past 1, SPILL_MIN_TOKENS 8k
   ( SPILL_GIB=abc; expect_die "SPILL_GIB is a number" port_validate 8 8 ) || exit 1'
 case_ "SPILL_GIB=0.0 is off" 0 'SPILL_GIB=0.0' '
   port_validate 8 0; port_map; expect "${#PORT_SERVE[@]} $(port_identity) ${STOP_TIMEOUT:-unset}" "0 off unset"'
-case_ "extra serve arguments: --spill-* and --snapshot-dir refused, --prompt-cache-gib accepted" 0 '' '
+case_ "extra serve arguments, the tier off: --spill-gib refused; --snapshot-dir (TensorFold's own snapshots) and tuning flags pass" 0 '' '
   port_check_extra --prompt-cache-gib 8 --reasoning-effort high || exit 1
-  expect_die "the extra argument --spill-gib" port_check_extra --spill-gib 8
+  port_check_extra --snapshot-dir none --snapshot-dir=/x --spill-min-tokens 4096 --spill-keep-builds 2 || exit 1
+  expect_die "the extra argument --spill-gib: the spill tier goes on through SPILL_GIB" port_check_extra --spill-gib 8
+  expect_die "the extra argument --spill-gib=8" port_check_extra --spill-gib=8'
+case_ "extra serve arguments, the tier on: a flag the recipe passes itself is refused, naming its setting; others pass" 0 'SPILL_GIB=8 PROMPT_CACHE_GIB=8' '
+  expect_die "the extra argument --snapshot-dir: .*SPILL_DIR" port_check_extra --snapshot-dir /x
   expect_die "the extra argument --snapshot-dir=/x" port_check_extra --snapshot-dir=/x
-  expect_die "the extra argument --snapshot-dir" port_check_extra --snapshot-dir /x'
+  expect_die "the extra argument --spill-min-free-gib: .*SPILL_MIN_FREE_GIB" port_check_extra --spill-min-free-gib 20
+  expect_die "the extra argument --spill-min-tokens=1: .*SPILL_MIN_TOKENS" port_check_extra --spill-min-tokens=1
+  expect_die "the extra argument --spill-highwater: .*SPILL_HIGHWATER" port_check_extra --spill-highwater 0.5
+  expect_die "the extra argument --spill-gib" port_check_extra --spill-gib 16
+  port_check_extra --spill-keep-builds 2 --prompt-cache-gib 8 || exit 1'
+case_ "extra serve arguments with ENGINE=python and the tier on: --spill-keep-builds (0088's, no setting) passes" 0 'ENGINE=python SPILL_GIB=64' '
+  port_check_extra --spill-keep-builds 3 || exit 1'
 
 # ---- spill v2
 case_ "refuse: SPILL_V2=1 without ZIG_HAS spill2, naming the missing patch" 0 'SPILL_GIB=64 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
-  expect_die "SPILL_V2=1: this image.s tensorfold-native has no the spill v2 port (Robert.s GLM patches 0110/0111).*ZIG_HAS" port_validate 8 8'
+  expect_die "SPILL_V2=1: this image.s tensorfold-native lacks the spill v2 port (Robert.s GLM patches 0110/0111).*ZIG_HAS" port_validate 8 8'
 case_ "refuse: TF_GLM_SPILL_V2=1 exported counts as explicit" 0 'SPILL_GIB=64 PROMPT_CACHE_GIB=8 TF_GLM_SPILL_V2=1' '
   expect "$PORT_V2_EXPLICIT $SPILL_V2" "1 1"; expect_die "SPILL_V2=1" port_validate 8 8'
 case_ "refuse: SPILL_V2=1 with ENGINE=python (patches/ has v1 only)" 0 'ENGINE=python SPILL_GIB=64 SPILL_V2=1' '
-  expect_die "Python engine.s patches/ have no the spill v2 port" port_validate "" ""'
+  expect_die "Python engine.s patches/ lack the spill v2 port" port_validate "" ""'
 case_ "spill v2: the flags (no --spill-highwater), the Python fork's variables, the engine's tuning as set" 0 '
   ZIG_HAS="mtp displaykv spill2" SPILL_GIB=64 SPILL_V2=1 SPILL_QUOTA=0.25 SPILL_TURNS=2 PROMPT_CACHE_GIB=8
   TF_GLM_SPILL_READ_BLOCKS=32 TF_GLM_SPILL_STAGE_MIB=256 TF_GLM_SPILL_LOAD_MS=40 TF_SPILL_DEFER_MS=500' '
@@ -157,7 +169,7 @@ case_ "SPILL_V2=1 without SPILL_GIB warns" 0 'SPILL_V2=1' '
 
 # ---- KV sharding
 case_ "refuse: KV_SHARD=1 without ZIG_HAS kvshard, naming the missing patch" 0 'KV_SHARD=1' '
-  expect_die "KV_SHARD=1: this image.s tensorfold-native has no the KV-shard port (Robert.s GLM patch 0118)" port_validate 8 0'
+  expect_die "KV_SHARD=1: this image.s tensorfold-native lacks the KV-shard port (Robert.s GLM patch 0118)" port_validate 8 0'
 case_ "refuse: TF_GLM_KV_SHARD=1 exported counts as explicit" 0 'TF_GLM_KV_SHARD=1' '
   expect "$PORT_SHARD_EXPLICIT $KV_SHARD" "1 1"; expect_die "KV-shard port" port_validate 8 0'
 case_ "KV shard: the variables, carry and twins on by default, the check passed only when set" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
@@ -173,7 +185,7 @@ case_ "refuse: KV_SHARD=1 at TP=3, --parallel 1, DRAFTER=mtp, TF_GLM_MULTI_LONE=
   expect_die "more than one stream .PARALLEL above 1., not --parallel 1" port_validate 1 0
   ( DRAFTER=mtp; expect_die "DRAFTER=mtp" port_validate 8 0 ) || exit 1
   ( TF_GLM_MULTI_LONE=1; expect_die "TF_GLM_MULTI_LONE=1" port_validate 8 0 ) || exit 1
-  ( ENGINE=python; expect_die "Python engine.s patches/ have no the KV-shard port" port_validate "" "" ) || exit 1
+  ( ENGINE=python; expect_die "Python engine.s patches/ lack the KV-shard port" port_validate "" "" ) || exit 1
   port_validate 16 0 >/dev/null || exit 1'
 case_ "refuse: KV_SHARD=2, TF_GLM_KV_SHARD_CARRY=yes, TF_GLM_KV_SHARD_CHECK=x" 0 'ZIG_HAS=kvshard' '
   ( KV_SHARD=2; expect_die "KV_SHARD .TF_GLM_KV_SHARD. is 0 or 1" port_validate 8 0 ) || exit 1
@@ -237,12 +249,25 @@ case_ "PREFIX_WAIT=1 / TF_GLM_PREFIX_WAIT=1 warn and do nothing; 0 is silent" 0 
   ( PREFIX_WAIT=0 TF_GLM_PREFIX_WAIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
   port_map; expect "${#PORT_ENV[@]}" 0'
 
-# ---- after the start: rank 0 opened no prompt cache, so the spill tier is not open
-case_ "after the start: a prompt cache budget of 0 with the spill tier on warns; kept states, or no tier, say nothing" 0 'SPILL_GIB=8 PROMPT_CACHE_GIB=8' '
-  expect_out "WARN: the spill tier is not open: rank 0 logged \"prompt cache: off (budget 0)\"" port_check_started "info: prompt cache: off (budget 0)"
-  expect_out "!WARN" port_check_started "info: prompt cache: 2.0 GiB for kept states, at most 14 (fixed 102 MiB each)"
-  ( SPILL_GIB=0; expect_out "!WARN" port_check_started "info: prompt cache: off (budget 0)" ) || exit 1
-  ( ENGINE=python; expect_out "!WARN" port_check_started "prompt cache: off (budget 0)" ) || exit 1'
+# ---- after the start: each rank opened its spill tier (rank 0's prompt cache budget above 0; every rank's own budget
+# above 0 too: each rank opens its tier from its own, with no agreement between them)
+r0_ok='info: prompt cache: 2.0 GiB for kept states, at most 14 (fixed 102 MiB each)
+info: spill tier: /spill/tfspill-00000000000000aa/rank0, up to 8 GiB, 0 states (0 MiB) found'
+r1_ok='info: spill tier: /spill/tfspill-00000000000000aa/rank1, up to 8 GiB, 0 states (0 MiB) found'
+case_ "after the start: a prompt cache budget of 0 with the spill tier on warns; every rank's tier open, or no tier, say nothing" 0 'SPILL_GIB=8 PROMPT_CACHE_GIB=8' "
+  expect_out 'WARN: the spill tier is not open: rank 0 logged \"prompt cache: off (budget 0)\"' port_check_started 'info: prompt cache: off (budget 0)' '$r1_ok'
+  expect_out '!WARN' port_check_started '$r0_ok' '$r1_ok'
+  expect_out '!WARN' port_check_started '$r0_ok'
+  ( SPILL_GIB=0; expect_out '!WARN' port_check_started 'info: prompt cache: off (budget 0)' '' ) || exit 1
+  ( ENGINE=python; expect_out '!WARN' port_check_started 'prompt cache: off (budget 0)' '' ) || exit 1"
+case_ "after the start: a rank that opened no spill tier while rank 0 did warns, naming the rank and the engine's reason" 0 'SPILL_GIB=8 PROMPT_CACHE_GIB=8' "
+  expect_out 'WARN: rank 1 opened no spill tier' port_check_started '$r0_ok' ''
+  expect_out 'WARN: rank 2 opened no spill tier' port_check_started '$r0_ok' '$r1_ok' 'info: prompt cache: something'
+  expect_out 'WARN: rank 1 opened no spill tier (it logged \"spill: cannot open /spill (AccessDenied); no spill tier\")' \
+    port_check_started '$r0_ok' 'error: spill: cannot open /spill (AccessDenied); no spill tier'
+  expect_out 'WARN: rank 0 opened no spill tier' port_check_started 'info: prompt cache: 2.0 GiB for kept states' '$r1_ok'
+  expect_out 'WARN: could not read rank 1.s log' port_check_started '$r0_ok' '(unread)'
+  expect_out '!rank 1 opened' port_check_started '$r0_ok' '(unread)'"
 
 # ---- the label (tf.recipe.port)
 case_ "the label: the same settings give the same word; another folder, quota or carry another" 0 "ZIG_HAS='$ALL_HAS' SPILL_GIB=8 SPILL_V2=1 KV_SHARD=1 PROMPT_CACHE_GIB=8" '
@@ -255,23 +280,33 @@ case_ "the label: the same settings give the same word; another folder, quota or
 # ---- the spill folder: port_spill_judge on synthetic probe lines (explicit SPILL_GIB: refusals die)
 G=1073741824
 case_ "judge: a local, writable folder with room passes" 0 'SPILL_GIB=8' "
-  port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 - 0 /data/spill' || exit 1
-  expect_out '!WARN' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 - 0 /data/spill'"
+  port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 0 0 - 0 /data/spill' || exit 1
+  expect_out '!WARN' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 0 0 - 0 /data/spill'"
 case_ "judge: refusals (network, memory, export, overlap, home, not writable, no room, ERR)" 0 'SPILL_GIB=8' "
-  expect_die 'network file system (nfs4)' port_spill_judge w1 'OK 1 nfs4 $((500 * G)) 0 - 0 /mnt/spill'
-  expect_die 'on tmpfs' port_spill_judge w1 'OK 1 tmpfs $((500 * G)) 0 - 0 /dev/shm/spill'
-  expect_die 'inside an NFS export' port_spill_judge here 'OK 1 ext4 $((500 * G)) 1 - 0 /home/u/.cache/huggingface/spill'
-  expect_die 'overlaps /home/u/.cache/huggingface' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 /home/u/.cache/huggingface 0 /home/u/.cache/huggingface/s'
-  expect_die '/ or your home folder' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 - 1 /home/u'
-  expect_die 'not writable by you' port_spill_judge here 'OK 0 ext4 $((500 * G)) 0 - 0 /data/spill'
-  expect_die 'you cannot create it' port_spill_judge here 'NEW 0 ext4 $((500 * G)) 0 - 0 /data/spill'
-  expect_die 'under SPILL_MIN_FREE_GIB' port_spill_judge here 'OK 1 ext4 $((40 * G)) 0 - 0 /data/spill'
+  expect_die 'network file system (nfs4)' port_spill_judge w1 'OK 1 nfs4 $((500 * G)) 0 0 0 - 0 /mnt/spill'
+  expect_die 'on tmpfs' port_spill_judge w1 'OK 1 tmpfs $((500 * G)) 0 0 0 - 0 /dev/shm/spill'
+  expect_die 'inside an NFS export' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 0 1 - 0 /home/u/.cache/huggingface/spill'
+  expect_die 'overlaps /home/u/.cache/huggingface' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 0 0 /home/u/.cache/huggingface 0 /home/u/.cache/huggingface/s'
+  expect_die '/ or your home folder' port_spill_judge here 'OK 1 ext4 $((500 * G)) 0 0 0 - 1 /home/u'
+  expect_die 'not writable by you' port_spill_judge here 'OK 0 ext4 $((500 * G)) 0 0 0 - 0 /data/spill'
+  expect_die 'you cannot create it' port_spill_judge here 'NEW 0 ext4 $((500 * G)) 0 0 0 - 0 /data/spill'
+  expect_die 'under SPILL_MIN_FREE_GIB' port_spill_judge here 'OK 1 ext4 $((40 * G)) 0 0 0 - 0 /data/spill'
   expect_die 'SPILL_DIR on w1: cannot create /x' port_spill_judge w1 'ERR cannot create /x'"
 case_ "judge: less room than SPILL_GIB + the floor warns; a folder to create is logged" 0 'SPILL_GIB=64' "
-  expect_out 'WARN: .*less than SPILL_GIB (64) + SPILL_MIN_FREE_GIB' port_spill_judge here 'OK 1 ext4 $((100 * G)) 0 - 0 /data/spill'
-  expect_out 'LOG: SPILL_DIR /data/spill on here does not exist yet' port_spill_judge here 'NEW 1 ext4 $((500 * G)) 0 - 0 /data/spill'"
+  expect_out 'WARN: .*less than SPILL_GIB (64) + SPILL_MIN_FREE_GIB' port_spill_judge here 'OK 1 ext4 $((100 * G)) 0 0 0 - 0 /data/spill'
+  expect_out 'LOG: SPILL_DIR /data/spill on here does not exist yet' port_spill_judge here 'NEW 1 ext4 $((500 * G)) 0 0 0 - 0 /data/spill'"
+case_ "judge: the tiers' own folders count as room, for the floor and for the cap" 0 'SPILL_GIB=64' "
+  expect_out '!WARN' port_spill_judge here 'OK 1 ext4 $((45 * G)) $((70 * G)) 0 0 - 0 /data/spill'
+  expect_out 'WARN: .*has 45 GiB free (and 20.0 GiB in the spill tiers. own folders, which the tier frees itself), less than SPILL_GIB (64)' \
+    port_spill_judge here 'OK 1 ext4 $((45 * G)) $((20 * G)) 0 0 - 0 /data/spill'
+  expect_die 'has 40 GiB free (and 2.0 GiB in the spill tiers. own folders, which the tier frees itself), under SPILL_MIN_FREE_GIB (50)' \
+    port_spill_judge here 'OK 1 ext4 $((40 * G)) $((2 * G)) 0 0 - 0 /data/spill'"
+case_ "judge: folders it cannot read: under the floor warns (no refusal), and no cap warning" 0 'SPILL_GIB=64' "
+  expect_out 'WARN: SPILL_DIR /data/spill on here has 40 GiB free, under SPILL_MIN_FREE_GIB (50), and holds spill folders this check cannot read' \
+    port_spill_judge here 'OK 1 ext4 $((40 * G)) 4096 1 0 - 0 /data/spill'
+  expect_out '!WARN' port_spill_judge here 'OK 1 ext4 $((60 * G)) 4096 1 0 - 0 /data/spill'"
 case_ "judge: a default tier's failure returns 1 with the reason (no refusal)" 0 "PT_FORK=1" "
-  port_spill_judge w1 'OK 1 nfs $((500 * G)) 0 - 0 /mnt/spill' && exit 1
+  port_spill_judge w1 'OK 1 nfs $((500 * G)) 0 0 0 - 0 /mnt/spill' && exit 1
   [[ \"\$PORT_SPILL_WHY\" == *'network file system (nfs)'* ]] || { echo \"\$PORT_SPILL_WHY\"; exit 1; }"
 
 # ---- spill_dir_probe on temporary folders (this machine: Linux or a Mac)
@@ -279,19 +314,31 @@ mkdir -p "$tmp/hf/hub" "$tmp/ro"
 tmpr=$(cd -P "$tmp" && pwd -P)
 case_ "probe: creates a missing folder (create=1) and describes it" 0 '' "
   l=\$(spill_dir_probe 1 '$tmp/a/spill' '$tmp/hf'); [[ -d '$tmp/a/spill' ]] || exit 1
-  read -r st w fs avail exp over top real <<<\"\$l\"
+  read -r st w fs avail tier tu exp over top real <<<\"\$l\"
   expect \"\$st \$w \$exp \$over \$top \$real\" 'OK 1 0 - 0 $tmpr/a/spill'
   [[ \"\$avail\" =~ ^[0-9]+\$ && \"\$avail\" -gt 0 ]] || { echo \"\$l\"; exit 1; }"
 case_ "probe: DRY_RUN (create=0) creates nothing and says NEW" 0 '' "
   l=\$(spill_dir_probe 0 '$tmp/b/spill'); [[ ! -e '$tmp/b' ]] || exit 1
-  read -r st w fs avail exp over top real <<<\"\$l\"; expect \"\$st \$w \$real\" 'NEW 1 $tmpr/b/spill'"
+  read -r st w fs avail tier tu exp over top real <<<\"\$l\"; expect \"\$st \$w \$real\" 'NEW 1 $tmpr/b/spill'"
 case_ "probe: a folder inside (or around) the Hugging Face cache overlaps it" 0 '' "
-  l=\$(spill_dir_probe 1 '$tmp/hf/spill' '$tmp/hf'); read -r st w fs avail exp over top real <<<\"\$l\"; expect \"\$over\" '$tmpr/hf'
-  l=\$(spill_dir_probe 1 '$tmp' '$tmp/hf'); read -r st w fs avail exp over top real <<<\"\$l\"; expect \"\$over\" '$tmpr/hf'"
+  l=\$(spill_dir_probe 1 '$tmp/hf/spill' '$tmp/hf'); read -r st w fs avail tier tu exp over top real <<<\"\$l\"; expect \"\$over\" '$tmpr/hf'
+  l=\$(spill_dir_probe 1 '$tmp' '$tmp/hf'); read -r st w fs avail tier tu exp over top real <<<\"\$l\"; expect \"\$over\" '$tmpr/hf'"
 case_ "probe: the same line through sh -c (a worker's login shell may be sh)" 0 '' "
-  expect \"\$(sh -c \"\$(declare -f spill_dir_probe); spill_dir_probe 1 '$tmp/s/spill' '$tmp/hf'\" | cut -d' ' -f1,2,5-)\" 'OK 1 0 - 0 $tmpr/s/spill'"
+  expect \"\$(sh -c \"\$(declare -f spill_dir_probe); spill_dir_probe 1 '$tmp/s/spill' '$tmp/hf'\" | cut -d' ' -f1,2,7-)\" 'OK 1 0 - 0 $tmpr/s/spill'"
 case_ "probe: the home folder itself" 0 '' "
-  HOME='$tmp/a'; l=\$(spill_dir_probe 1 '$tmp/a'); read -r st w fs avail exp over top real <<<\"\$l\"; expect \"\$top\" 1"
+  HOME='$tmp/a'; l=\$(spill_dir_probe 1 '$tmp/a'); read -r st w fs avail tier tu exp over top real <<<\"\$l\"; expect \"\$top\" 1"
+mkdir -p "$tmp/t/spill/other"
+for x in tfspill-00000000000000aa native-spill-00000000000000bb spill-00000000000000cc; do
+  mkdir -p "$tmp/t/spill/$x/rank0"; head -c 1048576 /dev/zero > "$tmp/t/spill/$x/rank0/s"
+done
+head -c 1048576 /dev/zero > "$tmp/t/spill/other/s"; head -c 1048576 /dev/zero > "$tmp/t/spill/spill-file"
+ln -s "$tmp/t/spill/other" "$tmp/t/spill/tfspill-00000000000000dd"
+case_ "probe: measures the spill tiers' own folders (tfspill-, native-spill-, spill-), not other entries or links" 0 '' "
+  for sh in bash sh; do
+    l=\$(\$sh -c \"\$(declare -f spill_dir_probe); spill_dir_probe 1 '$tmp/t/spill'\"); read -r st w fs avail tier tu rest <<<\"\$l\"
+    [[ \"\$tier\" =~ ^[0-9]+\$ ]] && (( tier >= 3 * 1048576 && tier < 3 * 1048576 + 262144 )) || { echo \"\$sh: \$l\"; exit 1; }
+    expect \"\$tu\" 0
+  done"
 if [[ "$(id -u)" != 0 ]]; then
   chmod 555 "$tmp/ro"
   case_ "probe: a folder that cannot be created is an error; an unwritable one says so" 0 '' "
@@ -317,6 +364,28 @@ case_ "spill check: a fork's default tier whose worker folder fails goes off eve
   expect_out 'WARN: SPILL TIER OFF for this start: SPILL_DIR .* on w1 overlaps' port_spill_check
   port_spill_check >/dev/null; port_map; expect \"\$SPILL_GIB \${STOP_TIMEOUT:-unset}\" '0 unset'
   expect \"\${PORT_ENV[*]}\" 'TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=1 TF_GLM_KV_SHARD_TWINS=1'"
+
+# ---- the free-disk floor: the tier's own folders count as room, since the engine frees them itself (it drops its oldest
+# files to keep the floor, and removes other builds' folders at open). df is stubbed (the probe's only df call), here and
+# in the worker's shell; the floor is 1 GiB and the tier's folder holds 8 MiB.
+# dfstub <free KiB>: the function, as text for a case's script
+dfstub() { printf 'df() { printf "Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/x 2097152 1 %s 50%%%% /\\n"; }; worker() { shift; bash -c "$(declare -f df); $1"; }' "$1"; }
+tierdir() { mkdir -p "$1/tfspill-00000000000000aa/rank0" && head -c 8388608 /dev/zero > "$1/tfspill-00000000000000aa/rank0/00000000000000aa.state"; }
+tierdir "$tmp/r1/spill"; tierdir "$tmp/r2/spill"; tierdir "$tmp/r3/spill"
+case_ "spill check: under the floor by less than the tier's own files: no refusal (it frees them itself)" 0 "SPILL_GIB=0.001 SPILL_MIN_FREE_GIB=1 PROMPT_CACHE_GIB=8 SPILL_DIR='$tmp/r1/spill' HF_CACHE='$tmp/hf'" "$stubs
+  $(dfstub $((1048576 - 4096)))
+  expect_out 'LOG: Spill tier: v1, up to 0.001 GiB' port_spill_check"
+case_ "spill check: under the floor by more than the tier's own files: refused, naming both" 0 "SPILL_GIB=0.001 SPILL_MIN_FREE_GIB=1 PROMPT_CACHE_GIB=8 SPILL_DIR='$tmp/r2/spill' HF_CACHE='$tmp/hf'" "$stubs
+  $(dfstub $((1048576 - 16384)))
+  expect_die 'has 0 GiB free (and 0.0 GiB in the spill tiers. own folders, which the tier frees itself), under SPILL_MIN_FREE_GIB (1)' port_spill_check"
+if [[ "$(id -u)" != 0 ]]; then
+  chmod 000 "$tmp/r3/spill/tfspill-00000000000000aa"
+  case_ "spill check: a tier folder it cannot read (the Zig engine's, root's 0700) under the floor: a warning, not a refusal" 0 "SPILL_GIB=0.001 SPILL_MIN_FREE_GIB=1 PROMPT_CACHE_GIB=8 SPILL_DIR='$tmp/r3/spill' HF_CACHE='$tmp/hf'" "$stubs
+    $(dfstub $((1048576 - 16384)))
+    expect_out 'WARN: SPILL_DIR .* on this Spark has 0 GiB free, under SPILL_MIN_FREE_GIB (1), and holds spill folders this check cannot read' port_spill_check
+    expect_out 'LOG: Spill tier: v1' port_spill_check"
+  chmod 700 "$tmp/r3/spill/tfspill-00000000000000aa"
+fi
 
 # ---- scripts/memavail.sh: the start check counts the pages parked on the per-CPU free lists, as the engine's 0119
 # does (native/cuda_memory.zig parkedBytes): its Zig tests' synthetic /proc/zoneinfo cases, as in the DeepSeek recipe
@@ -370,18 +439,39 @@ case_ "parked pages: no MemAvailable fails and prints nothing" 0 "source '$here/
   out=\$(mem_counting '$mt/meminfo-none' '$mt/z-many' 4096) && exit 1; [[ -z \"\$out\" ]]"
 case_ "parked pages: the page size from getconf by default" 0 "source '$here/memavail.sh'" "
   expect \"\$(mem_counting '$mt/meminfo' '$mt/z-six')\" \"\$(mem_counting '$mt/meminfo' '$mt/z-six' \$(getconf PAGESIZE))\""
-case_ "start check: mem_avail_gb is whole GiB (rounded down) and the parked GiB" 0 "source '$here/memavail.sh'" "
-  mem_counting() { echo '109.9 6.0 6442450944'; }; expect \"\$(mem_avail_gb)\" '109 6.0'"
-case_ "start check: mem_avail_gb on the synthetic Spark (100 GiB available, 6 GiB parked)" 0 "source '$here/memavail.sh'" "
+case_ "start check: mem_avail_gb 1 is whole GiB (rounded down) and the parked GiB" 0 "source '$here/memavail.sh'" "
+  mem_counting() { echo '109.9 6.0 6442450944'; }; expect \"\$(mem_avail_gb 1)\" '109 6.0'"
+case_ "start check: mem_avail_gb 1 on the synthetic Spark (100 GiB available, 6 GiB parked)" 0 "source '$here/memavail.sh'" "
   eval \"\$(declare -f mem_counting | sed '1s/mem_counting/mem_counting_file/')\"
   mem_counting() { mem_counting_file '$mt/meminfo' '$mt/z-six' 4096; }
-  expect \"\$(mem_avail_gb)\" '106 6.0'"
+  expect \"\$(mem_avail_gb 1)\" '106 6.0'"
+# free -g on a Spark right after an image copy (available 103), for the check of an engine that counts no parked pages
+freestub="free() { printf '               total        used        free      shared  buff/cache   available\\nMem:             119          12           3           0         101         103\\nSwap:             15           0          15\\n'; }"
+case_ "start check: mem_avail_gb 0 (the engine counts no parked pages) is free -g's available column alone, as before" 0 "source '$here/memavail.sh'" "
+  mem_counting() { echo '109.9 6.0 6442450944'; }; $freestub
+  expect \"\$(mem_avail_gb 0)\" '103 0'
+  expect \"\$(mem_avail_gb)\" '103 0'
+  expect \"\$(bash -c \"\$(declare -f free mem_counting mem_avail_gb); mem_avail_gb 0\")\" '103 0'"
 case_ "start check: mem_avail_gb runs on a worker as start.sh sends it (declare -f over ssh, here bash -c and sh -c)" 0 "source '$here/memavail.sh'" "
   for sh in bash sh; do
     expect \"\$(\$sh -c \"\$(declare -f mem_counting); mem_counting '$mt/meminfo' '$mt/z-six' 4096\")\" '106.0 6.0 6442450944'
   done
-  l=\$(bash -c \"\$(declare -f mem_counting mem_avail_gb); mem_avail_gb\")
+  l=\$(bash -c \"\$(declare -f mem_counting mem_avail_gb); mem_avail_gb 1\")
   if [[ -r /proc/meminfo ]]; then [[ \"\$l\" =~ ^[0-9]+\\ [0-9]+\\.[0-9]\$ ]] || { echo \"[\$l]\"; exit 1; }; fi"
+case_ "start check: port_parked (the engine counts the parked pages): ZIG_HAS parked for zig, patches' 0119 for python" 0 '' "
+  ! port_parked || { echo 'counted without the token'; exit 1; }
+  ( ZIG_HAS='mtp displaykv parked'; port_parked ) || { echo 'not counted with ZIG_HAS parked'; exit 1; }
+  ( ENGINE=python; _cfg_root='$tmp/root-no'; ! port_parked ) || { echo 'python counted without 0119'; exit 1; }
+  mkdir -p '$tmp/root-yes/patches'; : > '$tmp/root-yes/patches/0119-cuda-budget-parked-pages.patch'
+  ( ENGINE=python; _cfg_root='$tmp/root-yes'; port_parked ) || { echo 'python not counted with 0119'; exit 1; }
+  ( ENGINE=python ZIG_HAS=parked; _cfg_root='$tmp/root-no'; ! port_parked ) || { echo 'python counted by the zig token'; exit 1; }"
+check_start() { grep -qF -- "$1" "$root/start.sh" || { echo "start.sh lacks: $1"; return 1; }; }
+case_ "start.sh: the memory check passes the gate here and to each worker; the post-start check reads every rank" 0 '' "
+  $(declare -f check_start); root='$root'
+  check_start 'PARKED=0; ! port_parked || PARKED=1' || exit 1
+  check_start 'read -r here_gb here_parked <<<\"\$(mem_avail_gb \"\$PARKED\")\"' || exit 1
+  check_start 'declare -f mem_counting mem_avail_gb); mem_avail_gb \$PARKED' || exit 1
+  check_start 'port_check_started \"\${PORT_LOGS[@]}\"' || exit 1"
 if [[ -r /proc/meminfo ]]; then
   case_ "parked pages: this host's /proc/meminfo and /proc/zoneinfo" 0 "source '$here/memavail.sh'" "
     read -r a p b <<<\"\$(mem_counting)\"; [[ \"\$a\" =~ ^[0-9]+\\.[0-9]\$ && \"\$b\" =~ ^[0-9]+\$ ]] || { echo \"[\$a \$p \$b]\"; exit 1; }"

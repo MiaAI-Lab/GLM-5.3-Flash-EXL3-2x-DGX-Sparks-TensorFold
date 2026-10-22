@@ -1,13 +1,15 @@
 # The memory a Spark can give a starting rank, counted the way the engine's startup budget counts it: MemAvailable plus
 # the pages parked on the kernel's per-CPU free lists (wojo's GLM patch 0119, PR #149; the Zig engine's
 # native/cuda_memory.zig parkedBytes, as ported to the DeepSeek recipe's scripts/memavail.sh, from which this is copied).
+# Neither engine this recipe ships counts them yet (0119 is in neither patches/ nor zig/patches): start.sh counts them
+# only for an engine that does (scripts/port.sh: port_parked), and reads `free -g` as before otherwise.
 # Sourced by scripts/nodes.sh; start.sh sends mem_counting to each worker over ssh (self-contained: awk and getconf only).
 # bash 3.2 and POSIX awk (mawk, gawk, BSD awk), so that scripts/port_test.sh runs it on a Mac against synthetic /proc
 # files.
 #
 # A bulk free (prepare.sh's docker save | docker load of the image, a compiler's exit, the first start of a new image)
 # leaves 2-9 GiB on the per-CPU free lists for a minute or two. MemFree and MemAvailable do not count them, so a check
-# right after an image copy reads several GiB less than the engine (which counts them) has.
+# right after an image copy reads several GiB less than an engine with 0119 (which counts them) has.
 #
 # One rule, the same as the engine's 0119 (and not the Python fork's _parked_zone, which rested each list 256 MiB above
 # high_min): in /proc/zoneinfo, under each zone's `pagesets` line (the indented lines that follow it: four spaces, or the
@@ -57,12 +59,13 @@ mem_counting() {
     }' "$mi" "$zi"
 }
 
-# mem_avail_gb: "<whole GiB available> <parked GiB>" on this node for start.sh's memory check (mem_counting, the
-# available figure rounded down as `free -g` shows it); `free -g`'s available column and 0 when /proc/meminfo has no
-# MemAvailable. Self-contained with mem_counting (start.sh sends both to the workers).
+# mem_avail_gb [<parked 0|1>]: "<whole GiB available> <parked GiB>" on this node for start.sh's memory check. With 1
+# (the engine counts the parked pages: port_parked) mem_counting's figure, rounded down as `free -g` shows it; with 0
+# (the default), or when /proc/meminfo has no MemAvailable, `free -g`'s available column and 0, as before the port.
+# Self-contained with mem_counting (start.sh sends both to the workers).
 mem_avail_gb() {
   local m
-  if m=$(mem_counting 2>/dev/null) && [ -n "$m" ]; then
+  if [ "${1:-0}" = 1 ] && m=$(mem_counting 2>/dev/null) && [ -n "$m" ]; then
     echo "$m" | awk '{ printf "%d %s\n", $1, $2 }'
   else
     free -g 2>/dev/null | awk '/^Mem:/ { print $7, 0 }'
