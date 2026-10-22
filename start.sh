@@ -23,7 +23,10 @@
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
 #            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
-#            MEMORY_RESERVE_GIB, MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST, PORT
+#            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST,
+#            PORT
+#   ported   SPILL_GIB, SPILL_DIR, SPILL_MIN_TOKENS, SPILL_MIN_FREE_GIB, SPILL_HIGHWATER, SPILL_FLUSH_S, SPILL_V2,
+#            SPILL_QUOTA, SPILL_TURNS, KV_SHARD (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
 #            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks),
 #            WORKER3, FABRIC_PEER3, WORKER_HF_CACHE3 (4 Sparks), NCCL_ALGO (on a ring of 4: Ring)
@@ -111,7 +114,9 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
-  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image.
+  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. spill2, kvshard
+  # and spillshard (Robert's spill v2 and KV sharding, and the two together) join it once their ports are in zig/patches;
+  # until then port_validate (scripts/port.sh, below) refuses SPILL_V2=1 and KV_SHARD=1.
   ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
@@ -139,22 +144,15 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig image has no Python tower helper. VISION=1 loads the native tower, which dlopens cuDNN.
   [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision --vision-backend zig)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
-  if [[ "$SPILL_GIB" != 0 ]]; then
-    [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
-    SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
-                 --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
-  fi
-  # 0 is the qualified path. The engine keeps prompt states when this is raised.
-  SERVE_ARGS+=(--backend cuda --prompt-cache-gib 0)
+  # 0 is the qualified path. The engine keeps prompt states when this is raised (scripts/config.sh: PROMPT_CACHE_GIB),
+  # which the spill tier needs (scripts/port.sh; its flags come from port_map, below, for both engines)
+  [[ "$PROMPT_CACHE_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "PROMPT_CACHE_GIB is a size in GiB (0: no kept prompt states), not $PROMPT_CACHE_GIB"
+  SERVE_ARGS+=(--backend cuda --prompt-cache-gib "$PROMPT_CACHE_GIB")
 else
   [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
-  if [[ "$SPILL_GIB" != 0 ]]; then                   # patch 0088: the spill tier (scripts/config.sh)
-    [[ "$SPILL_DIR" == /* ]] || die "SPILL_DIR must be an absolute path (the same on every Spark), not $SPILL_DIR"
-    SERVE_ARGS+=(--spill-gib "$SPILL_GIB" --snapshot-dir /spill --spill-highwater "$SPILL_HIGHWATER"
-                 --spill-min-tokens "$SPILL_MIN_TOKENS" --spill-min-free-gib "$SPILL_MIN_FREE_GIB")
-  fi
 fi
+port_check_extra "$@"                 # the spill tier's settings go through SPILL_* (scripts/port.sh), not extra flags
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
 arg_value() {
@@ -167,6 +165,9 @@ arg_value() {
   done
   echo "$value"
 }
+# Robert's GLM features (scripts/port.sh: the spill tier, spill v2, KV sharding): their settings checked with the
+# effective --parallel and --prompt-cache-gib (the command line's win), before anything is stopped
+port_validate "$(arg_value --parallel)" "$(arg_value --prompt-cache-gib)"
 # Where to reach the server from this machine: a wildcard bind answers on loopback.
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
@@ -200,10 +201,27 @@ exec 8>"$STATE_DIR/start.lock"
 flock -n 8 || die "another ./start.sh is already running; wait for it to finish"
 need_workers
 (( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
+# SPILL_DIR on every Spark (created as you when missing; a default tier whose folder fails is turned off everywhere),
+# then the flags and variables every rank gets for the ported features (scripts/port.sh; none when they are all off)
+port_spill_check
+port_map
+SERVE_ARGS+=(${PORT_SERVE[@]+"${PORT_SERVE[@]}"})
 
 # ---------------------------------------------------------------- already running?
 all_running() { local i; running_here || return 1; for i in $(worker_ids); do running_worker "$i" || return 1; done; }
+# a running rank's tf.recipe.port label (scripts/port.sh: port_identity): "off" for a container started without one
+port_live() {
+  local l
+  if (( $1 == 0 )); then l=$(docker inspect -f '{{index .Config.Labels "tf.recipe.port"}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  else l=$(worker "$1" "docker inspect -f '{{index .Config.Labels \"tf.recipe.port\"}}' '$CONTAINER_NAME'" 2>/dev/null || true); fi
+  [[ -n "$l" && "$l" != '<no value>' ]] && echo "$l" || echo off
+}
 if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
+  # the ported features' settings are every rank's at start: a server running with others is not this configuration
+  for i in 0 $(worker_ids); do
+    [[ "$(port_live "$i")" == "$(port_identity)" ]] ||
+      die "$CONTAINER_NAME is running on $SPARKS with other spill / KV-shard settings (rank $i: $(port_live "$i"); asked: $(port_identity)): run ./start.sh restart to apply them"
+  done
   log "$CONTAINER_NAME is already running on $SPARKS (model: $(served_name || echo "not answering yet"), port $PORT): nothing to do."
   log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
   exit 0
@@ -373,12 +391,13 @@ fi
 zig_env() {
   local v l2=1 name
   [[ "$TF_GLM_L2PF" =~ ^(0|off)$ ]] && l2=0
-  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -v '^TF_GLM_L2PF=' || true)
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -v '^TF_GLM_L2PF=' | grep -vE "^($PORT_MAPPED_RE)=" || true)
   ENV_ARGS+=(-e "TF_GLM_ROCE=$([[ "$COMM" == roce ]] && echo 1 || echo 0)" -e "TF_GLM_L2PF=$l2")
   ENV_ARGS+=(-e "DRAFTER=$DRAFTER")   # the Zig engine's drafter choice (dflash2 | mtp), the same on every rank
   for v in TF_CUDA_DEVICE TF_GRAPH_LOG TF_ROUND_LOG TF_TP_TRACE TF_TP_STATS TF_TP_TIMEOUT_S; do
     [[ -z "${!v:-}" ]] || ENV_ARGS+=(-e "$v=${!v}")
   done
+  for v in ${PORT_ENV[@]+"${PORT_ENV[@]}"}; do ENV_ARGS+=(-e "$v"); done   # the ported features' (scripts/port.sh: port_map)
 }
 env_args() {
   local _skip='^$' name
@@ -390,7 +409,8 @@ env_args() {
     zig_env
     return
   fi
-  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
+  while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" | grep -vE "^($PORT_MAPPED_RE)=" || true)
+  for name in ${PORT_ENV[@]+"${PORT_ENV[@]}"}; do ENV_ARGS+=(-e "$name"); done   # the spill tier's (scripts/port.sh: port_map)
 }
 env_args
 RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
@@ -399,13 +419,14 @@ RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infi
 if (( DISPLAY_KV_MIB )) && [[ "$DISPLAY_KV_BACKEND" == dispram ]]; then
   RUN_ARGS+=(-v /run/dispram:/run/dispram -v /opt/kindling/dispram/python:/opt/dispram:ro -e PYTHONPATH=/opt/dispram)
 fi
-if [[ "$SPILL_GIB" != 0 ]]; then                   # the spill tier's directory on every rank, files owned by you
-  mkdir -p "$SPILL_DIR"
-  for i in $(worker_ids); do worker "$i" "mkdir -p '$SPILL_DIR'" || die "could not create SPILL_DIR on worker $i"; done
+if port_spill_on; then          # the spill tier's directory on every rank (port_spill_check made it), files owned by you
   # (files take the owner of SPILL_DIR on each Spark. No --init on these containers: a rank past 0 runs as PID 1
   # without a SIGTERM handler, so a stop leaves it serving rank 0's flush before both exit)
-  RUN_ARGS+=(-v "$SPILL_DIR":/spill -e TF_SPILL_FLUSH_S="$SPILL_FLUSH_S")
+  RUN_ARGS+=(-v "$SPILL_DIR":"$PORT_SPILL_MOUNT")
 fi
+# The ported features' settings on every rank's container (scripts/port.sh: port_identity; no label while they are all
+# off), which a later ./start.sh compares with what it is asked for
+[[ "$(port_identity)" == off ]] || RUN_ARGS+=(--label "tf.recipe.port=$(port_identity)")
 
 # ---------------------------------------------------------------- 3. launch, 4. load (a second try when the window does not fit)
 # No token goes into the containers: the ranks read only the local cache (HF_HUB_OFFLINE=1), and with HF_HUB_OFFLINE=0
@@ -571,6 +592,8 @@ for attempt in 1 2 3 4; do
   ./stop.sh >/dev/null
 done
 log "Server answered after $((SECONDS - start))s"
+# the spill tier opened (scripts/port.sh): rank 0's prompt cache can come out with no budget at all
+! port_spill_on || port_check_started "$(docker logs "$CONTAINER_NAME" 2>&1 | grep 'prompt cache:' || true)"
 
 # ---------------------------------------------------------------- 5. smoke test
 # Thinking off and greedy, so that a short reply has text (the model thinks first otherwise); no text, or one character repeated (a collapsed model: issues #76, #81, #86), fails the start.
@@ -589,7 +612,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
-    Window   $(arg_value --context) tokens$( (( TP == 2 )) || echo " · $TP Sparks (experimental)") · $(arg_value --parallel) at once · $KV KV · $DRAFTER drafts · $DENSE dense weights$( [[ "$VISION" == 1 ]] && echo " · images and video")$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")$( [[ "$SPLIT" == 1 ]] && echo " · split prefill")$( [[ "$KDA_CHUNKED" == 1 ]] && echo " · chunked KDA")
+    Window   $(arg_value --context) tokens$( (( TP == 2 )) || echo " · $TP Sparks (experimental)") · $(arg_value --parallel) at once · $KV KV · $DRAFTER drafts · $DENSE dense weights$( [[ "$VISION" == 1 ]] && echo " · images and video")$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")$( [[ "$SPLIT" == 1 ]] && echo " · split prefill")$( [[ "$KDA_CHUNKED" == 1 ]] && echo " · chunked KDA")$(port_summary)
     Drafts   $DRAFT_POLICY · copy drafts $( [[ "$COPY" == 1 ]] && echo "up to $COPY_MAX$( [[ "$COPY_CODE" == 1 ]] && echo ", code rules")" || echo off) · shared system prompts $( [[ "$SHARED_PREFIX" == 1 ]] && echo on || echo off)
     Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  ./start.sh restart

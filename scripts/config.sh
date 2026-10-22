@@ -480,17 +480,15 @@ prepared_state() {
   echo "$line"
 }
 
-# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
-# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
-# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
-# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
-# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
-SPILL_GIB="${SPILL_GIB:-0}"
-SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
-SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
-SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
-SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
-SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
-if [[ "$SPILL_GIB" != 0 ]]; then
-  STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
-fi
+# ENGINE=zig: kept prompt states, in GiB (--prompt-cache-gib; 0, the default, keeps none: the qualified path). The engine
+# gives them at most what MemAvailable leaves above MEMORY_RESERVE_GIB once the pool is up, so at the defaults the
+# budget comes out 0 (it logs "prompt cache: off (budget 0)"); a smaller KV_POOL_GIB leaves them room. Measured on two
+# Sparks (1M window, PARALLEL=8, KV_POOL_GIB=4, PROMPT_CACHE_GIB=16): a 2.0 GiB budget, the pool 1,734,656 tokens, and the
+# same 50k / 93k prompt again answered in 0.17 / 0.26 s instead of 24 / 48 s (ezoushen, Mia PR #187). The spill tier
+# spills these kept states, so with ENGINE=zig it needs PROMPT_CACHE_GIB above 0. ENGINE=python keeps states in the pool.
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
+
+# The spill tier (patch 0088-glm-spill-tier, off by default: SPILL_GIB, SPILL_DIR, SPILL_HIGHWATER, SPILL_MIN_TOKENS,
+# SPILL_MIN_FREE_GIB, SPILL_FLUSH_S; README: Spill tier) and the rest of Robert's GLM features ported to the Zig engine
+# (spill v2, KV sharding; all off by default): their settings, checks and mapping to the ranks are scripts/port.sh's.
+source "$_cfg_root/scripts/port.sh"
