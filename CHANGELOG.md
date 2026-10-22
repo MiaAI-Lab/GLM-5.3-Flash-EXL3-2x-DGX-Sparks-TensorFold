@@ -6,7 +6,8 @@ Every change to this recipe, newest first. Each release names the image it serve
 ## Unreleased
 
 - **The first start of a new image no longer gets a smaller pool** (patch `0119-cuda-budget-parked-pages`, by
-  [wojo](https://github.com/wojo)). TensorFold budgets each rank from `MemAvailable` at start; the first start of an
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)). TensorFold
+  budgets each rank from `MemAvailable` at start; the first start of an
   image the worker lacked read 89.44 GiB "within" on rank 0 against 94.86 for a warm restart of the same image, and
   kept 2 prompt states, not 32. On kernel 6.7+ a bulk free leaves GiBs of free pages on the per-CPU lists (`pagesets`
   `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`: the image copy in `prepare.sh` (`docker save`
@@ -171,7 +172,8 @@ Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad
 50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
 29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
 
-- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)):
   a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
   skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
   unless `SPILL_GIB` is set.
@@ -274,8 +276,9 @@ contributors' measurements are in the PRs.
   restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
   CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
   content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
-  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  through a kernel, as the pool's own moves there do). Authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), PR #78;
+  credits in `NOTICE` and `CREDITS.md`.
   Numbers: README, "Spill tier".
 - **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
   default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's

@@ -97,7 +97,7 @@ glm53-tensorfold-spark
   (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
   tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
   patches/0088-glm-spill-tier.patch (tensorfold/cuda/spill.py and its hooks in the GLM engine and multi.py) is authored
-  by Robert Wojciechowski (wojo, https://github.com/wojo). Its multi-rank design (an NVMe tier for kept prompt states,
+  by Robert Wojciechowski (GitHub @wojo, X @rwojo). Its multi-rank design (an NVMe tier for kept prompt states,
   one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
   that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
 

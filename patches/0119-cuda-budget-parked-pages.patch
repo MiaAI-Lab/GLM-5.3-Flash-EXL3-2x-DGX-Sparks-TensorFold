@@ -19,7 +19,8 @@
 # counts the N GiB free on the per-CPU page lists", from 0.25 GiB.
 # Only that startup read counts them: the live memory gate of the qwen3_5 / qwen4_exp families (torch_live) calls
 # available_bytes without a reading and keeps its figure; the GLM family reads MemAvailable only here. The 10 % reserve
-# is unchanged. Same replies: sizing only. tools/parked_pages_check.py. By @wojo.
+# is unchanged. Same replies: sizing only. tools/parked_pages_check.py.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo).
 
 diff --git tensorfold/cuda/capacity.py tensorfold/cuda/capacity.py
 --- tensorfold/cuda/capacity.py

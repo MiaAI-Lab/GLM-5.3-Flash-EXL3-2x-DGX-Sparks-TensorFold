@@ -148,8 +148,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
 - `docs/hermes-agent.md`, `tools/hermes_benchmark.py` and `tests/test_hermes_benchmark.py` (the Hermes Agent custom-endpoint
   guide and the synthetic speed harness with its tests): by Steve Darlow ([kerpopule](https://github.com/kerpopule)),
   in [PR #52](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/52).
-- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo)): `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
+- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X):
+  `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
   server, in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
   builds on, by its authors: the idea of persisting session state on NVMe per rank was proposed in MiaAI-Lab's
   GLM-5.3-Flash vLLM kit ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232)
@@ -208,7 +209,7 @@ If you believe something here is missing or credited wrongly, please open an iss
 - `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
 - `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
 - `0119-cuda-budget-parked-pages` (the start-up budget counts the pages parked on the per-CPU free lists): by
-  [wojo](https://github.com/wojo).
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
 - `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
   `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
 - `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
