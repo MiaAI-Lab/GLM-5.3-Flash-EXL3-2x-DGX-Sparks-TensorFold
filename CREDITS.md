@@ -141,8 +141,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   dispram ships here: the ranks import the host's client (`python/dispram.py`, GPL-3.0 with a bundling exception)
   mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
 - `0111-glm-chat-continued` (a conversation keeps its id across a rewind or a resume from disk, for patch `0089`'s
-  quota by Thomas Wade; issue #104 by [danielbanu](https://github.com/danielbanu)): by Robert Wojciechowski
-  ([wojo](https://github.com/wojo)).
+  quota by Thomas Wade; issue #104 by [danielbanu](https://github.com/danielbanu)): by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
 - `0098-glm-mmap-uploads` (the drafter's and the vision tower's tensors copied out of the safetensors mmap before
   they go to the GPU: kindling spark-os's 64 KiB-page kernel): by [BadAd84](https://github.com/BadAd84).
 - `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`: the launch order of the expert decode kernel's blocks): by
@@ -151,8 +151,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
 - `docs/hermes-agent.md`, `tools/hermes_benchmark.py` and `tests/test_hermes_benchmark.py` (the Hermes Agent custom-endpoint
   guide and the synthetic speed harness with its tests): by Steve Darlow ([kerpopule](https://github.com/kerpopule)),
   in [PR #52](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/52).
-- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo)): `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
+- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X):
+  `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
   server, in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
   builds on, by its authors: the idea of persisting session state on NVMe per rank was proposed in MiaAI-Lab's
   GLM-5.3-Flash vLLM kit ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232)
@@ -177,8 +178,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   and the quota from [issue #122](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/122),
   reported by [xiepengqi](https://github.com/xiepengqi), the free-disk floor making room in that order, content dedup
   by hard link, reads on a CUDA stream beside decoding after every rank's HAS, pictures by content keys, and the
-  prefix wait) by Robert Wojciechowski ([wojo](https://github.com/wojo)). It builds on `0088-glm-spill-tier`, whose
-  credits above apply to the tier around it.
+  prefix wait) by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
+  It builds on `0088-glm-spill-tier`, whose credits above apply to the tier around it.
 - `0089-glm-kept-state` (a byte budget for the kept states and a per-conversation quota, `TF_GLM_KEPT_BYTES_GIB` and
   `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
   [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased

@@ -8,7 +8,8 @@
 # request whose prefix another one is still prefilling waits for that state (TF_GLM_PREFIX_WAIT). New
 # tensorfold/cuda/spill_blocks.py (no model code).
 # Block layout, lineage, write-at-keep ring, release and fsync order: PR #118 by @BadAd84; eviction by conversation
-# for issue #122, reported by @xiepengqi; the rest by @wojo. Builds on 0088-glm-spill-tier. Apache-2.0.
+# for issue #122, reported by @xiepengqi; the rest by Robert Wojciechowski (GitHub @wojo, X @rwojo). Builds on
+# 0088-glm-spill-tier. Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
 index 0000000..30b9cbe
@@ -68,8 +69,8 @@ index 0000000..30b9cbe
 +authored by BadAd84 (https://github.com/BadAd84), carried over here. The spill tier around it (``spill.py``, patch
 +0088), lineage forks at each resume point, eviction by conversation and the quota (issue #122, reported by xiepengqi,
 +https://github.com/xiepengqi), the free-disk floor making room in that order, content dedup by hard link, reads beside
-+decoding after every rank's HAS (copied between rounds, as #118 does), and pictures by content keys are by wojo
-+(Robert Wojciechowski, https://github.com/wojo)."""
++decoding after every rank's HAS (copied between rounds, as #118 does), and pictures by content keys are by
++Robert Wojciechowski (GitHub @wojo, X @rwojo)."""
 +
 +from __future__ import annotations
 +

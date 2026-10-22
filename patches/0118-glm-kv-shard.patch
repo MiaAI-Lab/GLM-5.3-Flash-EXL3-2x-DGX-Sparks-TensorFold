@@ -5,7 +5,7 @@
 # attend locally (taken back when needed). Same bits as unsharded. Spill tier and display reservation supported.
 # A cache hit whose part has no room is carried to another part (its latents sent by the owner) when that saves a
 # recompute, an eviction or a pause (TF_GLM_KV_SHARD_CARRY, on), never to even out the parts.
-# Builds on 0110 (spill tier) and 0111. By @wojo. Apache-2.0.
+# Builds on 0110 (spill tier) and 0111. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
 @@ -12,7 +12,8 @@
