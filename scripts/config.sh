@@ -218,6 +218,20 @@ export TF_GLM_SIDE="${TF_GLM_SIDE:-$_tp4}"
 # needle.py) have run with it: 1 to try it. On four Sparks (a ring, with the TP=4 defaults) prefill +2.6% (131k 2,527
 # -> 2,592 tok/s), decode unchanged, one of four reference replies changed (one boot, 2026-10-08).
 export TF_GLM_MSA="${TF_GLM_MSA:-0}"
+# Prompt switches of patches 0124-0127, all off (0) by default; README "Prompt switches of patches 0124-0127" has what
+# each needs and what it measured on four Sparks cabled as a ring. Other prompt bits, so in the ranks' startup
+# comparison and the kept states' identity (patch 0107): TF_GLM_PROMPT_W8 (e4m3 copies of the dense matrices, ~1.7 GiB
+# a rank the startup estimate does not count; prefill +7%; drafted replies then differ from serial ones past ~2K
+# tokens), TF_GLM_PROMPT_FP8 (the same speed from the 4-bit weights) and TF_GLM_PROMPT_Y16 (+6.7%). The same bits:
+# TF_GLM_DRAFT_SKIP (+1.5-2%), TF_GLM_PARTIAL16 (with TF_GLM_PROMPT_PARTIALS=bf16; +5%), TF_GLM_PROMPT_HANDOFF8 (with
+# TF_GLM_PROMPT_W8; +2.5-3%) and TF_GLM_PRX (four Sparks on a ring: the split's exchanges RDMA-written by a proxy
+# thread a channel, no NCCL kernel; +9-13%), with TF_GLM_PRX_SHARE, TF_GLM_PRX_RINGAG and TF_GLM_PRX_ZC on top (+4%,
+# +0.3-1.7%, +2-2.5%).
+export TF_GLM_PROMPT_W8="${TF_GLM_PROMPT_W8:-0}" TF_GLM_PROMPT_FP8="${TF_GLM_PROMPT_FP8:-0}"
+export TF_GLM_PROMPT_Y16="${TF_GLM_PROMPT_Y16:-0}" TF_GLM_DRAFT_SKIP="${TF_GLM_DRAFT_SKIP:-0}"
+export TF_GLM_PARTIAL16="${TF_GLM_PARTIAL16:-0}" TF_GLM_PROMPT_HANDOFF8="${TF_GLM_PROMPT_HANDOFF8:-0}"
+export TF_GLM_PRX="${TF_GLM_PRX:-0}" TF_GLM_PRX_SHARE="${TF_GLM_PRX_SHARE:-0}"
+export TF_GLM_PRX_RINGAG="${TF_GLM_PRX_RINGAG:-0}" TF_GLM_PRX_ZC="${TF_GLM_PRX_ZC:-0}"
 # KDA prompt chunks in chunked (WY) form, one CUDA kernel of 32-row sub-chunks (patches 0012, 0014, 0039): prefill
 # 50k 29.3 -> 26.4 s, 149k 91.1 -> 84.5 s (one boot each); prompt states then sit on a 64-token grid.
 # Close to the serial kernel, not its bits: prompt arithmetic differs, drafted replies still equal serial ones. 0: off.

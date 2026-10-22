@@ -193,6 +193,12 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `0124-glm-prompt-fp8-y16` to `0127-glm-prx-failstop-idle` (the prompt switches of README "Prompt switches of patches
+  0124-0127"): by [mxfp0](https://github.com/mxfp0). In `0126-glm-prompt-ring-exchange` the KDA layers' FP8 handoff
+  (`TF_GLM_PROMPT_HANDOFF8`) and the two-way relay round the ring (`TF_GLM_PRX`) follow the prefill ring of
+  [RiNGSiDE](https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE) (`src/tp4/glm53_prefill_rdma`,
+  Apache 2.0), and the proxy's verbs setup follows b12x's `roce_proxy.c` (above); no code of either is copied beyond
+  the verbs calls' shape.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
