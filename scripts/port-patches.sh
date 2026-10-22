@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Export the GLM engine's port commits (Robert Wojciechowski's GLM-5.3-Flash patches 0088/0110/0111/0118/0119, spill v2,
-# continued chats, KV sharding and parked pages, ported to this Zig engine) as zig/patches/0014-zig-<name>.patch and
-# later, numbered after the last hand-written patch, which zig/Dockerfile applies with `git apply` after 0001-0013, in
-# filename order. Nothing is written unless every step holds:
+# Export the GLM engine's port commits (the GLM-5.3-Flash patches 0088/0110/0111/0118/0119 by Robert Wojciechowski
+# (GitHub @wojo, X @rwojo), spill v2, continued chats, KV sharding and parked pages, ported to this Zig engine) as
+# zig/patches/0014-zig-<name>.patch and later, numbered after the last hand-written patch, which zig/Dockerfile applies
+# with `git apply` after 0001-0013, in filename order. Nothing is written unless every step holds:
 #   1. a clean checkout of ZIG_TF_REF (the engine pin, scripts/config.sh) gets the hand-written zig/patches in filename
 #      order, exactly as the Dockerfile applies them, and must then equal BASE outside the excluded paths
 #   2. the patches: one per first-parent commit of BASE..BRANCH (--mode commits, the default; a merge is its whole diff
@@ -67,7 +67,7 @@ slug() {
 [[ "${PORT_PATCHES_LIB:-0}" != 1 ]] || return 0
 
 engine="$HOME/GitHub/tensorfold-glm"; branch=glm/integration; base=glm/zig-engine-base; mode=commits
-title="Robert Wojciechowski's (wojo) GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continued chats, KV sharding, parked pages), ported by him to the GLM Zig engine"
+title="GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continued chats, KV sharding, parked pages) by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine"
 dry=0; keep=0; excludes=(zig/tests/cuda/glm_p1/aot docs/glm-port); names=()
 AOT=zig/tests/cuda/glm_p1/aot
 while (( $# )); do
@@ -164,7 +164,8 @@ message() {
   by=""; md=""
   for a in ${authors[@]+"${authors[@]}"}; do
     if [[ "$a" == "Robert Wojciechowski" ]]; then
-      by+="${by:+, }Robert Wojciechowski (wojo, https://github.com/wojo)"; md+="${md:+, }Robert Wojciechowski ([wojo](https://github.com/wojo))"
+      by+="${by:+, }Robert Wojciechowski (GitHub @wojo, X @rwojo)"
+      md+="${md:+, }Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)"
     else by+="${by:+, }$a"; md+="${md:+, }$a"; fi
   done
   if (( spill )); then

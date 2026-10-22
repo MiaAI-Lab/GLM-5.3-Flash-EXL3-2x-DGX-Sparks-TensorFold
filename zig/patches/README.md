@@ -24,7 +24,8 @@ changes with them, the captured kernel set `zig/aot/glm-aot-sm121.tar.xz`, the D
 
 ## The port of Robert Wojciechowski's GLM features (0014 and later)
 
-Robert Wojciechowski's ([wojo](https://github.com/wojo)) GLM-5.3-Flash Python patches, spill v2 (0088/0110,
+The GLM-5.3-Flash Python patches by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
+[@rwojo](https://x.com/rwojo) on X), spill v2 (0088/0110,
 [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78) and
 [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)), continued chats (0111,
 [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)), KV sharding (0118,

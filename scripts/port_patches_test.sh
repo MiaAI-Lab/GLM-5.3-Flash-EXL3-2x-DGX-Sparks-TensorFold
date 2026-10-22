@@ -70,10 +70,10 @@ check_ "one commit: 0014, its header (marker, message, credits with BadAd84 for 
   has "$out" "ZIG_TF_REF + all patches = t/one"
   head -1 "$p" | grep -q "^# port-patches.sh: t/one @ " || { head -1 "$p"; exit 1; }
   sed -n 2p "$p" | grep -qx "glm_cuda: spill v2.s test commit" || { sed -n 2p "$p"; exit 1; }
-  grep -q "^Credits: Robert Wojciechowski (wojo, https://github.com/wojo); spill v2.s block store design .*BadAd84" "$p" || { grep Credits "$p"; exit 1; }
+  grep -q "^Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); spill v2.s block store design .*BadAd84" "$p" || { grep Credits "$p"; exit 1; }
   grep -qx "Apply from the checkout root with: git apply 0014-zig-glm-test.patch" "$p"
   [[ "$(grep -c "^diff --git " "$p")" == 1 ]]
-  has "$out" "| \`0014-zig-glm-test.patch\` | Robert Wojciechowski ([wojo](https://github.com/wojo)); block store design: [BadAd84]"'
+  has "$out" "| \`0014-zig-glm-test.patch\` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84]"'
 check_ "two commits: 0014 and 0015, one named, one from its subject; no BadAd84 without spill" '
   out=$(pp --dry-run --keep --branch t/two --name t/two~1=first) || { echo "$out"; exit 1; }
   d=$(kept "$out"); trap "rm -rf -- \"$d\"" EXIT
@@ -84,10 +84,12 @@ check_ "a merge is one patch (its whole diff), listing the commits it brings in"
   out=$(pp --dry-run --keep --branch t/merge --name t/merge=side) || { echo "$out"; exit 1; }
   d=$(kept "$out"); trap "rm -rf -- \"$d\"" EXIT; p=$d/out/0014-zig-side.patch
   [[ "$(ls "$d/out" | wc -l | tr -d " ")" == 1 ]] && grep -q "^Commits:" "$p" && grep -q "^- side: one" "$p" && grep -q "^- side: two" "$p"'
-check_ "squash: one patch for the range, named by --name" '
+check_ "squash: one patch for the range, named by --name, its first line the default title (credit included)" '
   out=$(pp --dry-run --keep --branch t/two --mode squash --name glm-port-test) || { echo "$out"; exit 1; }
   d=$(kept "$out"); trap "rm -rf -- \"$d\"" EXIT
-  [[ "$(cd "$d/out" && ls)" == 0014-zig-glm-port-test.patch ]] && grep -q "^- glm_cuda: first of two" "$d/out/0014-zig-glm-port-test.patch"'
+  [[ "$(cd "$d/out" && ls)" == 0014-zig-glm-port-test.patch ]] && grep -q "^- glm_cuda: first of two" "$d/out/0014-zig-glm-port-test.patch" || exit 1
+  sed -n 2p "$d/out/0014-zig-glm-port-test.patch" | grep -qF "by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him" ||
+    { sed -n 2p "$d/out/0014-zig-glm-port-test.patch"; exit 1; }'
 check_ "refused: a branch that changes the captured kernel set" '
   out=$(pp --dry-run --branch t/aot) && { echo "$out"; exit 1; }; has "$out" "changes the captured kernel set"'
 check_ "notes only (docs/glm-port): nothing to export, exit 0" '

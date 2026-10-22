@@ -127,10 +127,11 @@ client tools adapted to GLM.
   merge is one patch (its diff against its first parent) whose header lists the commits it brings in. Squash stays.
 - The header is the commit's message as written (GLM's 0012/0013 style: plain text, not R's `# ` lines), after a first
   line `# port-patches.sh: <branch> @ <sha> over <base> @ <sha> (<mode> <from>..<to>)` that marks it as exported, then a
-  `Credits:` line (the commits' authors, `Robert Wojciechowski (wojo, ...)` for Robert; BadAd84's block store design,
-  #118, when the patch's paths or its message say spill; none added when the message has its own `Credits:` line) and
-  GLM's `Apply from the checkout root with: git apply <file>` line. `git apply` reads from the first line that looks
-  like a patch, so a message with such a line (`diff `, `--- `, `+++ `, `@@ `, ...) is refused, not silently mangled.
+  `Credits:` line (the commits' authors, `Robert Wojciechowski (GitHub @wojo, X @rwojo)` for Robert; BadAd84's
+  block store design, #118, when the patch's paths or its message say spill; none added when the message has its own
+  `Credits:` line) and GLM's `Apply from the checkout root with: git apply <file>` line. `git apply` reads from the
+  first line that looks like a patch, so a message with such a line (`diff `, `--- `, `+++ `, `@@ `, ...) is refused,
+  not silently mangled.
 - Excluded from the patches and the comparisons: `zig/tests/cuda/glm_p1/aot` (the baseline carries the captured kernel
   set there; it ships as `zig/aot/glm-aot-sm121.tar.xz`) and `docs/glm-port/` (these notes). A branch that changes the
   kernel set is refused (checked after the base, so a wrong base is named as such): the image would lack those kernels.

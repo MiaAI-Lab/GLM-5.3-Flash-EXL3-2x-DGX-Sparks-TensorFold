@@ -101,7 +101,7 @@ glm53-tensorfold-spark
   (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
   tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
   patches/0088-glm-spill-tier.patch (tensorfold/cuda/spill.py and its hooks in the GLM engine and multi.py) is authored
-  by Robert Wojciechowski (wojo, https://github.com/wojo). Its multi-rank design (an NVMe tier for kept prompt states,
+  by Robert Wojciechowski (GitHub @wojo, X @rwojo). Its multi-rank design (an NVMe tier for kept prompt states,
   one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
   that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
 
@@ -129,12 +129,12 @@ bertholomus/TensorFold (a TensorFold fork; design only)
   from it; the code is ours.
 
 Contributions to this project (Apache-2.0, through its issues and pull requests)
-  zig/patches/0014 and later (planned, in progress for ENGINE=zig; none is here yet): Robert Wojciechowski's (wojo,
-  https://github.com/wojo) GLM patches 0088/0110/0111/0118/0119, ported by him to the GLM Zig engine; spill v2's block
-  store follows BadAd84's block-tier design (pull request #118). scripts/port.sh, scripts/memavail.sh,
+  zig/patches/0014 and later (planned, in progress for ENGINE=zig; none is here yet): the GLM patches
+  0088/0110/0111/0118/0119 by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine;
+  spill v2's block store follows BadAd84's block-tier design (pull request #118). scripts/port.sh, scripts/memavail.sh,
   scripts/port-patches.sh and the tools checklib.py, spill_check.py, resume_bench.py, prefix_fanout.py, selftest.py and
-  fake_server.py are by wojo, from his port of the same features to the DeepSeek-V4.1-Flash recipe; tools/exact.py is
-  that recipe's (MiaAI-Lab), with wojo's changes.
+  fake_server.py are by him, from his port of the same features to the DeepSeek-V4.1-Flash recipe; tools/exact.py is
+  that recipe's (MiaAI-Lab), with his changes.
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.
   patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by MiaAI-Lab.
   patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).

@@ -54,13 +54,14 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)), KV sharding (`0118`,
   [#152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)) and the parked pages
   (`0119`, [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149)), authored by
-  **Robert Wojciechowski ([wojo](https://github.com/wojo))** for the Python engine and being ported by him to the GLM
-  Zig engine, after his port of the same features to the DeepSeek-V4.1-Flash Zig engine. Spill v2's block store (the
-  2,048-token block layout, lineage, the write-at-keep ring, release and fsync order) is
-  **[BadAd84](https://github.com/BadAd84)**'s block-tier design (#118). The recipe side (`scripts/port.sh`,
-  `scripts/memavail.sh`, `scripts/port-patches.sh` and their tests) and the client tools `tools/checklib.py`,
-  `spill_check.py`, `resume_bench.py`, `prefix_fanout.py`, `selftest.py` and `fake_server.py` are wojo's, from his
-  DeepSeek recipe port; `tools/exact.py` is the DeepSeek recipe's (MiaAI-Lab), with wojo's eight-stream cases.
+  **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)** for the
+  Python engine and being ported by him to the GLM Zig engine, after his port of the same features to the
+  DeepSeek-V4.1-Flash Zig engine. Spill v2's block store (the 2,048-token block layout, lineage, the write-at-keep
+  ring, release and fsync order) is **[BadAd84](https://github.com/BadAd84)**'s block-tier design (#118). The recipe
+  side (`scripts/port.sh`, `scripts/memavail.sh`, `scripts/port-patches.sh` and their tests) and the client tools
+  `tools/checklib.py`, `spill_check.py`, `resume_bench.py`, `prefix_fanout.py`, `selftest.py` and `fake_server.py`
+  are his, from his DeepSeek recipe port; `tools/exact.py` is the DeepSeek recipe's (MiaAI-Lab), with his
+  eight-stream cases.
 - **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE
   all-gather of the Zig engine implements the RoCEnante protocol of b12x by local-inference-lab, as `0006-cuda-roce-allgather`
   does for the Python engine (below).
@@ -177,8 +178,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   guide and the synthetic speed harness with its tests): by Steve Darlow ([kerpopule](https://github.com/kerpopule)),
   in [PR #52](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/52).
 - `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo)): `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
-  server, in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
+  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X): `tensorfold/cuda/spill.py` and its
+  hooks in the GLM engine, `multi.py` and the server, in
+  [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
   builds on, by its authors: the idea of persisting session state on NVMe per rank was proposed in MiaAI-Lab's
   GLM-5.3-Flash vLLM kit ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232)
   by [gabewillen](https://github.com/gabewillen); the idea only, no code from that AGPL-3.0 project); the multi-rank
