@@ -5,7 +5,8 @@
 # whose own kept state the prompt repeats past its first prompt and the first 32 tokens of the reply to it, ids no other
 # conversation wrote. /health and /metrics count these streams and their prefill (chats_continued,
 # chats_continued_prefill_tokens); rank 0 logs one prefilling 4096 tokens or more, with where the prompt left the kept
-# state and what it resumed from. Builds on 0089-glm-kept-state (Thomas Wade, PR #65). By @wojo. Apache-2.0.
+# state and what it resumed from. Builds on 0089-glm-kept-state (Thomas Wade, PR #65).
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
 index 06f33e7..9eccfff 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
