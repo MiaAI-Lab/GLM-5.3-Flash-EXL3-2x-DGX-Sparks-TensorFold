@@ -1,0 +1,715 @@
+# On top of 0126: TF_GLM_PRX's failures end in bounded time, and an idle proxy sleeps. No new switch to turn on, no
+# change to a bit of any reply (four Sparks cabled as a ring, 2026-10-21: five solo greedy prompts of 5K-13K tokens,
+# identical replies with and without).
+#
+# Failures (cuda/prx_proxy.c): besides a failed completion, a proxy fails when nothing advances for
+#   TF_GLM_PRX_TIMEOUT_S (300) while calls are outstanding, when a neighbour's heartbeat (a counter every proxy writes
+#   to both neighbours every 0.5 s, busy or idle; a dead neighbour also fails that write after the queue pair's
+#   retries) stands still for TF_GLM_PRX_PEER_S (10) while calls are outstanding, when a neighbour's abort arrives, or
+#   when the rank's other channel failed. It then writes its abort to both neighbours (the failure goes round the
+#   ring), moves its queue pairs to the error state and holds every word the GPU can wait on (flags, send_done,
+#   consumed) at posted + 2^30 (CU_STREAM_WAIT_VALUE_GEQ compares cyclically) until prx_destroy: no GPU wait outlives
+#   a failure. prx_post then refuses calls, so the next call raises, and the samplers (multi.sample_streams,
+#   multi_tune.sample_packed, decode.sample_rows) raise once they read a sample (comm.check_prx), before a token
+#   computed after a released wait reaches a client; a failed iteration names the exchange's failure rather than what
+#   the GPU did on the released data (a CUDA error). TF_GLM_PRX_EXIT_S (10) after the failure the process exits
+#   (code 70), so start.sh's FOREGROUND watcher (or a router) restarts the server (0: it stays up, broken, as before).
+#   TF_GLM_PRX_FAULT=R:N (a test): on rank R, call N goes out with a bad rkey. /health shows each channel's calls,
+#   longest wait with calls outstanding, sleeps and failure (prx, prx_share).
+# Idle: a proxy caught up with every posted call (nothing outstanding: nothing can happen before the next prx_post)
+#   sleeps on a futex after TF_GLM_PRX_IDLE_MS (20); prx_post and prx_destroy wake it, and it wakes each second for
+#   its heartbeat. An idle server's two proxy threads a Spark no longer hold a core each (0: they poll, as in 0126).
+
+diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
+index 45ccba2..59d7708 100644
+--- tensorfold/cuda/comm.py
++++ tensorfold/cuda/comm.py
+@@ -33,6 +33,22 @@ def _library() -> ctypes.CDLL:
+     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
+ 
+ 
++def check_prx(comm) -> None:
++    """Raise if a TF_GLM_PRX channel of ``comm`` failed: its proxy released the GPU's waits, so what the GPU computed
++    since is garbage. The samplers call it once they read a sample, before a token goes anywhere."""
++
++    for prx in (getattr(comm, "prx", None), getattr(comm, "prx_share", None)):
++        if prx is not None:
++            prx.check()
++
++
++def prx_health(comm) -> dict:
++    """/health's view of the TF_GLM_PRX channels (``prx.Prx.health``), none without them."""
++
++    channels = {name: getattr(comm, name, None) for name in ("prx", "prx_share")}
++    return {name: prx.health() for name, prx in channels.items() if prx is not None}
++
++
+ class NCCL:
+     def __init__(self, rank: int, world: int, master: str, port: int) -> None:
+         from datetime import timedelta
+diff --git tensorfold/cuda/prx.py tensorfold/cuda/prx.py
+index 053c17e..20cb9df 100644
+--- tensorfold/cuda/prx.py
++++ tensorfold/cuda/prx.py
+@@ -13,7 +13,13 @@ the caller: written into the send slots and the own receive slot, read where the
+ TF_GLM_PRX_SLOT_MB (16) and TF_GLM_PRX_SLOTS (4) size the pinned region (slots x (7 + 1) x slot); TF_GLM_PRX_SHARE=1
+ opens a second channel (its own region, queue pairs and proxy; TF_GLM_PRX_SHARE_MB, 8) for the DSA layers' own-row
+ shares, which then run on a stream of their own (``hcsplit.HcSplit.share``); TF_GLM_PRX_HCA (default
+-NCCL_IB_HCA's devices) names the RDMA functions, each neighbour's pairs found by subnet (``roce.plan_routes``)."""
++NCCL_IB_HCA's devices) names the RDMA functions, each neighbour's pairs found by subnet (``roce.plan_routes``).
++
++A failure (prx_proxy.c: a failed write, TF_GLM_PRX_TIMEOUT_S (300) without progress, a neighbour silent for
++TF_GLM_PRX_PEER_S (10), an abort from a neighbour) releases every wait the GPU has on the exchange, so it computes on
++garbage: the next call raises, and so does ``comm.check_prx`` after the samplers read a sample, before any token
++reaches a client. TF_GLM_PRX_EXIT_S (10) later the process exits (0: it stays, broken). TF_GLM_PRX_IDLE_MS (20): how
++long a caught-up proxy polls before it sleeps until the next call (0: it never sleeps)."""
+ 
+ from __future__ import annotations
+ 
+@@ -63,7 +69,7 @@ def library() -> ctypes.CDLL:
+             ("prx_stat", u64, [p, i]), ("prx_destroy", None, [p])):
+         fn = getattr(lib, name)
+         fn.restype, fn.argtypes = res, args
+-    if lib.prx_abi_version() != 3:
++    if lib.prx_abi_version() != 4:
+         raise RuntimeError("unexpected prx_proxy ABI version")
+     return lib
+ 
+@@ -149,7 +155,6 @@ class Prx:
+             why = lib.prx_error(self.ctx).decode(errors="replace") if self.ctx else ""
+             self.close()
+             raise RuntimeError(f"TF_GLM_PRX could not connect: {why or 'see that rank'}")
+-        self.calls = 0
+ 
+     # -- region offsets (prx_proxy.c's) -------------------------------------------------------------------------
+     def _ctrl(self, line: int) -> int:
+@@ -223,9 +228,6 @@ class Prx:
+             base = self._recv(s, p)
+             self._copy([(into[p][i], lo, hi, base + o) for (i, lo, hi), o in zip(pieces, offs)], out=False)
+         _check(cu.cuStreamWriteValue32_v2(h, self._ctrl(3 * MAX_SLOTS + s), c + 1, 0), "consumed")
+-        self.calls += 1
+-        if self.calls % 64 == 0:
+-            self.check()
+ 
+     def _copy(self, segs, out: bool) -> None:
+         """Byte ranges between tensors and region offsets, (tensor bytes, lo, hi, region offset), on the copy engines
+@@ -254,7 +256,6 @@ class Prx:
+             h = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+             _check(_cu().cuStreamWaitValue32_v2(h, self._ctrl(4 * MAX_SLOTS + s), c - self.slots + 1, 0), "wait")
+             _check(_cu().cuStreamWaitValue32_v2(h, self._ctrl(3 * MAX_SLOTS + s), c - self.slots + 1, 0), "wait")
+-        self.calls += 1
+         return c, s
+ 
+     def _dview(self) -> torch.Tensor:
+@@ -305,11 +306,20 @@ class Prx:
+             raise RuntimeError(f"TF_GLM_PRX failed: {self.lib.prx_error(self.ctx).decode(errors='replace')} "
+                                f"[{self.stats()}]")
+ 
++    def health(self) -> dict:
++        """Calls posted, the longest wait with calls outstanding (against TF_GLM_PRX_TIMEOUT_S), sleeps, failure."""
++
++        if not self.ctx:
++            return {"closed": True}
++        lib, c = self.lib, self.ctx
++        return {"posted": lib.prx_stat(c, 2), "longest_wait_ms": lib.prx_stat(c, 9), "sleeps": lib.prx_stat(c, 10),
++                "failed": bool(lib.prx_failed(c))}
++
+     def stats(self) -> str:
+         if not self.ctx:
+             return "closed"
+         names = ("bytes", "completions", "posted", "sent", "relayed fwd", "relayed bwd", "send done", "freed",
+-                 "mtu enum")
++                 "mtu enum", "longest wait ms", "sleeps", "heartbeats")
+         return ", ".join(f"{n} {self.lib.prx_stat(self.ctx, i)}" for i, n in enumerate(names))
+ 
+     def close(self) -> None:
+diff --git tensorfold/cuda/prx_proxy.c tensorfold/cuda/prx_proxy.c
+index 376c7ff..9238c4a 100644
+--- tensorfold/cuda/prx_proxy.c
++++ tensorfold/cuda/prx_proxy.c
+@@ -13,16 +13,27 @@
+ //   flags           a 4-byte word on its own line after every stripe of every part (the NIC writes it after the
+ //                   data, on the same queue pair, so it is never visible first)
+ //   ctrl            ready[s], consumed[s] (GPU -> proxy, stream memory operations), send_done[s] (proxy -> GPU),
+-//                   credit[2] (a neighbour's freed calls, written by its NIC), the error word
++//                   credit[2] (a neighbour's freed calls, written by its NIC), the error word, beat[2] and abort
++//                   (written by the neighbours' NICs)
+ // A call c with M bytes for each peer: to the next rank its block (recv[from prev] there) and the first half of the
+ // across block (relay forward there); to the previous its block and the second half (relay backward). Each neighbour
+ // relays its half to the across rank. A rank writes call c into a neighbour's slot only once that neighbour has
+ // freed call c - slots (its GPU copied it out, its relays of it done): ``credit``. Every wait is on an earlier call,
+ // so the exchange cannot deadlock while every rank posts the same calls in the same order.
++//
++// Failures: a failed completion, no progress for TF_GLM_PRX_TIMEOUT_S while calls are outstanding, a neighbour whose
++// heartbeat (a counter its proxy writes here every PRX_BEAT_NS) stands still for TF_GLM_PRX_PEER_S, a neighbour's
++// abort or another channel's failure. The proxy then writes its abort to both neighbours, moves its queue pairs to the
++// error state and keeps every word the GPU can wait on (flags, send_done, consumed) at a value past all its waits
++// until prx_destroy; prx_post refuses calls, so the host raises. After TF_GLM_PRX_EXIT_S the process exits (the
++// ranks cannot agree any more; a supervisor restarts them).
++// Idle: caught up with every posted call (nothing outstanding), nothing can happen before the next prx_post, so after
++// TF_GLM_PRX_IDLE_MS the proxy sleeps on a futex that prx_post and prx_destroy wake (every second: a heartbeat).
+ 
+ #define _GNU_SOURCE
+ #include <errno.h>
+ #include <infiniband/verbs.h>
++#include <linux/futex.h>
+ #include <pthread.h>
+ #include <sched.h>
+ #include <stdatomic.h>
+@@ -30,8 +41,11 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
+ 
+-#define PRX_ABI 3
++#define PRX_ABI 4
+ #define PRX_MAX_HCAS 4
+ #define PRX_MAX_STRIPES 2
+ #define PRX_MAX_SLOTS 8
+@@ -53,6 +67,14 @@
+ #define KIND_RELAY_FWD 2
+ #define KIND_RELAY_BWD 3
+ #define KIND_CREDIT 4
++#define KIND_BEAT 5
++#define KIND_ABORT 6
++#define NS 1000000000ull
++#define PRX_BEAT_NS (NS / 2)
++#define PRX_NAP_NS (NS / 1000)                // between re-releases after a failure
++// a value past every wait the GPU can have pending: those are within PRX_QCAP + slots calls of ``posted``, and
++// CU_STREAM_WAIT_VALUE_GEQ compares cyclically ((int32_t)(*addr - value) >= 0)
++#define PRX_PAST (1u << 30)
+ 
+ typedef struct {
+     uint64_t region_addr;
+@@ -99,8 +121,15 @@ typedef struct {
+     int ring_ag;                          // TF_GLM_PRX_RINGAG: an all-gather's across halves relayed from the block
+     uint32_t send_pending[PRX_QCAP], relay_pending[2][PRX_QCAP];
+     uint64_t send_done, relay_done[2], freed, reported;
++    uint32_t inflight;                    // signaled exchange writes (sends, relays, credits) not yet completed
+     pthread_t thread;
+     atomic_int running, failed;
++    _Atomic uint32_t wake;                // the futex word an idle proxy sleeps on
++    atomic_int sleeping;
++    uint64_t timeout_ns, peer_ns, exit_ns, idle_ns, fault_call;
++    uint64_t progress_ns, longest_ns, beat_ns, seen_ns[2];
++    uint32_t beats, seen[2], origin;     // origin: as CTRL_ABORT
++    int beat_out[2];                      // link L's last heartbeat not completed yet
+     uint64_t stat[8];
+     char err[512];
+ } prx_ctx_t;
+@@ -111,7 +140,9 @@ typedef struct {
+ #define CTRL_SEND_DONE (4 * PRX_MAX_SLOTS)
+ #define CTRL_CREDIT (5 * PRX_MAX_SLOTS)   // [2]: credit[NEXT] written by the next rank, credit[PREV] by the previous
+ #define CTRL_ERROR (5 * PRX_MAX_SLOTS + 2)
+-#define CTRL_LINES (5 * PRX_MAX_SLOTS + 4)
++#define CTRL_BEAT (5 * PRX_MAX_SLOTS + 4) // [2]: heartbeats, as credit
++#define CTRL_ABORT (5 * PRX_MAX_SLOTS + 6) // a neighbour's abort: the rank where it started, plus one
++#define CTRL_LINES (5 * PRX_MAX_SLOTS + 8)
+ #define FLAG_PARTS 6                      // 4 recv parts, then relay FWD and BWD
+ #define FLAG_RELAY(dir) (4 + (dir))
+ 
+@@ -156,11 +187,43 @@ static int nbr(prx_ctx_t *c, int L) {
+     return L == NEXT ? (c->rank + 1) % c->world : (c->rank + c->world - 1) % c->world;
+ }
+ 
+-static void fail(prx_ctx_t *c, const char *fmt, int e) {
+-    if (!atomic_exchange(&c->failed, 1)) {
+-        snprintf(c->err, sizeof(c->err), "%s%s%s", fmt, e ? ": " : "", e ? strerror(e) : "");
+-        *ctrl_word(c, CTRL_ERROR) = 1;
++static atomic_int any_failed;            // a channel of this process failed: the others stop too
++static _Atomic uint32_t any_origin;      // that failure's origin (CTRL_ABORT's value)
++
++// the first failure's message; written before ``failed``, which the host reads first
++static void fail(prx_ctx_t *c, const char *what, int e) {
++    if (atomic_load(&c->failed)) return;
++    snprintf(c->err, sizeof(c->err), "%s%s%s", what, e ? ": " : "", e ? strerror(e) : "");
++    if (!c->origin) c->origin = (uint32_t)c->rank + 1;
++    *ctrl_word(c, CTRL_ERROR) = 1;
++    atomic_store(&c->failed, 1);
++}
++
++static uint64_t now_ns(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * NS + (uint64_t)t.tv_nsec;
++}
++
++static long futex(_Atomic uint32_t *word, int op, uint32_t v, const struct timespec *timeout) {
++    return syscall(SYS_futex, (uint32_t *)word, op, v, timeout, NULL, 0);
++}
++
++static void wake(prx_ctx_t *c) {
++    atomic_fetch_add(&c->wake, 1);
++    futex(&c->wake, FUTEX_WAKE_PRIVATE, 1, NULL);
++}
++
++// an env setting in seconds (scale 1) or ms (scale 1000), 0: off; -1 (setup fails) when not a number >= 0
++static int64_t env_ns(const char *name, double fallback, double scale) {
++    const char *v = getenv(name);
++    double x = fallback;
++    if (v && *v) {
++        char *end;
++        x = strtod(v, &end);
++        if (end == v || *end || !(x >= 0 && x <= 86400 * scale)) return -1;
+     }
++    return (int64_t)(x * (double)NS / scale);
+ }
+ 
+ uint64_t prx_blob_bytes(void) { return sizeof(prx_blob_t); }
+@@ -244,6 +307,27 @@ prx_ctx_t *prx_create(int world, int rank, int slots, uint64_t M, const char *co
+     for (int h = 0; h < n_hca; h++) c->gid_index[h] = gid_index[h];
+     const char *rag = getenv("TF_GLM_PRX_RINGAG");
+     c->ring_ag = rag && rag[0] == '1';
++    const char *names_ns[4] = {"TF_GLM_PRX_TIMEOUT_S", "TF_GLM_PRX_PEER_S", "TF_GLM_PRX_EXIT_S", "TF_GLM_PRX_IDLE_MS"};
++    int64_t ns[4] = {env_ns(names_ns[0], 300, 1), env_ns(names_ns[1], 10, 1), env_ns(names_ns[2], 10, 1),
++                     env_ns(names_ns[3], 20, 1000)};
++    for (int i = 0; i < 4; i++)
++        if (ns[i] < 0) {
++            snprintf(err, err_len, "%s: a number of %s (0: off), not '%s'", names_ns[i], i == 3 ? "ms" : "seconds",
++                     getenv(names_ns[i]));
++            free(c);
++            return NULL;
++        }
++    c->timeout_ns = (uint64_t)ns[0]; c->peer_ns = (uint64_t)ns[1]; c->exit_ns = (uint64_t)ns[2];
++    c->idle_ns = (uint64_t)ns[3];
++    // TF_GLM_PRX_FAULT=R:N (a test): on rank R, call N's sends go out with a bad rkey
++    c->fault_call = UINT64_MAX;
++    const char *fault = getenv("TF_GLM_PRX_FAULT");
++    int fr = -1;
++    unsigned long long fc = 0;
++    if (fault && *fault && sscanf(fault, "%d:%llu", &fr, &fc) == 2 && fr == rank) {
++        c->fault_call = fc;
++        fprintf(stderr, "[tensorfold] TF_GLM_PRX_FAULT: rank %d's call %llu goes out with a bad rkey\n", rank, fc);
++    }
+     for (int h = 0; h < n_hca; h++)
+         if (open_hca(c, h, names[h])) { snprintf(err, err_len, "%s", c->err); free(c); return NULL; }
+     const int *p = links;
+@@ -339,7 +423,9 @@ int prx_connect(prx_ctx_t *c, const void *blobs, uint64_t len) {
+     return 0;
+ }
+ 
++// the exchange's completions (heartbeats not counted), or -1
+ static int drain(prx_ctx_t *c) {
++    int done = 0;
+     for (int h = 0; h < c->n_hca; h++) {
+         struct ibv_wc wc[64];
+         int n = ibv_poll_cq(c->hca[h].cq, 64, wc);
+@@ -350,26 +436,32 @@ static int drain(prx_ctx_t *c) {
+             int kind = (int)(id & 0xf), L = (int)((id >> 4) & 1), s = (int)((id >> 5) & 3), two = (int)((id >> 7) & 1);
+             uint64_t call = id >> 8;
+             if (wc[i].status != IBV_WC_SUCCESS) {
+-                snprintf(c->err, sizeof(c->err),
+-                         "prx: RDMA write (kind %d, link %d, call %llu) failed: %s (vendor 0x%x)",
+-                         kind, L, (unsigned long long)call, ibv_wc_status_str(wc[i].status), wc[i].vendor_err);
+-                atomic_store(&c->failed, 1);
+-                *ctrl_word(c, CTRL_ERROR) = 1;
++                char why[256];
++                snprintf(why, sizeof(why), "prx: RDMA write to rank %d (kind %d, link %d, call %llu) failed: %s "
++                         "(vendor 0x%x)", nbr(c, L), kind, L, (unsigned long long)call,
++                         ibv_wc_status_str(wc[i].status), wc[i].vendor_err);
++                fail(c, why, 0);
+                 return -1;
+             }
+             c->link[L].outstanding[s] -= 1 + two;
++            if (kind == KIND_BEAT) {
++                c->beat_out[L] = 0;
++                continue;
++            }
++            c->inflight--;
+             if (kind == KIND_SEND) c->send_pending[call % PRX_QCAP]--;
+             else if (kind == KIND_RELAY_FWD) c->relay_pending[FWD][call % PRX_QCAP]--;
+             else if (kind == KIND_RELAY_BWD) c->relay_pending[BWD][call % PRX_QCAP]--;
+             c->stat[1]++;
++            done++;
+         }
+     }
+-    return 0;
++    return done;
+ }
+ 
+ static int room(prx_ctx_t *c, int L, int s, int need) {
+     while (c->link[L].outstanding[s] + need > PRX_DEPTH - 4) {
+-        if (drain(c)) return -1;
++        if (drain(c) < 0) return -1;
+         if (!atomic_load_explicit(&c->running, memory_order_relaxed)) return -1;
+     }
+     return 0;
+@@ -388,17 +480,19 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
+         struct ibv_send_wr wr[2], *bad = NULL;
+         struct ibv_sge sge;
+         memset(wr, 0, sizeof(wr));
++        uint64_t id = (call << 8) | ((uint64_t)s << 5) | ((uint64_t)L << 4) | (uint64_t)kind;
++        uint32_t rkey = k->rkey[s] ^ (kind == KIND_SEND && call == c->fault_call ? 0xffu : 0u);
+         int first = 0;
+         if (hi > lo) {
+             sge.addr = (uint64_t)(uintptr_t)(c->region + from + lo);
+             sge.length = (uint32_t)(hi - lo);
+             sge.lkey = c->hca[k->hca[s]].mr->lkey;
+-            wr[0].wr_id = 0;
++            wr[0].wr_id = id;                 // completes only in error
+             wr[0].sg_list = &sge;
+             wr[0].num_sge = 1;
+             wr[0].opcode = IBV_WR_RDMA_WRITE;
+             wr[0].wr.rdma.remote_addr = k->peer_addr + to + lo;
+-            wr[0].wr.rdma.rkey = k->rkey[s];
++            wr[0].wr.rdma.rkey = rkey;
+             wr[0].next = &wr[1];
+         } else {
+             first = 1;
+@@ -408,17 +502,17 @@ static int post_part(prx_ctx_t *c, int L, uint64_t from, uint64_t to, uint64_t n
+         fs.addr = (uint64_t)(uintptr_t)&val;
+         fs.length = 4;
+         fs.lkey = 0;
+-        wr[1].wr_id = (call << 8) | ((uint64_t)(first == 0) << 7) | ((uint64_t)s << 5) | ((uint64_t)L << 4) |
+-                      (uint64_t)kind;
++        wr[1].wr_id = id | ((uint64_t)(first == 0) << 7);
+         wr[1].sg_list = &fs;
+         wr[1].num_sge = 1;
+         wr[1].opcode = IBV_WR_RDMA_WRITE;
+         wr[1].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+         wr[1].wr.rdma.remote_addr = k->peer_addr + flag_off(c, slot, part, s);
+-        wr[1].wr.rdma.rkey = k->rkey[s];
++        wr[1].wr.rdma.rkey = rkey;
+         int rc = ibv_post_send(k->qp[s], &wr[first], &bad);
+         if (rc) { fail(c, "ibv_post_send", rc); return -1; }
+         k->outstanding[s] += 2 - first;
++        c->inflight++;
+         if (kind == KIND_SEND) c->send_pending[call % PRX_QCAP]++;
+         else if (kind == KIND_RELAY_FWD) c->relay_pending[FWD][call % PRX_QCAP]++;
+         else if (kind == KIND_RELAY_BWD) c->relay_pending[BWD][call % PRX_QCAP]++;
+@@ -565,6 +659,7 @@ static int step_done(prx_ctx_t *c) {
+             int rc = ibv_post_send(k->qp[0], &wr, &bad);
+             if (rc) { fail(c, "ibv_post_send(credit)", rc); return -1; }
+             k->outstanding[0]++;
++            c->inflight++;
+         }
+         c->reported = c->freed;
+         did = 1;
+@@ -572,20 +667,187 @@ static int step_done(prx_ctx_t *c) {
+     return did;
+ }
+ 
++// a 4-byte inline write of v to the neighbour on link L, its stripe s's queue pair, at its ctrl line
++static int post_word(prx_ctx_t *c, int L, int s, int line, uint32_t v, int kind) {
++    prx_link_t *k = &c->link[L];
++    struct ibv_sge fs = {.addr = (uint64_t)(uintptr_t)&v, .length = 4, .lkey = 0};
++    struct ibv_send_wr wr, *bad = NULL;
++    memset(&wr, 0, sizeof(wr));
++    wr.wr_id = ((uint64_t)s << 5) | ((uint64_t)L << 4) | (uint64_t)kind;
++    wr.sg_list = &fs;
++    wr.num_sge = 1;
++    wr.opcode = IBV_WR_RDMA_WRITE;
++    wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
++    wr.wr.rdma.remote_addr = k->peer_addr + (uint64_t)line * PRX_LINE;
++    wr.wr.rdma.rkey = k->rkey[s];
++    int rc = ibv_post_send(k->qp[s], &wr, &bad);
++    if (!rc) k->outstanding[s]++;
++    return rc;
++}
++
++// every PRX_BEAT_NS, busy or idle: a counter to each neighbour (it watches it while it has calls outstanding); a dead
++// neighbour fails the write after the queue pair's retries
++static int beat(prx_ctx_t *c, uint64_t t) {
++    if (t - c->beat_ns < PRX_BEAT_NS) return 0;
++    c->beat_ns = t;
++    c->beats++;
++    for (int L = 0; L < 2; L++) {
++        if (c->beat_out[L] || c->link[L].outstanding[0] + 1 > PRX_DEPTH - 4) continue;
++        int rc = post_word(c, L, 0, CTRL_BEAT + (L == NEXT ? PREV : NEXT), c->beats, KIND_BEAT);
++        if (rc) { fail(c, "ibv_post_send(heartbeat)", rc); return -1; }
++        c->beat_out[L] = 1;
++    }
++    return 0;
++}
++
++// while calls are outstanding: progress within TF_GLM_PRX_TIMEOUT_S, each neighbour's heartbeat within _PEER_S
++static int watch(prx_ctx_t *c, uint64_t t) {
++    char why[160];
++    for (int L = 0; L < 2; L++) {
++        uint32_t h = *ctrl_word(c, CTRL_BEAT + L);
++        if (h != c->seen[L]) {
++            c->seen[L] = h;
++            c->seen_ns[L] = t;
++        } else if (c->peer_ns && t - c->seen_ns[L] > c->peer_ns) {
++            snprintf(why, sizeof(why), "prx: no heartbeat from rank %d for %.0f s (TF_GLM_PRX_PEER_S): it is stopped "
++                     "or gone", nbr(c, L), (double)(t - c->seen_ns[L]) / NS);
++            fail(c, why, 0);
++            return -1;
++        }
++    }
++    if (c->timeout_ns && t - c->progress_ns > c->timeout_ns) {
++        snprintf(why, sizeof(why), "prx: no progress for %.0f s with calls outstanding (TF_GLM_PRX_TIMEOUT_S)",
++                 (double)(t - c->progress_ns) / NS);
++        fail(c, why, 0);
++        return -1;
++    }
++    return 0;
++}
++
++static void release(prx_ctx_t *c) {
++    uint32_t past = (uint32_t)atomic_load(&c->posted) + PRX_PAST;
++    for (int s = 0; s < c->slots; s++) {
++        for (int part = 0; part < FLAG_PARTS; part++)
++            for (int st = 0; st < PRX_MAX_STRIPES; st++)
++                *(volatile uint32_t *)(c->region + flag_off(c, s, part, st)) = past;
++        *ctrl_word(c, CTRL_SEND_DONE + s) = past;
++        *ctrl_word(c, CTRL_CONSUMED + s) = past;
++    }
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++}
++
++// drops every completion; returns those of ``kind``
++static int discard(prx_ctx_t *c, int kind) {
++    int n = 0;
++    for (int h = 0; h < c->n_hca; h++) {
++        struct ibv_wc wc[64];
++        int got = ibv_poll_cq(c->hca[h].cq, 64, wc);
++        for (int i = 0; i < got; i++) n += (int)(wc[i].wr_id & 0xf) == kind;
++    }
++    return n;
++}
++
++// after a failure, until prx_destroy: abort the neighbours, stop their writes here (the GPU's own consumed writes
++// may also lower a word again), keep the GPU's waits released
++static void hold(prx_ctx_t *c) {
++    uint32_t none = 0;
++    atomic_compare_exchange_strong(&any_origin, &none, c->origin);
++    atomic_store(&any_failed, 1);
++    uint64_t t0 = now_ns();
++    fprintf(stderr, "[tensorfold] TF_GLM_PRX failed on rank %d: %s; the GPU's waits are released%s\n", c->rank, c->err,
++            c->exit_ns ? ", the process exits soon (TF_GLM_PRX_EXIT_S)" : "");
++    int aborts = 0;
++    for (int L = 0; L < 2; L++)
++        for (int s = 0; s < c->link[L].n; s++) aborts += !post_word(c, L, s, CTRL_ABORT, c->origin, KIND_ABORT);
++    while (aborts > 0 && now_ns() - t0 < NS / 5) aborts -= discard(c, KIND_ABORT);
++    struct ibv_qp_attr a = {.qp_state = IBV_QPS_ERR};
++    for (int L = 0; L < 2; L++)
++        for (int s = 0; s < c->link[L].n; s++) ibv_modify_qp(c->link[L].qp[s], &a, IBV_QP_STATE);
++    struct timespec nap = {0, PRX_NAP_NS};
++    while (atomic_load(&c->running)) {
++        release(c);
++        discard(c, KIND_ABORT);
++        if (c->exit_ns && now_ns() - t0 >= c->exit_ns) {
++            fprintf(stderr, "[tensorfold] TF_GLM_PRX failed on rank %d %.0f s ago: exiting (TF_GLM_PRX_EXIT_S)\n",
++                    c->rank, (double)(now_ns() - t0) / NS);
++            _exit(70);
++        }
++        nanosleep(&nap, NULL);
++    }
++}
++
++// every posted call sent, relayed both ways, freed and reported, nothing in flight (send_done <= next_send and
++// freed <= relay_done <= relay_next <= posted): nothing can happen here before the next prx_post
++static int caught_up(prx_ctx_t *c, uint64_t posted) {
++    return c->send_done == posted && c->freed == posted && c->reported == c->freed && c->inflight == 0;
++}
++
++// caught up for TF_GLM_PRX_IDLE_MS: sleep until prx_post or prx_destroy wakes it, or a second for the heartbeat.
++// ``sleeping`` is set before ``posted`` is read again and prx_post stores ``posted`` before it reads ``sleeping``
++// (both sequentially consistent), so one of the two sees the other: a post is never missed
++static void nap(prx_ctx_t *c, uint64_t posted) {
++    uint32_t w = atomic_load(&c->wake);
++    atomic_store(&c->sleeping, 1);
++    if (atomic_load(&c->posted) == posted && atomic_load(&c->running) && !*ctrl_word(c, CTRL_ABORT) &&
++        !atomic_load(&any_failed)) {
++        struct timespec second = {1, 0};
++        futex(&c->wake, FUTEX_WAIT_PRIVATE, w, &second);
++        c->stat[2]++;
++    }
++    atomic_store(&c->sleeping, 0);
++}
++
+ static void *proxy_main(void *arg) {
+     prx_ctx_t *c = arg;
+-    uint64_t idle = 0;
++    uint64_t t = now_ns(), idle_since = t, spins = 0;
++    c->progress_ns = c->beat_ns = c->seen_ns[0] = c->seen_ns[1] = t;
+     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
+-        int a = step_sends(c), b = step_relays(c), d = drain(c), e = step_done(c);
+-        if (a < 0 || b < 0 || d < 0 || e < 0) {
+-            if (!c->err[0]) snprintf(c->err, sizeof(c->err), "prx: proxy stopped");
+-            atomic_store(&c->failed, 1);
+-            *ctrl_word(c, CTRL_ERROR) = 1;
++        // first: a neighbour's abort lands before that neighbour's queue pairs fail this rank's writes
++        uint32_t origin = *ctrl_word(c, CTRL_ABORT);
++        if (origin) {
++            char why[128];
++            snprintf(why, sizeof(why), "prx: rank %u failed and its abort reached this rank", origin - 1);
++            c->origin = origin;
++            fail(c, why, 0);
++            break;
++        }
++        if (atomic_load_explicit(&any_failed, memory_order_relaxed)) {
++            c->origin = atomic_load(&any_origin);
++            fail(c, "prx: another TF_GLM_PRX channel of this rank failed", 0);
+             break;
+         }
+-        if (a || b || e) idle = 0;
+-        else if (++idle > 1000000) sched_yield();
++        int a = step_sends(c), b = step_relays(c), d = drain(c), e = step_done(c);
++        if (a < 0 || b < 0 || d < 0 || e < 0) break;
++        t = now_ns();
++        if (beat(c, t)) break;
++        uint64_t posted = atomic_load_explicit(&c->posted, memory_order_acquire);
++        if (a || b || d || e) {
++            uint64_t gap = t - c->progress_ns;
++            if (gap > c->longest_ns) {
++                c->longest_ns = gap;
++                if (gap > NS)
++                    fprintf(stderr, "[tensorfold] TF_GLM_PRX rank %d: %.1f s without progress before call %llu, the "
++                            "longest so far (TF_GLM_PRX_TIMEOUT_S %.0f)\n", c->rank, (double)gap / NS,
++                            (unsigned long long)c->next_send, (double)c->timeout_ns / NS);
++            }
++            c->progress_ns = idle_since = t;
++            spins = 0;
++        } else if (!caught_up(c, posted)) {
++            idle_since = t;
++            if (watch(c, t)) break;
++        } else {
++            if (c->idle_ns && t - idle_since >= c->idle_ns) {
++                nap(c, posted);
++                t = now_ns();
++            } else if (!c->idle_ns && ++spins > 1000000) {
++                sched_yield();
++            }
++            c->progress_ns = c->seen_ns[0] = c->seen_ns[1] = t;
++            c->seen[0] = *ctrl_word(c, CTRL_BEAT + 0);
++            c->seen[1] = *ctrl_word(c, CTRL_BEAT + 1);
++        }
+     }
++    if (atomic_load(&c->failed)) hold(c);
+     return NULL;
+ }
+ 
+@@ -596,13 +858,15 @@ int prx_start(prx_ctx_t *c) {
+ }
+ 
+ // the next call (its sequence number): M bytes for each peer (a multiple of 16, at most the slot's), shared: one
+-// payload for every peer; -1 when the queue is full (the GPU is that far behind)
++// payload for every peer; -1 when the queue is full (the GPU is that far behind) or the exchange failed
+ int64_t prx_post(prx_ctx_t *c, uint64_t bytes, int shared) {
+     uint64_t call = atomic_load_explicit(&c->posted, memory_order_relaxed);
+-    if (bytes > c->M || bytes % 16 || call - c->send_done >= PRX_QCAP - 2 * PRX_MAX_SLOTS) return -1;
++    if (atomic_load(&c->failed) || bytes > c->M || bytes % 16 || call - c->send_done >= PRX_QCAP - 2 * PRX_MAX_SLOTS)
++        return -1;
+     c->desc[call % PRX_QCAP].bytes = (uint32_t)bytes;
+     c->desc[call % PRX_QCAP].shared = (uint32_t)(shared != 0);
+-    atomic_store_explicit(&c->posted, call + 1, memory_order_release);
++    atomic_store(&c->posted, call + 1);
++    if (atomic_load(&c->sleeping)) wake(c);
+     return (int64_t)call;
+ }
+ 
+@@ -620,13 +884,19 @@ uint64_t prx_stat(prx_ctx_t *c, int i) {
+         case 6: return c->send_done;
+         case 7: return c->freed;
+         case 8: return (uint64_t)c->hca[0].mtu;
++        case 9: return c->longest_ns / 1000000;
++        case 10: return c->stat[2];
++        case 11: return c->beats;
+         default: return 0;
+     }
+ }
+ 
+ void prx_destroy(prx_ctx_t *c) {
+     if (!c) return;
+-    if (atomic_exchange(&c->running, 0)) pthread_join(c->thread, NULL);
++    if (atomic_exchange(&c->running, 0)) {
++        wake(c);
++        pthread_join(c->thread, NULL);
++    }
+     for (int L = 0; L < 2; L++)
+         for (int s = 0; s < c->link[L].n; s++)
+             if (c->link[L].qp[s]) ibv_destroy_qp(c->link[L].qp[s]);
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 9998a2e..9887e59 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -9,6 +9,7 @@ from typing import Sequence
+ import numpy as np
+ import torch
+ 
++from tensorfold.cuda.comm import check_prx
+ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+@@ -131,8 +132,10 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+     greedy = sampling is None or sampling.temperature <= 0
+     if not greedy and not sampling.top_k:           # top_k off: the shared nucleus rule over every rank's shard
+         gather = one_rank if w.comm is None else comm_gather(w.comm)
+-        return nucleus_rows(logits, positions, sampling, offset=w.vocab_offset if offset is None else offset,
+-                            gather=gather if vote is None else vote.gather(gather), probs=probs)
++        chosen = nucleus_rows(logits, positions, sampling, offset=w.vocab_offset if offset is None else offset,
++                              gather=gather if vote is None else vote.gather(gather), probs=probs)
++        check_prx(w.comm)
++        return chosen
+     k = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
+     if probs is not None and greedy:
+         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
+@@ -161,6 +164,7 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+         chosen = choose_rows(values, tokens, positions, sampling)
+     if probs is not None:
+         probs.extend(_probability(values, tokens, chosen, sampling))
++    check_prx(w.comm)
+     return chosen
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 1027a78..5e602cc 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -46,6 +46,7 @@ from typing import Any, Callable, Sequence
+ import numpy as np
+ import torch
+ 
++from tensorfold.cuda.comm import check_prx, prx_health
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.server.errors import CapacityError  # TFCAP-0075
+ from tensorfold.cuda.streams import Stream, next_fill
+@@ -392,6 +393,7 @@ def sample_streams(w, parts: Sequence[tuple]) -> list[list[int]]:
+         if out[k] is None:
+             out[k] = nucleus_rows(logits, positions, sampling, offset=w.vocab_offset,
+                                   gather=one_rank if w.comm is None else comm_gather(w.comm))
++    check_prx(w.comm)
+     return out
+ 
+ 
+@@ -603,6 +605,7 @@ class MultiDecoder:
+                 },
+                 **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"spill": self.disk.info()} if self.disk is not None else {}),
++                **prx_health(self.w.comm),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -1678,6 +1681,7 @@ class MultiDecoder:
+             return self._iterate()
+         except Exception as exc:
+             self.broken = exc
++            check_prx(self.w.comm)                        # a failed exchange is the cause of what the GPU did next
+             raise
+ 
+     def _fill_turn(self) -> Lane | None:
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+index 587d644..6922848 100644
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -148,6 +148,7 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
+     ``NUCLEUS`` best (value, id, mass), its shard's mass and width. Row by row the arithmetic is ``nucleus_rows``' and
+     ``sample_rows``'; a nucleus part some row of which runs past the candidates reads whole shards on its own."""
+ 
++    from tensorfold.cuda.comm import check_prx
+     from tensorfold.cuda.sampling import MASS, NUCLEUS, WIDER, _draw, _shares, comm_gather, one_rank, union_cover
+     from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
+@@ -230,6 +231,7 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
+                               positions, sampling)
+             out[k] = [token for token, _ in drawn]
+             r0 += R
++    check_prx(w.comm)
+     return out
+ 
+ 
