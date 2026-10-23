@@ -39,6 +39,12 @@ g checkout -q -b t/aot "$B"; mkdir -p "$eng/zig/tests/cuda/glm_p1/aot"; echo x >
 g add zig/tests/cuda/glm_p1/aot/extra.json; edit aot; g commit -q -m "glm_cuda: a new kernel capture"
 g checkout -q -b t/notes "$B"; mkdir -p "$eng/docs/glm-port"; echo notes > "$eng/docs/glm-port/x.md"; g add docs/glm-port/x.md
 g commit -q -m "docs/glm-port: notes only"
+g checkout -q -b t/credits "$B"; edit credits
+g commit -q -m "glm_cuda: a shard commit beside spill v2's tests
+
+Touches nothing of the spill design.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); GLM patch 0118."
 g checkout -q -b t/msg "$B"; edit msg; g commit -q -m "glm_cuda: a message that quotes a diff
 
 --- a/x
@@ -47,6 +53,9 @@ g checkout -q -b t/msg "$B"; edit msg; g commit -q -m "glm_cuda: a message that 
 # a copy of this recipe's script, pins and patches: the writes land there
 rec=$tmp/recipe; mkdir -p "$rec/scripts" "$rec/zig"
 cp "$here/port-patches.sh" "$here/config.sh" "$rec/scripts/"; cp -R "$root/zig/patches" "$rec/zig/"
+# without the patches this recipe exported (0014 and later): the checks start from the hand-written ones
+for f in "$rec"/zig/patches/*.patch; do head -n 1 "$f" | grep -q '^# port-patches.sh:' && rm -f -- "$f"; done
+grep -v '^[|] .*<!-- port-patches -->' "$root/zig/patches/README.md" > "$rec/zig/patches/README.md"
 pp() { /bin/bash "$rec/scripts/port-patches.sh" --engine "$eng" --base "$B" "$@" 2>&1; }
 
 # check_ <name> <script>: the script in a subshell (with $out from it); exit 0 passes
@@ -74,6 +83,13 @@ check_ "one commit: 0014, its header (marker, message, credits with BadAd84 for 
   grep -qx "Apply from the checkout root with: git apply 0014-zig-glm-test.patch" "$p"
   [[ "$(grep -c "^diff --git " "$p")" == 1 ]]
   has "$out" "| \`0014-zig-glm-test.patch\` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84]"'
+check_ "a message with its own credits paragraph: kept as written, no second line, BadAd84 only where it names him" '
+  out=$(pp --dry-run --keep --branch t/credits --name t/credits=credits) || { echo "$out"; exit 1; }
+  d=$(kept "$out"); trap "rm -rf -- \"$d\"" EXIT; p=$d/out/0014-zig-credits.patch
+  [[ "$(grep -c "^Credits:" "$p")" == 1 ]] || { grep Credits "$p"; exit 1; }
+  ! grep -q BadAd84 "$p" || exit 1
+  grep "<!-- port-patches -->" <<<"$out" | grep -q BadAd84 && { echo "$out"; exit 1; }
+  has "$out" "| \`0014-zig-credits.patch\` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) |"'
 check_ "two commits: 0014 and 0015, one named, one from its subject; no BadAd84 without spill" '
   out=$(pp --dry-run --keep --branch t/two --name t/two~1=first) || { echo "$out"; exit 1; }
   d=$(kept "$out"); trap "rm -rf -- \"$d\"" EXIT
@@ -124,6 +140,11 @@ check_ "write: one export, then a second replaces it (README rows rewritten, han
   # the base alone again: nothing exported, the earlier export stays (and says so)
   out=$(pp --branch t/base) || { echo "$out"; exit 1; }; has "$out" "stay as they are"
   [[ -f "$rec/zig/patches/0015-zig-glm-cuda-second-of-two.patch" ]]'
+check_ "write: a re-export without --name keeps each commit's patch name" '
+  out=$(pp --branch t/two --name t/two~1=first-one --name t/two=second-one) || { echo "$out"; exit 1; }
+  out=$(pp --branch t/two) || { echo "$out"; exit 1; }
+  [[ "$(cd "$rec/zig/patches" && ls 001[4-9]*)" == "0014-zig-first-one.patch
+0015-zig-second-one.patch" ]] || { ls "$rec/zig/patches"; exit 1; }'
 check_ "write: a new hand-written 0014 moves the export after it (once the base contains it)" '
   # the base with a hand-written 0014: one more commit on the base, and its diff as the patch
   g checkout -q -b t/base2 "$B"; edit hand; g commit -q -m "hand-written fix"

@@ -21,11 +21,12 @@
 #                                [--name [REV=]SLUG]... [--title TEXT] [--exclude PATH]... [--keep]
 #   --dry-run         build and check the patches in a temporary folder, print what would change, write nothing
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-glm)
-#   --branch REF      what to export (default glm/integration)
+#   --branch REF      what to export (default glm/series: the port's per-feature commits)
 #   --base REF        what it is relative to: ZIG_TF_REF plus the hand-written patches (default glm/zig-engine-base)
 #   --mode            commits (default: one patch per first-parent commit) or squash (one patch for BASE..BRANCH)
-#   --name REV=SLUG   commits: the patch of commit REV is NNNN-zig-SLUG.patch (repeatable; a commit without one is named
-#                     from its subject); squash: --name SLUG (default glm-port)
+#   --name REV=SLUG   commits: the patch of commit REV is NNNN-zig-SLUG.patch (repeatable; a commit without one keeps
+#                     the name of the patch already exported from it, else is named from its subject); squash: --name
+#                     SLUG (default glm-port)
 #   --title TEXT      squash: the patch's first header line (default: the port's summary)
 #   --exclude PATH    leave PATH out of the patches and the comparisons as well (repeatable)
 #   --keep            keep the temporary folder (printed) for inspection
@@ -66,7 +67,7 @@ slug() {
 # Sourced with PORT_PATCHES_LIB=1 (scripts/port_test.sh): define the helpers above and stop here
 [[ "${PORT_PATCHES_LIB:-0}" != 1 ]] || return 0
 
-engine="$HOME/GitHub/tensorfold-glm"; branch=glm/integration; base=glm/zig-engine-base; mode=commits
+engine="$HOME/GitHub/tensorfold-glm"; branch=glm/series; base=glm/zig-engine-base; mode=commits
 title="GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continued chats, KV sharding, parked pages) by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine"
 dry=0; keep=0; excludes=(zig/tests/cuda/glm_p1/aot docs/glm-port); names=()
 AOT=zig/tests/cuda/glm_p1/aot
@@ -116,6 +117,10 @@ for x in ${names[@]+"${names[@]}"}; do
     bare=$s
   fi
 done
+old_name() {  # <commit>: the slug of the exported patch already here that came from it, or nothing
+  local i
+  for i in ${old_shas[@]+"${!old_shas[@]}"}; do [[ "$1" != "${old_shas[$i]}"* ]] || { echo "${old_slugs[$i]}"; return; }; done
+}
 name_of() {  # <commit>: its --name slug, or nothing
   local i
   for i in ${name_shas[@]+"${!name_shas[@]}"}; do [[ "${name_shas[$i]}" != "$1" ]] || { echo "${name_slugs[$i]}"; return; }; done
@@ -123,9 +128,16 @@ name_of() {  # <commit>: its --name slug, or nothing
 
 # the patches already there: hand-written ones stay and set the next number; exported ones (first line) are replaced
 generated() { head -n 1 "$1" 2>/dev/null | grep -q '^# port-patches.sh:'; }
-hand=(); old=(); last=0
+hand=(); old=(); last=0; old_shas=(); old_slugs=()
 for p in $(cd "$root/zig/patches" && LC_ALL=C ls -1 -- *.patch 2>/dev/null); do
-  if generated "$root/zig/patches/$p"; then old+=("$p"); continue; fi
+  if generated "$root/zig/patches/$p"; then
+    old+=("$p")
+    # the commit it came from (its first line's "(commits FROM..TO)"): a re-export keeps the patch's name for it
+    c=$(head -n 1 "$root/zig/patches/$p" | sed -n 's/.*(commits [0-9a-f]*\.\.\([0-9a-f]*\)).*/\1/p')
+    s=${p#[0-9][0-9][0-9][0-9]-zig-}; s=${s%.patch}
+    [[ -z "$c" ]] || { old_shas+=("$c"); old_slugs+=("$s"); }
+    continue
+  fi
   hand+=("$p")
   [[ "$p" =~ ^([0-9]+)- ]] && (( 10#${BASH_REMATCH[1]} > last )) && last=$((10#${BASH_REMATCH[1]}))
 done
@@ -138,7 +150,8 @@ mkdir -p "$tmp/out"
 # ---------------------------------------------------------------- 1. the patches
 # message <out file> <subject or empty> <commit>...: the header text of one patch (the commits' messages, or the subject
 # and the commits' subjects), with a credits line unless it has one. Its authors: the commits' (a merge's: those it
-# brings in); BadAd84's block store design is credited when the patch or its message is about spill.
+# brings in); BadAd84's block store design is credited when the patch or its message is about spill, or, for a message
+# with its own credits paragraph, when that paragraph names him (the README row follows it).
 message() {
   local out=$1 subject=$2 c who by md spill=0 authors=() a seen
   shift 2
@@ -161,6 +174,8 @@ message() {
   done
   grep -qi spill "$out" && spill=1
   for c in "$@"; do git -C "$engine" diff --name-only "$c^1" "$c" -- "${spec[@]}" | grep -qi spill && spill=1; done
+  # a message with a credits paragraph of its own is credited as it says: BadAd84's design only where it names him
+  if grep -q '^Credits:' "$out"; then spill=0; sed -n '/^Credits:/,/^[[:space:]]*$/p' "$out" | grep -q BadAd84 && spill=1; fi
   by=""; md=""
   for a in ${authors[@]+"${authors[@]}"}; do
     if [[ "$a" == "Robert Wojciechowski" ]]; then
@@ -215,7 +230,7 @@ else
     else
       message "$tmp/msg" "" "$c"
     fi
-    n=$(name_of "$c"); [[ -n "$n" ]] || n=${bare:-$(slug "$s")}
+    n=$(name_of "$c"); [[ -n "$n" ]] || n=$(old_name "$c"); [[ -n "$n" ]] || n=${bare:-$(slug "$s")}
     [[ -n "$n" ]] || n=commit-$(git -C "$engine" rev-parse --short=8 "$c")
     emit "$c^1" "$c" "$n" "$tmp/msg" "$s"
   done
