@@ -226,3 +226,22 @@ use the new probe line; a mutation pass of 8 single-line reversals of the fixes 
 | R4 (minor): every `--spill-*` / `--snapshot-dir` extra argument refused | **Fixed.** Refused: `--spill-gib` always (it would turn on a tier with no checked or mounted folder); with the tier on, `--snapshot-dir`, `--spill-highwater` (v1 only), `--spill-min-tokens`, `--spill-min-free-gib`, which `port_map` passes after the extras (so the extra would be silently ignored), naming the setting to use. Everything else passes as before: `--spill-keep-builds` (0088's, no setting), `--snapshot-dir` with the tier off (TensorFold's own snapshot folder). `=`-forms handled. |
 | R5 (nit): only rank 0's log is read after the start | **Fixed in the recipe, flagged for the engine.** `port_check_started` takes every rank's `prompt cache:` / `spill tier:` / `spill: cannot open` lines (workers over ssh; `(unread)` when ssh fails) and warns for each rank with no `spill tier:` line, quoting the engine's reason. It now runs after the smoke test: `cacheFor` is the last step of each rank's setup, and rank 0 can answer `/v1/models` before rank 1 has reached it; the smoke test needs every rank. The engine gap stays: `cacheFor` opens each rank's tier from its own budget with no agreement, and a rank without one answers a disk restore with `error.NoSpillTier`. The fix (agree the budget across ranks, or open the tier on every rank when rank 0's budget is above 0) belongs to cache-core / glm-spill. |
 | R6 (nit): "has no the spill v2 port" | **Fixed:** "lacks the spill v2 port" (and "patches/ lack ..."); the tests' patterns follow. |
+
+## Round 3: the port in `zig/patches` (`0014`-`0023`)
+
+The engine's per-feature series (`glm/series` in `~/GitHub/tensorfold-glm`, ten commits on `glm/zig-engine-base`, its
+last tree `glm/integration`'s after round 3's merge outside `docs/glm-port`; the engine's own notes:
+`docs/glm-port/series.md` there) exported with `scripts/port-patches.sh` as `0014-zig-glm-parked-pages` ...
+`0023-zig-glm-spill-kv-shard`. What changed here with it:
+
+| Where | Change |
+| --- | --- |
+| `zig/patches/0014`-`0023`, `README.md` | the exported patches and their rows; the port's section says what each brings, its switch and default, what was measured on the pair (g1/g2 only), and that `0014`-`0016` are also offered alone |
+| `start.sh` | `ZIG_HAS`'s default is `mtp displaykv spill2 kvshard spillshard parked`: `SPILL_V2=1` and `KV_SHARD=1` start, the memory check counts the parked pages |
+| `scripts/port.sh` | `port_missing` says a token is missing from `ZIG_HAS` (not that the port is absent); spill v2 beyond two ranks is refused before anything stops (a fork's default degrades: v1 for an explicit `SPILL_GIB`, else off), as the engine refuses it at start; the probe counts the v2 tier's own `glm-spill-<hash>` folders as room (core/spill under GLM's prefix: the probe knew only `native-spill-`, so a full v2 tier counted as used and could refuse the start) |
+| `scripts/port-patches.sh` | the default branch is `glm/series`; a commit with no `--name` keeps the name of the patch already exported from it (so `--dry-run` with no arguments reproduces `0014`-`0023`); a message with its own `Credits:` paragraph is credited as it says (the series' KV-shard patch touches spill v2's tests, which made the file-name rule credit BadAd84's design) |
+| `scripts/port_test.sh` | the cases run with the new default `ZIG_HAS`; the ones about a missing port name an image without it (`mtp displaykv`); new: the default names a feature exactly when `zig/patches` carries it (by content: `parkedBytes`, `cuda_spill_tier.zig`, `gpu_paths = true`, `KvShardHomeFull`), spill v2 at TP=3, the `glm-spill-` probe |
+| `scripts/port_patches_test.sh` | starts from the hand-written patches (the copy drops this recipe's exports); new: the credits paragraph, a re-export keeping names |
+| `docs/zig-engine.md`, `README.md`, `CHANGELOG.md`, `CREDITS.md`, `NOTICE` | the settings' rows as implemented (`SPILL_V2`, `KV_SHARD`, `PROMPT_CACHE_GIB` with the GPU finding, parked pages, `TENSORFOLD_PREPARE_FLOOR_GIB`, continued chats), the credits for `0014`-`0023` |
+
+Robert's fork defaults are a further branch, `fork-main` (one commit, "Robert's defaults"): see its own section there.

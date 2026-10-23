@@ -114,11 +114,12 @@ if [[ "$ENGINE" == zig ]]; then
   # The Zig engine serves one fixed configuration so far (docs/zig-engine.md lists every setting and its status): what it
   # cannot do yet is refused here, before anything is stopped, never silently dropped
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
-  # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. spill2, kvshard
-  # and spillshard (Robert's spill v2 and KV sharding, and the two together) join it once their ports are in zig/patches;
-  # until then port_validate (scripts/port.sh, below) refuses SPILL_V2=1 and KV_SHARD=1. parked joins it with the port of
-  # 0119 (the engine's budget counts the parked pages; the memory check below counts them only then).
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv}"
+  # mtp and displaykv are in zig/patches (r107-int); so are Robert's GLM features since zig/patches/0014-0023: spill2
+  # (spill v2, 0018/0019/0021), kvshard (KV sharding, 0020/0022), spillshard (the two together, 0023) and parked (the
+  # engine's budget counts the parked pages, 0014; the memory check below counts them only then). ZIG_HAS can still drop
+  # one for a narrower image (zig/patches without it): port_validate (scripts/port.sh, below) then refuses SPILL_V2=1 or
+  # KV_SHARD=1, and the memory check reads MemAvailable alone.
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
@@ -364,7 +365,7 @@ fi
 # With less, rank 0 refuses the window and names one that fits, which the load below then starts again with.
 # Memory freed in bulk a moment ago (prepare.sh's image copy) can still sit on the kernel's per-CPU free lists, outside
 # MemAvailable for a minute or two. An engine with patch 0119 counts it in its budget, and then so does this check
-# (scripts/port.sh: port_parked, ZIG_HAS parked or patches/'s 0119; neither engine here has it yet): mem_avail_gb
+# (scripts/port.sh: port_parked, ZIG_HAS parked (zig/patches/0014, in its default) or patches/'s 0119): mem_avail_gb
 # (scripts/memavail.sh), here and on each worker. Without 0119 both read MemAvailable alone, as `free -g` shows it.
 parked_note() { awk -v p="${1:-0}" 'BEGIN { if (p + 0 >= 0.1) printf " (%.1f of it parked on the per-CPU free lists)", p }'; }
 PARKED=0; ! port_parked || PARKED=1

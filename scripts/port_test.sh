@@ -26,10 +26,13 @@ grep -q '^PORT_SPILL_DEFAULT_GIB=64 ' "$fork_sh" && grep -q '^PORT_SPILL_V2_DEFA
   grep -q '^PORT_SPILL_QUOTA_DEFAULT=0.25 ' "$fork_sh" ||
   { echo "FAIL the fork variant of port.sh (its default lines moved?)"; exit 1; }
 ALL_HAS="mtp displaykv spill2 kvshard spillshard"
+# start.sh's default ZIG_HAS (the image with zig/patches/0014-0023), and an image without the port's patches
+DEF_HAS="mtp displaykv spill2 kvshard spillshard parked"
+NO_PORT="mtp displaykv"
 
 # case_ <name> <expected exit 0|1> <script before port.sh> <script after>: runs both in a subshell over a fresh port.sh,
 # with the serving settings of the two-Spark Zig default (TP 2, PARALLEL 8, DFlash2, PROMPT_CACHE_GIB 0, ZIG_HAS as
-# start.sh's default) and nothing of the caller's environment; die/warn/log stubbed (die exits 1)
+# start.sh's default: $DEF_HAS) and nothing of the caller's environment; die/warn/log stubbed (die exits 1)
 case_() {
   local name=$1 want=$2 got out
   n=$((n + 1))
@@ -37,7 +40,7 @@ case_() {
     for v in $(compgen -v | grep -E '^(SPILL_|KV_SHARD|TF_GLM_|TF_SPILL_|PREFIX_WAIT|STOP_TIMEOUT|PROMPT_CACHE_GIB|ZIG_HAS|WORKER)'); do
       unset "$v"
     done
-    ENGINE=zig TP=2 PARALLEL=8 DRAFTER=dflash2 TF_GLM_MULTI_LONE=0 PROMPT_CACHE_GIB=0 ZIG_HAS="mtp displaykv"
+    ENGINE=zig TP=2 PARALLEL=8 DRAFTER=dflash2 TF_GLM_MULTI_LONE=0 PROMPT_CACHE_GIB=0 ZIG_HAS="$DEF_HAS"
     HOME=/home/u HF_CACHE=/home/u/.cache/huggingface NFS_PATH=/home/u/.cache/huggingface DRY_RUN=0
     die()  { echo "DIE: $*"; exit 1; }
     warn() { echo "WARN: $*"; }
@@ -146,9 +149,9 @@ case_ "extra serve arguments with ENGINE=python and the tier on: --spill-keep-bu
   port_check_extra --spill-keep-builds 3 || exit 1'
 
 # ---- spill v2
-case_ "refuse: SPILL_V2=1 without ZIG_HAS spill2, naming the missing patch" 0 'SPILL_GIB=64 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
+case_ "refuse: SPILL_V2=1 without ZIG_HAS spill2 (an image without the port), naming the missing patch" 0 'ZIG_HAS=$NO_PORT SPILL_GIB=64 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
   expect_die "SPILL_V2=1: this image.s tensorfold-native lacks the spill v2 port (Robert.s GLM patches 0110/0111).*ZIG_HAS" port_validate 8 8'
-case_ "refuse: TF_GLM_SPILL_V2=1 exported counts as explicit" 0 'SPILL_GIB=64 PROMPT_CACHE_GIB=8 TF_GLM_SPILL_V2=1' '
+case_ "refuse: TF_GLM_SPILL_V2=1 exported counts as explicit" 0 'ZIG_HAS=$NO_PORT SPILL_GIB=64 PROMPT_CACHE_GIB=8 TF_GLM_SPILL_V2=1' '
   expect "$PORT_V2_EXPLICIT $SPILL_V2" "1 1"; expect_die "SPILL_V2=1" port_validate 8 8'
 case_ "refuse: SPILL_V2=1 with ENGINE=python (patches/ has v1 only)" 0 'ENGINE=python SPILL_GIB=64 SPILL_V2=1' '
   expect_die "Python engine.s patches/ lack the spill v2 port" port_validate "" ""'
@@ -163,6 +166,12 @@ case_ "spill v2: the flags (no --spill-highwater), the Python fork's variables, 
   done
   [[ "$(port_identity)" =~ ^spill=v2,shard=0,sum= ]] || exit 1
   expect "$(port_summary)" " · spill v2 64 GiB"'
+case_ "refuse: SPILL_V2=1 at TP=3; a fork's default there: v1 for an explicit SPILL_GIB, else the tier off (warned)" 0 'ZIG_HAS=spill2 SPILL_GIB=64 SPILL_V2=1 PROMPT_CACHE_GIB=8 TP=3' '
+  expect_die "SPILL_V2=1: spill v2 runs on two Sparks only for now .TP=2., not TP=3" port_validate 8 8
+  ( PORT_V2_EXPLICIT=0; expect_out "WARN: SPILL V2 OFF for this start: spill v2 runs on two Sparks only" port_validate 8 8
+    port_validate 8 8 >/dev/null; expect "$SPILL_GIB $SPILL_V2" "64 0" ) || exit 1
+  ( PORT_V2_EXPLICIT=0 PORT_SPILL_EXPLICIT=0; expect_out "WARN: SPILL TIER OFF for this start: spill v2 runs on two Sparks only" port_validate 8 8
+    port_validate 8 8 >/dev/null; expect "$SPILL_GIB" 0 ) || exit 1'
 case_ "spill v2 defaults: no quota, 4 turns" 0 'ZIG_HAS=spill2 SPILL_GIB=8 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
   port_validate 8 8; port_map; expect "${PORT_ENV[*]}" "TF_SPILL_FLUSH_S=60 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0 TF_GLM_SPILL_TURNS=4"'
 case_ "aliases: TF_GLM_SPILL_QUOTA / _TURNS alone are taken; with both set the recipe name wins, with a warning" 0 '
@@ -185,9 +194,9 @@ case_ "SPILL_V2=1 without SPILL_GIB warns" 0 'SPILL_V2=1' '
   expect_out "WARN: SPILL_V2=1 does nothing without SPILL_GIB" port_validate 8 0'
 
 # ---- KV sharding
-case_ "refuse: KV_SHARD=1 without ZIG_HAS kvshard, naming the missing patch" 0 'KV_SHARD=1' '
+case_ "refuse: KV_SHARD=1 without ZIG_HAS kvshard (an image without the port), naming the missing patch" 0 'ZIG_HAS=$NO_PORT KV_SHARD=1' '
   expect_die "KV_SHARD=1: this image.s tensorfold-native lacks the KV-shard port (Robert.s GLM patch 0118)" port_validate 8 0'
-case_ "refuse: TF_GLM_KV_SHARD=1 exported counts as explicit" 0 'TF_GLM_KV_SHARD=1' '
+case_ "refuse: TF_GLM_KV_SHARD=1 exported counts as explicit" 0 'ZIG_HAS=$NO_PORT TF_GLM_KV_SHARD=1' '
   expect "$PORT_SHARD_EXPLICIT $KV_SHARD" "1 1"; expect_die "KV-shard port" port_validate 8 0'
 case_ "KV shard: the variables, carry and twins on by default, the check passed only when set" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
   port_validate 8 0; port_map
@@ -231,7 +240,7 @@ case_ "fork defaults with every port in the image: spill v2 and KV shard on" 0 "
   port_validate 8 8; port_map
   expect "${PORT_SERVE[*]}" "--spill-gib 64 --snapshot-dir /spill --spill-min-tokens 8192 --spill-min-free-gib 50"
   expect "${PORT_ENV[*]}" "TF_SPILL_FLUSH_S=60 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_SPILL_TURNS=4 TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=1 TF_GLM_KV_SHARD_TWINS=1"'
-case_ "fork defaults on the stock image (no spill2, kvshard): both off with warnings, as before the port" 0 "PT_FORK=1 PROMPT_CACHE_GIB=8" '
+case_ "fork defaults on an image without the port (no spill2, kvshard): both off with warnings, as before the port" 0 "PT_FORK=1 ZIG_HAS='$NO_PORT' PROMPT_CACHE_GIB=8" '
   o=$(port_validate 8 8); grep -q "WARN: SPILL TIER OFF for this start: .*spill v2 port" <<<"$o" && grep -q "WARN: KV SHARDING OFF for this start: .*KV-shard port" <<<"$o" || { echo "$o"; exit 1; }
   port_validate 8 8 >/dev/null; port_map
   expect "${#PORT_ENV[@]} ${#PORT_SERVE[@]} $(port_identity) ${STOP_TIMEOUT:-unset}" "0 0 off unset"'
@@ -345,15 +354,15 @@ case_ "probe: the same line through sh -c (a worker's login shell may be sh)" 0 
 case_ "probe: the home folder itself" 0 '' "
   HOME='$tmp/a'; l=\$(spill_dir_probe 1 '$tmp/a'); read -r st w fs avail tier tu exp over top real <<<\"\$l\"; expect \"\$top\" 1"
 mkdir -p "$tmp/t/spill/other"
-for x in tfspill-00000000000000aa native-spill-00000000000000bb spill-00000000000000cc; do
+for x in tfspill-00000000000000aa glm-spill-00000000000000ee native-spill-00000000000000bb spill-00000000000000cc; do
   mkdir -p "$tmp/t/spill/$x/rank0"; head -c 1048576 /dev/zero > "$tmp/t/spill/$x/rank0/s"
 done
 head -c 1048576 /dev/zero > "$tmp/t/spill/other/s"; head -c 1048576 /dev/zero > "$tmp/t/spill/spill-file"
 ln -s "$tmp/t/spill/other" "$tmp/t/spill/tfspill-00000000000000dd"
-case_ "probe: measures the spill tiers' own folders (tfspill-, native-spill-, spill-), not other entries or links" 0 '' "
+case_ "probe: measures the spill tiers' own folders (tfspill-, glm-spill-, native-spill-, spill-), not other entries or links" 0 '' "
   for sh in bash sh; do
     l=\$(\$sh -c \"\$(declare -f spill_dir_probe); spill_dir_probe 1 '$tmp/t/spill'\"); read -r st w fs avail tier tu rest <<<\"\$l\"
-    [[ \"\$tier\" =~ ^[0-9]+\$ ]] && (( tier >= 3 * 1048576 && tier < 3 * 1048576 + 262144 )) || { echo \"\$sh: \$l\"; exit 1; }
+    [[ \"\$tier\" =~ ^[0-9]+\$ ]] && (( tier >= 4 * 1048576 && tier < 4 * 1048576 + 262144 )) || { echo \"\$sh: \$l\"; exit 1; }
     expect \"\$tu\" 0
   done"
 if [[ "$(id -u)" != 0 ]]; then
@@ -476,7 +485,8 @@ case_ "start check: mem_avail_gb runs on a worker as start.sh sends it (declare 
   l=\$(bash -c \"\$(declare -f mem_counting mem_avail_gb); mem_avail_gb 1\")
   if [[ -r /proc/meminfo ]]; then [[ \"\$l\" =~ ^[0-9]+\\ [0-9]+\\.[0-9]\$ ]] || { echo \"[\$l]\"; exit 1; }; fi"
 case_ "start check: port_parked (the engine counts the parked pages): ZIG_HAS parked for zig, patches' 0119 for python" 0 '' "
-  ! port_parked || { echo 'counted without the token'; exit 1; }
+  ( ZIG_HAS='mtp displaykv'; ! port_parked ) || { echo 'counted without the token'; exit 1; }
+  port_parked || { echo 'not counted with start.sh.s default'; exit 1; }
   ( ZIG_HAS='mtp displaykv parked'; port_parked ) || { echo 'not counted with ZIG_HAS parked'; exit 1; }
   ( ENGINE=python; _cfg_root='$tmp/root-no'; ! port_parked ) || { echo 'python counted without 0119'; exit 1; }
   mkdir -p '$tmp/root-yes/patches'; : > '$tmp/root-yes/patches/0119-cuda-budget-parked-pages.patch'
@@ -489,6 +499,15 @@ case_ "start.sh: the memory check passes the gate here and to each worker; the p
   check_start 'read -r here_gb here_parked <<<\"\$(mem_avail_gb \"\$PARKED\")\"' || exit 1
   check_start 'declare -f mem_counting mem_avail_gb); mem_avail_gb \$PARKED' || exit 1
   check_start 'port_check_started \"\${PORT_LOGS[@]}\"' || exit 1"
+case_ "start.sh's default ZIG_HAS is these cases' default, and names each of the port's features exactly when zig/patches carries it (by content)" 0 '' "
+  $(declare -f check_start); root='$root'
+  check_start 'ZIG_HAS=\"\${ZIG_HAS:-$DEF_HAS}\"' || exit 1
+  carries() { cat '$root'/zig/patches/*.patch | grep -qF -- \"\$1\"; }
+  for f in 'parked:+pub fn parkedBytes(' 'spill2:+++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig' 'kvshard:+pub const gpu_paths = true;' 'spillshard:return error.KvShardHomeFull;'; do
+    t=\${f%%:*}; m=\${f#*:}
+    if [[ ' $DEF_HAS ' == *\" \$t \"* ]]; then carries \"\$m\" || { echo \"ZIG_HAS's default names \$t, but no zig/patches patch adds: \$m\"; exit 1; }
+    else ! carries \"\$m\" || { echo \"zig/patches carries \$t (\$m), but ZIG_HAS's default does not name it\"; exit 1; }; fi
+  done"
 if [[ -r /proc/meminfo ]]; then
   case_ "parked pages: this host's /proc/meminfo and /proc/zoneinfo" 0 "source '$here/memavail.sh'" "
     read -r a p b <<<\"\$(mem_counting)\"; [[ \"\$a\" =~ ^[0-9]+\\.[0-9]\$ && \"\$b\" =~ ^[0-9]+\$ ]] || { echo \"[\$a \$p \$b]\"; exit 1; }"

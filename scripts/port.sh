@@ -6,10 +6,11 @@
 # off nothing below adds a flag, a variable, a mount or a label, and every rank runs as before. A fork may turn a default
 # on by changing those values (and PORT_SPILL_QUOTA_DEFAULT); a default that cannot run here is turned off with a
 # warning, while the same setting given explicitly refuses.
-# The Zig engine serves the v2 tier and KV sharding only once their ports are in zig/patches; ZIG_HAS (start.sh) then
-# lists them: spill2, kvshard, and spillshard for the two together. Until then an explicit setting refuses and names
-# the missing patch. ENGINE=python (patches/) has the v1 tier (0088) only. Likewise the start memory check counts the
-# parked pages only once the engine does (port_parked: ZIG_HAS parked, or patches/'s 0119).
+# The Zig engine serves the v2 tier and KV sharding from zig/patches/0014-0023 (the port's engine series); ZIG_HAS
+# (start.sh, whose default lists them) names them: spill2, kvshard, and spillshard for the two together. An image
+# without them (a narrower ZIG_HAS) refuses an explicit setting and names the missing patch. ENGINE=python (patches/)
+# has the v1 tier (0088) only. Likewise the start memory check counts the parked pages only where the engine does
+# (port_parked: ZIG_HAS parked, zig/patches/0014; or patches/'s 0119).
 # Kept to bash 3.2 syntax (with scripts/memavail.sh) so that scripts/port_test.sh runs on a Mac too. scripts/config.sh
 # and scripts/nodes.sh use `declare -A`, which bash 3.2 lacks; the tests source this file alone.
 
@@ -21,9 +22,10 @@
 #   SPILL_DIR          the same absolute path on every Spark, mounted at /spill: a folder you can write, on a local disk,
 #                      outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves HF_CACHE to the workers);
 #                      start.sh checks it on every Spark and creates it (as you) when missing. The ranks run as root: the
-#                      Zig engine's tier (cuda_spill.zig) writes its tfspill-<hash> folders and files as root, readable by
-#                      root only (0700 / 0600), so removing them takes sudo (tools/spill_check.py: --sudo); the Python
-#                      engine's (0088) hands its files to SPILL_DIR's owner
+#                      Zig engine's v1 tier (cuda_spill.zig) writes its tfspill-<hash> folders and files as root, readable
+#                      by root only (0700 / 0600), so removing them takes sudo (tools/spill_check.py: --sudo); its v2 tier
+#                      hands its glm-spill-<hash> folders to SPILL_DIR's owner (the files in them stay root's); the
+#                      Python engine's (0088) hands its files to SPILL_DIR's owner
 #   SPILL_MIN_TOKENS   shorter kept states are not written (8192)
 #   SPILL_MIN_FREE_GIB free disk the tier leaves on SPILL_DIR's file system: past it writes are refused (50)
 #   SPILL_FLUSH_S      what a clean stop gives the tier to write what still waits (60; the ranks' TF_SPILL_FLUSH_S);
@@ -39,7 +41,8 @@
 #   TF_GLM_SPILL_READ_BLOCKS, TF_GLM_SPILL_STAGE_MIB, TF_GLM_SPILL_LOAD_MS, TF_SPILL_DEFER_MS: the engine's own tuning,
 #                      passed as set (unset: the engine's defaults)
 # KV sharding (0118): each conversation's latent cache stored once, on the Spark that owns it, instead of on both
-# (~1.9x the pool's tokens in the same memory on the Python engine). Two Sparks, PARALLEL above 1, DFlash2 drafts,
+# (~1.9x the pool's tokens in the same memory on the Python engine; 1.83x measured on the Zig engine: 1,511,424 tokens
+# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts,
 # TF_GLM_MULTI_LONE=0; ENGINE=zig with ZIG_HAS kvshard (with the spill tier: v2 and ZIG_HAS spillshard).
 #   KV_SHARD=1               (TF_GLM_KV_SHARD) on; 0 (the default) off. A fork's default of 1 applies only where the
 #                            Python fork turned it on (TP=2, PARALLEL above 1, TF_GLM_MULTI_LONE=0), silently off elsewhere
@@ -100,7 +103,7 @@ port_missing() {
     spillshard) what="the port of spill v2 and KV sharding together" ;;
   esac
   if [[ "$ENGINE" == zig ]]; then
-    echo "this image's tensorfold-native lacks $what: it is not in zig/patches yet (ZIG_HAS lists spill2, kvshard and spillshard once it is; now: ${ZIG_HAS:-empty})"
+    echo "this image's tensorfold-native lacks $what: ZIG_HAS does not name it (zig/patches/0014-0023 bring spill2, kvshard and spillshard, which start.sh's default ZIG_HAS lists; now: ${ZIG_HAS:-empty})"
   else
     echo "the Python engine's patches/ lack $what (Robert's fork, wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, has them for ENGINE=python)"
   fi
@@ -203,6 +206,11 @@ port_validate() {
     if port_v2_on && ! port_has spill2; then
       (( ! PORT_V2_EXPLICIT )) || die "SPILL_V2=1: $(port_missing spill2). Set SPILL_V2=0 for the v1 tier"
       port_v2_default_off "$(port_missing spill2)"
+    fi
+    # the engine refuses spill v2 beyond two ranks (its rank protocol and identity are the pair's): before anything stops
+    if port_v2_on && [[ "$TP" != 2 ]]; then
+      (( ! PORT_V2_EXPLICIT )) || die "SPILL_V2=1: spill v2 runs on two Sparks only for now (TP=2), not TP=$TP. Set SPILL_V2=0 for the v1 tier"
+      port_v2_default_off "spill v2 runs on two Sparks only for now (TP=2), not TP=$TP"
     fi
     if [[ "$KV_SHARD" == 1 ]]; then
       why=""
@@ -391,8 +399,10 @@ port_summary() {
 # <home-or-root 0|1> <canonical path>", or "ERR <reason>". Exported: under a path that /var/lib/nfs/etab, /etc/exports or
 # /etc/exports.d/*.exports lists. Tier bytes: the disk the spill tiers' own folders in <dir> take (du), which the engine
 # frees itself (it drops its oldest files to keep the floor, and removes other builds' folders at open): tfspill-<hash>
-# (the Zig v1 tier), native-spill-<hash> (v2, core/spill) and spill-<hash> (the Python engine's 0088); not symlinks. Tier
-# unread 1: one of them could not be read through (the Zig engine writes them as root, 0700), so it counts short.
+# (the Zig v1 tier), glm-spill-<hash> (the Zig v2 tier, zig/patches/0021: core/spill under GLM's prefix; its folders are
+# SPILL_DIR's owner's), native-spill-<hash> (core/spill's other families) and spill-<hash> (the Python engine's 0088); not
+# symlinks. Tier unread 1: one of them could not be read through (the Zig v1 tier writes them as root, 0700), so it
+# counts short.
 spill_dir_probe() {
   local create=$1 d=$2 st=OK p real rest w=0 fs="" avail exp=0 e x f fr over=- top=0 home tb=0 tu=0 k
   shift 2
@@ -408,7 +418,7 @@ spill_dir_probe() {
   [ -n "$fs" ] || fs=$(stat -f -c %T "$p" 2>/dev/null) || fs=""
   avail=$(df -Pk "$p" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 * 1024 }')
   if [ "$st" = OK ]; then
-    for x in "$d"/tfspill-* "$d"/native-spill-* "$d"/spill-*; do
+    for x in "$d"/tfspill-* "$d"/glm-spill-* "$d"/native-spill-* "$d"/spill-*; do
       [ -d "$x" ] && [ ! -L "$x" ] || continue
       k=$(du -sk -- "$x" 2>/dev/null) || tu=1
       k=${k%%[!0-9]*}

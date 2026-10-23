@@ -21,6 +21,16 @@ changes with them, the captured kernel set `zig/aot/glm-aot-sm121.tar.xz`, the D
 | `0011-zig-glm-greedy-draft-probs.patch` | Hector Isaza, PR #191 | sampler fix: a greedy draft that asks for its probability gets a full top-k row (the one-candidate fast path left the draft ids stale and MTP drafts were almost never accepted; replies stayed exact). No switch |
 | `0012-zig-glm-cache-reserve.patch` | Hector Isaza, PR #202 | the prompt cache's keep floor and refused saves: `TF_GLM_KEEP_HEADROOM_GIB` (2 GiB; 0 turns it off) above the memory reserve, the ranks agree on room before a keep and on the save after it (a refused save is kept by none, the prompt goes on from its rows), and the cache stays off with an MTP head |
 | `0013-zig-glm-round-batching.patch` | Hector Isaza, PR #202 | a round's draws and commits in one call each with several streams (one sampler readback, one commit table, one tap pass): eight streams 90.5 tok/s with drafts (89.1 before), replies identical to the per-window engine's. No switch |
+| `0014-zig-glm-parked-pages.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | glm_cuda: the startup budgets count the pages parked on the per-CPU free lists (port of GLM 0119) (engine `glm/series` @ `d9d631748d76`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0015-zig-server-prepare-memory.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | server + core: a long prompt's preparation no longer runs rank 0 out of memory (port of DeepSeek 0023, GLM's three renders) (engine `glm/series` @ `2a16b14a4903`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0016-zig-core-chat-id.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | core prompt cache: a shared cut no longer joins two conversations (engine `glm/series` @ `b42a552e7693`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0017-zig-core-chat-continued.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | core prompt cache + lane host: a request keeps its conversation when it continues it without its own turn state (port of GLM 0111) (engine `glm/series` @ `b54a7d4048bb`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0018-zig-core-spill-store.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84](https://github.com/BadAd84) (#118) | core/spill: the disk block store of spill v2 (port of GLM 0110's store, lifted from the DeepSeek port) (engine `glm/series` @ `e4fb5b76cb1b`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0019-zig-core-cache-tier.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84](https://github.com/BadAd84) (#118) | core prompt cache + lane host: spill v2's Tier, restore jobs and the restore service beside decoding (port of GLM 0110's host side) (engine `glm/series` @ `97c4f8e0f0f3`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0020-zig-glm-kv-shard-host.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | glm_cuda: KV shard host side: the part planner and pool parts, switches and their agreement, storage, placement check and telemetry (port of GLM 0118, parts 1-2) (engine `glm/series` @ `6f3edbfe37f4`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0021-zig-glm-spill-blocks.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84](https://github.com/BadAd84) (#118) | glm_cuda: spill v2 for GLM: kept-state packing, the rank protocol, the compatibility fingerprint and the GLM tier behind TF_GLM_SPILL_V2=1 (port of GLM 0110) (engine `glm/series` @ `76543016e1a8`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0022-zig-glm-kv-shard.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) | glm_cuda: KV shard device paths: owner-computed decode and glm_shard.cu, a prompt chunk's history fetch, prompt borrowing and kept states' carries; TF_GLM_KV_SHARD=1 on (port of GLM 0118, parts 3-5) (engine `glm/series` @ `96226f0d9b35`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
+| `0023-zig-glm-spill-kv-shard.patch` | Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X); block store design: [BadAd84](https://github.com/BadAd84) (#118) | glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks) (engine `glm/series` @ `9148d935db9b`; its switches, defaults and measurements: the header; exported by `scripts/port-patches.sh`) <!-- port-patches --> |
 
 ## The port of Robert Wojciechowski's GLM features (0014 and later)
 
@@ -30,22 +40,45 @@ The GLM-5.3-Flash Python patches by Robert Wojciechowski ([wojo](https://github.
 [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)), continued chats (0111,
 [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)), KV sharding (0118,
 [#152](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/152)) and the parked pages
-(0119, [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149)), are being ported to
-this engine (planned, in progress: none is here yet). They arrive as `0014-zig-<name>.patch` and later, one patch per
-feature, each the diff of one engine commit with a header that says what it does, its switches and defaults, what was
-measured and whose work it is (spill v2's block store design is [BadAd84](https://github.com/BadAd84)'s, #118). Every
-switch is off in the engine and byte-identical when off; `scripts/port.sh` has the recipe's settings for them (all off
-by default) and `ZIG_HAS` lifts their refusals once they are here (`docs/zig-engine.md`).
+(0119, [#149](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/149)), ported by him to
+this engine, with two fixes to the base engine he found on the way (a long prompt's preparation running rank 0 out of
+memory, the DeepSeek recipe's 0023, and a shared prompt cut joining two conversations), arrive here as `0014` to
+`0023`: one patch per feature, in the order they build on each other, each the diff of one commit of the engine branch
+`glm/series` (in the port's TensorFold repository, from `glm/zig-engine-base`) with a header that says what it does,
+its switches and defaults, what was measured on the pair and whose work it is (spill v2's block store design is
+[BadAd84](https://github.com/BadAd84)'s, #118). After `0023` the engine is the port's integration branch
+(`glm/integration`, round 3) without the port's notes.
 
-They are made by `scripts/port-patches.sh`, never by hand: the engine branch (default `glm/integration`, in the port's
-TensorFold repository) is exported relative to `glm/zig-engine-base`, which must be `ZIG_TF_REF` plus `0001`-`0013`
-exactly (with the captured kernel set at `zig/tests/cuda/glm_p1/aot`, which no patch carries); each first-parent commit
-becomes one patch, named with `--name REV=SLUG` (else from its subject), its message the patch's header. It refuses
-unless the patches here reproduce the base on a clean `ZIG_TF_REF` and every new patch applies after them and gives the
-branch's tree (outside the kernel set and the port's notes, `docs/glm-port/`). An exported patch's first line is
-`# port-patches.sh: ...`; the script replaces those and rewrites only the table rows it owns (marked
-`<!-- port-patches -->`), after the last hand-written row above. `scripts/port-patches.sh --dry-run` checks without
-writing; `--branch glm/zig-engine-base` checks the base alone.
+| Patches | Switch (both ranks unless noted) | Default (engine; this recipe) |
+| --- | --- | --- |
+| `0014` parked pages | none (sizing only) | on |
+| `0015` prepare memory | `TENSORFOLD_PREPARE_FLOOR_GIB` (rank 0; GiB, `0` turns the gate off) | on (3 GiB) |
+| `0016` shared-cut chat id | none | on |
+| `0017` continued chats | none (chat ids drive only the cache's eviction policy and `/health`) | on |
+| `0018`, `0019`, `0021` spill v2 | `TF_GLM_SPILL_V2=1` with `--spill-gib` and `--snapshot-dir` (recipe: `SPILL_GIB`, `SPILL_V2`, `scripts/port.sh`) | off; v1 stays the rollback |
+| `0020`, `0022` KV sharding | `TF_GLM_KV_SHARD=1` (recipe: `KV_SHARD`), `_CARRY`, `_TWINS`, `_CHECK` | off |
+| `0023` spill v2 with KV sharding | both of the above | off |
+
+Every new switch is off in the engine and byte-identical when off, and off in this recipe (`scripts/port.sh`'s
+defaults); `ZIG_HAS`'s default lists `spill2`, `kvshard`, `spillshard` and `parked` now that they are here
+(`docs/zig-engine.md`). Measured on the pair (round 1 and round 2's images, the port as one patch): every feature off,
+`tools/exact.py` 39/39 identical to the base engine; the prompt cache on (`KV_POOL_GIB=4`, `PROMPT_CACHE_GIB=8`),
+39/39; KV sharding on, 39/39, the pool 1.83x the tokens in the same memory; spill v2 on, 39/39, `tools/spill_check.py`
+20 of 22 main cases and 4 of 4 restart cases (each header says which). The round-3 changes (two concurrent restores
+each restoring from disk, in `0019`; spill v2 with KV sharding, `0023`) have not run on the pair yet. `0014`, `0015`
+and `0016` are also offered alone as pull requests against this branch, with the same bytes: whichever lands first,
+the other copy is an exact duplicate (`git apply --reverse --check` passes).
+
+They are made by `scripts/port-patches.sh`, never by hand: the engine branch (default `glm/series`) is exported
+relative to `glm/zig-engine-base`, which must be `ZIG_TF_REF` plus `0001`-`0013` exactly (with the captured kernel set
+at `zig/tests/cuda/glm_p1/aot`, which no patch carries); each first-parent commit becomes one patch, named with
+`--name REV=SLUG` (else the name of the patch already exported from that commit, else from its subject), its message
+the patch's header. It refuses unless the patches here reproduce the base on a clean `ZIG_TF_REF` and every new patch
+applies after them and gives the branch's tree (outside the kernel set and the port's notes, `docs/glm-port/`). An
+exported patch's first line is `# port-patches.sh: ...`; the script replaces those and rewrites only the table rows it
+owns (marked `<!-- port-patches -->`), after the last hand-written row above. `scripts/port-patches.sh --dry-run`
+checks without writing (with no arguments it reproduces `0014`-`0023` from `glm/series`); `--branch
+glm/zig-engine-base` checks the base alone.
 
 ## Ordering rules
 

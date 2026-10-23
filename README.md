@@ -393,7 +393,10 @@ The measurements above are the Python engine's. With `ENGINE=zig` (the default) 
 states, so it also needs `PROMPT_CACHE_GIB` above 0 and DFlash2 drafts: `./start.sh` refuses `SPILL_GIB` without them,
 and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)). Its files
 are root's, not yours: the ranks run as root and the Zig tier keeps them readable by root only, so removing them takes
-`sudo`.
+`sudo`. Robert's spill v2 (`SPILL_V2=1`, `zig/patches/0018`-`0023`, off by default) writes every kept state when it is
+kept, in 2,048-token blocks a conversation's turns share, reads it back beside decoding and survives a crash; it also
+runs with KV sharding (`KV_SHARD=1`). Both need the prompt cache's room: at the default `KV_POOL_GIB` its budget is 0,
+so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with).
 
 ## Worker weights over NFS
 
@@ -980,7 +983,7 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
 | `tools/exact.py record --out A.json` / `compare A.json B.json` | `ENGINE=zig`: greedy replies of one image against another by token hash (cold sizes to 100k, resumes, eight streams against the same eight alone, three interleaved conversations); record the second with `--like A.json`. Cases past the window (`CONTEXT`) are left out |
-| `tools/spill_check.py`, `tools/resume_bench.py` | `ENGINE=zig`, for Robert's spill v2 port (`zig/patches/0014` and later, not here yet): restores from disk proven by the tier's counters and equal to a baseline (eviction, damaged files, a cancel, two at once, a restart, `kill -9`, the free-disk floor); cold / memory / disk time to first token. Prompts capped to `CONTEXT` |
+| `tools/spill_check.py`, `tools/resume_bench.py` | `ENGINE=zig`, for Robert's spill v2 port (`zig/patches/0018`-`0023`): restores from disk proven by the tier's counters and equal to a baseline (eviction, damaged files, a cancel, two at once, a restart, `kill -9`, the free-disk floor); cold / memory / disk time to first token. Prompts capped to `CONTEXT` |
 | `tools/prefix_fanout.py` | `ENGINE=zig` with `PROMPT_CACHE_GIB` above 0: a shared system prompt fanned out at 1, 2, 4 and 8 streams; `--expect-one-fill` checks the prefix is computed once at every level (the Zig engine fills one prompt at a time, which is why the Python fork's prefix wait is not ported) |
 | `tools/selftest.py` | the four tools above against `tools/fake_server.py`, on any machine (no GPU, no server): each must pass on a correct fake and fail on one with the fault it exists to catch |
 
