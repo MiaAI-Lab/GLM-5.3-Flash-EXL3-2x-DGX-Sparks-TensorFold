@@ -258,3 +258,23 @@ re-exported `glm/series` (3181fe20) with its defaults, plus `--name` for the fiv
 from, and a rewritten commit is a new one. The files and their names are as before; every header's `glm/series` sha
 moved, and `0019`, `0021` and `0023` carry the fixes. Nothing else here changed (no setting, no default; `ZIG_HAS`
 as before). Tests: `scripts/port_test.sh` 113/113, `scripts/port_patches_test.sh` 15/15, `tools/selftest.py` 83/83.
+
+### Series review fixes (2026-10-23)
+
+The series review passed `glm/series` and found 4 minor issues and 4 nits in the recipe and the notes. F1 (the fork's
+"6.2 GiB" sizing line) and F2 (`port_retry`'s relative `$0`) are `fork-main`'s alone and fixed there; F3 has a
+`fork-main` half. On this branch:
+
+| Finding | Outcome |
+| --- | --- |
+| F3 (minor): `PROMPT_CACHE_GIB` (or `--prompt-cache-gib`) set while `KV_POOL_GIB` is not keeps nothing, since at the default pool the kept-state budget is 0 (g1: "prompt cache: off (budget 0)") | **Fixed (warns).** `scripts/config.sh` records `PORT_POOL_EXPLICIT` before it fills in the default; `port_validate` calls `port_pool_check` (`ENGINE=zig` with DFlash2, the effective cache above 0, the pool not set), which warns with the pair's numbers (`KV_POOL_GIB=4` with `PROMPT_CACHE_GIB=8`: 6.2 GiB, 5.1 GiB with spill v2 on). Nothing changes size here; the fork applies its pool (its own section). |
+| F4 (minor): `CHANGELOG.md` and `scripts/memavail.sh` still said neither engine counts the parked pages | **Fixed.** Both now say `ENGINE=zig` counts them with `zig/patches/0014` (`ZIG_HAS parked`, in the default) and `ENGINE=python` only with a `patches/0119` the recipe does not carry. `start.sh` already counted them when `ZIG_HAS` lists `parked` (`port_parked`, `PARKED=1`: unchanged, its tests as before); the test that ties `ZIG_HAS`'s default to `zig/patches` now also fails while `memavail.sh` or the CHANGELOG says otherwise. |
+| F5 (nit): "Every new switch is off in the engine and byte-identical when off" | **Fixed** in `zig/patches/README.md` and the CHANGELOG: spill v2's and KV sharding's switches are off and byte-identical when off; the base fixes are on by default (`0014` parked pages, `0015`'s gate at 3 GiB, `0015`'s other changes without a switch), and `0016`/`0017` have no switch and change only eviction and the counters, never a reply. |
+| F6 (nit): `0016`'s header claims "the same bytes" as `glm/pr-chat-id` but drops the standalone's note on v1 spill | **Documented in `zig/patches/README.md`** (the header is the series commit's message; rewriting it would move every sha from `0016` on and re-export seven patches for a note): "the same diff", and the note itself, with what `0017` changes about it (the lane host keeps the cut and the turn in one conversation, so with the whole series v1 counts the cut as superseded again, as the base engine did; spill v2 writes at keep and is unaffected). |
+| F7 (nit): `series.md` said commits 6-9 were not host-tested on their own, against its table | **Already fixed** in the engine's notes commit 3181fe20 (the follow-ups pass rewrote the paragraph: "the others ran only `test-cuda-host` as first made, and after the follow-ups 6 and 8 the engine_api tests and 8 `test-glm-cuda-host`", which matches the table). No change; `glm/series` and the exported headers stay as they are. |
+| F8 (nit): the plain credit wrapped mid-parenthesis | **Fixed** in `NOTICE`, `scripts/port-patches.sh`'s header, `CREDITS.md`, the CHANGELOG (two) and `zig/patches/README.md`: each credit on one line. None was broken in the exported headers or the engine commits' messages (scanned). New check: `credit_split` (awk) finds a plain or Markdown credit that starts on one line and ends on the next, comment marks and a patch's `+` dropped; `scripts/port_test.sh` runs it over every file here that names him (it found the six above before the fix). Mia's `0004` names him with a bare GitHub link in an engine doc comment (the prompt cache's credits for the spill tier, patch 0088): hand-written upstream code, left as it is. |
+
+Tests: `scripts/port_test.sh` 118/118 (113 before; the new F3, F4 and F8 checks failed first on the unfixed tree),
+`scripts/port_patches_test.sh` 15/15, `tools/selftest.py` 83/83, `bash -n` of every script; `scripts/port-patches.sh
+--dry-run` (no arguments, `--keep`) reproduces `0014`-`0023` byte for byte from `glm/series` 3181fe20 and leaves the
+README's rows as they are.

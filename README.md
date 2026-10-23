@@ -396,7 +396,9 @@ are root's, not yours: the ranks run as root and the Zig tier keeps them readabl
 `sudo`. Robert's spill v2 (`SPILL_V2=1`, `zig/patches/0018`-`0023`, off by default) writes every kept state when it is
 kept, in 2,048-token blocks a conversation's turns share, reads it back beside decoding and survives a crash; it also
 runs with KV sharding (`KV_SHARD=1`). Both need the prompt cache's room: at the default `KV_POOL_GIB` its budget is 0,
-so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with).
+so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with:
+a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on, whose pinned staging comes first; `./start.sh` warns when
+`PROMPT_CACHE_GIB` is set without `KV_POOL_GIB`).
 
 ## Worker weights over NFS
 

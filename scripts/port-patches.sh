@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Export the GLM engine's port commits (the GLM-5.3-Flash patches 0088/0110/0111/0118/0119 by Robert Wojciechowski
-# (GitHub @wojo, X @rwojo), spill v2, continued chats, KV sharding and parked pages, ported to this Zig engine) as
-# zig/patches/0014-zig-<name>.patch and later, numbered after the last hand-written patch, which zig/Dockerfile applies
-# with `git apply` after 0001-0013, in filename order. Nothing is written unless every step holds:
+# Export the GLM engine's port commits (the GLM-5.3-Flash patches 0088/0110/0111/0118/0119 by
+# Robert Wojciechowski (GitHub @wojo, X @rwojo), spill v2, continued chats, KV sharding and parked pages, ported to this
+# Zig engine) as zig/patches/0014-zig-<name>.patch and later, numbered after the last hand-written patch, which
+# zig/Dockerfile applies with `git apply` after 0001-0013 in filename order. Nothing is written unless every step holds:
 #   1. a clean checkout of ZIG_TF_REF (the engine pin, scripts/config.sh) gets the hand-written zig/patches in filename
 #      order, exactly as the Dockerfile applies them, and must then equal BASE outside the excluded paths
 #   2. the patches: one per first-parent commit of BASE..BRANCH (--mode commits, the default; a merge is its whole diff

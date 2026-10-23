@@ -31,16 +31,17 @@ DEF_HAS="mtp displaykv spill2 kvshard spillshard parked"
 NO_PORT="mtp displaykv"
 
 # case_ <name> <expected exit 0|1> <script before port.sh> <script after>: runs both in a subshell over a fresh port.sh,
-# with the serving settings of the two-Spark Zig default (TP 2, PARALLEL 8, DFlash2, PROMPT_CACHE_GIB 0, ZIG_HAS as
-# start.sh's default: $DEF_HAS) and nothing of the caller's environment; die/warn/log stubbed (die exits 1)
+# with the serving settings of the two-Spark Zig default (TP 2, PARALLEL 8, DFlash2, PROMPT_CACHE_GIB 0, KV_POOL_GIB
+# at its default 12.5, not set (PORT_POOL_EXPLICIT 0), ZIG_HAS as start.sh's default: $DEF_HAS) and nothing of the
+# caller's environment; die/warn/log stubbed (die exits 1)
 case_() {
   local name=$1 want=$2 got out
   n=$((n + 1))
   out=$( (
-    for v in $(compgen -v | grep -E '^(SPILL_|KV_SHARD|TF_GLM_|TF_SPILL_|PREFIX_WAIT|STOP_TIMEOUT|PROMPT_CACHE_GIB|ZIG_HAS|WORKER)'); do
+    for v in $(compgen -v | grep -E '^(SPILL_|KV_SHARD|KV_POOL_GIB|PORT_|TF_GLM_|TF_SPILL_|PREFIX_WAIT|STOP_TIMEOUT|PROMPT_CACHE_GIB|ZIG_HAS|WORKER)'); do
       unset "$v"
     done
-    ENGINE=zig TP=2 PARALLEL=8 DRAFTER=dflash2 TF_GLM_MULTI_LONE=0 PROMPT_CACHE_GIB=0 ZIG_HAS="$DEF_HAS"
+    ENGINE=zig TP=2 PARALLEL=8 DRAFTER=dflash2 TF_GLM_MULTI_LONE=0 PROMPT_CACHE_GIB=0 KV_POOL_GIB=12.5 ZIG_HAS="$DEF_HAS"
     HOME=/home/u HF_CACHE=/home/u/.cache/huggingface NFS_PATH=/home/u/.cache/huggingface DRY_RUN=0
     die()  { echo "DIE: $*"; exit 1; }
     warn() { echo "WARN: $*"; }
@@ -122,7 +123,24 @@ case_ "ENGINE=python: spill v1 without PROMPT_CACHE_GIB (it keeps states in the 
   port_validate "" ""; port_map
   expect "${PORT_SERVE[*]}" "--spill-gib 64 --snapshot-dir /spill --spill-highwater 0.70 --spill-min-tokens 8192 --spill-min-free-gib 50"'
 case_ "ENGINE=python: PROMPT_CACHE_GIB above 0 warns that it does nothing" 0 'ENGINE=python PROMPT_CACHE_GIB=8' '
-  expect_out "WARN: PROMPT_CACHE_GIB=8 does nothing with ENGINE=python" port_validate "" ""'
+  expect_out "WARN: PROMPT_CACHE_GIB=8 does nothing with ENGINE=python" port_validate "" ""
+  expect_out "!KV_POOL_GIB at its default" port_validate "" ""'
+# The pool is sized first: at the default KV_POOL_GIB the kept-state budget came out 0 on the pair (g1)
+case_ "PROMPT_CACHE_GIB (or --prompt-cache-gib) above 0 with KV_POOL_GIB not set warns: at the default pool the budget is 0" 0 'PROMPT_CACHE_GIB=8' '
+  expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (12.5): .*prompt cache: off (budget 0)" port_validate 8 8
+  expect_out "KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on" port_validate 8 8
+  PROMPT_CACHE_GIB=0; expect_out "WARN: PROMPT_CACHE_GIB=16 with KV_POOL_GIB at its default (12.5)" port_validate 8 16
+  ( TP=3 KV_POOL_GIB=32; expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (32)" port_validate 8 8 ) || exit 1'
+case_ "no pool warning with KV_POOL_GIB set (even to 12.5), no cache, MTP drafts (no prompt cache) or ENGINE=python" 0 'PROMPT_CACHE_GIB=8' '
+  ( PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
+  ( PORT_POOL_EXPLICIT=1; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
+  ( PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
+  ( DRAFTER=mtp; expect_out "!KV_POOL_GIB at its default" port_validate 1 8 ) || exit 1
+  ( ENGINE=python; expect_out "!KV_POOL_GIB at its default" port_validate "" 8 ) || exit 1'
+case_ "scripts/config.sh records whether KV_POOL_GIB was set, before it fills in the default" 0 '' "
+  a=\$(grep -nF 'PORT_POOL_EXPLICIT=0; [[ -z \"\${KV_POOL_GIB:-}\" ]] || PORT_POOL_EXPLICIT=1' '$here/config.sh' | cut -d: -f1)
+  b=\$(grep -nF 'KV_POOL_GIB=\"\${KV_POOL_GIB:-\$_pool}\"' '$here/config.sh' | cut -d: -f1)
+  [[ -n \"\$a\" && -n \"\$b\" ]] && (( a < b )) || { echo \"config.sh: recorded at [\$a], defaulted at [\$b]\"; exit 1; }"
 case_ "refuse: spill with MTP drafts (zig: no prompt cache)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
   expect_die "DRAFTER=mtp" port_validate 1 8'
 case_ "refuse: a relative SPILL_DIR, SPILL_HIGHWATER past 1, SPILL_MIN_TOKENS 8k, SPILL_GIB abc" 0 'PROMPT_CACHE_GIB=8' '
@@ -234,7 +252,7 @@ case_ "KV shard and spill v2 together with ZIG_HAS spillshard" 0 "ZIG_HAS='$ALL_
   [[ "$(port_identity)" =~ ^spill=v2,shard=1,sum= ]] || exit 1'
 
 # ---- a fork's defaults (PT_FORK=1: spill v2 64 GiB, KV sharding)
-case_ "fork defaults with every port in the image: spill v2 and KV shard on" 0 "PT_FORK=1 ZIG_HAS='$ALL_HAS' PROMPT_CACHE_GIB=8" '
+case_ "fork defaults with every port in the image: spill v2 and KV shard on" 0 "PT_FORK=1 ZIG_HAS='$ALL_HAS' PROMPT_CACHE_GIB=8 KV_POOL_GIB=4 PORT_POOL_EXPLICIT=1" '
   expect "$PORT_SPILL_EXPLICIT $PORT_V2_EXPLICIT $PORT_SHARD_EXPLICIT $SPILL_GIB $SPILL_V2 $KV_SHARD $STOP_TIMEOUT" "0 0 0 64 1 1 90"
   expect_out "!WARN" port_validate 8 8
   port_validate 8 8; port_map
@@ -507,7 +525,12 @@ case_ "start.sh's default ZIG_HAS is these cases' default, and names each of the
     t=\${f%%:*}; m=\${f#*:}
     if [[ ' $DEF_HAS ' == *\" \$t \"* ]]; then carries \"\$m\" || { echo \"ZIG_HAS's default names \$t, but no zig/patches patch adds: \$m\"; exit 1; }
     else ! carries \"\$m\" || { echo \"zig/patches carries \$t (\$m), but ZIG_HAS's default does not name it\"; exit 1; }; fi
-  done"
+  done
+  # and the start check's notes say which engine counts the parked pages (0014 once zig/patches carries it)
+  if carries '+pub fn parkedBytes('; then
+    grep -q 'zig/patches/0014' '$here/memavail.sh' && ! grep -qi 'neither engine' '$here/memavail.sh' '$root/CHANGELOG.md' ||
+      { echo 'memavail.sh or the CHANGELOG still says no engine here counts the parked pages'; exit 1; }
+  fi"
 if [[ -r /proc/meminfo ]]; then
   case_ "parked pages: this host's /proc/meminfo and /proc/zoneinfo" 0 "source '$here/memavail.sh'" "
     read -r a p b <<<\"\$(mem_counting)\"; [[ \"\$a\" =~ ^[0-9]+\\.[0-9]\$ && \"\$b\" =~ ^[0-9]+\$ ]] || { echo \"[\$a \$p \$b]\"; exit 1; }"
@@ -549,6 +572,50 @@ check_ "port-patches: slug and patchlike" '
   for l in "diff --git a/x b/x" "--- a/x" "+++ b/x" "@@ -1 +1 @@" "GIT binary patch"; do
     printf "text\n%s\n" "$l" > "$t"; patchlike "$t" >/dev/null || { echo "not caught: $l"; exit 1; }
   done'
+
+# ---- Robert's credit is never broken across lines (plain "Robert Wojciechowski (GitHub @wojo, X @rwojo)", Markdown
+# "Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)"): every text
+# file that names him, the exported patches' headers (their engine commits' messages) included
+# credit_split <file>...: "<file>:<line>" for each credit that starts on a line and ends on the next (the next line's
+# indentation and comment marks dropped: # // //! * -- > and a patch's leading +)
+credit_split() {
+  awk '
+    function norm(s) { sub(/^[ \t]*[+]?[ \t]*(#+|\/\/[\/!]?|[*]|--|>)?[ \t]*/, "", s); return s }
+    FNR == 1 { prev = "" }
+    {
+      cur = $0; sub(/[ \t\r]+$/, "", cur)
+      if (FNR > 1 && prev != "") {
+        j = prev " " norm(cur); b = length(prev)
+        for (k = 1; k <= 3; k++) {
+          s = j; off = 0
+          while (match(s, pat[k])) {
+            st = off + RSTART; en = st + RLENGTH - 1
+            if (st <= b && en > b) { print FILENAME ":" FNR - 1; break }
+            off += RSTART + RLENGTH - 1; s = substr(s, RSTART + RLENGTH)
+          }
+        }
+      }
+      prev = cur
+    }
+    BEGIN {
+      pat[1] = "Robert Wojciechowski \\(GitHub @wojo, X @rwojo\\)"
+      pat[2] = "Robert Wojciechowski \\(\\[wojo\\]\\(https://github[.]com/wojo\\) on GitHub, \\[@rwojo\\]\\(https://x[.]com/rwojo\\) on X\\)"
+      pat[3] = "Robert Wojciechowski \\((GitHub|\\[wojo\\])"
+    }' "$@" | sort -u
+}
+check_ "credits: credit_split finds a credit broken anywhere in it, and only that" '
+  t=$(mktemp -d "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -rf -- \"$t\"" EXIT
+  printf "%s\n" "# by Robert Wojciechowski (GitHub" "# @wojo, X @rwojo), ported" > "$t/a"
+  printf "%s\n" "  (patch 0088, #78 by Robert Wojciechowski" "  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X))" > "$t/b"
+  printf "%s\n" "+//! the spill tier, by Robert" "+//! Wojciechowski (GitHub @wojo, X @rwojo)." > "$t/c"
+  printf "%s\n" "Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); spill v2" "design: BadAd84" "by Robert Wojciechowski" "(https://github.com/wojo), not a credit of this form" > "$t/d"
+  [[ "$(credit_split "$t/a" "$t/b" "$t/c" "$t/d" | tr "\n" " ")" == "$t/a:1 $t/b:1 $t/c:1 " ]] ||
+    { credit_split "$t/a" "$t/b" "$t/c" "$t/d"; exit 1; }'
+check_ "credits: no file here breaks Robert's credit across lines (zig/patches' exported headers included)" '
+  files=$(cd "$root" && grep -rlI --exclude-dir=.git "Wojciechowski" . | sed "s|^\./||")
+  [[ -n "$files" ]] || { echo "no file names him: the scan found nothing to check"; exit 1; }
+  bad=$(cd "$root" && credit_split $files)
+  [[ -z "$bad" ]] || { echo "broken across lines (keep each credit on one line):"; echo "$bad"; exit 1; }'
 
 # ---- every script parses (bash -n, with this bash)
 for f in "$root"/start.sh "$root"/start-tp3.sh "$root"/start-tp4.sh "$root"/start-tp4-switchless.sh "$root"/stop.sh "$here"/*.sh; do

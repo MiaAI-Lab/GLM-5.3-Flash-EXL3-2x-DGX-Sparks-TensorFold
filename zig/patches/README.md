@@ -34,8 +34,8 @@ changes with them, the captured kernel set `zig/aot/glm-aot-sm121.tar.xz`, the D
 
 ## The port of Robert Wojciechowski's GLM features (0014 and later)
 
-The GLM-5.3-Flash Python patches by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
-[@rwojo](https://x.com/rwojo) on X), spill v2 (0088/0110,
+The GLM-5.3-Flash Python patches by
+Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), spill v2 (0088/0110,
 [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78) and
 [#124](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/124)), continued chats (0111,
 [#128](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/128)), KV sharding (0118,
@@ -59,15 +59,26 @@ its switches and defaults, what was measured on the pair and whose work it is (s
 | `0020`, `0022` KV sharding | `TF_GLM_KV_SHARD=1` (recipe: `KV_SHARD`), `_CARRY`, `_TWINS`, `_CHECK` | off |
 | `0023` spill v2 with KV sharding | both of the above | off |
 
-Every new switch is off in the engine and byte-identical when off, and off in this recipe (`scripts/port.sh`'s
-defaults); `ZIG_HAS`'s default lists `spill2`, `kvshard`, `spillshard` and `parked` now that they are here
-(`docs/zig-engine.md`). Measured on the pair (round 1 and round 2's images, the port as one patch): every feature off,
-`tools/exact.py` 39/39 identical to the base engine; the prompt cache on (`KV_POOL_GIB=4`, `PROMPT_CACHE_GIB=8`),
-39/39; KV sharding on, 39/39, the pool 1.83x the tokens in the same memory; spill v2 on, 39/39, `tools/spill_check.py`
-20 of 22 main cases and 4 of 4 restart cases (each header says which). The round-3 changes (two concurrent restores
-each restoring from disk, in `0019`; spill v2 with KV sharding, `0023`) have not run on the pair yet. `0014`, `0015`
-and `0016` are also offered alone as pull requests against this branch, with the same bytes: whichever lands first,
-the other copy is an exact duplicate (`git apply --reverse --check` passes).
+Spill v2's and KV sharding's switches (`0018`-`0023`) are off in the engine and byte-identical when off, and off in
+this recipe (`scripts/port.sh`'s defaults). The base fixes are on by default, as fixes are: `0014`'s parked pages (no
+switch; sizing only, the same replies) and `0015`'s preparation gate (`TENSORFOLD_PREPARE_FLOOR_GIB`, 3 GiB; `0` turns
+the gate off, while the rest of `0015`, the scratch given back and the one-pass signer, has no switch). `0016` and
+`0017` have no switch either: they change which conversation a kept state belongs to, so which states the cache evicts,
+and what `/health`, `/metrics` and rank 0's log report with a prompt cache, never a reply. `ZIG_HAS`'s default lists
+`spill2`, `kvshard`, `spillshard` and `parked` now that they are here (`docs/zig-engine.md`). Measured on the pair
+(round 1 and round 2's images, the port as one patch): every feature off, `tools/exact.py` 39/39 identical to the base
+engine; the prompt cache on (`KV_POOL_GIB=4`, `PROMPT_CACHE_GIB=8`: a 6.2 GiB budget for kept states, 5.1 GiB with
+spill v2 on, whose 1,066 MiB of pinned staging comes first), 39/39; KV sharding on, 39/39, the pool 1.83x the tokens in
+the same memory; spill v2 on, 39/39, `tools/spill_check.py` 20 of 22 main cases and 4 of 4 restart cases (each header
+says which). The round-3 changes (two concurrent restores each restoring from disk, in `0019`; spill v2 with KV
+sharding, `0023`) have not run on the pair yet. `0014`, `0015` and `0016` are also offered alone as pull requests
+against this branch, with the same diff: whichever lands first, the other copy is an exact duplicate (`git apply
+--reverse --check` passes). Their headers are the series' messages, not the standalones': `0016`'s leaves out a note
+of `glm/pr-chat-id`'s. With that fix alone, a shared cut and the turn kept after it get different conversation ids, so
+the v1 spill tier no longer counts the cut as superseded by that turn and writes it to disk when it is evicted (as the
+Python fork's `_superseded` exempts shared cuts). From `0017` on the lane host keeps both in the request's
+conversation (as Python 0089 does), which `0016`'s header says instead: with the whole series v1 counts the cut as
+superseded by its conversation's later turn again, as the base engine did (spill v2 writes at keep and is not affected).
 
 They are made by `scripts/port-patches.sh`, never by hand: the engine branch (default `glm/series`) is exported
 relative to `glm/zig-engine-base`, which must be `ZIG_TF_REF` plus `0001`-`0013` exactly (with the captured kernel set

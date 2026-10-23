@@ -388,6 +388,8 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # tokens (2026-10-08); its lowest free memory under a 1M-token prompt is not measured yet. Each rank holds a quarter of
 # the weights instead of a third, so it leaves more memory free.
 case "$TP" in 3|4) _pool=32 ;; *) _pool=12.5 ;; esac
+# Whether KV_POOL_GIB was set: a prompt cache with the default pool gets no budget (scripts/port.sh: port_pool_check)
+PORT_POOL_EXPLICIT=0; [[ -z "${KV_POOL_GIB:-}" ]] || PORT_POOL_EXPLICIT=1
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 # The display reservation in the pool (patch 0072, PARALLEL above 1): the GB10 firmware keeps ~2 GiB for a screen that
@@ -486,6 +488,8 @@ prepared_state() {
 # Sparks (1M window, PARALLEL=8, KV_POOL_GIB=4, PROMPT_CACHE_GIB=16): a 2.0 GiB budget, the pool 1,734,656 tokens, and the
 # same 50k / 93k prompt again answered in 0.17 / 0.26 s instead of 24 / 48 s (ezoushen, Mia PR #187). The spill tier
 # spills these kept states, so with ENGINE=zig it needs PROMPT_CACHE_GIB above 0. ENGINE=python keeps states in the pool.
+# Set above 0 while KV_POOL_GIB is not, start.sh warns that the default pool leaves it nothing (scripts/port.sh:
+# port_pool_check; on the port's pair KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8 gave 6.2 GiB, 5.1 with spill v2 on).
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
 
 # The spill tier (patch 0088-glm-spill-tier, off by default: SPILL_GIB, SPILL_DIR, SPILL_HIGHWATER, SPILL_MIN_TOKENS,

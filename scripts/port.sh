@@ -60,6 +60,8 @@ PORT_SPILL_QUOTA_DEFAULT=0 # SPILL_QUOTA when it is not set (v2 only; 0: none). 
 PORT_SPILL_EXPLICIT=0; [[ -z "${SPILL_GIB:-}" ]] || PORT_SPILL_EXPLICIT=1
 PORT_V2_EXPLICIT=0; [[ -z "${SPILL_V2:-}${TF_GLM_SPILL_V2:-}" ]] || PORT_V2_EXPLICIT=1
 PORT_SHARD_EXPLICIT=0; [[ -z "${KV_SHARD:-}${TF_GLM_KV_SHARD:-}" ]] || PORT_SHARD_EXPLICIT=1
+# Whether KV_POOL_GIB was set: scripts/config.sh records it before it fills in the default (port_pool_check)
+PORT_POOL_EXPLICIT=${PORT_POOL_EXPLICIT:-0}
 # The v2 and KV-shard settings that were set: they do nothing without their feature (port_validate warns)
 PORT_V2_SET=""
 for _n in SPILL_QUOTA TF_GLM_SPILL_QUOTA SPILL_TURNS TF_GLM_SPILL_TURNS TF_GLM_SPILL_READ_BLOCKS TF_GLM_SPILL_STAGE_MIB \
@@ -141,6 +143,17 @@ port_shard_default_off() {
 # reason and it returns 1 (the caller then turns the tier off).
 PORT_SPILL_WHY=""
 port_spill_refuse() { (( PORT_SPILL_EXPLICIT )) || { PORT_SPILL_WHY=$1; return 1; }; die "$1"; }
+
+# port_pool_check <prompt cache GiB>: ENGINE=zig with DFlash2 (MTP drafts turn the prompt cache off), PROMPT_CACHE_GIB or
+# --prompt-cache-gib above 0 while KV_POOL_GIB was not set. The engine sizes the KV pool first and gives the kept prompt
+# states only what is left above MEMORY_RESERVE_GIB: at the default pool that is nothing (the pair, TP=2 at 12.5:
+# "prompt cache: off (budget 0)"), so no state would be kept. Warns; the pool stays as it is. The pair's sizing:
+# KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8, a 6.2 GiB budget (g1b), 5.1 GiB with spill v2 on (g2: its 1,066 MiB of pinned
+# staging is taken before the pool).
+port_pool_check() {
+  [[ "$ENGINE" == zig && "$DRAFTER" == dflash2 ]] && port_gt0 "$1" && (( ! PORT_POOL_EXPLICIT )) || return 0
+  warn "PROMPT_CACHE_GIB=$1 with KV_POOL_GIB at its default ($KV_POOL_GIB): the engine sizes the KV pool first and gives the kept prompt states only what is left above MEMORY_RESERVE_GIB, and at the default pool that left nothing on the pair (KV_POOL_GIB=12.5: \"prompt cache: off (budget 0)\"), so no prompt state would be kept. Set KV_POOL_GIB lower with it; the pair ran KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on (its 1,066 MiB of pinned staging is taken before the pool)"
+}
 
 # ---------------------------------------------------------------- checks (no ssh, nothing changed)
 # port_validate <parallel> <prompt cache GiB>: every setting's form, and the combinations the engine cannot run, before
@@ -237,6 +250,8 @@ port_validate() {
         else port_shard_default_off "the spill tier is on and $why"; fi
       fi
     fi
+    # a prompt cache the default pool leaves no room for
+    port_pool_check "$cache"
   else
     # the Python engine (patches/): the v1 tier only
     if port_v2_on; then

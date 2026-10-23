@@ -129,10 +129,10 @@ bertholomus/TensorFold (a TensorFold fork; design only)
   from it; the code is ours.
 
 Contributions to this project (Apache-2.0, through its issues and pull requests)
-  zig/patches/0014 to 0023 (ENGINE=zig): the GLM patches 0088/0110/0111/0118/0119 by Robert Wojciechowski (GitHub
-  @wojo, X @rwojo), ported by him to the GLM Zig engine, with his two base-engine fixes (0015 prepare memory, from his
-  DeepSeek recipe's 0023; 0016 the shared-cut chat id); spill v2's block store follows BadAd84's block-tier design
-  (pull request #118). scripts/port.sh, scripts/memavail.sh,
+  zig/patches/0014 to 0023 (ENGINE=zig): the GLM patches 0088/0110/0111/0118/0119 by
+  Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine, with his two base-engine fixes
+  (0015 prepare memory, from his DeepSeek recipe's 0023; 0016 the shared-cut chat id); spill v2's block store follows
+  BadAd84's block-tier design (pull request #118). scripts/port.sh, scripts/memavail.sh,
   scripts/port-patches.sh and the tools checklib.py, spill_check.py, resume_bench.py, prefix_fanout.py, selftest.py and
   fake_server.py are by him, from his port of the same features to the DeepSeek-V4.1-Flash recipe; tools/exact.py is
   that recipe's (MiaAI-Lab), with his changes.

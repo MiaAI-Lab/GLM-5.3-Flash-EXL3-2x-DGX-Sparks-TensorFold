@@ -1,8 +1,10 @@
 # The memory a Spark can give a starting rank, counted the way the engine's startup budget counts it: MemAvailable plus
 # the pages parked on the kernel's per-CPU free lists (wojo's GLM patch 0119, PR #149; the Zig engine's
 # native/cuda_memory.zig parkedBytes, as ported to the DeepSeek recipe's scripts/memavail.sh, from which this is copied).
-# Neither engine this recipe ships counts them yet (0119 is in neither patches/ nor zig/patches): start.sh counts them
-# only for an engine that does (scripts/port.sh: port_parked), and reads `free -g` as before otherwise.
+# start.sh counts them only for an engine that does (scripts/port.sh: port_parked), and reads `free -g` as before
+# otherwise: ENGINE=zig does with zig/patches/0014 (0119's port, glm_cuda/cuda_cache_plan.zig parkedBytes; ZIG_HAS
+# parked, which start.sh's default lists), ENGINE=python only with patches/0119-cuda-budget-parked-pages.patch, which
+# patches/ does not carry.
 # Sourced by scripts/nodes.sh; start.sh sends mem_counting to each worker over ssh (self-contained: awk and getconf only).
 # bash 3.2 and POSIX awk (mawk, gawk, BSD awk), so that scripts/port_test.sh runs it on a Mac against synthetic /proc
 # files.
