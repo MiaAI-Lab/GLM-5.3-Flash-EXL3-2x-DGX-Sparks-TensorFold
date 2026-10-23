@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits d9d631748d76..2a16b14a4903); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ ee578fd4237f over glm/zig-engine-base @ 0db3e2f6652b (commits d9d631748d76..2a16b14a4903); regenerate with scripts/port-patches.sh, do not edit
 server + core: a long prompt's preparation no longer runs rank 0 out of memory (port of DeepSeek 0023, GLM's three renders)
 
 The template's render and the tokenizer's encode and decode built their

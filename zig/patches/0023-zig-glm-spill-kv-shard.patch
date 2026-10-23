@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits d0b25f0c94ec..dbe61751a8b0); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ ee578fd4237f over glm/zig-engine-base @ 0db3e2f6652b (commits d0b25f0c94ec..15e06e463cc9); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks)
 
 With KV sharding a kept state's latent rows are only on the rank that owned
@@ -20,8 +20,8 @@ refusal of the pair goes).
   with the home recorded, and the resume then places it as any kept state
   (in its part, moved home, carried, or from 0). A restore whose resume
   could only start from 0 (its home part full, no carry) does not start
-  (KvShardHomeFull, before any read); beside other restores in flight it
-  waits for them and asks again, as the cache tier's other refusals do.
+  (KvShardHomeFull, asked before the cache makes room and before any read):
+  its prompt prefills at once, also beside other restores in flight.
 - Points per part (points_part0, points_part1) in every rank's tier counters
   on /health and /metrics.
 
