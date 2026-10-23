@@ -245,3 +245,16 @@ last tree `glm/integration`'s after round 3's merge outside `docs/glm-port`; the
 | `docs/zig-engine.md`, `README.md`, `CHANGELOG.md`, `CREDITS.md`, `NOTICE` | the settings' rows as implemented (`SPILL_V2`, `KV_SHARD`, `PROMPT_CACHE_GIB` with the GPU finding, parked pages, `TENSORFOLD_PREPARE_FLOOR_GIB`, continued chats), the credits for `0014`-`0023` |
 
 Robert's fork defaults are a further branch, `fork-main` (one commit, "Robert's defaults"): see its own section there.
+
+### Re-export after merge round 3's follow-ups (2026-10-23)
+
+The engine fixed two of round 3's leftovers (`docs/glm-port/merge-r3.md` there, "Follow-ups": `KvShardHomeFull` is
+one of the prompt cache's `point_errors`, so it is never deferred; `Tier.VTable.check`, asked before the store makes
+room, so a restore refused for its point evicts no kept state) and folded them into the series: `0019`, `0021` and
+`0023` changed, `0020` and `0022` were re-applied unchanged, `0014`-`0018` are untouched. `scripts/port-patches.sh`
+re-exported `glm/series` (3181fe20) with its defaults, plus `--name` for the five rewritten commits (`f139cada` to
+`core-cache-tier`, `8455b2ce` to `glm-kv-shard-host`, `68854c0f` to `glm-spill-blocks`, `d0b25f0c` to
+`glm-kv-shard`, `dbe61751` to `glm-spill-kv-shard`): a re-export keeps a patch's name only for the commit it came
+from, and a rewritten commit is a new one. The files and their names are as before; every header's `glm/series` sha
+moved, and `0019`, `0021` and `0023` carry the fixes. Nothing else here changed (no setting, no default; `ZIG_HAS`
+as before). Tests: `scripts/port_test.sh` 113/113, `scripts/port_patches_test.sh` 15/15, `tools/selftest.py` 83/83.

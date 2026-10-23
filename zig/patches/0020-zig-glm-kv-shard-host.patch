@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 14e8577b6303 over glm/zig-engine-base @ 0db3e2f6652b (commits 97c4f8e0f0f3..6f3edbfe37f4); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits f139cada683a..8455b2cef6de); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: KV shard host side: the part planner and pool parts, switches and their agreement, storage, placement check and telemetry (port of GLM 0118, parts 1-2)
 
 KV sharding as GLM's Python 0118 designs it, not the DeepSeek port's lanes:
@@ -69,7 +69,7 @@ index 13f284bcf8a22f1e24e279befece99b2f69de772..cfd45f405a0bd323b4340657fa272953
  
  /// A worked example for the learner: token ids, the answer from `start`; `decide`: its assistant header's last row.
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 78d011ee282b840037bf8f401c0d216facff0585..efbac8119d36d24e31b15b75a696e8231b6d4d03 100644
+index 64da0ee048a49979e8ed32217e53b6d1db958034..4263f7d2709753a275fbb904e51106be4c536b80 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -71,6 +71,9 @@ pub const LaneHost = struct {

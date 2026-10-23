@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 14e8577b6303 over glm/zig-engine-base @ 0db3e2f6652b (commits 6f3edbfe37f4..76543016e1a8); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits 8455b2cef6de..68854c0fff08); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 for GLM: kept-state packing, the rank protocol, the compatibility fingerprint and the GLM tier behind TF_GLM_SPILL_V2=1 (port of GLM 0110)
 
 The GLM family's half of spill v2, on the core store and the prompt cache's
@@ -4254,10 +4254,10 @@ index 0000000000000000000000000000000000000000..3d94a4955271c6b6cbf95d820d2de386
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_spill_tier.zig b/zig/src/families/glm_cuda/cuda_spill_tier.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..1899a6e124b697052ccaca2dd96ae0d654e79d03
+index 0000000000000000000000000000000000000000..f737fe1cad26c4d888647d16d0a83f372c168ae0
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig
-@@ -0,0 +1,1565 @@
+@@ -0,0 +1,1583 @@
 +//! Spill v2's GLM tier: core/prompt_cache's `Tier` over every rank's core/spill block store, with step A's packing
 +//! (cuda_spill_state) and step B's rank protocol (cuda_spill_wire over Flash Next's mirror). Port of wojo's GLM 0110
 +//! (PR #124; BadAd84's block tier: write at keep through a pinned staging ring pumped 4 blocks between rounds, 16
@@ -5348,20 +5348,34 @@ index 0000000000000000000000000000000000000000..1899a6e124b697052ccaca2dd96ae0d6
 +            return self.jobs.count() >= self.max_restores or self.side.store.readsFull();
 +        }
 +
-+        /// A restore of point `id` (found by lookup): this rank's reads first (TooMany, NoSlot: refused for capacity,
-+        /// nothing sent), then `has` on every rank (a rank that lacks the point or holds it damaged makes every rank
-+        /// forget it), then the destination, and a `begin` note that has every other rank reserve its own under the
-+        /// same key and start its reads. Its transaction.
-+        pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
-+            self.side.e.current();
++        /// begin's refusals of point `id` itself that no room cures, from this rank's own records with nothing read,
++        /// sent or reserved: UnknownPoint and BadPoint (not a point lookup gave), SpillMissing (gone from this rank's
++        /// store: forgotten here). The prompt cache asks it before it makes room for the restore
++        /// (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin asks it again.
++        pub fn check(self: *Self, id: u64, at: u32) !void {
++            _ = try self.checked(id, at);
++        }
++
++        fn checked(self: *Self, id: u64, at: u32) !PointRef {
 +            const side = self.side;
-+            if (self.jobs.count() >= self.max_restores) return error.TooManyRestores;
 +            const ref = self.points.get(id) orelse return error.UnknownPoint;
 +            if (at != ref.at) return error.BadPoint;
 +            if (!side.store.presence(ref.key)) {
 +                _ = self.points.remove(id);
 +                return error.SpillMissing;
 +            }
++            return ref;
++        }
++
++        /// A restore of point `id` (found by lookup): `check`'s refusals first, then this rank's reads (TooMany,
++        /// NoSlot: refused for capacity, nothing sent), then `has` on every rank (a rank that lacks the point or holds
++        /// it damaged makes every rank forget it), then the destination, and a `begin` note that has every other rank
++        /// reserve its own under the same key and start its reads. Its transaction.
++        pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
++            self.side.e.current();
++            const side = self.side;
++            if (self.jobs.count() >= self.max_restores) return error.TooManyRestores;
++            const ref = try self.checked(id, at);
 +            try self.jobs.ensureUnusedCapacity(self.gpa, 1);
 +            const txn = self.next_txn;
 +            const rx = try side.newRx(txn, ref.key, at);
@@ -5743,6 +5757,7 @@ index 0000000000000000000000000000000000000000..1899a6e124b697052ccaca2dd96ae0d6
 +            .lookup = lookupFn,
 +            .begin = beginFn,
 +            .full = fullFn,
++            .check = checkFn,
 +            .poll = pollFn,
 +            .cancel = cancelFn,
 +            .keep = keepFn,
@@ -5773,6 +5788,9 @@ index 0000000000000000000000000000000000000000..1899a6e124b697052ccaca2dd96ae0d6
 +        }
 +        fn fullFn(ptr: *anyopaque) bool {
 +            return of(ptr).full();
++        }
++        fn checkFn(ptr: *anyopaque, point: *const pc.Point) anyerror!void {
++            return of(ptr).check(point.id, point.at);
 +        }
 +        fn pollFn(ptr: *anyopaque, job: u64, budget_ns: u64) pc.Poll {
 +            return switch (of(ptr).poll(job, budget_ns)) {
@@ -6432,10 +6450,10 @@ index 0000000000000000000000000000000000000000..9a8a02bdcbcc6a3e6ddd2ba6db65a679
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ad2c6ba2728af81f5880683fe8875ac6248065df
+index 0000000000000000000000000000000000000000..eaf83cf09441e946286c4059132303aee0a7730c
 --- /dev/null
 +++ b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,492 @@
 +//! Spill v2's GLM tier on two ranks in one thread (cuda_spill_tier_rig.zig): host-memory kept states of the real GLM
 +//! layout, each rank's own core/spill store under TF_SPILL_TEST_DIR, rank 1 following rank 0's notes and asks.
 +const std = @import("std");
@@ -6622,6 +6640,12 @@ index 0000000000000000000000000000000000000000..ad2c6ba2728af81f5880683fe8875ac6
 +    try testing.expect(!l.full());
 +    const pa = l.lookup(a, 0, @intCast(a.len - 1), &.{}, 0).?;
 +    const pb = l.lookup(b, 0, @intCast(b.len - 1), &.{}, 0).?;
++    // `check`, which the prompt cache asks before it makes room: a point no lookup gave, or at another position, is
++    // refused with nothing read; a's passes
++    try testing.expectError(error.UnknownPoint, l.check(std.math.maxInt(u64), pa.at));
++    try testing.expectError(error.BadPoint, l.check(pa.id, pa.at + 64));
++    try l.check(pa.id, pa.at);
++    try testing.expectEqual(@as(usize, 0), l.side.rxs.count());
 +    const job = try l.begin(pa.id, pa.at, false);
 +    try p.sink.take(&p.r[1]);
 +    // one restore in flight is the cap: full before any room is made, and a begin refused for capacity

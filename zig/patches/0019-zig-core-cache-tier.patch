@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 14e8577b6303 over glm/zig-engine-base @ 0db3e2f6652b (commits e4fb5b76cb1b..97c4f8e0f0f3); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits e4fb5b76cb1b..f139cada683a); regenerate with scripts/port-patches.sh, do not edit
 core prompt cache + lane host: spill v2's Tier, restore jobs and the restore service beside decoding (port of GLM 0110's host side)
 
 The prompt cache's half of spill v2, re-implemented on v1.0.7's store and lane
@@ -228,7 +228,7 @@ index f395c7475e7ca55507f7ce235fe937fb391de8d1..13f284bcf8a22f1e24e279befece99b2
      _ = @import("prompt_radix.zig");
      _ = @import("prompt_imprint.zig");
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index c9166233f8b926d173e256d4ce60927173da44cc..78d011ee282b840037bf8f401c0d216facff0585 100644
+index c9166233f8b926d173e256d4ce60927173da44cc..64da0ee048a49979e8ed32217e53b6d1db958034 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -1,4 +1,13 @@
@@ -741,7 +741,7 @@ index c9166233f8b926d173e256d4ce60927173da44cc..78d011ee282b840037bf8f401c0d216f
 +        h.unlock();
 +        room catch return false;
 +        // (the best memory state stays while the budget holds it beside the restore: refused, the pass resumes it; a
-+        // full tier refuses before any room is made)
++        // full tier, or a point the tier's check refuses, is refused before any room is made)
 +        const begun = store.restoreBeginOver(p, r.prompt, .{ .have = probe.memory, .again = job.deferred_since != null });
 +        status.noteKept(h); // (its room may have evicted kept states, begun or not)
 +        if (begun) |rs| {
@@ -2400,7 +2400,7 @@ index 93ed09d28383845658ba12b1446ea547055f1d94..479260a0971543607eb987fa8513b9c8
      pub fn stepped(x: *Fake) be.Backend {
          return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow } };
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1cc68f109f 100644
+index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..f4395d00b053330724d1c632d0ac5cb95a528506 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -1,4 +1,9 @@
@@ -2433,7 +2433,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
  };
  
  pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0, chats_continued: u64 = 0, chats_continued_prefill_tokens: u64 = 0 };
-@@ -198,6 +209,290 @@ pub const Kept = struct { held: bool, shared: usize };
+@@ -198,6 +209,297 @@ pub const Kept = struct { held: bool, shared: usize };
  /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
  pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
  
@@ -2651,6 +2651,13 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
 +        /// before the store makes room for a restore, so a refusal costs no kept state (error.TierFull, nothing evicted).
 +        /// Null: never full (a capacity refusal from `begin` then comes after the room was made).
 +        full: ?*const fn (ptr: *anyopaque) bool = null,
++        /// begin's refusals of `point` itself that no room cures, decided from the tier's own records with nothing read,
++        /// reserved or sent (GLM: the point unknown, or gone from this rank's store; KvShardHomeFull): asked after `full`
++        /// and before the store makes room for the restore, so such a refusal evicts no kept state for a restore that
++        /// never starts. The error is the one `begin` would return. What `begin` may still refuse after the room is
++        /// what the room may cure (the destination's memory: GLM's SpillReserve) or what needs every rank (GLM's
++        /// `has`). Null: no such check (every refusal from `begin` then comes after the room was made).
++        check: ?*const fn (ptr: *anyopaque, point: *const Point) anyerror!void = null,
 +        /// Progress the job by at most `budget_ns` of engine-thread copies; after ready or failed the job is gone.
 +        poll: *const fn (ptr: *anyopaque, job: u64, budget_ns: u64) Poll,
 +        /// Stop a pending job: reads stop, issued DMA is waited for, reservations go (called once per job at most).
@@ -2724,7 +2731,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
  pub const Store = struct {
      gpa: Allocator,
      family: Snapshots,
-@@ -213,6 +508,13 @@ pub const Store = struct {
+@@ -213,6 +515,13 @@ pub const Store = struct {
      policy: Policy = .{},
      next_chat: u32 = 1,
      roots: std.AutoHashMapUnmanaged(u32, u32) = .empty, // each conversation's first prompt length (continuedChat)
@@ -2738,7 +2745,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
  
      const SHARED_KEYS = 64;
  
-@@ -221,6 +523,8 @@ pub const Store = struct {
+@@ -221,6 +530,8 @@ pub const Store = struct {
      }
  
      pub fn deinit(s: *Store) void {
@@ -2747,7 +2754,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          for (s.entries.items) |e| s.free(e);
          s.entries.deinit(s.gpa);
          s.shared_keys.deinit(s.gpa);
-@@ -228,11 +532,34 @@ pub const Store = struct {
+@@ -228,11 +539,34 @@ pub const Store = struct {
          s.held = 0;
      }
  
@@ -2782,7 +2789,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          s.gpa.destroy(e);
      }
  
-@@ -240,7 +567,7 @@ pub const Store = struct {
+@@ -240,7 +574,7 @@ pub const Store = struct {
      /// conversation does not hold it (multi.py `_superseded`).
      fn evict(s: *Store, i: usize, to_disk: bool) void {
          const e = s.entries.items[i];
@@ -2791,7 +2798,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          s.remove(i);
      }
  
-@@ -262,9 +589,28 @@ pub const Store = struct {
+@@ -262,9 +596,28 @@ pub const Store = struct {
          return if (s.family.vtable.spare) |f| f(s.family.ptr) else 0;
      }
  
@@ -2822,7 +2829,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
      }
  
      /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
-@@ -272,6 +618,26 @@ pub const Store = struct {
+@@ -272,6 +625,26 @@ pub const Store = struct {
          return at > 0 and (!s.rules.planned or s.startAt(starts, at) == at);
      }
  
@@ -2849,7 +2856,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
      /// The chunk start at or before `at`: the request's, else the family's grid (0 when none).
      fn startAt(s: *const Store, starts: []const u32, at: u32) u32 {
          if (starts.len == 0 and s.rules.grid > 0) return at - at % s.rules.grid;
-@@ -298,11 +664,273 @@ pub const Store = struct {
+@@ -298,11 +671,276 @@ pub const Store = struct {
              const n = e.tokens.len;
              if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
              if (!modes.equal(e.decode_spans, spans, e.at)) continue;
@@ -2916,10 +2923,12 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
 +    pub const Refusal = enum { none, restores_in_flight, budget };
 +
 +    /// restoreBegin for a request whose best memory state is `o.have`. A full tier (Tier.VTable.full) refuses first,
-+    /// with error.TierFull and nothing evicted, so the shorter state is still there to resume. Otherwise the room
-+    /// spares `have` when the budget holds both it and the restore (a refusal by the tier then leaves it), and evicts
-+    /// it as restoreBegin does when the budget cannot hold both: a restore that can start always beats the shorter
-+    /// state. After a refusal `have` may be gone: look it up again (Store.find), never through the old pointer.
++    /// with error.TierFull and nothing evicted, so the shorter state is still there to resume; then the tier's check
++    /// of the point (Tier.VTable.check), whose refusal (begin's own error) evicts nothing either. The room is made only
++    /// once both pass. It spares `have` when the budget holds both it and the restore (a refusal by the tier then
++    /// leaves it), and evicts it as restoreBegin does when the budget cannot hold both: a restore that can start always
++    /// beats the shorter state. After a refusal `have` may be gone: look it up again (Store.find), never through the
++    /// old pointer.
 +    pub fn restoreBeginOver(s: *Store, p: Point, key: []const u32, o: Over) !*Restore {
 +        for (s.restoring.items) |r| if (r.point.id == p.id) {
 +            s.tier_stats.restores_shared += 1;
@@ -2931,6 +2940,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
 +            if (!o.again) s.tier_stats.restores_refused += 1;
 +            return error.TierFull;
 +        };
++        if (t.vtable.check) |check| try check(t.ptr, &p); // (a refusal of the point: not counted, as begin's are not)
 +        const bytes = s.pointBytes(p);
 +        s.refused_for = .none;
 +        const spare_have = if (o.have) |e| s.restoring_bytes + bytes + e.bytes <= s.budget else false;
@@ -3123,7 +3133,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
      /// Restore the longest prefix matching tokens and canonical spans, then plan prompt-cache marks.
      pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque, spans: []const modes.Span) !Plan {
          return s.beginRewind(a, prompt, history_len, 0, shared, starts, owner, spans);
-@@ -375,15 +1003,22 @@ pub const Store = struct {
+@@ -375,15 +1013,22 @@ pub const Store = struct {
              } else false;
              if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
          }
@@ -3148,7 +3158,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          while (s.entries.items.len > 0) s.remove(s.entries.items.len - 1);
          s.shared_keys.clearRetainingCapacity();
          s.imprint = null;
-@@ -456,6 +1091,7 @@ pub const Store = struct {
+@@ -456,6 +1101,7 @@ pub const Store = struct {
          s.clock += 1;
          e.used = s.clock;
          s.counts.hits += 1;
@@ -3156,7 +3166,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          const last = s.gpa.dupe(u32, prompt) catch return;
          s.gpa.free(e.last);
          e.last = last;
-@@ -503,12 +1139,22 @@ pub const Store = struct {
+@@ -503,12 +1149,22 @@ pub const Store = struct {
  
      /// `keep` in conversation `chat` (its request's, `join`; 0: the conversation of the state it extends, `chatOf`).
      pub fn keepIn(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, chat_in: u32) bool {
@@ -3179,7 +3189,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
              e.shared = e.shared or shared;
              if (shared) learned.learn(s, e, starts);
              return true;
-@@ -525,16 +1171,24 @@ pub const Store = struct {
+@@ -525,16 +1181,24 @@ pub const Store = struct {
          while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
              if (s.family.vtable.reuses) |f| if (f(s.family.ptr, at)) break;
              const free_ = s.spare();
@@ -3208,7 +3218,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
          const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
              s.gpa.destroy(e);
-@@ -551,8 +1205,15 @@ pub const Store = struct {
+@@ -551,8 +1215,15 @@ pub const Store = struct {
              s.gpa.destroy(e);
              return s.fail(at, err);
          };
@@ -3225,7 +3235,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          owns_decoded = false;
          s.entries.append(s.gpa, e) catch {
              s.free(e);
-@@ -560,9 +1221,13 @@ pub const Store = struct {
+@@ -560,9 +1231,13 @@ pub const Store = struct {
          };
          s.held += charged;
          s.counts.kept += 1;
@@ -3240,7 +3250,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          return true;
      }
  
-@@ -574,11 +1239,11 @@ pub const Store = struct {
+@@ -574,11 +1249,11 @@ pub const Store = struct {
          const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
          if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
          const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
@@ -3254,7 +3264,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          const e = s.gpa.create(Entry) catch return have;
          e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
          e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
-@@ -599,7 +1264,7 @@ pub const Store = struct {
+@@ -599,7 +1274,7 @@ pub const Store = struct {
      /// The spill tier's longest stored state this prompt extends, when it is longer than `have`: read into new storage as an
      /// entry no conversation owns. Else `have`.
      fn spillRecall(s: *Store, prompt: []const u32, have: ?*Entry) ?*Entry {
@@ -3263,7 +3273,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          const find_stored = s.family.vtable.stored orelse return have;
          const load = s.family.vtable.load orelse return have;
          var hit: Stored = .{ .at = 0, .key = 0, .tokens = &.{} };
-@@ -628,7 +1293,7 @@ pub const Store = struct {
+@@ -628,7 +1303,7 @@ pub const Store = struct {
      /// eviction frees its memory at once.
      fn earlyWrite(s: *Store) void {
          const hw = s.policy.spill_highwater;
@@ -3272,7 +3282,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          if (@as(f64, @floatFromInt(s.held)) <= hw * @as(f64, @floatFromInt(s.budget))) return;
          const f = s.family.vtable.evict orelse return;
          const i = s.capVictim(null, true) orelse return;
-@@ -637,9 +1302,10 @@ pub const Store = struct {
+@@ -637,9 +1312,10 @@ pub const Store = struct {
          if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
      }
  
@@ -3285,7 +3295,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
          const f = s.family.vtable.evict orelse return 0;
          var t0: std.c.timespec = undefined;
          _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t0);
-@@ -884,7 +1550,7 @@ pub const Store = struct {
+@@ -884,7 +1560,7 @@ pub const Store = struct {
          }.lt);
          k.hits, k.misses, k.evicted, k.restored = .{ s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.restored };
          k.chats_continued, k.chats_continued_prefill_tokens = .{ s.counts.chats_continued, s.counts.chats_continued_prefill_tokens };
@@ -3294,7 +3304,7 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
              k.spill_on = true;
              f(s.family.ptr, &k.spill);
          };
-@@ -951,6 +1617,7 @@ test {
+@@ -951,6 +1627,7 @@ test {
      _ = @import("prompt_cache_rewind_test.zig");
      _ = @import("prompt_cache_policy_test.zig");
      _ = @import("prompt_cache_chat_test.zig");
@@ -3304,10 +3314,10 @@ index 1f887fd4edaf26c3d1d7e1366eb72470a01b9698..7ffdc69ab5671a0056194e481dc43b1c
  }
 diff --git a/zig/src/core/prompt_cache_fake_tier.zig b/zig/src/core/prompt_cache_fake_tier.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..ceef5e43c09db0d59ddd8a205941f8c754247d26
+index 0000000000000000000000000000000000000000..a01a2feace345da9e3e2ec6421d462ed3c02d273
 --- /dev/null
 +++ b/zig/src/core/prompt_cache_fake_tier.zig
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,385 @@
 +//! An in-memory prompt-cache Tier for tests (no disk, no CUDA; one lock for the engine thread and the test's): writes
 +//! are queued at keep and published by `pump`, a restore needs `polls` polls, and every misuse (a job cancelled twice,
 +//! a poll of a gone job) is recorded.
@@ -3342,6 +3352,11 @@ index 0000000000000000000000000000000000000000..ceef5e43c09db0d59ddd8a205941f8c7
 +    /// is (a family whose restores hold until they end what a begin needs; not GLM's SpillReserve, whose restores keep
 +    /// their destinations: `refuse` models that one); null: no such limit.
 +    busy_err: ?anyerror = null,
++    /// The next `unfit` restores are refused with `unfit_err`, a refusal of the point itself that no room cures (GLM's
++    /// KvShardHomeFull, an unknown point): by Tier.VTable.check before the store makes room, or by `begin` when it is
++    /// asked without one; nothing reserved, and `refused` counts them.
++    unfit: u32 = 0,
++    unfit_err: anyerror = error.KvShardHomeFull,
 +    refused: u64 = 0,
 +    begins: u64 = 0,
 +    /// The next `full` asks of Tier.VTable.full answer true (the tier at its cap before any room is made; `fulls`
@@ -3393,7 +3408,7 @@ index 0000000000000000000000000000000000000000..ceef5e43c09db0d59ddd8a205941f8c7
 +    }
 +
 +    pub fn tier(t: *FakeTier) pc.Tier {
-+        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .full = isFull, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
++        return .{ .ptr = t, .vtable = &.{ .lookup = lookup, .begin = begin, .full = isFull, .check = check, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts } };
 +    }
 +
 +    fn lock(t: *FakeTier) void {
@@ -3463,11 +3478,27 @@ index 0000000000000000000000000000000000000000..ceef5e43c09db0d59ddd8a205941f8c7
 +        return true;
 +    }
 +
++    fn check(ptr: *anyopaque, _: *const pc.Point) anyerror!void {
++        const t = of(ptr);
++        t.lock();
++        defer t.unlock();
++        try t.unfitted();
++    }
++
++    /// The next `unfit` refusal, if any is left (lock held).
++    fn unfitted(t: *FakeTier) !void {
++        if (t.unfit == 0) return;
++        t.unfit -= 1;
++        t.refused += 1;
++        return t.unfit_err;
++    }
++
 +    fn begin(ptr: *anyopaque, p: *const pc.Point) anyerror!u64 {
 +        const t = of(ptr);
 +        t.lock();
 +        defer t.unlock();
 +        t.begins += 1;
++        try t.unfitted();
 +        if (t.refuse > 0) {
 +            t.refuse -= 1;
 +            t.refused += 1;
@@ -3674,10 +3705,10 @@ index 0000000000000000000000000000000000000000..ceef5e43c09db0d59ddd8a205941f8c7
 +};
 diff --git a/zig/src/core/prompt_cache_tier_test.zig b/zig/src/core/prompt_cache_tier_test.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..91ea127f613685aafc69b83aef9a2495a99a0549
+index 0000000000000000000000000000000000000000..1854f19fab4f807304c722de16468964f89af880
 --- /dev/null
 +++ b/zig/src/core/prompt_cache_tier_test.zig
-@@ -0,0 +1,840 @@
+@@ -0,0 +1,881 @@
 +//! The prompt cache's durable tier (wojo's GLM 0110, as the DeepSeek port's core has it): a fake in-memory tier, and a
 +//! family whose state is a running hash of the prompt, so a restored state equals a fresh pass exactly when it should.
 +//! (0111's continuation cases are prompt_cache_chat_test.zig's.)
@@ -4296,6 +4327,47 @@ index 0000000000000000000000000000000000000000..91ea127f613685aafc69b83aef9a2495
 +    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
 +    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
 +    try std.testing.expectEqual(@as(u32, 30), s.find(&a, &.{}, &.{}).?.at);
++}
++
++test "a restore the tier refuses for its point evicts no kept state for it; one the tier accepts still makes its room" {
++    var f: Sum = .{};
++    var tier: FakeTier = .{ .gpa = gpa, .codec = f.codec() };
++    defer tier.deinit();
++    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 250); // states of 100 + at bytes
++    defer s.deinit();
++    s.setTier(tier.tier(), 0);
++    const d = seq(48, 1);
++    const b = seq(48, 300);
++    try std.testing.expect(keepAt(&s, &f, &d, 10, .{})); // the prompt's own memory state: 110 bytes at 10
++    try std.testing.expect(keepAt(&s, &f, &b, 10, .{})); // another conversation's: 220 of 250 held
++    _ = try tier.put(d[0..30], 30, std.mem.asBytes(&Sum.State{ .at = 30, .sum = Sum.fresh(&d, 30) }), 0, 0, false);
++    const pr = s.probe(&d, &.{}, &.{});
++    const hit = pr.memory.?;
++    const p = pr.durable.?; // 130 bytes: beside the hit, b's state must go to make its room
++    // refused for the point itself (GLM's KvShardHomeFull: its home part full, no carry), first and asked again: no
++    // kept state evicted, nothing begun or charged
++    tier.unfit = 2;
++    try std.testing.expectError(error.KvShardHomeFull, s.restoreBeginOver(p, &d, .{ .have = hit }));
++    try std.testing.expectError(error.KvShardHomeFull, s.restoreBeginOver(p, &d, .{ .have = hit, .again = true }));
++    try std.testing.expectEqual(@as(u64, 2), tier.refused);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expectEqual(@as(u64, 220), s.held);
++    try std.testing.expect(s.find(&b, &.{}, &.{}) != null);
++    try std.testing.expectEqual(hit, s.find(&d, &.{}, &.{}).?); // the pass resumes at 10
++    try std.testing.expectEqual(@as(usize, 0), s.restoring.items.len);
++    try std.testing.expectEqual(@as(u64, 0), s.restoring_bytes);
++    try std.testing.expectEqual(@as(u64, 0), tier.begins); // refused before begin
++    try std.testing.expectEqual(@as(u64, 0), s.tier_stats.restores_refused); // (a refusal of the point, as begin's)
++    // accepted: its room is made as before (b's state evicted, the hit spared beside it), and it restores
++    const r = try s.restoreBeginOver(p, &d, .{ .have = hit });
++    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
++    try std.testing.expect(s.find(&b, &.{}, &.{}) == null);
++    try std.testing.expectEqual(hit, s.find(&d, &.{}, &.{}).?);
++    try std.testing.expectEqual(@as(u64, 130), s.restoring_bytes);
++    try std.testing.expect(s.held + s.restoring_bytes <= s.budget);
++    try std.testing.expectEqual(pc.Restored.adopted, settle(&s, r));
++    try std.testing.expectEqual(@as(u32, 30), s.find(&d, &.{}, &.{}).?.at);
 +}
 +
 +test "a NoRoom is worth waiting for only when the restores in flight hold the rest of the budget" {

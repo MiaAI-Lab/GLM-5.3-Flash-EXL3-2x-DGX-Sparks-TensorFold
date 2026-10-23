@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 14e8577b6303 over glm/zig-engine-base @ 0db3e2f6652b (commits 96226f0d9b35..9148d935db9b); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 3181fe208738 over glm/zig-engine-base @ 0db3e2f6652b (commits d0b25f0c94ec..dbe61751a8b0); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks)
 
 With KV sharding a kept state's latent rows are only on the rank that owned
@@ -49,8 +49,63 @@ MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patches 0110
 and 0118, MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#124 and #152.
 Apply from the checkout root with: git apply 0023-zig-glm-spill-kv-shard.patch
 
+diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
+index 71ae408c7f1d43cf509ab77064bce059d13ef5df..fd9415c8ea669b0310b744026e8bbf7b1f8e4bbf 100644
+--- a/zig/src/core/lane_host_tier_test.zig
++++ b/zig/src/core/lane_host_tier_test.zig
+@@ -974,6 +974,50 @@ test "a restore refused for its destination's memory (GLM's SpillReserve) waits
+     try std.testing.expectEqual(@as(u64, 2), r.tier.refused); // once more, when the first ended
+ }
+ 
++test "a restore refused because its home part has no room (GLM's KvShardHomeFull) beside one in flight is admitted on memory at once, not deferred" {
++    var a: Box = .{};
++    defer a.deinit();
++    var b: Box = .{};
++    defer b.deinit();
++    const r = try Rig.create(.{ .load_ms = 5, .defer_ms = 10_000 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release); // the first restore stays in flight until the end
++    _ = try r.point(&t2, 8);
++    const e = r.host.engine();
++    const areq: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(1, &areq, a.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 1;
++        }
++    }.ok);
++    // the second point is on disk but its resume could only start from 0 (its home part full, no carry): its own
++    // placement, which no restore in flight holds, so its prompt prefills now rather than waiting for the first restore
++    r.tier.refuse = 1 << 20;
++    r.tier.refuse_err = error.KvShardHomeFull;
++    const other = [_]u32{ 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6 };
++    _ = try r.point(&other, 8);
++    const breq: Request = .{ .prompt = &other, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &breq, b.sink());
++    for (0..5000) |_| {
++        if (b.finished() != null) break;
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expectEqual(@as(?Reason, Reason.length), b.finished()); // with the first restore still in flight
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    try b.exact(&other);
++    try std.testing.expect(a.finished() == null);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred);
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred_expired);
++    try std.testing.expectEqual(@as(u64, 1), r.tier.refused); // asked once, never again
++    r.tier.gate.store(true, .release);
++    try std.testing.expectEqual(Reason.length, a.wait());
++    try std.testing.expectEqual(@as(?u32, 8), a.cached);
++    try a.exact(&t2);
++    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_begun);
++}
++
+ // -- prompt passes while requests are parked (whole passes service nothing) -----------------------------------------
+ 
+ /// Records, at each watched pass's first chunk (on the engine thread), how many restores the store had adopted.
 diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
-index 7ffdc69ab5671a0056194e481dc43b1cc68f109f..244f726c8808d034369cf9d4b816ffa8c1239f32 100644
+index f4395d00b053330724d1c632d0ac5cb95a528506..5efa1254314bb108157698cd9635b12aeb5e6257 100644
 --- a/zig/src/core/prompt_cache.zig
 +++ b/zig/src/core/prompt_cache.zig
 @@ -320,8 +320,10 @@ pub const TierCounts = struct {
@@ -74,6 +129,36 @@ index 7ffdc69ab5671a0056194e481dc43b1cc68f109f..244f726c8808d034369cf9d4b816ffa8
      };
  };
  
+@@ -369,12 +373,15 @@ pub const TierCounts = struct {
+ pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
+ 
+ /// Refusals that name the point itself, never deferred (Store.deferrable): the store's NoTier and BadPoint; a family
+-/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank; core/spill's Missing; the fake
+-/// tier's PointMissing. No wait cures them (the tier forgets a point it learned is gone), with one exception:
+-/// SpillNotOnEveryRank is also GLM's answer while a rank's own write of the point is still queued (`incomplete`, kept
+-/// on every rank), which a later ask would find published. It stays here: rank 0 cannot see that write publish without
+-/// asking every rank `has` again, a gather each time, and the case needs a lookup to choose the point (its memory state
+-/// already evicted) while another rank is still writing it.
++/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank, KvShardHomeFull; core/spill's
++/// Missing; the fake tier's PointMissing. No wait for the restores in flight cures them (the tier forgets a point it
++/// learned is gone), with one exception: SpillNotOnEveryRank is also GLM's answer while a rank's own write of the
++/// point is still queued (`incomplete`, kept on every rank), which a later ask would find published. It stays here:
++/// rank 0 cannot see that write publish without asking every rank `has` again, a gather each time, and the case needs
++/// a lookup to choose the point (its memory state already evicted) while another rank is still writing it.
++/// KvShardHomeFull (GLM, owner-sharded KV: the point's home part has no room for its resume and no carry can take it)
++/// names the point's placement, which no restore holds (a restore's end frees no pool rows; a stream's may), so the
++/// prompt prefills at once, in a part with room, instead of waiting beside the restores in flight.
+ pub const point_errors = [_]anyerror{
+     error.NoTier,
+     error.BadPoint,
+@@ -383,6 +390,7 @@ pub const point_errors = [_]anyerror{
+     error.SpillNotOnEveryRank,
+     error.Missing,
+     error.PointMissing,
++    error.KvShardHomeFull,
+ };
+ 
+ /// The ranks a tier reports counters for (TP ranks; more are not reported).
 diff --git a/zig/src/core/spill/store.zig b/zig/src/core/spill/store.zig
 index fca7028b74e78326486acdbee9db91b48ca3f988..b6ed6613daa1f600e6b22590fdf8cfa25ae1b71d 100644
 --- a/zig/src/core/spill/store.zig
@@ -1411,7 +1496,7 @@ index 957f37da1d16bfcb0b57a29237af8fb64156d51b..666ed97427f45ff1e8047a0cacc34ad9
 +    try expectState(&sh, b.k, .{ .buf = @intFromPtr(buf.ptr), .sec = b.k.sec, .home = 0 });
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_spill_tier.zig b/zig/src/families/glm_cuda/cuda_spill_tier.zig
-index 1899a6e124b697052ccaca2dd96ae0d654e79d03..59e2231946772d016353a08c368f58d59600b59b 100644
+index f737fe1cad26c4d888647d16d0a83f372c168ae0..3cb35382a6cbe4adb83775f090ac1da491316ae0 100644
 --- a/zig/src/families/glm_cuda/cuda_spill_tier.zig
 +++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig
 @@ -16,11 +16,19 @@
@@ -1527,29 +1612,58 @@ index 1899a6e124b697052ccaca2dd96ae0d654e79d03..59e2231946772d016353a08c368f58d5
              if (lin.forks.len > wire.max_forks) return null; // (a keep note carries no more: no rank holds a point another lacks)
              const origin: ?format.Origin = if (w.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = w.fork } else null) else null;
              const keyed = w.key[0..at];
-@@ -1091,7 +1117,10 @@ pub fn Leader(comptime E: type) type {
-         /// A restore of point `id` (found by lookup): this rank's reads first (TooMany, NoSlot: refused for capacity,
-         /// nothing sent), then `has` on every rank (a rank that lacks the point or holds it damaged makes every rank
-         /// forget it), then the destination, and a `begin` note that has every other rank reserve its own under the
--        /// same key and start its reads. Its transaction.
-+        /// same key and start its reads. Its transaction. Owner-sharded, before any of it: KvShardHomeFull when the
-+        /// resume could only start from 0 (its home part full, no carry: the engine's tierResumable), nothing read,
-+        /// sent or forgotten (not a capacity refusal: the prompt prefills at once, or, while other restores are in
-+        /// flight, asks again as they end: Store.deferrable; their ends free no pool rows, a stream's may).
-         pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
-             self.side.e.current();
+@@ -1090,13 +1116,16 @@ pub fn Leader(comptime E: type) type {
+ 
+         /// begin's refusals of point `id` itself that no room cures, from this rank's own records with nothing read,
+         /// sent or reserved: UnknownPoint and BadPoint (not a point lookup gave), SpillMissing (gone from this rank's
+-        /// store: forgotten here). The prompt cache asks it before it makes room for the restore
+-        /// (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin asks it again.
++        /// store: forgotten here), and owner-sharded KvShardHomeFull (begin, below). The prompt cache asks it before it
++        /// makes room for the restore (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin
++        /// asks it again.
+         pub fn check(self: *Self, id: u64, at: u32) !void {
+             _ = try self.checked(id, at);
+         }
+ 
+-        fn checked(self: *Self, id: u64, at: u32) !PointRef {
++        const Checked = struct { ref: PointRef, part: ?u32 };
++
++        fn checked(self: *Self, id: u64, at: u32) !Checked {
              const side = self.side;
-@@ -1102,6 +1131,9 @@ pub fn Leader(comptime E: type) type {
+             const ref = self.points.get(id) orelse return error.UnknownPoint;
+             if (at != ref.at) return error.BadPoint;
+@@ -1104,18 +1133,27 @@ pub fn Leader(comptime E: type) type {
                  _ = self.points.remove(id);
                  return error.SpillMissing;
              }
+-            return ref;
 +            // owner-sharded: the part it was kept from (its home), which every rank must hold it under
 +            const part = (side.store.partOf(ref.key) orelse return error.SpillMissing).part;
 +            if (side.layout.homeOf(part) catch null) |home| if (!try side.e.tierResumable(at, home)) return error.KvShardHomeFull;
++            return .{ .ref = ref, .part = part };
+         }
+ 
+         /// A restore of point `id` (found by lookup): `check`'s refusals first, then this rank's reads (TooMany,
+         /// NoSlot: refused for capacity, nothing sent), then `has` on every rank (a rank that lacks the point or holds
+         /// it damaged makes every rank forget it), then the destination, and a `begin` note that has every other rank
+-        /// reserve its own under the same key and start its reads. Its transaction.
++        /// reserve its own under the same key and start its reads. Its transaction. Owner-sharded, before any of it:
++        /// KvShardHomeFull when the resume could only start from 0 (its home part full, no carry: the engine's
++        /// tierResumable), nothing read, sent or forgotten (not a capacity refusal, and one of
++        /// prompt_cache.point_errors: the prompt prefills at once, other restores in flight or not, since their ends
++        /// free no pool rows; a stream's may).
+         pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
+             self.side.e.current();
+             const side = self.side;
+             if (self.jobs.count() >= self.max_restores) return error.TooManyRestores;
+-            const ref = try self.checked(id, at);
++            const c = try self.checked(id, at);
++            const ref = c.ref;
++            const part = c.part;
              try self.jobs.ensureUnusedCapacity(self.gpa, 1);
              const txn = self.next_txn;
              const rx = try side.newRx(txn, ref.key, at);
-@@ -1111,7 +1143,7 @@ pub fn Leader(comptime E: type) type {
+@@ -1125,7 +1163,7 @@ pub fn Leader(comptime E: type) type {
              };
              const mine = [1]u64{@backingInt(wire.Absence.present)};
              var all: [wire.max_world]u64 = undefined;
@@ -1558,7 +1672,7 @@ index 1899a6e124b697052ccaca2dd96ae0d654e79d03..59e2231946772d016353a08c368f58d5
                  side.rxEnd(rx, .cancel, false);
                  return e;
              };
-@@ -1344,8 +1376,10 @@ pub fn Follower(comptime E: type) type {
+@@ -1358,8 +1396,10 @@ pub fn Follower(comptime E: type) type {
              switch (m.*) {
                  .keep => |k| {
                      const kp: *L.Kept = @ptrCast(@alignCast(kept orelse return error.KeepWithoutState));
@@ -1571,7 +1685,7 @@ index 1899a6e124b697052ccaca2dd96ae0d654e79d03..59e2231946772d016353a08c368f58d5
                          self.skipped += 1;
                          return;
                      }
-@@ -1393,7 +1427,7 @@ pub fn Follower(comptime E: type) type {
+@@ -1407,7 +1447,7 @@ pub fn Follower(comptime E: type) type {
              const side = self.side;
              _ = side.retire();
              switch (m.*) {
@@ -1580,7 +1694,7 @@ index 1899a6e124b697052ccaca2dd96ae0d654e79d03..59e2231946772d016353a08c368f58d5
                  .validate => |v| out[0] = @backingInt(self.validate(v.txn)),
                  .stats => {
                      side.refresh();
-@@ -1403,11 +1437,16 @@ pub fn Follower(comptime E: type) type {
+@@ -1417,11 +1457,16 @@ pub fn Follower(comptime E: type) type {
              }
          }
  
@@ -1896,7 +2010,7 @@ index 9a8a02bdcbcc6a3e6ddd2ba6db65a679faf05d7a..aa110f72c4e4975f8d71c4cce9c77d15
      pub fn settle(p: *Pair) !void {
          var i: usize = 0;
 diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
-index ad2c6ba2728af81f5880683fe8875ac6248065df..4d99b0da05973916677e6edca4e975496cbf1987 100644
+index eaf83cf09441e946286c4059132303aee0a7730c..3cb70f54627b5b71f6570442a8ca3fcb256ae0ad 100644
 --- a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
 +++ b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
 @@ -8,6 +8,7 @@ const rig = @import("cuda_spill_tier_rig.zig");
@@ -1915,7 +2029,7 @@ index ad2c6ba2728af81f5880683fe8875ac6248065df..4d99b0da05973916677e6edca4e97549
      }
      try testing.expectEqual(@as(usize, 0), p.pg.fatals);
  }
-@@ -441,6 +443,12 @@ test "the staging plan: the ring, read-ahead and small states as asked; under tw
+@@ -447,6 +449,12 @@ test "the staging plan: the ring, read-ahead and small states as asked; under tw
      // with DFlash2's rings the small slot grows by the drafter's 22,282,240 bytes
      const d = try st.Layout.init(l.g, 64, .{ .kv = 4, .ring = 2176 });
      try testing.expectEqual(std.mem.alignForward(usize, l.small_bytes + 22_282_240, 4096), (try tier.plan(.{ .dir = "/s", .gib = 1 }, &d)).small_slot);
@@ -1928,7 +2042,7 @@ index ad2c6ba2728af81f5880683fe8875ac6248065df..4d99b0da05973916677e6edca4e97549
  }
  
  test "spill v2 off: a two-rank pass with no tier sends only the pass's note, writes nothing and allocates no staging" {
-@@ -484,3 +492,309 @@ test "spill v2 off: a two-rank pass with no tier sends only the pass's note, wri
+@@ -490,3 +498,313 @@ test "spill v2 off: a two-rank pass with no tier sends only the pass's note, wri
      rig.Lanes.releaseFn(&r0, &s0);
      rig.Lanes.releaseFn(&r1, &s1);
  }
@@ -2092,6 +2206,9 @@ index ad2c6ba2728af81f5880683fe8875ac6248065df..4d99b0da05973916677e6edca4e97549
 +    // the carry off: a's restore is refused before any read, `has` or reservation on either rank (its point stays on
 +    // both); the carry on: s's too, a carry never taking a state under the minimum
 +    for (&p.e) |*e| e.carry = false;
++    // (`check`, which the prompt cache asks before it makes room for the restore, refuses it the same way)
++    const pa = p.lead0().lookup(a, 0, @intCast(a.len - 1), &.{}, 0).?;
++    try testing.expectError(error.KvShardHomeFull, p.lead0().check(pa.id, pa.at));
 +    try testing.expectError(error.KvShardHomeFull, p.restore(a));
 +    for (&p.e) |*e| e.carry = true;
 +    try testing.expectError(error.KvShardHomeFull, p.restore(s));
@@ -2105,6 +2222,7 @@ index ad2c6ba2728af81f5880683fe8875ac6248065df..4d99b0da05973916677e6edca4e97549
 +    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
 +    // part 0 has room again: both restore with the carry off, each resumed in its home part exactly, nothing carried
 +    try p.vacate(full);
++    try p.lead0().check(pa.id, pa.at);
 +    for (&p.e) |*e| e.carry = false;
 +    const resumed = [2]usize{ p.e[0].resumed, p.e[1].resumed }; // (a pass resumes its own mark's state too)
 +    for ([_][]const u32{ a, s }, [_]u32{ at, small }) |ids, n| {
