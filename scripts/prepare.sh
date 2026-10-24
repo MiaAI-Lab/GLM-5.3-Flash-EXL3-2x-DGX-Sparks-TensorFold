@@ -246,13 +246,18 @@ log "Image $IMAGE identical on $SPARKS"
 # ---------------------------------------------------------------- 4. download (head)
 # One revision on both ranks: MODEL_REVISION / DFLASH2_REVISION (config.sh; empty: what the Hub calls main when first
 # downloaded, then kept).
-command -v hf >/dev/null || warn "host 'hf' CLI not found, downloading from inside the container"
+if [[ "$ENGINE" == python ]] && ! command -v hf >/dev/null; then
+  warn "host 'hf' CLI not found, downloading from inside the container"
+fi
 download() {  # <repo id> <revision or empty>
   if command -v hf >/dev/null; then
     # Host CLI: resumable, parallel, writes the standard HF cache layout.
     hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
   else
-    [[ "$ENGINE" == python ]] || die "ENGINE=zig: the Zig image has no Python to download with; install the Hugging Face CLI on this host (pip install -U huggingface_hub; the 'hf' command)"
+    if [[ "$ENGINE" != python ]]; then  # let the caller check for a pinned snapshot
+      warn "ENGINE=zig: host 'hf' CLI not found and the Zig image has no Python; checking for a cached pinned snapshot. To download, install the Hugging Face CLI on this host (pip install -U huggingface_hub; the 'hf' command)"
+      return 1
+    fi
     # Keep downloads owned by the host user, in the same HF_CACHE/hub layout as the host CLI.
     docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
       -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
@@ -263,9 +268,9 @@ for id in "${models[@]}"; do
   pin=$(model_revision "$id"); dir=$(model_cache_dir "$id")
   log "Downloading $id${pin:+ @ ${pin:0:8}} into $HF_CACHE/hub (resumes if interrupted)"
   if ! download "$id" "$pin"; then
-    # no network: a pinned snapshot already here is enough (serving reads the local cache only)
+    # download unavailable or failed: a pinned snapshot already here is enough (serving reads the local cache only)
     [[ -n "$pin" && -f "$dir/snapshots/$pin/config.json" ]] || die "$id: the download failed"
-    warn "$id: could not reach Hugging Face; using the snapshot already here (${pin:0:8})"
+    warn "$id: could not download; using the pinned snapshot already here (${pin:0:8})"
   fi
   # a download by commit sha writes no refs/main: name the pin there when nothing else is (tools that take repo ids)
   [[ -z "$pin" || -f "$dir/refs/main" ]] || { mkdir -p "$dir/refs"; printf %s "$pin" > "$dir/refs/main"; }
