@@ -118,7 +118,9 @@ if [[ "$ENGINE" == zig ]]; then
   # (spill v2, 0018/0019/0021), kvshard (KV sharding, 0020/0022), spillshard (the two together, 0023) and parked (the
   # engine's budget counts the parked pages, 0014; the memory check below counts them only then). ZIG_HAS can still drop
   # one for a narrower image (zig/patches without it): port_validate (scripts/port.sh, below) then refuses SPILL_V2=1 or
-  # KV_SHARD=1, and the memory check reads MemAvailable alone.
+  # KV_SHARD=1, and the memory check reads MemAvailable alone. mtpcache (kept prompt states with MTP drafts) is named
+  # only for an image built with it (not in the default until zig/patches has it); without it port_validate warns that
+  # PROMPT_CACHE_GIB keeps nothing with DRAFTER=mtp.
   ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"

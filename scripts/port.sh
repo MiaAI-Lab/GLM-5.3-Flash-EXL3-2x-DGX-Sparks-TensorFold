@@ -17,7 +17,8 @@
 # ---------------------------------------------------------------- the settings
 # Spill tier: kept prompt states written to each Spark's local disk and read back instead of a new prefill, also after
 # a clean restart (README: Spill tier). ENGINE=zig spills the prompt cache's kept states, so it needs PROMPT_CACHE_GIB
-# above 0 (scripts/config.sh) and DFlash2 drafts (MTP drafts turn the Zig prompt cache off).
+# above 0 (scripts/config.sh) and DFlash2 drafts (with MTP drafts the kept states also hold the MTP head's state, which
+# no spill tier stores yet: they stay in memory, ZIG_HAS mtpcache).
 #   SPILL_GIB          the cap a Spark (GiB; 0: off, the default)
 #   SPILL_DIR          the same absolute path on every Spark, mounted at /spill: a folder you can write, on a local disk,
 #                      outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves HF_CACHE to the workers);
@@ -144,14 +145,14 @@ port_shard_default_off() {
 PORT_SPILL_WHY=""
 port_spill_refuse() { (( PORT_SPILL_EXPLICIT )) || { PORT_SPILL_WHY=$1; return 1; }; die "$1"; }
 
-# port_pool_check <prompt cache GiB>: ENGINE=zig with DFlash2 (MTP drafts turn the prompt cache off), PROMPT_CACHE_GIB or
+# port_pool_check <prompt cache GiB>: ENGINE=zig with DFlash2 (or MTP drafts, kept where ZIG_HAS names mtpcache), PROMPT_CACHE_GIB or
 # --prompt-cache-gib above 0 while KV_POOL_GIB was not set. The engine sizes the KV pool first and gives the kept prompt
 # states only what is left above MEMORY_RESERVE_GIB: at the default pool that is nothing (the pair, TP=2 at 12.5:
 # "prompt cache: off (budget 0)"), so no state would be kept. Warns; the pool stays as it is. The pair's sizing:
 # KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8, a 6.2 GiB budget (g1b), 5.1 GiB with spill v2 on (g2: its 1,066 MiB of pinned
 # staging is taken before the pool).
 port_pool_check() {
-  [[ "$ENGINE" == zig && "$DRAFTER" == dflash2 ]] && port_gt0 "$1" && (( ! PORT_POOL_EXPLICIT )) || return 0
+  [[ "$ENGINE" == zig ]] && { [[ "$DRAFTER" == dflash2 ]] || port_has mtpcache; } && port_gt0 "$1" && (( ! PORT_POOL_EXPLICIT )) || return 0
   warn "PROMPT_CACHE_GIB=$1 with KV_POOL_GIB at its default ($KV_POOL_GIB): the engine sizes the KV pool first and gives the kept prompt states only what is left above MEMORY_RESERVE_GIB, and at the default pool that left nothing on the pair (KV_POOL_GIB=12.5: \"prompt cache: off (budget 0)\"), so no prompt state would be kept. Set KV_POOL_GIB lower with it; the pair ran KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on (its 1,066 MiB of pinned staging is taken before the pool)"
 }
 
@@ -207,9 +208,13 @@ port_validate() {
       KV_SHARD=0
   fi
   if [[ "$ENGINE" == zig ]]; then
-    # the spill tier spills the prompt cache's kept states: with none kept it never opens (a silent no-op before)
+    # MTP drafts: kept prompt states hold the MTP head's state too, where the image has that port (else the engine
+    # turns its prompt cache off with them); no spill tier stores it yet, so their states stay in memory
+    if [[ "$DRAFTER" != dflash2 ]] && port_gt0 "$cache" && ! port_has mtpcache; then
+      warn "PROMPT_CACHE_GIB=$cache with DRAFTER=$DRAFTER: this image's engine keeps no prompt state with MTP drafts (ZIG_HAS does not name mtpcache, the port that keeps the MTP head's state with them; now: ${ZIG_HAS:-empty}), so its prompt cache is off. Set DRAFTER=dflash2 to keep prompt states"
+    fi
     if port_spill_on && [[ "$DRAFTER" != dflash2 ]]; then
-      port_spill_refuse "SPILL_GIB=$SPILL_GIB with DRAFTER=$DRAFTER: the Zig engine keeps no prompt states with MTP drafts (its prompt cache is off), so the spill tier would write nothing. Set DRAFTER=dflash2, or SPILL_GIB=0" ||
+      port_spill_refuse "SPILL_GIB=$SPILL_GIB with DRAFTER=$DRAFTER: the Zig engine's spill tier does not store the MTP head's state yet (with MTP drafts the kept prompt states stay in memory), so it would write nothing. Set DRAFTER=dflash2, or SPILL_GIB=0" ||
         port_spill_default_off "$PORT_SPILL_WHY"
     fi
     if port_spill_on && ! port_gt0 "$cache"; then
