@@ -1,0 +1,116 @@
+# Patch 0118: broken GLM health and opt-in process exit (TensorFold v0.6.0 + recipe patches).
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -74,6 +74,14 @@
+     if s < 0:
+         raise ValueError(f"TF_GLM_MULTI_WATCHDOG_S: seconds (0: off), not {value!r}")
+     return s
++
++
++def exit_on_broken(value: str | None = None) -> bool:
++    """Opt-in process exit when the ranks can no longer be trusted to agree."""
++    raw = (os.environ.get("TF_GLM_EXIT_ON_BROKEN", "") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_EXIT_ON_BROKEN: 0 or 1, not {raw!r}")
++    return raw == "1"
+
+
+ def watchdog_exits(value: str | None = None) -> bool:
+@@ -564,6 +572,7 @@
+         self.next_chat = 0
+         self.outbox: list[int] = []
+         self.idle = True
++        self.exit_on_broken = exit_on_broken()
+         self.broken: Exception | None = None
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+         self.eos = tuple(self.w.cfg.eos)
+@@ -611,6 +620,22 @@
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
++
++    def _break(self, exc: Exception) -> None:
++        # Every error path latches its first cause before any cleanup that might itself fail or hang.
++        if self.broken is None:
++            self.broken = exc
++            if self.exit_on_broken:
++                import sys
++                import traceback
++
++                try:
++                    print("[tensorfold] engine broken; TF_GLM_EXIT_ON_BROKEN=1: exiting with code 1",
++                          file=sys.stderr, flush=True)
++                    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
++                    sys.stderr.flush()
++                finally:
++                    os._exit(1)   # SystemExit in the scheduler thread would leave the HTTP process alive.
+
+     def _check(self) -> None:
+         if self.broken is not None:
+@@ -892,7 +917,7 @@
+         try:
+             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
+         except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
+-            self.broken = exc
++            self._break(exc)
+             raise
+         self.lanes[sid].key = key
+
+@@ -1474,7 +1499,7 @@
+         try:
+             return self._finish_load(h.lid)
+         except Exception as exc:              # a failed all-gather: the ranks may no longer agree
+-            self.broken = exc
++            self._break(exc)
+             raise
+
+     def _finish_load(self, lid: int) -> bool:
+@@ -1672,7 +1697,7 @@
+                 self.disk.stats.behind_s += time.perf_counter() - t0
+             return self._iterate()
+         except Exception as exc:
+-            self.broken = exc
++            self._break(exc)
+             raise
+
+     def _fill_turn(self) -> Lane | None:
+@@ -2290,13 +2315,13 @@
+     def drop(self) -> list[Stream]:
+         """After an error in an iteration: forget every stream (the ranks can no longer be trusted to agree)."""
+
++        if self.broken is None:
++            self._break(RuntimeError("an iteration failed"))
+         live = [l.s for l in self.lanes.values()]
+         if self.partial is not None:
+             self.partial.close()
+             self.partial = None
+         self.lanes = {}
+-        if self.broken is None:
+-            self.broken = RuntimeError("an iteration failed")
+         return live
+
+     def stats(self, s: Stream) -> dict:
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -91,6 +91,11 @@
+                     extra = {}
+                 body["streams"].update(extra.pop("streams", {}))
+                 body.update(extra)
++        # Read the latch independently of mutable counters: a failed counters read must not hide a broken engine.
++        broken = getattr(decoder, "broken", None)
++        if broken is not None:
++            body["ok"] = False
++            body["broken"] = f"{type(broken).__name__}: {str(broken)[:200]}"     # /health is unauthenticated: bounded
+         window = getattr(app, "effective_context_window", None)
+         if window:
+             body["context_length"] = int(window)
+--- tensorfold/server/metrics.py
++++ tensorfold/server/metrics.py
+@@ -186,6 +186,7 @@
+ )
+ _SPILL_GAUGES = {"entries", "pending", "stored_bytes", "disk_free_bytes", "highwater", "writers"}
+ _HEALTH_GAUGES = (
++    ("ok", "Engine health: 1 healthy, 0 broken (see /health for the reason)."),
+     ("context_length", "Tokens a request's prompt and reply may hold (the server's effective window)."),
+     ("streams_max", "Streams the concurrent engine decodes at most (--parallel)."),
+     ("pool_tokens", "Token rows in the concurrent engine's shared cache pool."),

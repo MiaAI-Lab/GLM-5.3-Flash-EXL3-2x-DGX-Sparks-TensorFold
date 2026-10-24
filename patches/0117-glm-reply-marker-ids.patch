@@ -1,0 +1,194 @@
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -7,6 +7,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import re
+ import uuid
+ from typing import Any
+@@ -221,6 +222,97 @@
+                          or _THINK_CLOSE.startswith(after)):
+         return end, "pending"                   # a block, or the think block's close, being written
+     return end, "reasoning"
++
++
++# patch 0117 (TF_GLM_REPLY_IDS): GLM's reply markup, which its tokenizer holds as single tokens
++GLM_MARKERS = ("<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
++               "</arg_value>")
++_INERT = chr(0xE000)            # a spelled marker's last character while the parsers read it (the same length)
++_INERT_JSON = chr(92) + "ue000"  # that character as json.dumps(ensure_ascii=True) writes it
++
++
++class ReplyMarks:
++    """TF_GLM_REPLY_IDS (patch 0117, on unless 0): GLM's reply markup is markup only where the reply's own marker
++    tokens wrote it. ``</think>``, ``<tool_call>`` and the argument tags are single tokens; the same text spelled in
++    ordinary tokens (a quoted tag, an example call, an echoed document) is words. ``reply()`` follows one reply;
++    its ``mask`` makes those spellings inert at the same length, so the text parsers (the think split, the call
++    hiding and streaming, the end parser, the closing of a cut call) keep their offsets and skip them, and
++    ``unmask`` gives them back in what is sent. Patch 0122 is the request's side of the same rule."""
++
++    def __init__(self, tok: Any, markers: tuple[str, ...] = GLM_MARKERS) -> None:
++        self.tok = tok
++        self.ids: dict[int, str] = {}
++        for mark in markers:
++            token = tok.token_to_id(mark)
++            if token is not None and tok.decode([token], skip_special_tokens=False) == mark:
++                self.ids[token] = mark
++        self.inert = {mark: mark[:-1] + _INERT for mark in self.ids.values()}
++
++    @classmethod
++    def from_env(cls, tok: Any) -> "ReplyMarks | None":
++        value = os.environ.get("TF_GLM_REPLY_IDS", "1").strip() or "1"
++        if value not in ("0", "1"):
++            raise ValueError(f"TF_GLM_REPLY_IDS={value!r}: expected 0 or 1")
++        if value == "0":
++            return None
++        marks = cls(tok)
++        print(f"[tensorfold] reply markup is read at its {len(marks.ids)} marker tokens; the same text spelled in "
++              f"ordinary tokens stays words (TF_GLM_REPLY_IDS=0 turns it off)", flush=True)
++        return marks
++
++    def reply(self) -> "_ReplyMarks":
++        return _ReplyMarks(self)
++
++    def unmask(self, value: Any) -> Any:
++        """``value`` (text, or the lists and dicts of a delta or a reply) with every inert marker given back."""
++
++        if isinstance(value, str):
++            if _INERT not in value and _INERT_JSON not in value:
++                return value
++            for mark, inert in self.inert.items():
++                value = value.replace(inert, mark).replace(mark[:-1] + _INERT_JSON, mark)
++            return value
++        if isinstance(value, list):
++            return [self.unmask(v) for v in value]
++        if isinstance(value, tuple):
++            return tuple(self.unmask(v) for v in value)
++        if isinstance(value, dict):
++            return {k: self.unmask(v) for k, v in value.items()}
++        return value
++
++
++class _ReplyMarks:
++    """One reply's real markers: for each marker's text, which of its occurrences the reply's marker tokens wrote
++    (the occurrences of that text in the decode before each such token), read as the tokens arrive."""
++
++    def __init__(self, marks: ReplyMarks) -> None:
++        self.marks = marks
++        self.real: dict[str, set[int]] = {mark: set() for mark in marks.ids.values()}
++        self.seen = 0
++
++    def mask(self, text: str, tokens: list[int]) -> str:
++        ids = self.marks.ids
++        for at in range(self.seen, len(tokens)):
++            mark = ids.get(tokens[at])
++            if mark is not None:
++                self.real[mark].add(self.marks.tok.decode(tokens[:at], skip_special_tokens=False).count(mark))
++        self.seen = len(tokens)
++        cuts = []
++        for mark, real in self.real.items():
++            at, n = text.find(mark), 0
++            while at >= 0:
++                if n not in real:
++                    cuts.append((at, mark))
++                n += 1
++                at = text.find(mark, at + len(mark))
++        if not cuts:
++            return text
++        out, done = [], 0
++        for at, mark in sorted(cuts):
++            out += [text[done:at], self.marks.inert[mark]]
++            done = at + len(mark)
++        out.append(text[done:])
++        return "".join(out)
+ 
+ 
+ class ThinkSplit:
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -399,6 +399,16 @@
+         xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+         answer_raw = [""]
+         closing = [""]                       # what closes a GLM call the reply ended inside on an end token (#22)
++        # patch 0117: GLM's markup is markup only at the reply's own marker tokens (TF_GLM_REPLY_IDS); the parsers
++        # read the reply with its spelled markers inert, and what is sent has them back
++        marks = getattr(self, "reply_ids", None) if chat else None
++        reply_marks = marks.reply() if marks is not None else None
++
++        def mask(text: str) -> str:
++            return reply_marks.mask(text, out) if reply_marks is not None else text
++
++        def unmask(value: Any) -> Any:
++            return marks.unmask(value) if reply_marks is not None else value
+         # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
+         think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
+                  else None)
+@@ -419,7 +429,7 @@
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
+-            raw = raw + closing[0] if finished else raw
++            raw = mask(raw) + closing[0] if finished else mask(raw)
+             reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+@@ -448,10 +458,10 @@
+             reasoning, answer, raw = visible(False)
+             delta: dict[str, Any] = {}
+             if len(reasoning) > sent["reasoning"]:
+-                delta["reasoning_content"] = reasoning[sent["reasoning"]:]
++                delta["reasoning_content"] = unmask(reasoning)[sent["reasoning"]:]
+                 sent["reasoning"] = len(reasoning)
+             if len(answer) > sent["content"]:
+-                delta["content"] = answer[sent["content"]:]
++                delta["content"] = unmask(answer)[sent["content"]:]
+                 sent["content"] = len(answer)
+             return delta, raw
+ 
+@@ -491,7 +501,7 @@
+                     wrote = True
+                 parts: list[dict[str, Any]] = []
+                 if calls_stream is not None and not stopped["client"]:
+-                    parts += calls_stream.feed(call_text(raw))
++                    parts += unmask(calls_stream.feed(call_text(raw)))
+                     if parts or wrote:
+                         quiet_since[0] = time.monotonic()
+                     elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+@@ -607,13 +617,13 @@
+         ended = bool(out) and out[-1] in ends and not stopped["stop"]
+         if ended and glm_calls:
+             final_raw = stream.final()
+-            closing[0] = close_glm_call(stops.visible(final_raw) if stops.strings else final_raw, tools)
++            closing[0] = close_glm_call(mask(stops.visible(final_raw) if stops.strings else final_raw), tools)
+         reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+-        text = stops.visible(raw_text) + closing[0]
++        text = mask(stops.visible(raw_text)) + closing[0]
+         raw_answer = split(text, True)[1]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -636,6 +646,8 @@
+             final["content"] = tail
+         finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
+                                                          else "length")
++        final, calls, call_deltas = unmask(final), unmask(calls), unmask(call_deltas)
++        content, reasoning = unmask(content), unmask(reasoning)
+         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
+             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
+         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -64,6 +64,8 @@
+ 
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
++        from tensorfold.cuda.reply_text import ReplyMarks
++        self.reply_ids = ReplyMarks.from_env(self.tok)      # patch 0117: the reply's markup at its marker tokens only
+         if self.vision is not None:
+             media_template(self.template, Path(model_dir))
+         clear = os.environ.get("TF_GLM_CLEAR_THINKING", "0").strip() or "0"

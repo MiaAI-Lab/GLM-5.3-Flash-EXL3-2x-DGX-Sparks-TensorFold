@@ -1,0 +1,91 @@
+# A streamed Messages reply opens with the prompt's token count, not zeros. message_start carried
+# usage({}), all zeros, and the real counts only landed in self.tokens from the engine's final chunk,
+# so a client that reads prompt counts from the head (Claude Code's context-window indicator) showed
+# ~0% used on every streaming request, live on a Spark (GLM-5.3-Flash-EXL3, test image): message_start
+# {input_tokens: 0, cache_read_input_tokens: 0} while the closing message_delta carried the correct
+# total. The head now names the prompt's full count with cache fields 0 (input_tokens the whole
+# prompt, output_tokens 0, cache_creation_input_tokens 0, cache_read_input_tokens 0), and the final
+# message_delta keeps the engine's input/cache_read split (input = full - cached, cache_read =
+# cached: the share the engine served from kept prompt states, a fresh prompt reports 0), the two
+# totals equal; the whole (non-streamed) reply reports the same split. Mirror of the Zig server's fix
+# (TensorFold PR #672, ad1abffb).
+# The count comes from the prompt the request already rendered, not a second render: the CUDA chat
+# handler's prepared prompt is the same one the final usage's prompt_tokens is len() of (kept-state
+# replay and compaction included), so the handler hands len(prepared.prompt) to the translated
+# request's wire (responses.Wire.prompt_len, passed to the head's opened()) before its stream head is
+# written. The Mac server's stream head is written before app.chat renders (the render rides the job
+# the call submits), so there the count is not known at head time: a second normalize+template+tokenize
+# pass on the request thread would grow TTFT with prompt size, and deferring message_start to the first
+# usage chunk would arrive after the content (the only usage chunk is the last one). The Mac head keeps
+# the old zeros; the Sparks' CUDA server, this recipe's production path, carries the count.
+# Direct chat requests never see this: their wfile is the socket, not a Wire, and the the reply-text and server files
+# (cuda/reply_text.py, cuda/server.py) are untouched, so the patch stacks on them. CPU check:
+# tools/test_anthropic_stream_head.py.
+
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -129,12 +129,15 @@
+     """The chat handler's side of its socket: the status and headers, then the JSON body or each stream event; a
+     stream's comment lines (the keep-alives of patch 0111) are written to ``comments`` as they came."""
+ 
+-    def __init__(self, opened: Callable[[], None], event: Callable[[dict[str, Any] | None], None],
++    def __init__(self, opened: Callable[[int], None], event: Callable[[dict[str, Any] | None], None],
+                  comments: Any) -> None:
+         self.opened, self.event, self.comments = opened, event, comments
+         self.status: int | None = None
+         self.stream = False
+         self.data = bytearray()
++        # the chat handler's prepared prompt length, set before its stream head: a translated request's
++        # Messages head names the prompt's size (its usage otherwise leaves the client's context read at 0)
++        self.prompt_len = 0
+ 
+     def write(self, data: bytes) -> int:
+         self.data += data
+@@ -148,7 +151,7 @@
+             kinds = [v.strip() for k, _, v in (line.partition(":") for line in head[1:]) if k.lower() == "content-type"]
+             self.stream = self.status == 200 and bool(kinds) and kinds[0].startswith("text/event-stream")
+             if self.stream:
+-                self.opened()
++                self.opened(self.prompt_len)
+         while self.stream and (end := self.data.find(b"\n\n")) >= 0:
+             block = bytes(self.data[:end])
+             del self.data[:end + 2]
+@@ -207,7 +210,7 @@
+     reply = Reply(base, send if request.stream else None,
+                   (lambda final: store.put(final, request.added)) if request.store else None)
+ 
+-    def opened() -> None:
++    def opened(_: int = 0) -> None:
+         handler.send_response(200)
+         handler.send_header("Content-Type", "text/event-stream")
+         handler.send_header("Cache-Control", "no-cache")
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -219,6 +219,10 @@
+                 except RequestError as exc:
+                     code, _hd = admission_response(exc)
+                     return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
++                # a translated request's wire takes the prepared prompt's length, so its stream head names
++                # the prompt's size (its usage otherwise leaves the client's context read at 0)
++                if isinstance(self.wfile, responses.Wire):
++                    self.wfile.prompt_len = len(getattr(prepared, "prompt", None) or ())
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/event-stream")
+                 self.send_header("Cache-Control", "no-cache")
+--- tensorfold/server/anthropic.py
++++ tensorfold/server/anthropic.py
+@@ -72,7 +72,13 @@
+ 
+     reply = Reply(reply_model(app, body), send)
+ 
+-    def opened() -> None:
++    def opened(prompt_len: int = 0) -> None:
++        if prompt_len:
++            # the head names the prompt's full count with cache fields 0; the split of it the engine
++            # served from kept states (input = full - cached, cache_read = cached) arrives with the
++            # final message_delta, and the whole (non-streamed) reply reports the same split
++            reply.base["usage"] = {"input_tokens": prompt_len, "output_tokens": 0,
++                                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+         handler.send_response(200)
+         handler.send_header("Content-Type", "text/event-stream")
+         handler.send_header("Cache-Control", "no-cache")

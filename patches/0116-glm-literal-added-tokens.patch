@@ -1,0 +1,267 @@
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -215,18 +215,27 @@
+                 raise RequestError("messages must be a list")
+             from tensorfold.server.prompts import has_images, prepare_images, tool_media_parts
+ 
+-            def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
++            def render(messages: list[dict[str, Any]], tools=tools,
++                       **images: bool) -> str:   # text renders as it always has
+                 try:
+                     return self.template.render(messages, tools=tools, enable_thinking=thinking, extra=kwargs,
+                                                 **images)
+                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
+                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+ 
++            # patch 0116: text from the request (a <think> quoted in a message, a <tool_call> in a file or in a tool's
++            # description, a <|user|> in a log) stays text where a family sets ``literal`` (GLM): masked here, after
++            # what the family adds to the messages, and encoded as text below. Pictures go through prepare_images,
++            # unmasked.
++            literal = getattr(self, "literal", None)
++            messages, shown_tools, masked = body["messages"], tools, False
++            if literal is not None:
++                messages, shown_tools, masked = literal.mask(self._messages_to_mask(messages), tools)
+             # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM)
+-            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
++            reminded = (tool_media_parts(messages) if getattr(self, "tool_media_reminders", False)
+                         and getattr(self, "vision", None) is None else None)
+             if reminded is not None:
+-                text = render(reminded, allow_images=True)
++                text = render(reminded, shown_tools, allow_images=True)
+             elif has_images(body["messages"]):
+                 rendered = prepare_images(self.vision, body["messages"],
+                                           lambda messages: render(messages, allow_images=True),
+@@ -235,8 +244,8 @@
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+             else:
+-                text = render(body["messages"])
+-            prompt = self._encode_ids(text, False)
++                text = render(messages, shown_tools)
++            prompt = literal.encode(self.tok, text) if masked else self._encode_ids(text, False)
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+         else:
+@@ -249,6 +258,12 @@
+         # sampling is resolved here, so a malformed control is refused before a stream opens
+         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
+                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
++
++    def _messages_to_mask(self, messages: Any) -> Any:
++        """The messages ``literal`` masks (patch 0116): as sent. A family that adds to them before its template
++        renders them adds it here first, so what it adds is masked too and it reads the messages as sent."""
++
++        return messages
+ 
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -6,6 +6,7 @@
+ from pathlib import Path
+ from typing import Any, Callable
+ 
++from tensorfold.cuda.literal_tokens import LiteralTokens
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+@@ -71,6 +72,15 @@
+             raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
+         effort_tail_enabled()       # a typo fails at load, not at the first request
+         self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
++        self.literal = LiteralTokens.from_env(self.tok)     # patch 0116: added-token text in a request stays text
++
++    def _messages_to_mask(self, messages: Any) -> Any:
++        """The kept reasoning put back before the messages are masked (patch 0116): found by the messages as sent
++        (``remember`` keyed them so), and masked like reasoning a client sends back. The template's own ``restore``
++        is then left only the steps found nowhere."""
++
++        kept = getattr(self.template, "kept", None)
++        return kept.restore(messages) if kept is not None else messages
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+diff --git tensorfold/cuda/literal_tokens.py tensorfold/cuda/literal_tokens.py
+new file mode 100644
+--- /dev/null
++++ tensorfold/cuda/literal_tokens.py
+@@ -0,0 +1,177 @@
++"""Added-token text inside a chat request, tokenized as text.
++
++The chat template renders the messages (and the tools' definitions) into one string and the server encodes it
++whole, so a request that only mentions an added token (a ``<think>`` quoted from another model's output, a
++``<tool_call>`` in a file being edited or in a tool's description, a ``<|user|>`` pasted from a log) became that
++token. The model never saw the text, and a reply quoting it broke the reasoning/content split. Here the request's
++text is masked before rendering (one private-use character per guarded token), the template renders around the masks,
++and each mask is encoded as its token's text, split so that no added token can match. The tokens the template itself
++writes are untouched, and a request without any guarded text encodes exactly as before.
++
++Masked: every message's content, its ``reasoning_content`` / ``reasoning``, its calls' arguments (parsed when they
++are a JSON object, so an escaped ``\\u003cthink\\u003e`` the template would write back as ``<think>`` is caught too),
++and the tools' definitions. Not masked: ``/nothink`` (GLM's no-thinking switch in a user turn), an assistant turn that
++carries its reasoning inline (``<think>...</think>answer`` with no ``reasoning_content``: the template splits it
++there), and a request that already holds one of the private-use characters used as masks.
++
++``TF_GLM_LITERAL_TOKENS=0`` turns it off.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++from typing import Any
++
++# Kept as a token even inside a user's text: GLM reads "/nothink" in a user turn as its no-thinking switch.
++KEEP = frozenset({"/nothink"})
++_BASE = 0xE000                      # Unicode private use area: one character per guarded token
++
++
++class LiteralTokens:
++    """Masks guarded added-token text in a request, and encodes a rendered prompt with the masks as plain text."""
++
++    def __init__(self, tok: Any):
++        decoder = tok.get_added_tokens_decoder()
++        added_ids = set(decoder)
++        texts = sorted({t.content for t in decoder.values()} - KEEP, key=len, reverse=True)   # longest first
++        self.plain: dict[str, list[int]] = {}           # mask character -> the token's text as ordinary tokens
++        self._mask_of: dict[str, str] = {}
++        for text in texts:
++            ids = _as_text(tok, text, added_ids)
++            if ids is None:
++                continue
++            mask = chr(_BASE + len(self.plain))
++            self.plain[mask] = ids
++            self._mask_of[text] = mask
++        self._find = re.compile("|".join(re.escape(t) for t in self._mask_of)) if self._mask_of else None
++        self._split = re.compile("(" + "|".join(map(re.escape, self.plain)) + ")") if self.plain else None
++        self._span = (_BASE, _BASE + len(self.plain))
++
++    @classmethod
++    def from_env(cls, tok: Any) -> "LiteralTokens | None":
++        if os.environ.get("TF_GLM_LITERAL_TOKENS", "1") == "0":
++            return None
++        guard = cls(tok)
++        print(f"[tensorfold] added-token text in requests is tokenized as text ({len(guard.plain)} tokens guarded; "
++              f"TF_GLM_LITERAL_TOKENS=0 turns it off)", flush=True)
++        return guard
++
++    # -- masking -----------------------------------------------------------------------------------------------------
++
++    def mask(self, messages: Any, tools: Any = None) -> tuple[Any, Any, bool]:
++        """``(messages, tools, True)`` with guarded text masked, or both unchanged and False.
++
++        Only a prompt rendered from what this returned True for goes through ``encode``: a private-use character a
++        client sent itself is then never read as a mask (such a request is left unmasked)."""
++
++        if self._find is None or not isinstance(messages, list):
++            return messages, tools, False
++        request = [messages, tools]
++        if _any_string(request, self._collides):         # a private-use character of ours already in the request
++            return messages, tools, False
++        if not _any_string(request, self._maybe):
++            return messages, tools, False
++        return ([self._message(m) if isinstance(m, dict) else m for m in messages],
++                self._sub(tools) if tools is not None else None, True)
++
++    def _maybe(self, text: str) -> bool:
++        """Guarded text, or a JSON escape that may decode to some (in a call's arguments)."""
++
++        return bool(self._find.search(text)) or "\\u" in text
++
++    def _message(self, message: dict[str, Any]) -> dict[str, Any]:
++        out = dict(message)
++        separated = isinstance(out.get("reasoning_content"), str) or isinstance(out.get("reasoning"), str)
++        # An assistant turn that carries its reasoning inline ("<think>...</think>answer") is left as the template
++        # expects it; every other content is text.
++        inline = out.get("role") == "assistant" and not separated and "</think>" in _flat_text(out.get("content"))
++        if "content" in out and not inline:
++            out["content"] = self._sub(out["content"])
++        for key in ("reasoning_content", "reasoning"):
++            if isinstance(out.get(key), str):
++                out[key] = self._sub(out[key])
++        if isinstance(out.get("tool_calls"), list):
++            out["tool_calls"] = [self._call(call) for call in out["tool_calls"]]
++        return out
++
++    def _call(self, call: Any) -> Any:
++        if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
++            return call
++        function = dict(call["function"])
++        arguments = function.get("arguments")
++        if isinstance(arguments, str):
++            # The template writes the arguments' values, not their JSON: a JSON object's values are masked as the
++            # template will see them (escapes decoded), and handed on as the mapping the server would parse anyway.
++            try:
++                parsed = json.loads(arguments)
++            except ValueError:
++                parsed = None
++            if isinstance(parsed, dict):
++                masked = self._sub(parsed)
++                function["arguments"] = masked if masked != parsed else arguments
++            else:
++                function["arguments"] = self._sub(arguments)
++        elif arguments is not None:
++            function["arguments"] = self._sub(arguments)
++        return {**call, "function": function}
++
++    def _sub(self, value: Any) -> Any:
++        """Masks guarded text in every string a value holds, mapping keys included."""
++
++        if isinstance(value, str):
++            return self._find.sub(lambda m: self._mask_of[m.group(0)], value)
++        if isinstance(value, list):
++            return [self._sub(v) for v in value]
++        if isinstance(value, dict):
++            return {self._sub(k): self._sub(v) for k, v in value.items()}
++        return value
++
++    def _collides(self, text: str) -> bool:
++        lo, hi = self._span
++        return any(lo <= ord(c) < hi for c in text)
++
++    # -- encoding ----------------------------------------------------------------------------------------------------
++
++    def encode(self, tok: Any, text: str) -> list[int]:
++        """A prompt rendered from a masked request (``mask`` returned True), each mask encoded as its token's text.
++
++        The text between masks is encoded in one batch call (Python's GIL released); HF tokenizers encodes the text
++        around an added token on its own too, so those pieces' ids are unchanged."""
++
++        parts = [p for p in self._split.split(text) if p]
++        pieces = [p for p in parts if p not in self.plain]
++        encoded = iter(tok.encode_batch_fast(pieces, add_special_tokens=False) if pieces else ())
++        ids: list[int] = []
++        for part in parts:
++            ids.extend(self.plain[part] if part in self.plain else next(encoded).ids)
++        return ids
++
++
++def _as_text(tok: Any, text: str, added_ids: set[int]) -> list[int] | None:
++    """The token's text as ordinary tokens: encoded in two pieces so the added token cannot match."""
++
++    for cut in range(1, len(text)):
++        ids = (tok.encode(text[:cut], add_special_tokens=False).ids
++               + tok.encode(text[cut:], add_special_tokens=False).ids)
++        if not added_ids.intersection(ids) and tok.decode(ids, skip_special_tokens=False) == text:
++            return ids
++    return None
++
++
++def _any_string(value: Any, test) -> bool:
++    if isinstance(value, str):
++        return bool(test(value))
++    if isinstance(value, list):
++        return any(_any_string(v, test) for v in value)
++    if isinstance(value, dict):
++        return any(_any_string(k, test) or _any_string(v, test) for k, v in value.items())
++    return False
++
++
++def _flat_text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
++    return ""

@@ -79,8 +79,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build locally. scripts/publish-image.sh prints both.
 # The same image serves two and three Sparks.
-IMAGE_TAG="${IMAGE_TAG:-v0.6.0-e66c657a433d}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:14b5072e8e9918f1080153f57321415a387bc7d78cf9c9b44a7aeae2d4399ccf}"
+IMAGE_TAG="${IMAGE_TAG:-v0.6.0-7e5bd69b1266}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:4263622942a7b0b149cd6b963375e1418bd206b4ab6f76c3df299256a866e50e}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
@@ -270,6 +270,11 @@ export TF_GLM_EFFORT_TAIL="${TF_GLM_EFFORT_TAIL:-0}"
 MAX_QUEUED="${MAX_QUEUED:-}"
 # A streamed request is checked before its 200 goes out (patch 0095), so it gets the same 429 + Retry-After.
 export TF_GLM_MAX_QUEUED="$MAX_QUEUED"
+# A streamed reply that has sent nothing for SSE_KEEPALIVE_S seconds writes an SSE comment line, ": keepalive" (patch
+# 0111). A request waiting for a lane or filling a long prompt is silent otherwise, and a proxy in front cuts an idle
+# stream (Cloudflare: after about two minutes, issue #106). Clients skip comment lines; the events are the same bytes.
+# Every streaming route (chat, completions, Messages, Responses). 0: off.
+export TENSORFOLD_SSE_KEEPALIVE_S="${SSE_KEEPALIVE_S:-${TENSORFOLD_SSE_KEEPALIVE_S:-15}}"
 # Sampled decode with the checkpoint's defaults (temperature 1, top_p 0.95, top_k 0) draws from the top_p nucleus
 # (patch 0034). Stock TensorFold tests each rank's candidates alone, which fails on any two ranks whenever both hold
 # part of the nucleus, so every such step gathered and sorted the whole vocabulary on the CPU: ~15 tok/s against

@@ -88,6 +88,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   past 1023.
 - `0059-server-refused-bodies`: TensorFold v0.6.1's fix for #181 (commit 50dfe38a, by
   [SxMShaDoW](https://github.com/SxMShaDoW)), backported to v0.6.0.
+- `0113-http-get-delete-body-discard` (GET and DELETE bodies read before the response, as `0059` does for refused
+  requests): by [cawilliamson](https://github.com/cawilliamson).
 - `0060-glm-keep-thinking` (earlier turns keep their reasoning, `TF_GLM_CLEAR_THINKING`): by
   [kky42](https://github.com/kky42), pull request #23.
 - `0071-glm-shared-prefix-copy` (a shared system prompt's resume keeps the writer's kept prompt, issue #43): by
@@ -130,6 +132,12 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   MLX-style server, issues #67, #74): uses the reader `tensorfold/server/request_body.py` (`read_body`, TensorFold
   commit 977f2cc), authored by Jordi Posthumus ([JordiPosthumus](https://github.com/JordiPosthumus)) and brought in by
   `0084`; the call sites are ours. TensorFold's own chunked-body issue is ashhart/TensorFold#244.
+- `0111-server-sse-keepalive` (SSE keep-alive comments while a streamed reply is silent, issue #106): the diagnosis,
+  the measurements behind a Cloudflare Tunnel, the design (a `: keepalive` comment line after
+  `TENSORFOLD_SSE_KEEPALIVE_S` seconds of silence) and the first patch and CPU test, for the chat stream, by
+  [stevehansen](https://github.com/stevehansen) in [issue #106](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/106);
+  this version, which also carries the comments through the Messages and Responses streams, and its extended test,
+  by [BadAd84](https://github.com/BadAd84).
 - `0085-glm-select-split-loop` (the split selection's last pass over the earlier chunks only): by
   [BadAd84](https://github.com/BadAd84).
 - `0086-glm-prompt-scores-loop` (the prompt scoring, one row and many pool blocks a program): by
@@ -140,6 +148,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [kindling spark-os](https://github.com/kindlingai/kindling-spark-os) by Matt Mastracci (Kindling AI). Nothing of
   dispram ships here: the ranks import the host's client (`python/dispram.py`, GPL-3.0 with a bundling exception)
   mounted read-only at run time and talk to `dispramd` (AGPL-3.0) over its socket.
+- `0119-glm-chat-continued` (a conversation keeps its id across a rewind or a resume from disk, for patch `0089`'s
+  quota by Thomas Wade; issue #104 by [danielbanu](https://github.com/danielbanu)): by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
 - `0098-glm-mmap-uploads` (the drafter's and the vision tower's tensors copied out of the safetensors mmap before
   they go to the GPU: kindling spark-os's 64 KiB-page kernel): by [BadAd84](https://github.com/BadAd84).
 - `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`: the launch order of the expert decode kernel's blocks): by
@@ -148,8 +159,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
 - `docs/hermes-agent.md`, `tools/hermes_benchmark.py` and `tests/test_hermes_benchmark.py` (the Hermes Agent custom-endpoint
   guide and the synthetic speed harness with its tests): by Steve Darlow ([kerpopule](https://github.com/kerpopule)),
   in [PR #52](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/52).
-- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo)): `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
+- `0088-glm-spill-tier` (kept prompt states on local disk, `SPILL_GIB`): authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X):
+  `tensorfold/cuda/spill.py` and its hooks in the GLM engine, `multi.py` and the
   server, in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78). What it
   builds on, by its authors: the idea of persisting session state on NVMe per rank was proposed in MiaAI-Lab's
   GLM-5.3-Flash vLLM kit ([pull request #232](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/232)
@@ -179,6 +191,28 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
 - `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
 - `0103-glm-qmm-decode-noclusters` (decode matmuls reduce through the partials buffer at few rows): by [BadAd84](https://github.com/BadAd84).
+- `0109-responses-tool-image` (image parts in a Responses `function_call_output`): by
+  [StrayDragon](https://github.com/StrayDragon), [pull request #175](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/175) for [issue #162](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/162), backporting the `_output` hunk of TensorFold commit 69d0ca9 (v0.6.3, TensorFold issue #235).
+- `0110-vision-mpo-first-frame` (an iPhone MPO JPEG is read from its first frame): the diagnosis (the `n_frames` guard refuses
+  an MPO's second frame) is by [robertforbes68](https://github.com/robertforbes68) in [issue #201](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/201); the code is our own.
+- `0112-anthropic-stream-head-usage` (a streamed Messages head carries the prompt's token count): by
+  [kky42](https://github.com/kky42) (commits authored as evilpsycho42), [pull request #145](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/145), mirroring the Zig server's fix (TensorFold PR #672).
+- `0114-glm-tool-tag-mention` (a tool call after a quoted `<tool_call>` tag is a call again): by
+  [kky42](https://github.com/kky42) (commits authored as evilpsycho42), [pull request #134](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/134).
+- `0115-glm-unoffered-tool-call` (a call to a tool the request did not offer, reported): by [kky42](https://github.com/kky42) (commits authored as evilpsycho42), [pull request #140](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/140); its report adapted from
+  [BadAd84](https://github.com/BadAd84)'s `0114-glm-tool-call-rejections` (#137).
+- `0116-glm-literal-added-tokens` (a quoted added token stays text): by [ahinore](https://github.com/ahinore) (the commit is
+  authored as iegamo), [pull request #164](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/164).
+- `0117-glm-reply-marker-ids` (a reply's markup is read at its marker tokens): by [ahinore](https://github.com/ahinore),
+  [pull request #203](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/203), the reply's side of `0116`'s rule. It follows `TENSORFOLD_REPLY_IDS` of
+  [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold) (commit 113a151c, in Zig, which credits the rule to DeepInfer's output parsing); the Python code is ahinore's.
+- `0118-glm-broken-health-exit` (`/health` and `/metrics` report a broken engine; opt-in `TF_GLM_EXIT_ON_BROKEN`): by
+  [bblicke1](https://github.com/bblicke1), [pull request #146](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/146).
+- `0120-glm-fork-point-shared` (a kept state a second conversation goes on from is a shared prefix): the diagnosis and the first fix (the writer's next ids kept with a state, the state flagged when a resumed prompt goes on otherwise, the flag kept when the same ids are kept again) are by [RyanLeeUPC](https://github.com/RyanLeeUPC) in [issue #121](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/121); the rest by [BadAd84](https://github.com/BadAd84).
+- `0121-glm-kept-reasoning-linear` (kept reasoning restored in one pass over the conversation): by
+  [cawilliamson](https://github.com/cawilliamson).
+- `0122-cuda-budget-parked-pages` (the start-up budget counts the pages parked on the per-CPU free lists): by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
