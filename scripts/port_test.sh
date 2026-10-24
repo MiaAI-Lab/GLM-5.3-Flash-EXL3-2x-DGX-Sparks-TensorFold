@@ -27,7 +27,7 @@ grep -q '^PORT_SPILL_DEFAULT_GIB=64 ' "$fork_sh" && grep -q '^PORT_SPILL_V2_DEFA
   { echo "FAIL the fork variant of port.sh (its default lines moved?)"; exit 1; }
 ALL_HAS="mtp displaykv spill2 kvshard spillshard"
 # start.sh's default ZIG_HAS (the image with zig/patches/0014-0029), and an image without the port's patches
-DEF_HAS="mtp displaykv spill2 kvshard spillshard parked mtpcache fill pictures"
+DEF_HAS="mtp displaykv spill2 kvshard spillshard parked mtpcache fill pictures prefixwait"
 NO_PORT="mtp displaykv"
 
 # case_ <name> <expected exit 0|1> <script before port.sh> <script after>: runs both in a subshell over a fresh port.sh,
@@ -671,7 +671,7 @@ case_ "start.sh's default ZIG_HAS is these cases' default, and names each of the
   check_start 'ZIG_HAS=\"\${ZIG_HAS:-$DEF_HAS}\"' || exit 1
   carries() { cat '$root'/zig/patches/*.patch | grep -qF -- \"\$1\"; }
   for f in 'parked:+pub fn parkedBytes(' 'spill2:+++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig' 'kvshard:+pub const gpu_paths = true;' 'spillshard:return error.KvShardHomeFull;' \
-           'mtpcache:+++ b/zig/src/families/glm_cuda/cuda_mtp_keep.zig' 'fill:return error.FillWithMtp;' 'pictures:+++ b/zig/src/core/prompt_media.zig'; do
+           'mtpcache:+++ b/zig/src/families/glm_cuda/cuda_mtp_keep.zig' 'fill:return error.FillWithMtp;' 'pictures:+++ b/zig/src/core/prompt_media.zig' 'prefixwait:+++ b/zig/src/core/lane_host_prefix_test.zig'; do
     t=\${f%%:*}; m=\${f#*:}
     if [[ ' $DEF_HAS ' == *\" \$t \"* ]]; then carries \"\$m\" || { echo \"ZIG_HAS's default names \$t, but no zig/patches patch adds: \$m\"; exit 1; }
     else ! carries \"\$m\" || { echo \"zig/patches carries \$t (\$m), but ZIG_HAS's default does not name it\"; exit 1; }; fi

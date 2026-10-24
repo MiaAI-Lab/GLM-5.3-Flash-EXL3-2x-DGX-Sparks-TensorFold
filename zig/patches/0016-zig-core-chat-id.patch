@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits 2a16b14a4903..b42a552e7693); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r5 @ e1352d709873 over glm/zig-engine-base @ 0db3e2f6652b (commits 2a16b14a4903..b42a552e7693); regenerate with scripts/port-patches.sh, do not edit
 core prompt cache: a shared cut no longer joins two conversations
 
 chatOf gave a kept state the conversation of the longest kept state its prompt

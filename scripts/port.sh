@@ -126,7 +126,7 @@ port_missing() {
     pictures)   what="the kept prompts with pictures (zig/patches/0027-0028)" ;;
   esac
   if [[ "$ENGINE" == zig ]]; then
-    echo "this image's tensorfold-native lacks $what: ZIG_HAS does not name it (zig/patches/0014-0029 bring spill2, kvshard, spillshard, mtpcache, fill and pictures, which start.sh's default ZIG_HAS lists; now: ${ZIG_HAS:-empty})"
+    echo "this image's tensorfold-native lacks $what: ZIG_HAS does not name it (zig/patches/0014-0030 bring spill2, kvshard, spillshard, mtpcache, fill, pictures and prefixwait, which start.sh's default ZIG_HAS lists; now: ${ZIG_HAS:-empty})"
   else
     echo "the Python engine's patches/ lack $what (Robert's fork, wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, has them for ENGINE=python)"
   fi

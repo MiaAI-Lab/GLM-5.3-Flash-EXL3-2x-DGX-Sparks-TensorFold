@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits 4483a96ecf21..e3ae8a62096d); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r5 @ e1352d709873 over glm/zig-engine-base @ 0db3e2f6652b (commits 4483a96ecf21..e3ae8a62096d); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: the vision tower's workspace for its largest pass is taken at start, before the staging and the pool are sized
 
 The tower took its buffers lazily at the first picture (~0.4 GiB for a pass

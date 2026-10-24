@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits b42a552e7693..b54a7d4048bb); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r5 @ e1352d709873 over glm/zig-engine-base @ 0db3e2f6652b (commits b42a552e7693..b54a7d4048bb); regenerate with scripts/port-patches.sh, do not edit
 core prompt cache + lane host: a request keeps its conversation when it continues it without its own turn state (port of GLM 0111)
 
 v1.0.7's store gave each kept state the conversation of the longest kept state

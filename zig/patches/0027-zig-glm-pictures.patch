@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits 2387efe46102..8acebf74c7af); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r5 @ e1352d709873 over glm/zig-engine-base @ 0db3e2f6652b (commits 2387efe46102..8acebf74c7af); regenerate with scripts/port-patches.sh, do not edit
 core + server + glm_cuda lanes: a prompt with pictures is kept and resumed under its content key; a pass attaches its pictures once, every mark's segment injects them, a resumed pass runs the tower only for the pictures past its cut (TF_GLM_IMAGE_CACHE, TF_GLM_IMAGE_MARK_SNAP)
 
 A prompt with pictures or clips held the image placeholder (154854) at every

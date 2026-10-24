@@ -122,7 +122,7 @@ if [[ "$ENGINE" == zig ]]; then
   # states with MTP drafts, 0025; without it port_validate warns that PROMPT_CACHE_GIB keeps nothing with DRAFTER=mtp),
   # fill (FILL=1's sliced prompt fills, 0026; without it FILL=1 is refused) and pictures (prompts with pictures kept,
   # resumed and spilled, 0027-0028; without it VISION=1 with a prompt cache warns that they are not kept).
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked mtpcache fill pictures}"
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked mtpcache fill pictures prefixwait}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
