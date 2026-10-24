@@ -96,9 +96,9 @@ case_ "defaults: everything off, no flag, variable or label; SPILL_DIR beside th
   expect "${STOP_TIMEOUT:-unset}" unset
   expect "$PORT_MAPPED_RE" "$PORT_MAPPED_BASE"
   expect "$SPILL_DIR" /home/u/.cache/tensorfold-spill'
-case_ "defaults: the ranks' passthrough drops only the three switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2, TF_GLM_FILL)" 0 '' '
+case_ "defaults: the ranks' passthrough drops only the switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2, TF_GLM_FILL, TF_GLM_PREFIX_WAIT and its bound)" 0 '' '
   port_validate 8 0; port_map
-  expect "$(printf "%s\n" TF_GLM_KV_SHARD=0 TF_GLM_FILL=1 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60 |
+  expect "$(printf "%s\n" TF_GLM_KV_SHARD=0 TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 TF_GLM_PREFIX_WAIT_MS=9 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60 |
     grep -vE "^($PORT_MAPPED_RE)=" | paste -sd" " -)" "TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60"'
 case_ "defaults with ENGINE=python: off as well" 0 'ENGINE=python' '
   port_validate "" ""; port_map; expect "${#PORT_ENV[@]} ${#PORT_SERVE[@]} $(port_identity)" "0 0 off"'
@@ -178,7 +178,7 @@ case_ "FILL=1: TF_GLM_FILL=1 on every rank, the label and summary say so; off (t
   expect "$FILL" 0
   port_validate 8 0; port_map; expect "${#PORT_ENV[@]} $(port_identity)" "0 off"
   FILL=1; port_validate 8 0; port_map
-  expect "${PORT_ENV[*]}" "TF_GLM_FILL=1"
+  expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1"
   [[ "$(port_identity)" =~ ^spill=0,shard=0,fill=1,sum=[0-9]+$ ]] || { port_identity; exit 1; }
   expect "$(port_summary)" " · sliced fills"
   [[ "TF_GLM_FILL=1" =~ ^($PORT_MAPPED_RE)= ]] || exit 1'
@@ -187,7 +187,7 @@ case_ "FILL from TF_GLM_FILL when only that is set; FILL wins over it, with a wa
   ( FILL=0; expect_out "WARN: TF_GLM_FILL=1 is overridden by FILL=0" port_validate 8 0 ) || exit 1'
 case_ "FILL=1 with KV sharding and spill v2: every variable together, the label names all three" 0 "ZIG_HAS='$ALL_HAS fill' FILL=1 KV_SHARD=1 SPILL_GIB=8 SPILL_V2=1" '
   port_validate 8 8; port_map
-  [[ " ${PORT_ENV[*]} " == *" TF_GLM_KV_SHARD=1 "* && " ${PORT_ENV[*]} " == *" TF_GLM_SPILL_V2=1 "* && "${PORT_ENV[*]}" == *" TF_GLM_FILL=1" ]] || { echo "${PORT_ENV[*]}"; exit 1; }
+  [[ " ${PORT_ENV[*]} " == *" TF_GLM_KV_SHARD=1 "* && " ${PORT_ENV[*]} " == *" TF_GLM_SPILL_V2=1 "* && " ${PORT_ENV[*]} " == *" TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 "* ]] || { echo "${PORT_ENV[*]}"; exit 1; }
   [[ "$(port_identity)" =~ ^spill=v2,shard=1,fill=1,sum= ]] || { port_identity; exit 1; }'
 case_ "refuse: FILL=2, FILL=1 with DRAFTER=mtp (also with mtpcache), FILL=1 without ZIG_HAS fill (naming the patch)" 0 '' '
   ( FILL=2; expect_die "FILL .TF_GLM_FILL. is 0 or 1, not 2" port_validate 8 0 ) || exit 1
@@ -383,11 +383,37 @@ case_ "fork default spill with MTP drafts: off with a warning" 0 "PT_FORK=1 ZIG_
   expect_out "WARN: SPILL TIER OFF for this start: SPILL_GIB=64 with DRAFTER=mtp" port_validate 1 8'
 
 # ---- prefix wait: not ported
-case_ "PREFIX_WAIT=1 / TF_GLM_PREFIX_WAIT=1 warn and do nothing; 0 is silent" 0 '' '
-  ( PREFIX_WAIT=1; expect_out "WARN: PREFIX_WAIT=1 does nothing: the prefix wait .* is not ported" port_validate 8 0 ) || exit 1
-  ( TF_GLM_PREFIX_WAIT=1; expect_out "WARN: TF_GLM_PREFIX_WAIT=1 does nothing" port_validate 8 0 ) || exit 1
-  ( PREFIX_WAIT=0 TF_GLM_PREFIX_WAIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
-  port_map; expect "${#PORT_ENV[@]}" 0'
+# ---- the prefix wait (PREFIX_WAIT, the Python fork's 0110; the Zig engine's lane host with FILL=1)
+case_ "PREFIX_WAIT with FILL=1: on by default, TF_GLM_PREFIX_WAIT to every rank (0 when off), TF_GLM_PREFIX_WAIT_MS as set" 0 'FILL=1' '
+  expect "$PREFIX_WAIT" 1
+  port_validate 8 8; port_map
+  expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1"
+  expect "$(port_summary)" " · sliced fills"
+  a=$(port_identity)
+  ( PREFIX_WAIT=0; port_validate 8 8; port_map; expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=0"
+    expect "$(port_summary)" " · sliced fills (no prefix wait)"; [[ "$(port_identity)" != "$a" ]] ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=5000; port_validate 8 8; port_map
+    expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 TF_GLM_PREFIX_WAIT_MS=5000" ) || exit 1
+  for x in TF_GLM_PREFIX_WAIT TF_GLM_PREFIX_WAIT_MS; do [[ "$x=1" =~ ^($PORT_MAPPED_RE)= ]] || { echo "$x not mapped"; exit 1; }; done'
+case_ "PREFIX_WAIT from TF_GLM_PREFIX_WAIT when only that is set; PREFIX_WAIT wins over it, with a warning" 0 'FILL=1 TF_GLM_PREFIX_WAIT=0' '
+  expect "$PREFIX_WAIT" 0
+  port_validate 8 8 >/dev/null; port_map; expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=0"
+  ( PREFIX_WAIT=1; expect_out "WARN: TF_GLM_PREFIX_WAIT=0 is overridden by PREFIX_WAIT=1" port_validate 8 8 ) || exit 1'
+case_ "PREFIX_WAIT without FILL=1: nothing passed (whole passes fill one prompt at a time); set, it warns; unset or 0 silent" 0 '' '
+  expect_out "!WARN" port_validate 8 0; port_map; expect "${#PORT_ENV[@]}" 0
+  ( PREFIX_WAIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
+  ( PORT_PW_EXPLICIT=1 PREFIX_WAIT=1; expect_out "WARN: PREFIX_WAIT=1 does nothing without FILL=1" port_validate 8 0; port_map; expect "${#PORT_ENV[@]}" 0 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=5000; expect_out "WARN: TF_GLM_PREFIX_WAIT_MS=5000 does nothing without FILL=1" port_validate 8 0 ) || exit 1'
+case_ "PREFIX_WAIT=1 set with FILL=1 and no prompt cache warns (nothing is kept to resume); the default does not" 0 'FILL=1 PREFIX_WAIT=1' '
+  expect_out "WARN: PREFIX_WAIT=1 does nothing without a prompt cache" port_validate 8 0
+  ( PORT_PW_EXPLICIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1'
+case_ "refuse: PREFIX_WAIT=2, TF_GLM_PREFIX_WAIT_MS not a whole number of milliseconds" 0 'FILL=1' '
+  ( PREFIX_WAIT=2; expect_die "PREFIX_WAIT .TF_GLM_PREFIX_WAIT. is 0 or 1, not 2" port_validate 8 8 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=1s; expect_die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds" port_validate 8 8 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=-5; expect_die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds" port_validate 8 8 ) || exit 1'
+case_ "PREFIX_WAIT=1 with ENGINE=python: a warning that it does nothing, and nothing passed" 0 'ENGINE=python PREFIX_WAIT=1' '
+  expect_out "WARN: PREFIX_WAIT=1 does nothing with ENGINE=python" port_validate "" ""
+  port_validate "" "" >/dev/null; port_map; expect "${#PORT_ENV[@]}" 0'
 
 # ---- after the start: each rank opened its spill tier (rank 0's prompt cache budget above 0; every rank's own budget
 # above 0 too: each rank opens its tier from its own, with no agreement between them)

@@ -57,8 +57,18 @@
 # passes, as before. ENGINE=zig with ZIG_HAS fill; refused with DRAFTER=mtp (one MTP head serves every stream).
 # scripts/config.sh sets its default; the line below is for the tests, which source this file alone.
 FILL="${FILL:-${TF_GLM_FILL:-0}}"
-# PREFIX_WAIT / TF_GLM_PREFIX_WAIT (the Python fork's 0110): not ported, and not needed: the Zig engine admits and fills
-# one prompt at a time, so no request ever prefills a prefix another one is still filling. Set, it warns and does nothing.
+# The prefix wait (the Python fork's 0110, on the Zig engine's lane host from glm/prefix-wait; see below for the patch):
+# with FILL=1, requests that arrive together on one system prompt all start filling at once, and each computed it (g6,
+# prefix_fanout: 31,488 / 85,440 / 199,360 duplicate tokens at 2 / 4 / 8 at once on a 28k-token prompt). With the wait a
+# request whose prompt shares a cut another prompt is still filling waits for that prompt to keep it, holding no lane,
+# then resumes from it: the prefix is computed once. Whole passes (FILL=0) never need it: each ends before the next
+# request is admitted, which finds its cut kept.
+#   PREFIX_WAIT=1           (TF_GLM_PREFIX_WAIT) on, the default; 0 off. Passed only with FILL=1, and it needs the prompt
+#                           cache (PROMPT_CACHE_GIB above 0: the cut is a kept prompt state)
+#   TF_GLM_PREFIX_WAIT_MS   the wait's bound in ms (unset: the engine's 60000; 0 off), passed as set with FILL=1
+# An image whose engine predates the wait ignores both (it reads neither): FILL=1 then runs as before.
+PORT_PW_EXPLICIT=0; [[ -z "${PREFIX_WAIT:-}${TF_GLM_PREFIX_WAIT:-}" ]] || PORT_PW_EXPLICIT=1
+PREFIX_WAIT="${PREFIX_WAIT:-${TF_GLM_PREFIX_WAIT:-1}}"
 PORT_SPILL_DEFAULT_GIB=0   # SPILL_GIB when it is not set (0: off). Robert's fork: 64
 PORT_SPILL_V2_DEFAULT=0    # SPILL_V2 when it is not set (0: v1). Robert's fork: 1
 PORT_SHARD_DEFAULT=0       # KV_SHARD when it is not set, where it can run (0: off). Robert's fork: 1
@@ -186,16 +196,15 @@ port_vision_check() {
 port_validate() {
   local par=${1:-$PARALLEL} cache=${2:-${PROMPT_CACHE_GIB:-0}} x why
   # the switches' aliases: the recipe's name wins
-  for x in "KV_SHARD TF_GLM_KV_SHARD" "FILL TF_GLM_FILL" "SPILL_V2 TF_GLM_SPILL_V2" "SPILL_QUOTA TF_GLM_SPILL_QUOTA" "SPILL_TURNS TF_GLM_SPILL_TURNS"; do
+  for x in "KV_SHARD TF_GLM_KV_SHARD" "FILL TF_GLM_FILL" "PREFIX_WAIT TF_GLM_PREFIX_WAIT" "SPILL_V2 TF_GLM_SPILL_V2" "SPILL_QUOTA TF_GLM_SPILL_QUOTA" "SPILL_TURNS TF_GLM_SPILL_TURNS"; do
     set -- $x
     [[ -z "${!1:-}" || -z "${!2:-}" || "${!1}" == "${!2}" ]] || warn "$2=${!2} is overridden by $1=${!1} (the recipe's name wins)"
   done
-  for x in PREFIX_WAIT TF_GLM_PREFIX_WAIT; do
-    [[ -z "${!x:-}" || "${!x}" == 0 ]] ||
-      warn "$x=${!x} does nothing: the prefix wait (the Python fork's 0110) is not ported, and not needed by the Zig engine, which admits and fills one prompt at a time"
-  done
   [[ "$KV_SHARD" =~ ^[01]$ ]] || die "KV_SHARD (TF_GLM_KV_SHARD) is 0 or 1, not $KV_SHARD"
   [[ "$FILL" =~ ^[01]$ ]] || die "FILL (TF_GLM_FILL) is 0 or 1, not $FILL"
+  [[ "$PREFIX_WAIT" =~ ^[01]$ ]] || die "PREFIX_WAIT (TF_GLM_PREFIX_WAIT) is 0 or 1, not $PREFIX_WAIT"
+  [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" || "$TF_GLM_PREFIX_WAIT_MS" =~ ^[0-9]{1,9}$ ]] ||
+    die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds (0: no wait), not $TF_GLM_PREFIX_WAIT_MS"
   [[ "$SPILL_V2" =~ ^[01]$ ]] || die "SPILL_V2 (TF_GLM_SPILL_V2) is 0 or 1, not $SPILL_V2"
   port_num "$SPILL_GIB" || die "SPILL_GIB is a number of GiB (0: off), not $SPILL_GIB"
   [[ -z "${TF_GLM_KV_SHARD_CARRY:-}" || "$TF_GLM_KV_SHARD_CARRY" =~ ^[01]$ ]] || die "TF_GLM_KV_SHARD_CARRY is 0 or 1, not $TF_GLM_KV_SHARD_CARRY"
@@ -285,6 +294,14 @@ port_validate() {
     if [[ "$FILL" == 1 ]]; then
       [[ "$DRAFTER" == dflash2 ]] || die "FILL=1: sliced prompt fills do not run with DRAFTER=$DRAFTER (one MTP head serves every stream; the engine refuses it too). Set FILL=0"
       port_has fill || die "FILL=1: $(port_missing fill). Set FILL=0"
+      # the prefix wait resumes a cut another prompt keeps: a kept prompt state
+      [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) || port_gt0 "$cache" ||
+        warn "PREFIX_WAIT=1 does nothing without a prompt cache (PROMPT_CACHE_GIB=$cache): the cut a request waits for is a kept prompt state"
+    else
+      # whole passes fill one prompt at a time: a request finds the cut of the one before it kept, nothing to wait for
+      [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) ||
+        warn "PREFIX_WAIT=1 does nothing without FILL=1: whole prompt passes fill one prompt at a time, so a request already finds the shared cut of the one before it kept"
+      [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" ]] || warn "TF_GLM_PREFIX_WAIT_MS=$TF_GLM_PREFIX_WAIT_MS does nothing without FILL=1"
     fi
     # a prompt cache the default pool leaves no room for, and the vision tower's share of what it gets
     port_pool_check "$cache"
@@ -300,6 +317,8 @@ port_validate() {
       port_shard_default_off "$(port_missing kvshard)"
     fi
     ! port_gt0 "$cache" || warn "PROMPT_CACHE_GIB=$cache does nothing with ENGINE=python, which keeps prompt states in the KV pool (KV_POOL_GIB)"
+    [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) ||
+      warn "PREFIX_WAIT=1 does nothing with ENGINE=python (this recipe's v0.6.0 has no prefix wait; the Zig engine's needs FILL=1)"
     if [[ "$FILL" == 1 ]]; then
       warn "FILL=1 does nothing with ENGINE=python (the Zig engine's sliced fills); the Python engine fills beside decoding in layer slices (FILL_BUDGET_MS)"
       FILL=0
@@ -387,8 +406,9 @@ port_check_started() {
 # TF_SPILL_FLUSH_S (glm_cuda/cuda_native.zig openSpill); v2 keeps the flags (--spill-highwater is v1's: not passed)
 # and adds TF_GLM_SPILL_V2, TF_GLM_SPILL_QUOTA (a share), TF_GLM_SPILL_TURNS, TF_GLM_SPILL_READ_BLOCKS,
 # TF_GLM_SPILL_STAGE_MIB, TF_GLM_SPILL_LOAD_MS, TF_SPILL_DEFER_MS; KV sharding TF_GLM_KV_SHARD, _CARRY, _TWINS, _CHECK;
-# sliced fills TF_GLM_FILL (cuda_native.zig: 1, or 0/unset; in the ranks' settings text only when on).
-PORT_MAPPED_BASE='TF_GLM_KV_SHARD|TF_GLM_SPILL_V2|TF_GLM_FILL'
+# sliced fills TF_GLM_FILL (cuda_native.zig: 1, or 0/unset; in the ranks' settings text only when on); the prefix wait
+# TF_GLM_PREFIX_WAIT (1 default, 0 off) and TF_GLM_PREFIX_WAIT_MS (native/cuda.zig serve: rank 0's admission alone).
+PORT_MAPPED_BASE='TF_GLM_KV_SHARD|TF_GLM_SPILL_V2|TF_GLM_FILL|TF_GLM_PREFIX_WAIT|TF_GLM_PREFIX_WAIT_MS'
 PORT_MAPPED_SPILL='TF_SPILL_FLUSH_S'
 PORT_MAPPED_V2='TF_GLM_SPILL_QUOTA|TF_GLM_SPILL_TURNS|TF_GLM_SPILL_READ_BLOCKS|TF_GLM_SPILL_STAGE_MIB|TF_GLM_SPILL_LOAD_MS|TF_SPILL_DEFER_MS'
 PORT_MAPPED_SHARD='TF_GLM_KV_SHARD_CARRY|TF_GLM_KV_SHARD_TWINS|TF_GLM_KV_SHARD_CHECK'
@@ -417,7 +437,10 @@ port_map() {
     [[ -z "${TF_GLM_KV_SHARD_CHECK:-}" ]] || PORT_ENV+=("TF_GLM_KV_SHARD_CHECK=$TF_GLM_KV_SHARD_CHECK")
     PORT_MAPPED_RE+="|$PORT_MAPPED_SHARD"
   fi
-  [[ "$FILL" != 1 ]] || PORT_ENV+=("TF_GLM_FILL=1")
+  if [[ "$FILL" == 1 ]]; then
+    PORT_ENV+=("TF_GLM_FILL=1" "TF_GLM_PREFIX_WAIT=$PREFIX_WAIT")
+    [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" ]] || PORT_ENV+=("TF_GLM_PREFIX_WAIT_MS=$TF_GLM_PREFIX_WAIT_MS")
+  fi
   return 0
 }
 
@@ -458,7 +481,7 @@ port_summary() {
   local s=""
   ! port_spill_on || s+=" · spill $( [[ "$SPILL_V2" == 1 ]] && echo v2 || echo v1) $SPILL_GIB GiB"
   [[ "$KV_SHARD" != 1 ]] || s+=" · KV shard"
-  [[ "$FILL" != 1 ]] || s+=" · sliced fills"
+  [[ "$FILL" != 1 ]] || s+=" · sliced fills$( [[ "$PREFIX_WAIT" == 1 ]] || echo " (no prefix wait)" )"
   echo "$s"
 }
 

@@ -69,7 +69,9 @@ From the Python fork's recipe:
 - The switches are not exported by `config.sh`; they reach the ranks only through `port_map`, after the checks.
 - The parked-page rule is the engine's (count - high_min, 512 MiB rest without high_min), not the fork's
   `_parked_zone` (high_min + 256 MiB of slack): one rule for the recipe and the engine.
-- `PREFIX_WAIT` is not ported (the Zig engine fills one prompt at a time; GAP.md): it warns.
+- `PREFIX_WAIT` (default 1, as the fork's) is passed as `TF_GLM_PREFIX_WAIT` only with `FILL=1` (engine `glm/prefix-wait`:
+  the lane host's wait for a cut another sliced fill is computing); with whole passes nothing needs it (each ends before
+  the next admission), and set explicitly it warns. `TF_GLM_PREFIX_WAIT_MS` (the bound) passes as set with `FILL=1`.
 - The fork's `parked_pages_check` CI step: this recipe has no CI; `scripts/port_test.sh` runs the synthetic cases, and
   the engine's own 0119 tests come with `glm/base-fixes`.
 

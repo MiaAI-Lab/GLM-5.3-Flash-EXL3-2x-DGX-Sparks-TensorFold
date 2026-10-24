@@ -16,10 +16,13 @@ counts what the engine did with the shared prefix:
 
 PASS / FAIL per level: every request answered (and == baseline by strong token hash with --baseline); level 1
 (sequential) must reuse the cut (duplicate <= --dup-tolerance per follower); with --expect-one-fill every level must.
-Without it levels above 1 are measured and reported, not judged. The Zig engine admits one whole prompt pass at a time,
-so a request sharing the prefix finds the one before it already kept: one fill at every level is expected, which is why
-the Python fork's prefix wait (its 0110) is not ported (scripts/port.sh, PREFIX_WAIT). This tool is that claim's check:
---expect-one-fill on the Sparks, with the prompt cache on (PROMPT_CACHE_GIB). A level whose every request found the
+Without it levels above 1 are measured and reported, not judged. With whole prompt passes (FILL=0) the Zig engine runs
+one pass at a time, so a request sharing the prefix finds the one before it already kept. With sliced fills (FILL=1)
+requests that arrive together all start filling, and each computed the prefix (g6: 31,488 / 85,440 / 199,360 duplicate
+tokens at c2 / c4 / c8) until the engine's prefix wait (the Python fork's 0110, PREFIX_WAIT=1 with FILL=1,
+scripts/port.sh): a request waits for the cut another fill is computing and resumes from it. One fill at every level is
+expected either way; this tool is that claim's check: --expect-one-fill on the Sparks, with the prompt cache on
+(PROMPT_CACHE_GIB). A level whose every request found the
 prefix already cached was not cold (a rerun of the same --baseline prompts on a warm server): it is a SKIP, a failure
 with --strict-cold. Run each pass on a freshly started server. From the DeepSeek recipe's port (wojo's fork,
 tools/prefix_fanout.py). Stdlib only.
