@@ -44,7 +44,8 @@ Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https:
 this engine, with two fixes to the base engine he found on the way (a long prompt's preparation running rank 0 out of
 memory, the DeepSeek recipe's 0023, and a shared prompt cut joining two conversations), arrive here as `0014` to
 `0023`: one patch per feature, in the order they build on each other, each the diff of one commit of the engine branch
-`glm/series` (in the port's TensorFold repository, from `glm/zig-engine-base`) with a header that says what it does,
+`glm/series` (published as [`wojo/TensorFold` `glm-zig/series`](https://github.com/wojo/TensorFold/tree/glm-zig/series), from
+`glm-zig/engine-base`) with a header that says what it does,
 its switches and defaults, what was measured on the pair and whose work it is (spill v2's block store design is
 [BadAd84](https://github.com/BadAd84)'s, #118). After `0023` the engine is the port's integration branch
 (`glm/integration`, round 3) without the port's notes.
@@ -70,8 +71,15 @@ and what `/health`, `/metrics` and rank 0's log report with a prompt cache, neve
 engine; the prompt cache on (`KV_POOL_GIB=4`, `PROMPT_CACHE_GIB=8`: a 6.2 GiB budget for kept states, 5.1 GiB with
 spill v2 on, whose 1,066 MiB of pinned staging comes first), 39/39; KV sharding on, 39/39, the pool 1.83x the tokens in
 the same memory; spill v2 on, 39/39, `tools/spill_check.py` 20 of 22 main cases and 4 of 4 restart cases (each header
-says which). The round-3 changes (two concurrent restores each restoring from disk, in `0019`; spill v2 with KV
-sharding, `0023`) have not run on the pair yet. `0014`, `0015` and `0016` are also offered alone as pull requests
+says which). Round 3 as this series (`0014`-`0023`, 2026-10-24): every feature off 39/39; the cache on 39/39; KV sharding
+39/39 (fan-out one fill); spill v2 39/39 and spill v2 with KV sharding (`0023`) 39/39, each passing
+`tools/spill_check.py`'s main and restart cases except two the client got wrong (dual-restore's D1 kept its point inside
+its question, and "no temporaries" listed the folders while a state was being written again; both fixed in `tools/`)
+and cancel (not exercised: the restore finished first); two concurrent restores (`0019`), checked against a running server with
+KV sharding and spill v2 both on, both came from disk in 2.28 s while a stream decoded (its worst gap 0.13 s). Decode on
+the pair (`--parallel 8`, short prompts, aggregate tok/s at 1/2/4/8 streams): every feature off 51.4/72.0/91.9/118.2,
+KV sharding + spill v2 + the cache 49.7/65.4/92.5/115.4, this recipe's `ENGINE=python` 50.1/69.4/93.2/93.7. Cold
+prefill about 2,000 tok/s on all three at 13k and 51k tokens. `0014`, `0015` and `0016` are also offered alone as pull requests
 against this branch, with the same diff: whichever lands first, the other copy is an exact duplicate (`git apply
 --reverse --check` passes). Their headers are the series' messages, not the standalones': `0016`'s leaves out a note
 of `glm/pr-chat-id`'s. With that fix alone, a shared cut and the turn kept after it get different conversation ids, so
