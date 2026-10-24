@@ -142,6 +142,45 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
+- **Spill tier, blocks** (patch `0110-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
+  every kept prompt state is written to local disk when it is kept, in blocks of 2,048 tokens that later turns and forks
+  of the same conversation share, so a conversation resumes from disk after an eviction, a clean restart, a `kill -9` or
+  a watchdog restart, and a turn writes only its new rows (a 10.4k-token turn of a 50k conversation: 68 MiB, not the
+  whole state). Each conversation keeps its newest `SPILL_TURNS` (4) states, older turns trimmed as each one is written
+  (each held a ~91 MB small part; the rows stay, the newest turn names them), and small parts go to disk with O_DIRECT,
+  so the page cache keeps no copy. Room goes by conversation: old turns beyond `SPILL_TURNS`, abandoned forks, whole
+  conversations least recently used, shared system prompts last; `SPILL_QUOTA` caps one conversation's share (#122,
+  reported by [xiepengqi](https://github.com/xiepengqi): one conversation's per-turn states filled 128 GiB in 30 minutes
+  and pushed the others out). The free-disk floor makes room in the same order. Blocks with equal bytes are linked, not
+  written twice. Rank 0 asks every Spark before a read (HAS). The block layout, the lineage, writing at keep through a
+  pinned ring and the fsync order are those of
+  [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
+  [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
+  one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
+  A restore reads ahead on 8 threads into pinned slots (`TF_GLM_SPILL_READ_BLOCKS`, 16) and the engine copies the
+  blocks read between rounds (`TF_GLM_SPILL_LOAD_MS`, 40 ms, one budget for every restore in flight, each first in
+  turn; beside decoding streams a restore ends only once those copies are done, rather than its end copying the
+  read-ahead in one pause), as #118 does: issued from the reader's own thread, each
+  copy waited on the decode loop (~0.25 ms a call against ~9 us idle), so a 260k-token restore beside a decoding stream
+  took 1.0-1.3 s on two Sparks and 8.6-12.7 s on three (measured by [BadAd84](https://github.com/BadAd84)); now
+  0.54-0.61 s with 32 blocks read ahead (idle 0.40-0.46 s), the same replies. The read-ahead's first blocks go in the
+  two 64 MiB read buffers pinned at start (ten blocks on two Sparks); the rest is pinned before the pool is sized, in
+  power-of-two pieces, so that comes out of the pool, not the margin it keeps (the default 16 blocks: ~14k tokens at
+  `PARALLEL=4`; 9 costs the pool nothing). The write ring's size is `TF_GLM_SPILL_STAGE_MIB` (256 MiB). A restore
+  whose read fails on one Spark (a damaged or missing block) ends on every Spark and the
+  prompt is computed again: a Spark with more blocks left than read slots (above ~65k tokens) waited for ever for the
+  slots its own copies held (a ~100k-token conversation with damaged blocks on two Sparks: the request hung until the
+  client gave up after 15 minutes; now answered in 50 s, its prompt recomputed). CPU check: `hang` in
+  `tools/spill_blocks_check.py`.
+- **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
+  with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
+  agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
+  first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies. Counted in `/health` (`prefix_waits`,
+  `prefix_wait_tokens`) and `/metrics` (`prefix_waits_total`, `prefix_wait_tokens_total`).
+- `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
+  `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
+  block store and its hooks in `multi.py` (a read only reads; the engine copies, rank 1 as far as LOADPART says);
+  `tools/spill_blocks_mutants.sh` runs it on faithful mutants of each fix.
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
@@ -187,7 +226,8 @@ Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad
 50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
 29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
 
-- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)):
   a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
   skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
   unless `SPILL_GIB` is set.
@@ -290,8 +330,9 @@ contributors' measurements are in the PRs.
   restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
   CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
   content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
-  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  through a kernel, as the pool's own moves there do). Authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), PR #78;
+  credits in `NOTICE` and `CREDITS.md`.
   Numbers: README, "Spill tier".
 - **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
   default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's
