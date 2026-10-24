@@ -337,15 +337,23 @@ port_check_extra() {
 }
 
 # port_check_started <rank 0's log> [<rank 1's log>...]: with the spill tier on (ENGINE=zig), every rank must have opened
-# it (each log: its "prompt cache:", "spill tier:" and "spill: cannot open" lines; "(unread)" when it could not be read).
-# Rank 0 first needs a prompt cache, which the tier writes from: its budget is what MemAvailable leaves above the reserve
-# once the pool is up, so it can come out 0 even with PROMPT_CACHE_GIB above 0 (Mia PR #187), and no tier opens. Each
-# rank opens its tier from its own budget (cuda_native.zig cacheFor), with no agreement between the ranks: a Spark with
-# a little less memory free can come out with none while rank 0 writes and restores states it cannot follow. Warns; the
-# server runs on.
+# it (each log: its lines matching PORT_TIER_LOG_RE; "(unread)" when it could not be read). The engine's lines
+# (glm_cuda/cuda_native.zig): v1 opens with "spill tier: <dir>, up to ..." and fails with "spill: cannot open <dir>
+# (<error>); no spill tier"; v2 (SPILL_V2=1) opens with "rank N: spill v2 tier: <dir>, up to ..." and fails with "rank N:
+# spill v2's store under <dir> did not open (<error>)". The tier asked for is the one looked for: a rank that logged the
+# other version's line warns too. Rank 0 first needs a prompt cache, which the tier writes from: its budget is what
+# MemAvailable leaves above the reserve once the pool is up, so it can come out 0 even with PROMPT_CACHE_GIB above 0
+# (Mia PR #187), and no tier opens. Each rank opens its v1 tier from its own budget (cuda_native.zig cacheFor), with no
+# agreement between the ranks: a Spark with a little less memory free can come out with none while rank 0 writes and
+# restores states it cannot follow (v2 agrees one budget and fails the start on every rank when a store does not open,
+# so there a missing line means a log that did not get that far). Warns; the server runs on.
+PORT_TIER_LOG_RE="prompt cache:|spill tier: |spill v2 tier: |spill: cannot open|spill v2's store under .* did not open"
 port_check_started() {
   [[ "$ENGINE" == zig ]] && port_spill_on || return 0
-  local line l r=0
+  local line l r=0 want='spill tier: ' other='spill v2 tier: ' failed='spill: cannot open.*' v=v1 ov=v2 name='spill tier'
+  if [[ "$SPILL_V2" == 1 ]]; then
+    want='spill v2 tier: ' other='spill tier: ' failed="spill v2's store under .* did not open.*" v=v2 ov=v1 name='spill v2 tier'
+  fi
   line=$(grep -m1 -o 'prompt cache: off[^"]*' <<<"$1" || true)
   if [[ -n "$line" ]]; then
     warn "the spill tier is not open: rank 0 logged \"$line\", and the tier writes only kept prompt states. Lower KV_POOL_GIB (the pool takes that memory first) or MEMORY_RESERVE_GIB, then ./start.sh restart"
@@ -353,10 +361,13 @@ port_check_started() {
   fi
   for l in "$@"; do
     if [[ "$l" == '(unread)' ]]; then warn "could not read rank $r's log: whether its spill tier opened is not checked"
-    elif ! grep -q 'spill tier: ' <<<"$l"; then
-      line=$(grep -m1 -o 'spill: cannot open.*' <<<"$l" || true)
-      if (( r == 0 )); then warn "rank 0 opened no spill tier${line:+ (it logged \"$line\")}: no kept state is written to disk"
-      else warn "rank $r opened no spill tier${line:+ (it logged \"$line\")}: rank 0 writes and restores kept states that rank $r cannot follow (a restore from disk fails there). Each rank's prompt cache budget is its own: free memory on that Spark (or lower KV_POOL_GIB), then ./start.sh restart"; fi
+    elif grep -q -- "$want" <<<"$l"; then :
+    elif grep -q -- "$other" <<<"$l"; then
+      warn "rank $r opened the $ov spill tier, not $v (SPILL_V2=$SPILL_V2): this image's engine did not take the setting; ./start.sh stop, then check ZIG_HAS and the image"
+    else
+      line=$(grep -m1 -o -- "$failed" <<<"$l" || true)
+      if (( r == 0 )); then warn "rank 0 opened no $name${line:+ (it logged \"$line\")}: no kept state is written to disk"
+      else warn "rank $r opened no $name${line:+ (it logged \"$line\")}: rank 0 writes and restores kept states that rank $r cannot follow (a restore from disk fails there). Each rank's prompt cache budget is its own: free memory on that Spark (or lower KV_POOL_GIB), then ./start.sh restart"; fi
     fi
     r=$((r + 1))
   done

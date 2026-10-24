@@ -624,9 +624,9 @@ fi
 # the spill tier opened on every rank (scripts/port.sh): each rank's prompt cache budget is its own, and can come out 0.
 # After the smoke test, which every rank followed, so each has set up its prompt cache (rank 0 may answer before)
 if port_spill_on; then
-  PORT_LOGS=("$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open' || true)")
+  PORT_LOGS=("$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E "$PORT_TIER_LOG_RE" || true)")
   for i in $(worker_ids); do
-    PORT_LOGS+=("$(worker "$i" "docker logs '$CONTAINER_NAME' 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open'; true" 2>/dev/null || echo '(unread)')")
+    PORT_LOGS+=("$(worker "$i" "docker logs '$CONTAINER_NAME' 2>&1 | grep -E $(printf %q "$PORT_TIER_LOG_RE"); true" 2>/dev/null || echo '(unread)')")
   done
   port_check_started "${PORT_LOGS[@]}"
 fi

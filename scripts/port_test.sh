@@ -408,6 +408,33 @@ case_ "after the start: a rank that opened no spill tier while rank 0 did warns,
   expect_out 'WARN: rank 0 opened no spill tier' port_check_started 'info: prompt cache: 2.0 GiB for kept states' '$r1_ok'
   expect_out 'WARN: could not read rank 1.s log' port_check_started '$r0_ok' '(unread)'
   expect_out '!rank 1 opened' port_check_started '$r0_ok' '(unread)'"
+# spill v2's start lines, as glm_cuda/cuda_native.zig openTier logs them (g3 and g6 with SPILL_V2=1 printed exactly these,
+# and the check above, which knew v1's "spill tier:" only, warned "rank 0 opened no spill tier" for both ranks), and its
+# failure line (one rank's store that did not open fails the start on every rank, so a log that has it has no tier line)
+v2_r0="info: prompt cache: 5.1 GiB for kept states, at most 14 (fixed 102 MiB each)
+info: rank 0: spill v2 tier: /spill, up to 16 GiB, 0 points (0 MiB) found; each kept state written at keep from 8192 tokens, keeping 20 GiB of disk free; its folders given to the spill directory's owner"
+v2_r1="info: rank 1: spill v2 tier: /spill, up to 16 GiB, 3 points (812 MiB) found; each kept state written at keep from 8192 tokens, keeping 20 GiB of disk free; owner-sharded (TF_GLM_KV_SHARD: a point's latent rows on its home part's rank only)"
+v2_bad="error: rank 1: spill v2's store under /spill did not open (AccessDenied)"
+case_ "after the start, spill v2: both ranks' \"spill v2 tier:\" lines say nothing; a missing one warns, with the engine's reason" 0 'SPILL_GIB=16 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
+  port_validate 8 8
+  expect_out "!WARN" port_check_started "$v2_r0" "$v2_r1"
+  expect_out "!WARN" port_check_started "$v2_r0"
+  expect_out "WARN: rank 1 opened no spill v2 tier" port_check_started "$v2_r0" ""
+  expect_out "WARN: rank 0 opened no spill v2 tier" port_check_started "info: prompt cache: 5.1 GiB for kept states" "$v2_r1"
+  expect_out "WARN: rank 1 opened no spill v2 tier (it logged \"spill v2.s store under /spill did not open (AccessDenied)\")" \
+    port_check_started "$v2_r0" "$v2_bad"
+  expect_out "WARN: the spill tier is not open: rank 0 logged \"prompt cache: off (budget 0)\"" port_check_started "info: prompt cache: off (budget 0)" "$v2_r1"'
+case_ "after the start: a rank that opened the other version of the tier than asked warns, naming both" 0 'SPILL_GIB=16 PROMPT_CACHE_GIB=8' '
+  ( SPILL_V2=1; port_validate 8 8; expect_out "WARN: rank 1 opened the v1 spill tier, not v2 (SPILL_V2=1)" port_check_started "$v2_r0" "$r1_ok" ) || exit 1
+  ( port_validate 8 8; expect_out "WARN: rank 0 opened the v2 spill tier, not v1 (SPILL_V2=0)" port_check_started "$v2_r0" "$r1_ok" ) || exit 1
+  ( port_validate 8 8; expect_out "!WARN" port_check_started "$r0_ok" "$r1_ok" ) || exit 1'
+case_ "start.sh reads each rank's tier lines through port.sh's pattern, which keeps v1's, v2's and their failures" 0 '' '
+  for l in "$r0_ok" "$v2_r0" "$v2_r1" "$v2_bad" "error: spill: cannot open /spill (AccessDenied); no spill tier"; do
+    while IFS= read -r x; do grep -qE -- "$PORT_TIER_LOG_RE" <<<"$x" || { echo "the pattern drops: $x"; exit 1; }; done <<<"$l"
+  done
+  ! grep -qE -- "$PORT_TIER_LOG_RE" <<<"info: rank 0: kv shard: two parts" || { echo "the pattern keeps an unrelated line"; exit 1; }
+  grep -qF -- "grep -E \"\$PORT_TIER_LOG_RE\"" "'"$root"'/start.sh" || { echo "start.sh does not grep with PORT_TIER_LOG_RE"; exit 1; }
+  [[ "$(grep -c -- "PORT_TIER_LOG_RE" "'"$root"'/start.sh")" == 2 ]] || { echo "start.sh: rank 0 and the workers both through it"; exit 1; }'
 
 # ---- the label (tf.recipe.port)
 case_ "the label: the same settings give the same word; another folder, quota or carry another" 0 "ZIG_HAS='$ALL_HAS' SPILL_GIB=8 SPILL_V2=1 KV_SHARD=1 PROMPT_CACHE_GIB=8" '
