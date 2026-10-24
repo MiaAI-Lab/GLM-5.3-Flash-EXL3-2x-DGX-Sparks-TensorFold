@@ -162,6 +162,42 @@ def main():
     assert obj.held is None and not obj.decoder.admitted
     checks.append("memory-held cancellation")
 
+    # A request held by NoRoom must not repeat prestage on every retry round.
+    # On stock code with discard before admit, each NoRoom re-runs prestage
+    # (6 reads across 6 rounds); with deferred discard it runs exactly once.
+    reads = []
+    class SpillDecoder(Decoder):
+        def __init__(self):
+            super().__init__()
+            self.can_admit = False
+
+        def prestage(self, stream):
+            reads.append(stream)
+            return None
+
+        def admit(self, stream):
+            if not self.can_admit:
+                raise ns["NoRoom"]("no room in KV cache")
+            super().admit(stream)
+
+    obj = scheduler()
+    obj.decoder = SpillDecoder()
+    thread, reply = ask(obj, lambda: False)
+    for _ in range(6):
+        obj._iteration()
+    assert len(reads) == 1 and obj.held is not None and not obj.decoder.admitted
+    obj.decoder.can_admit = True
+    obj._iteration()
+    assert len(reads) == 1 and obj.held is None
+    stream = next(iter(obj.decoder.streams.values()))
+    assert obj.decoder.admitted == [stream] and id(stream) not in obj.staged
+    stream.take([2])
+    stream.done = True
+    obj._iteration()
+    thread.join(2)
+    assert not thread.is_alive() and reply.get("stats") is not None
+    checks.append("repeated NoRoom does not re-prestage held request")
+
     obj = scheduler()
     thread, reply = ask(obj, lambda: True)
     obj._admit(obj.waiting.get_nowait())
