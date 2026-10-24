@@ -238,6 +238,8 @@ class Fake:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        if n.endswith(".st") and self.a.small_write_ms:   # a real small state is ~100 MB: its temporary lives a while
+            time.sleep(self.a.small_write_ms / 1000)
         os.rename(tmp, path)
         with self.lock:
             self.stored[r] += len(data)
@@ -421,7 +423,9 @@ class Fake:
                     if why:
                         self.t[why[1]][why[0]] += 1
                         self.c["restores_failed"] += 1
-                        if why[0] != "presence_refused":     # a rank that lacks it: the others keep theirs
+                        # a rank that lacks it: the others keep theirs (GLM's tier, --presence-forgets: every rank
+                        # forgets it, so the prompt's pass keeps it again and writes it anew)
+                        if why[0] != "presence_refused" or self.a.presence_forgets:
                             self.forget(h)
                     else:
                         self.c["disk_hits_committed"] += 1
@@ -673,6 +677,10 @@ def main():
                                                                    "stores); 0: statvfs")
     ap.add_argument("--write-ms", type=float, default=40)
     ap.add_argument("--restore-ms-per-block", type=float, default=15)
+    ap.add_argument("--presence-forgets", action="store_true", help="a restore refused for presence forgets the point "
+                    "on every rank (GLM's tier), so it is kept and written again")
+    ap.add_argument("--small-write-ms", type=float, default=0, help="how long a small state's temporary lives before "
+                    "its rename")
     ap.add_argument("--serial-prefill", action="store_true", help="one prompt pass at a time (the Zig engine's admission)")
     ap.add_argument("--prefill-us-per-token", type=float, default=20)
     ap.add_argument("--decode-ms-per-token", type=float, default=2)

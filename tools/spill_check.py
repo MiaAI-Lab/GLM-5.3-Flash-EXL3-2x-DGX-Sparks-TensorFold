@@ -42,7 +42,7 @@ Phases and their checks (each PASS / FAIL / SKIP, SKIP = not exercised and why; 
   drop         (server stopped) remove MM's manifest on rank 1, recorded in --state
   postrestart  every rank recovered its points; R1 restores from disk, reply == base; missing-rank1: MM, whose
                manifest rank 1 lost while stopped, is not restored (presence refused, or rank 1 holds fewer points),
-               reply == baseline (recomputed); no temporaries
+               reply == baseline (recomputed); no temporaries once every rank's writes settle (MM's pass writes it again)
   prekill      seed K1 (committed); run --resolve-cmd (the PIDs, before K2); stream K2 and run --kill-cmd the moment
                its write is queued and pending (spill.writes_pending > 0), or print KILL NOW
   postkill     K1 restores from disk; K2 == baseline (from disk or recomputed; SKIP of the in-flight case when its
@@ -521,6 +521,11 @@ class Run:
                       f"staging_peak={cc.get('spill.staging_peak')}")
 
     def temporaries(self, check):
+        """No temporary on any rank once this process's own writes have settled. A write in flight names its files
+        `.<name>.<pid>.<seq>.tmp` until its rename (GLM: a refused point is forgotten on every rank and the prompt's pass
+        writes it again, its ~100 MB small state for a while: g3 listed rank 0's mid-write), so the listing waits for
+        every rank's writes_pending to reach 0 (--commit-timeout); a temporary left by an earlier process stays one."""
+        settled = C.wait_until(lambda: not self.c().get("spill.writes_pending"), self.a.commit_timeout, 0.5)
         found = {}
         for r, d_ in self.ranks.items():
             try:
@@ -530,7 +535,8 @@ class Run:
         if not found:
             return self.rc.add(check, "SKIP", "no rank directory given")
         n = sum(len(v) for v in found.values())
-        self.rc.check(check, n == 0, f"temporaries per rank: { {r: len(v) for r, v in found.items()} }", temporaries=found)
+        self.rc.check(check, n == 0, f"temporaries per rank: { {r: len(v) for r, v in found.items()} }"
+                      + ("" if settled else f" (writes still pending after {self.a.commit_timeout}s)"), temporaries=found)
 
     # ------------------------------------------------------------------ phases
     def go(self) -> int:

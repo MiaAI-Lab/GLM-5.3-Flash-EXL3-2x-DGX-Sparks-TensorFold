@@ -241,6 +241,22 @@ def t_spill(work):
                     expect_ok=False)
             finally:
                 f.stop()
+        # GLM's tier: the refused MM is forgotten on every rank and written again by its own pass, a slow small state
+        # (g3: its temporary still there when postrestart listed): "no temporaries" must wait for that write
+        g0, g1, gst = j("spill-gf-r0"), j("spill-gf-r1"), j("spill-gf-state.json")
+        f = Fake(work, "spill-presence-forgets", "--spill-dir", g0, "--spill-dir-rank1", g1, "--mem-points", "6",
+                 "--presence-forgets", "--small-write-ms", "1500", *FAST)
+        fakes.append(f)
+        gdirs = ["--rank0-dir", g0, "--rank1-dir", g1, "--commit-timeout", "30", "--state", gst]
+        run(work, "spill: presence-forgets prerestart", S + ["run", "--url", f.url, "--baseline", rec, "--phase",
+                                                             "prerestart"] + gdirs)
+        f.stop()
+        run(work, "spill: presence-forgets drop", S + ["drop", "--state", gst, "--rank1-dir", g1])
+        f.start()
+        run(work, "spill: postrestart waits for MM's write again before judging temporaries (--strict)", S + [
+            "run", "--url", f.url, "--baseline", rec, "--phase", "postrestart", "--strict",
+            "--receipt", j("r-spill-gf.json")] + gdirs)
+        f.stop()
         # a store that restores without rank 1's presence: missing-rank1 must catch it
         m0, m1, mst = j("spill-ip-r0"), j("spill-ip-r1"), j("spill-ip-state.json")
         f = Fake(work, "spill-ignore-presence", "--spill-dir", m0, "--spill-dir-rank1", m1, "--mem-points", "6",
