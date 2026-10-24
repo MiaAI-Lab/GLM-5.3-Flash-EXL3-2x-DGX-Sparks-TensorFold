@@ -15,6 +15,7 @@ Credits: Ash Hart and the TensorFold contributors, jschmied (PR #443), b12x by l
 - `ENGINE=zig` with `DRAFTER=mtp` starts: the checkpoint's MTP head is chosen by `DRAFTER=mtp` in the containers (passed to every rank), not `--drafter mtp`, which `tensorfold-native serve` read as a model path and refused ("mtp is neither a directory nor a Hugging Face repo id").
 - `ENGINE=zig`: `zig/patches/0007` sends a long batch's record before the batch itself on the TP control link (`Records.put` in `zig/src/families/flashnext/cuda_mirror.zig`). Rank 1 reads the link only after the record, so a batch larger than the socket buffers (a prompt of roughly 262,000 tokens or more, 4 bytes a token) blocked rank 0's write while rank 1 waited for the record, until `TF_TP_TIMEOUT_S` ended the request with `LinkWriteFailed`. With the record first, 262,032-, 512,030- and 1,000,031-token prompts are served at `--context 1048576` (TP=2). It adds a regression test: a 16 MB prompt over 64 KiB socket buffers.
 - `ENGINE=zig`: `zig/patches/0008` adds constexpr values and a bounded `MISSING-VARIANT` summary to failed captured-kernel lookups (`Set.find` in `zig/src/cuda/aot.zig`). It marks incomplete summaries `TRUNCATED` and helps identify missing captures; the summary is not a complete archive specification. Variant selection and `MissingTritonVariant` are unchanged
+- `ENGINE=zig`: `zig/patches/0014-zig-chat-id.patch`: a conversation that resumes the shared system-prompt state (`SHARED_PREFIX`) no longer takes the id of the conversation that kept it, so `TF_GLM_KEEP_PER_CHAT` no longer counts two conversations' turns as one conversation's (each evicted the other's turns, and the entry cap took the other's turn as an older one of its own). `/health`'s `kept_mix` lists a shared cut as a conversation of its own. By Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
 
 ## Unreleased: 4 Sparks (experimental), on a switch or a ring without one; prompt and decode paths for 2 to 4 Sparks
 
@@ -159,7 +160,8 @@ Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad
 50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
 29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
 
-- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)):
   a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
   skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
   unless `SPILL_GIB` is set.
@@ -262,8 +264,9 @@ contributors' measurements are in the PRs.
   restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
   CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
   content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
-  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  through a kernel, as the pool's own moves there do). Authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X) in PR #78; credits in `NOTICE`
+  and `CREDITS.md`.
   Numbers: README, "Spill tier".
 - **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
   default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's
