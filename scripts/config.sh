@@ -341,6 +341,10 @@ _extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; 
   if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
+# PyTorch's caching allocator grows in fixed segments and does not give fragmented ones back, so over days of
+# mixed-size requests a rank's device allocation ratchets up until the host runs out (#143). expandable_segments
+# lets the allocator grow and reclaim within one mapping instead; set CUDA_ALLOC_CONF to override or to "" to unset.
+CUDA_ALLOC_CONF="${CUDA_ALLOC_CONF-expandable_segments:True}"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
 # (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680).
