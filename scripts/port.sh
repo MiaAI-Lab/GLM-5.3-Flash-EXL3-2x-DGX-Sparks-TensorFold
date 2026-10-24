@@ -42,8 +42,8 @@
 #                      passed as set (unset: the engine's defaults)
 # KV sharding (0118): each conversation's latent cache stored once, on the Spark that owns it, instead of on both
 # (~1.9x the pool's tokens in the same memory on the Python engine; 1.83x measured on the Zig engine: 1,511,424 tokens
-# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts,
-# TF_GLM_MULTI_LONE=0; ENGINE=zig with ZIG_HAS kvshard (with the spill tier: v2 and ZIG_HAS spillshard).
+# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts; ENGINE=zig with ZIG_HAS kvshard
+# (with the spill tier: v2 and ZIG_HAS spillshard). TF_GLM_MULTI_LONE=1 only warns: it does nothing on the Zig engine.
 #   KV_SHARD=1               (TF_GLM_KV_SHARD) on; 0 (the default) off. A fork's default of 1 applies only where the
 #                            Python fork turned it on (TP=2, PARALLEL above 1, TF_GLM_MULTI_LONE=0), silently off elsewhere
 #   TF_GLM_KV_SHARD_CARRY    1 (default): a kept conversation whose part is full is carried into the other part; 0: not
@@ -230,9 +230,11 @@ port_validate() {
       if [[ "$TP" != 2 ]]; then why="it is written for two Sparks (TP=2), not TP=$TP"
       elif [[ ! "$par" =~ ^[0-9]{1,4}$ ]] || (( par < 2 )); then why="it needs more than one stream (PARALLEL above 1), not --parallel $par"
       elif [[ "$DRAFTER" != dflash2 ]]; then why="it does not run with DRAFTER=$DRAFTER (MTP drafts)"
-      elif [[ "${TF_GLM_MULTI_LONE:-0}" != 0 ]]; then why="it does not run with TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE"
       fi
       [[ -z "$why" ]] || die "KV_SHARD=1: $why. Set KV_SHARD=0"
+      # the Python fork refuses its lone-stream decode with sharding; the Zig engine has none, so it only warns
+      [[ "${TF_GLM_MULTI_LONE:-0}" == 0 ]] ||
+        warn "TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE does nothing on the Zig engine (it has no lone-stream decode); KV_SHARD=1 runs as without it"
       if ! port_has kvshard; then
         (( ! PORT_SHARD_EXPLICIT )) || die "KV_SHARD=1: $(port_missing kvshard). Set KV_SHARD=0"
         port_shard_default_off "$(port_missing kvshard)"

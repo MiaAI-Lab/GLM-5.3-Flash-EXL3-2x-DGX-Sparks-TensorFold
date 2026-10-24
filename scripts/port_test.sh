@@ -224,13 +224,17 @@ case_ "KV shard: the variables, carry and twins on by default, the check passed 
   expect "$(port_summary)" " · KV shard"
   TF_GLM_KV_SHARD_CARRY=0 TF_GLM_KV_SHARD_CHECK=1024; port_validate 8 0; port_map
   expect "${PORT_ENV[*]}" "TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_KV_SHARD_TWINS=1 TF_GLM_KV_SHARD_CHECK=1024"'
-case_ "refuse: KV_SHARD=1 at TP=3, --parallel 1, DRAFTER=mtp, TF_GLM_MULTI_LONE=1, ENGINE=python" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
+case_ "refuse: KV_SHARD=1 at TP=3, --parallel 1, DRAFTER=mtp, ENGINE=python" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
   ( TP=3; expect_die "two Sparks .TP=2., not TP=3" port_validate 8 0 ) || exit 1
   expect_die "more than one stream .PARALLEL above 1., not --parallel 1" port_validate 1 0
   ( DRAFTER=mtp; expect_die "DRAFTER=mtp" port_validate 8 0 ) || exit 1
-  ( TF_GLM_MULTI_LONE=1; expect_die "TF_GLM_MULTI_LONE=1" port_validate 8 0 ) || exit 1
   ( ENGINE=python; expect_die "Python engine.s patches/ lack the KV-shard port" port_validate "" "" ) || exit 1
   port_validate 16 0 >/dev/null || exit 1'
+case_ "KV_SHARD=1 with TF_GLM_MULTI_LONE=1: a warning (it does nothing on the Zig engine), sharding on" 0 'ZIG_HAS=kvshard KV_SHARD=1 TF_GLM_MULTI_LONE=1' '
+  expect_out "WARN: TF_GLM_MULTI_LONE=1 does nothing on the Zig engine" port_validate 8 0
+  port_validate 8 0 >/dev/null; port_map; expect "$KV_SHARD ${PORT_ENV[*]}" "1 TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=1 TF_GLM_KV_SHARD_TWINS=1"
+  ( TF_GLM_MULTI_LONE=0; expect_out "!MULTI_LONE" port_validate 8 0 ) || exit 1
+  ( KV_SHARD=0; expect_out "!MULTI_LONE" port_validate 8 0 ) || exit 1'
 case_ "refuse: KV_SHARD=2, TF_GLM_KV_SHARD_CARRY=yes, TF_GLM_KV_SHARD_CHECK=x" 0 'ZIG_HAS=kvshard' '
   ( KV_SHARD=2; expect_die "KV_SHARD .TF_GLM_KV_SHARD. is 0 or 1" port_validate 8 0 ) || exit 1
   ( TF_GLM_KV_SHARD_CARRY=yes; expect_die TF_GLM_KV_SHARD_CARRY port_validate 8 0 ) || exit 1
