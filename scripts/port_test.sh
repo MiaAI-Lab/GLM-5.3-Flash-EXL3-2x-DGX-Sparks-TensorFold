@@ -131,18 +131,31 @@ case_ "PROMPT_CACHE_GIB (or --prompt-cache-gib) above 0 with KV_POOL_GIB not set
   expect_out "KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on" port_validate 8 8
   PROMPT_CACHE_GIB=0; expect_out "WARN: PROMPT_CACHE_GIB=16 with KV_POOL_GIB at its default (12.5)" port_validate 8 16
   ( TP=3 KV_POOL_GIB=32; expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (32)" port_validate 8 8 ) || exit 1'
-case_ "no pool warning with KV_POOL_GIB set (even to 12.5), no cache, MTP drafts (no prompt cache) or ENGINE=python" 0 'PROMPT_CACHE_GIB=8' '
+case_ "no pool warning with KV_POOL_GIB set (even to 12.5), no cache, MTP drafts on an image that keeps no state with them, or ENGINE=python" 0 'PROMPT_CACHE_GIB=8' '
   ( PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
   ( PORT_POOL_EXPLICIT=1; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
   ( PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
   ( DRAFTER=mtp; expect_out "!KV_POOL_GIB at its default" port_validate 1 8 ) || exit 1
   ( ENGINE=python; expect_out "!KV_POOL_GIB at its default" port_validate "" 8 ) || exit 1'
+# MTP drafts keep prompt states where the engine has the port (ZIG_HAS mtpcache: kept states with the MTP head's section)
+case_ "MTP drafts with ZIG_HAS mtpcache keep prompt states (the pool warning as with DFlash2); without it, a warning that none is kept" 0 'PROMPT_CACHE_GIB=8 DRAFTER=mtp PARALLEL=1' '
+  ( ZIG_HAS="$DEF_HAS mtpcache"
+    expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (12.5)" port_validate 1 8
+    expect_out "!keeps no prompt state" port_validate 1 8
+    PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4; expect_out "!WARN" port_validate 1 8 ) || exit 1
+  expect_out "WARN: PROMPT_CACHE_GIB=8 with DRAFTER=mtp: this image.s engine keeps no prompt state with MTP drafts .*mtpcache" port_validate 1 8
+  ( PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 1 0 ) || exit 1
+  ( DRAFTER=dflash2 PORT_POOL_EXPLICIT=1; expect_out "!keeps no prompt state" port_validate 8 8 ) || exit 1'
 case_ "scripts/config.sh records whether KV_POOL_GIB was set, before it fills in the default" 0 '' "
   a=\$(grep -nF 'PORT_POOL_EXPLICIT=0; [[ -z \"\${KV_POOL_GIB:-}\" ]] || PORT_POOL_EXPLICIT=1' '$here/config.sh' | cut -d: -f1)
   b=\$(grep -nF 'KV_POOL_GIB=\"\${KV_POOL_GIB:-\$_pool}\"' '$here/config.sh' | cut -d: -f1)
   [[ -n \"\$a\" && -n \"\$b\" ]] && (( a < b )) || { echo \"config.sh: recorded at [\$a], defaulted at [\$b]\"; exit 1; }"
-case_ "refuse: spill with MTP drafts (zig: no prompt cache)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
-  expect_die "DRAFTER=mtp" port_validate 1 8'
+case_ "refuse: spill with MTP drafts, also where their states are kept (the tier does not store the MTP head yet)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
+  expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8
+  ( ZIG_HAS="$DEF_HAS mtpcache"; expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8 ) || exit 1
+  ( ZIG_HAS="$DEF_HAS mtpcache" SPILL_V2=1; expect_die "DRAFTER=mtp" port_validate 1 8 ) || exit 1'
+case_ "refuse: KV_SHARD=1 with MTP drafts, also where their states are kept" 0 'ZIG_HAS="$DEF_HAS mtpcache" KV_SHARD=1 DRAFTER=mtp' '
+  expect_die "KV_SHARD=1: it .*DRAFTER=mtp" port_validate 8 0'
 case_ "refuse: a relative SPILL_DIR, SPILL_HIGHWATER past 1, SPILL_MIN_TOKENS 8k, SPILL_GIB abc" 0 'PROMPT_CACHE_GIB=8' '
   ( SPILL_GIB=8 SPILL_DIR=spill; PORT_SPILL_EXPLICIT=1; expect_die "SPILL_DIR must be an absolute path" port_validate 8 8 ) || exit 1
   ( SPILL_GIB=8 SPILL_HIGHWATER=1.5; expect_die SPILL_HIGHWATER port_validate 8 8 ) || exit 1
