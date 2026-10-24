@@ -178,6 +178,7 @@ def t_counters(work):
 
 def t_spill(work):
     j = lambda n: os.path.join(work, n)  # noqa: E731
+    run(work, "spill: every item's hit resumes its seed's kept point (test_spill_items.py)", tool("test_spill_items.py"))
     d0, d1 = j("spill-r0"), j("spill-r1")
     base = Fake(work, "spill-base", *FAST)
     sp = ["--spill-dir", d0, "--spill-dir-rank1", d1, "--mem-points", "6", "--write-ms", "150"] + FAST

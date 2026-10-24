@@ -110,15 +110,28 @@ def items(a, sizes):
     return it
 
 
-def doc(salt, name, tokens, seed):
-    return f"[ref {salt}-{name}]\n" + C.words(C.words_for(tokens), seed + sum(map(ord, name)) * 7919)
+def doc(salt, name, tokens, seed, pad=0):
+    """An item's text: `pad` (record's, in the baseline's meta.pads) adds that many words and renames its ref, so a
+    padded item shares nothing with its unpadded try."""
+    ref = f"{salt}-{name}" + (f"+{pad}" if pad else "")
+    return f"[ref {ref}]\n" + C.words(C.words_for(tokens) + pad, seed + sum(map(ord, name)) * 7919)
 
 
-def msgs(salt, name, tokens, seed, q):
+def msgs(salt, name, tokens, seed, q, pad=0):
     if name == DECODER:
         return [{"role": "user", "content": f"[ref {salt}-dec] Write a long, detailed story about a lighthouse keeper "
                                             "who finds a map. Do not stop early."}]
-    return [{"role": "user", "content": doc(salt, name, tokens, seed) + "\n\n" + q}]
+    return [{"role": "user", "content": doc(salt, name, tokens, seed, pad) + "\n\n" + q}]
+
+
+# An item's seed and hit diverge at their question, and the engine keeps the seed's state at its last keep-grid
+# boundary (GLM: the last 64-token boundary before the prompt's end), so a seed ending a few tokens past a boundary keeps
+# a point holding part of Q_SEED that its hit can never resume, from memory or disk (g2 and g3's D1: seed 37,963 kept
+# at 37,952, its hit resumed 0 even in the cache-on record, so dual-restore read one point and prefilled D1 cold).
+# record checks each item: the seed sent again resumes its kept point, and the hit must resume as far; when it does not,
+# the item is padded by PAD_STEP words (about a third of the grid: past any question's tail) and recorded again.
+PAD_STEP = 24
+PAD_TRIES = 4
 
 
 def estimate(tokens: int, bytes_per_position: int = BYTES_PER_POSITION, small: int = SMALL_STATE_BYTES) -> dict:
@@ -194,26 +207,51 @@ def record(a) -> int:
         C.log(f"record: {over} do not fit the window ({a.context} tokens, CONTEXT or --context: at most "
               f"{C.fit(a.context, a.max_tokens)} a prompt)")
         return 2
-    rows = {}
+    rows, pads, unverified, unresumable = {}, {}, [], []
     for name, tokens in its.items():
         if name == DECODER:
             rows[name] = {"seed": srv.chat(msgs(salt, name, tokens, a.seed, ""), a.decoder_tokens)}
         else:
-            rows[name] = {"seed": srv.chat(msgs(salt, name, tokens, a.seed, Q_SEED), a.max_tokens),
-                          "hit": srv.chat(msgs(salt, name, tokens, a.seed, Q_HIT), a.max_tokens)}
+            for t in range(PAD_TRIES):
+                pad = t * PAD_STEP
+                row = {"seed": srv.chat(msgs(salt, name, tokens, a.seed, Q_SEED, pad), a.max_tokens),
+                       "hit": srv.chat(msgs(salt, name, tokens, a.seed, Q_HIT, pad), a.max_tokens)}
+                again = srv.chat(msgs(salt, name, tokens, a.seed, Q_SEED, pad), a.max_tokens)
+                if any("error" in x for x in (*row.values(), again)):
+                    break
+                kept, got = again.get("cached_tokens") or 0, row["hit"].get("cached_tokens") or 0
+                if kept == 0:          # no cache on the record server (or nothing kept): it cannot be verified here
+                    unverified.append(name)
+                    break
+                if got >= kept:
+                    break
+                C.log(f"  {name}: its hit resumed {got} of its seed's {kept} kept tokens (the kept point holds part "
+                      f"of the question){'; padding it ' + str(PAD_STEP) + ' words' if t + 1 < PAD_TRIES else ''}")
+            else:
+                unresumable.append(name)
+            rows[name] = row
+            if pad:
+                pads[name] = pad
         r = rows[name]["seed"]
         C.log(f"  {name}: " + (r.get("error") or f"prompt={r['prompt_tokens']} out={r['completion_tokens']} "
-                                                  f"sha={r['token_sha'][:12]}({r['token_sha_source']}) {r['seconds']}s"))
-    errors = [n for n, r in rows.items() if any("error" in x for x in r.values())]
+                                                  f"sha={r['token_sha'][:12]}({r['token_sha_source']}) {r['seconds']}s"
+                                                  + (f" (padded {pads[name]} words)" if name in pads else "")))
+    errors = [n for n, r in rows.items() if any("error" in x for x in r.values())] + unresumable
     weak = [n for n, r in rows.items() if any(x.get("token_sha_source") != "server" for x in r.values() if "error" not in x)]
     doc_ = {"meta": {"tool": "spill_check", "schema": 1, "salt": salt, "seed": a.seed, "model": a.model, "url": srv.url,
                      "context": a.context, "max_tokens": a.max_tokens, "decoder_tokens": a.decoder_tokens, "items": its, "sizes": sizes,
+                     "pads": pads, "hits_unverified": unverified,
                      "label": a.label, "weak": weak, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                      "health": srv.health()}, "rows": rows}
     with open(a.out, "w") as f:
         json.dump(doc_, f, indent=1, sort_keys=True)
     if weak:
         C.log(f"WARNING: no tensorfold.token_sha for {weak}: the record is WEAK (run needs --allow-weak)")
+    if unverified:
+        C.log(f"WARNING: {unverified}: a seed sent again resumed nothing (record on a server with the prompt cache on "
+              "to check that each hit resumes its seed's kept point)")
+    if unresumable:
+        C.log(f"ERROR: {unresumable}: the hit never resumed its seed's kept point in {PAD_TRIES} paddings")
     C.log(f"wrote {a.out}: {len(rows)} items, errors {errors}")
     return 1 if errors else 0
 
@@ -225,6 +263,7 @@ class Run:
         self.base = json.load(open(a.baseline))
         m = self.base["meta"]
         self.salt, self.seed, self.its = m["salt"], m["seed"], m["items"]
+        self.pads = m.get("pads", {})
         self.srv = C.Server(a.url, m["model"] if not a.model_given else a.model, a.timeout, self.seed)
         self.mt, self.dt = m["max_tokens"], m["decoder_tokens"]
         self.rc = C.Receipt("spill_check", {"phase": a.phase, "url": self.srv.url, "baseline": a.baseline,
@@ -237,7 +276,18 @@ class Run:
         self.files = {}
 
     def m(self, name, q):
-        return msgs(self.salt, name, self.its[name], self.seed, q)
+        return msgs(self.salt, name, self.its[name], self.seed, q, self.pads.get(name, 0))
+
+    def unresumable(self, name):
+        """Why `name`'s hit cannot resume its seed's point at all (an old record's item whose kept point holds part
+        of the question: its baseline hit, on a cache-on record, resumed nothing while others did), or None."""
+        rows = self.base["rows"]
+        if "pads" in self.base["meta"] or (rows[name]["hit"].get("cached_tokens") or 0) > 0:
+            return None
+        if not any((r.get("hit", {}).get("cached_tokens") or 0) > 0 for r in rows.values()):
+            return None
+        return (f"{name}: its hit resumed 0 in the baseline record (a cache-on record where other hits resumed): its "
+                f"seed's kept point holds part of the question, so no tier can restore it; record again")
 
     def hit(self, name):
         return self.srv.chat(self.m(name, Q_HIT), self.mt)
@@ -325,6 +375,9 @@ class Run:
                                     f"+{d['prompt_cache.memory_hits']}: eviction incomplete? raise --max-fillers)"]
         if not ok:
             why.append(detail)
+        u = self.unresumable(name)
+        if u and not from_disk:
+            why.append(u)
         self.rc.check(check, from_disk and ok, "; ".join(why) or f"from disk ({d['prompt_cache.restored_tokens']} "
                       f"tokens, cached {row.get('cached_tokens')}), {detail}", row=row, deltas=d, **(extra or {}))
         return from_disk and ok
@@ -420,6 +473,7 @@ class Run:
         okd, dd = C.same_reply(self.base["rows"][DECODER]["seed"], rd, True)
         both = (d["prompt_cache.disk_hits_committed"] or 0) >= 2
         why = [] if both else [f"not both from disk (disk_hits_committed +{d['prompt_cache.disk_hits_committed']})"]
+        why += [u for u in (self.unresumable("D1"), self.unresumable("D2")) if u]
         why += [f"D1: {d1}"] if not ok1 else []
         why += [f"D2: {d2}"] if not ok2 else []
         why += [f"decoder: {dd}"] if not okd else []
