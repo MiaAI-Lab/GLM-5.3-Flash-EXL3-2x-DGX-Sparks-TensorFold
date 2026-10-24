@@ -24,7 +24,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 # the throwaway engine: a shared clone, test branches from the base
 eng=$tmp/engine
 git clone -q --shared --no-checkout "$engine" "$eng" || { echo "FAIL cannot clone $engine"; exit 1; }
-g() { git -C "$eng" -c user.name="Robert Wojciechowski" -c user.email=robert@wojo.net -c advice.detachedHead=false "$@"; }
+g() { git -C "$eng" -c user.name="Robert Wojciechowski" -c user.email=port-patches-test@example.invalid -c advice.detachedHead=false "$@"; }
 B=origin/$base_ref
 g checkout -q -b t/base "$B" || { echo "FAIL cannot check out $B"; exit 1; }
 F=zig/src/families/glm_cuda/cuda_pool_capacity.zig
