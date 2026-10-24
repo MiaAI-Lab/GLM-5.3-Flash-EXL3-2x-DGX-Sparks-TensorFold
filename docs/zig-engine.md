@@ -43,6 +43,7 @@ would change what is served.
 | `MEMORY_RESERVE_GIB`, `KV_POOL_GIB` | `TENSORFOLD_MEMORY_RESERVE_GIB` and `TF_GLM_CACHE_GIB`, passed as for Python; the memory-sized pool is in branch `r107-cx-displaykv` (see `DISPLAY_KV_*` below); the 19.6 GiB default is the Python engine's measurement |
 | `TF_GLM_EFFORT_TAIL`, `TF_GLM_CLEAR_THINKING`, `STREAM_SMOOTH`, `STREAM_SMOOTH_MS`, `TF_GLM_LOOP_GUARD`, `MAX_QUEUED` (`TF_GLM_MAX_QUEUED`), `TF_GLM_KEEP_REASONING`, `TF_GLM_KEEP_REASONING_MB`, `TF_GLM_ASSISTANT_ENDS`, `TF_GLM_PROMPT_STOP` | implemented (`zig/src/server/recipe.zig`, branch `r107-int`): the ranks read the recipe's own names, passed unchanged |
 | `KV_POOL_GIB`, `TF_GLM_CACHE_ENTRIES`, `TF_GLM_CACHE_SHARE_PCT`, `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `SHARED_PREFIX` | the engine keeps prompt states. `./start.sh` passes `--prompt-cache-gib 0` (the qualified path); raise it to keep states (`./start.sh --prompt-cache-gib 8`: the last flag wins). The budget is the asked size, at most what is free at start minus the reserve (`MEMORY_RESERVE_GIB`) and the keep headroom, `TF_GLM_KEEP_HEADROOM_GIB` (2; patch 0012): the kept states stop that far above the reserve, so the prompts' buffers can grow into it. A keep that would take the machine under the reserve is skipped at that mark on every rank (a warning; earlier and later states are unaffected), and a save the engine still refuses is skipped the same way on every rank, the prompt going on from the rows it ran, instead of ending the server |
+| parked pages (no setting) | `zig/patches/0014-zig-parked-pages.patch`: the KV pool's room and the kept prompt states' budget count MemAvailable plus the pages parked on the kernel's per-CPU free lists (on a unified GPU, read once at start; a line per rank from 0.25 GiB), so a start right after an image copy is not budgeted several GiB short. `./start.sh`'s memory check counts them the same way, here and on each worker (`scripts/memavail.sh`; `scripts/memavail_test.sh`), only for an engine that does (`ZIG_HAS` includes `parked`) |
 | `SPILL_*` | implemented: the same `--spill-gib` / `--snapshot-dir` / `--spill-*` flags as the Python path. Default `SPILL_GIB=0` |
 | `VISION`, `VISION_URLS` | implemented (`--vision --vision-backend zig`, `--vision-urls`). Default `VISION=0` under `ENGINE=zig` so the text server keeps the tower's memory; `VISION=1` loads the native tower on rank 0 (the image carries cuDNN; there is no Python helper) |
 | `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | implemented. Default off. `ZIG_HAS` includes `displaykv` |
@@ -63,8 +64,8 @@ would change what is served.
 A Zig rank gets what a Python rank gets: every `TENSORFOLD_*`, `TF_GLM_*` and `TF_ROCE_*` variable that
 `scripts/config.sh` exports or you set (variables the engine does not read are ignored; a malformed value of one it does
 read fails the start), plus `TF_GLM_ROCE` from `COMM`, `TF_GLM_L2PF` as 0 or 1, and `TF_CUDA_DEVICE`, `TF_GRAPH_LOG`,
-`TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`) lifts the refusal of a feature
-once its port is in `zig/patches`.
+`TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`, `parked`) lifts the
+refusal of a feature once its port is in `zig/patches` (`parked`: `./start.sh`'s memory check counts the parked pages).
 
 ## Prefill capture coverage
 
