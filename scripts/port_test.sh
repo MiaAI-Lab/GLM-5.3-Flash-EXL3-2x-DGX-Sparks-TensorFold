@@ -141,6 +141,15 @@ case_ "scripts/config.sh records whether KV_POOL_GIB was set, before it fills in
   a=\$(grep -nF 'PORT_POOL_EXPLICIT=0; [[ -z \"\${KV_POOL_GIB:-}\" ]] || PORT_POOL_EXPLICIT=1' '$here/config.sh' | cut -d: -f1)
   b=\$(grep -nF 'KV_POOL_GIB=\"\${KV_POOL_GIB:-\$_pool}\"' '$here/config.sh' | cut -d: -f1)
   [[ -n \"\$a\" && -n \"\$b\" ]] && (( a < b )) || { echo \"config.sh: recorded at [\$a], defaulted at [\$b]\"; exit 1; }"
+case_ "scripts/config.sh: VISION defaults to 1 for ENGINE=zig at TP=2 and ENGINE=python, 0 for ENGINE=zig at TP=3/4; a set VISION stays" 0 '' "
+  line=\$(grep -E '^VISION=\"\\\$\\{VISION:-' '$here/config.sh')
+  [[ -n \"\$line\" ]] || { echo 'config.sh: no VISION default line'; exit 1; }
+  for c in 'zig 2 1' 'zig 3 0' 'zig 4 0' 'python 2 1' 'python 3 1'; do
+    set -- \$c
+    got=\$( unset VISION; ENGINE=\$1 TP=\$2; eval \"\$line\"; echo \"\$VISION\" )
+    [[ \"\$got\" == \"\$3\" ]] || { echo \"ENGINE=\$1 TP=\$2: VISION=\$got, wanted \$3\"; exit 1; }
+  done
+  got=\$( VISION=0 ENGINE=zig TP=2; eval \"\$line\"; echo \"\$VISION\" ); [[ \"\$got\" == 0 ]] || { echo \"a set VISION=0 became \$got\"; exit 1; }"
 case_ "refuse: spill with MTP drafts (zig: no prompt cache)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
   expect_die "DRAFTER=mtp" port_validate 1 8'
 case_ "refuse: a relative SPILL_DIR, SPILL_HIGHWATER past 1, SPILL_MIN_TOKENS 8k, SPILL_GIB abc" 0 'PROMPT_CACHE_GIB=8' '
