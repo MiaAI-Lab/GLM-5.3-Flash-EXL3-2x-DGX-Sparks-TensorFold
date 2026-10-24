@@ -245,6 +245,39 @@ case_ "KV-shard settings without KV_SHARD=1 warn (and pass to the ranks as befor
 case_ "KV_SHARD wins over TF_GLM_KV_SHARD, with a warning" 0 'ZIG_HAS=kvshard KV_SHARD=1 TF_GLM_KV_SHARD=0' '
   expect_out "WARN: TF_GLM_KV_SHARD=0 is overridden by KV_SHARD=1" port_validate 8 0; expect "$KV_SHARD" 1'
 
+# ---- long contexts on the Zig engine (port_long_context, zig/aot/glm-aot-coverage.txt)
+LC_PRE="_cfg_root=$root"
+case_ "long context: past 262,144 tokens TF_TP_TIMEOUT_S=1500 unless set; not at 262,144, not with ENGINE=python" 0 "$LC_PRE" '
+  port_long_context 1048576 8 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" 1500
+  ( unset TF_TP_TIMEOUT_S; port_long_context 262144 8 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" unset ) || exit 1
+  ( unset TF_TP_TIMEOUT_S; ENGINE=python; port_long_context 1048576 4 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" unset ) || exit 1
+  ( TF_TP_TIMEOUT_S=900; port_long_context 1048576 8 >/dev/null; expect "$TF_TP_TIMEOUT_S" 900 ) || exit 1
+  ( unset TF_TP_TIMEOUT_S; TP=3; port_long_context 1048576 8 >/dev/null; expect "$TF_TP_TIMEOUT_S" 1500 ) || exit 1'
+case_ "long context: the GPU-checked window is silent, one the coverage test checked warns what is unverified, one past it can miss" 0 "$LC_PRE" '
+  expect_out "!WARN" port_long_context 131072 8
+  expect_out "WARN: ENGINE=zig: CONTEXT=1048576 PARALLEL=8: the kernel set holds every Triton variant.*no GPU run has served it yet.*Unverified: a long prompt.s memory on each Spark, TF_TP_TIMEOUT_S=1500" port_long_context 1048576 8
+  expect_out "no GPU run has served it yet" port_long_context 131072 4
+  expect_out "no GPU run has served it yet" port_long_context 200000 8
+  expect_out "outside what the kernel set.s coverage test checked (contexts up to 1048576" port_long_context 2097152 8
+  expect_out "outside what the kernel set.s coverage test checked" port_long_context 131072 2'
+case_ "long context: a coverage record of another kernel set, or none, leaves every window unchecked; TP=3 keeps the arena warning" 0 "$LC_PRE; tmp=$tmp" '
+  printf "aot=%064d\ncontexts=1048576\nparallel=8\ngpu=131072\ngpu_parallel=8\n" 0 > "$tmp/cov-other.txt"
+  ( PORT_COVERAGE=$tmp/cov-other.txt; expect_out "is for set 000000000000, this one is 29ad991945a3.*unchecked" port_long_context 131072 8 ) || exit 1
+  ( PORT_COVERAGE=$tmp/none.txt; expect_out "no coverage record for this kernel set.*unchecked" port_long_context 131072 8 ) || exit 1
+  ( TP=3; expect_out "keyed on the 8-stream, 131072-token arena" port_long_context 1048576 8; expect_out "!WARN" port_long_context 131072 8 ) || exit 1
+  grep -q "^aot=$(cut -c1-64 "$root/zig/aot/glm-aot-sm121.tar.xz.sha256")$" "$root/zig/aot/glm-aot-coverage.txt" || { echo "the coverage record is not for zig/aot/glm-aot-sm121.tar.xz"; exit 1; }'
+LC_DEFAULT='ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-0}"'
+LC_CTX='if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi'
+case_ "scripts/config.sh: ENGINE=zig defaults to 131072, ZIG_CONTEXT_1M=1 to 1,048,576 at TP=2 only" 0 '' '
+  grep -qxF -- "$LC_DEFAULT" "$here/config.sh" || { echo "no ZIG_CONTEXT_1M default of 0"; exit 1; }
+  grep -qxF -- "$LC_CTX" "$here/config.sh" || { echo "the ENGINE=zig CONTEXT default moved"; exit 1; }
+  for ENGINE in zig python; do for TP in 2 3; do for ZIG_CONTEXT_1M in 0 1; do
+    _ctx=python; eval "$LC_CTX"; want=python
+    [[ "$ENGINE" == zig ]] && want=131072; [[ "$ENGINE" == zig && "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && want=1048576
+    expect "$ENGINE $TP $ZIG_CONTEXT_1M $_ctx" "$ENGINE $TP $ZIG_CONTEXT_1M $want"
+  done; done; done
+  ! grep -q "no prompts past ~32k tokens" "$here/config.sh" || { echo "the stale 32k comment is back"; exit 1; }'
+
 # ---- spill and KV sharding together
 case_ "refuse: KV_SHARD=1 with spill v1 (both explicit)" 0 'ZIG_HAS="kvshard spillshard" KV_SHARD=1 SPILL_GIB=8' '
   expect_die "the v1 spill tier does not know the owner parts.*Turn one off" port_validate 8 8'

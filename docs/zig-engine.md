@@ -37,7 +37,7 @@ would change what is served.
 | `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, TP=3 on a triangle with `SPLIT=0 COMM=nccl` and TP=4 on a ring of four with `SPLIT=0 COMM=nccl` (both experimental, see below; TP=3 also takes `COMM=roce`). TP=4 on a switch is untested and refused; the RoCE ring relay is not ported (start refuses `COMM=roce` at TP=4) |
 | `MODEL_ID`, `MODEL_REVISION`, `ABLIT`, `DFLASH2_ID`, `DFLASH2_REVISION`, `HF_CACHE`, `WORKER_WEIGHTS*`, `NFS_*` | unchanged: the snapshots are mounted at `/root/.cache/huggingface` and passed as `MODEL` and `--drafter` (`ABLIT=1` has the same architecture; not tried yet) |
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
-| `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
+| `CONTEXT`, `PARALLEL`, `ZIG_CONTEXT_1M` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`, the window GPU runs have served. At TP=2 the kernel set holds every Triton variant for windows up to 1,048,576 at PARALLEL 4 or 8 (checked offline: "1M context" below); `ZIG_CONTEXT_1M=1` makes 1,048,576 the default at TP=2 (gated until the GPU sweep passes), and past 262,144 tokens `TF_TP_TIMEOUT_S` defaults to 1500. `./start.sh` warns at any window no GPU run has served, naming what is unverified, and at one past the coverage test (`scripts/port.sh`: `port_long_context`) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
 | `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> no `--drafter`; the container gets `DRAFTER=mtp` (PARALLEL=1), which the Zig engine reads from its environment. The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
@@ -105,9 +105,42 @@ concurrent requests, tools/vision and 20 benchmark requests passed at 128K
 context with DFlash2. This does not qualify arbitrary MTP configurations,
 1M context, or every other missing-capture path. No speedup is claimed.
 
+## 1M context (TP=2, gated: `ZIG_CONTEXT_1M=1`)
+
+**Kernels.** The engine's host test `cuda_aot_coverage_test.zig` (engine branch `glm/ctx-1m`) runs the engine's own
+launch code on a driver that only hands out addresses and looks every Triton launch up in this kernel set as the
+engine would: decode windows of 1-64 rows over the pool's decode scratch, prompt chunks of every row count a prompt can
+have (a multiple of 64 up to 2,048, or a prompt's last 1-63 rows: the engine cuts a prompt at its 64-token grid point)
+at every position on the 64-token grid, in every extent from the prompt's own up to the window's, the row split off and
+on, both ranks. At CONTEXT 131072, 262144, 524288 and 1048576, PARALLEL 4 and 8, KV pools of 825,344 to 4,194,304 rows
+and their KV-shard parts: **no variant missing** (`zig/aot/glm-aot-coverage.txt`, which `./start.sh` reads). The set
+does lack the selection of a prompt block under 64 rows (`_select_split` with int64 pools out, SEG=0 VIS=0 TOKS=0;
+`_select_rows` BLOCK=4096 VIS=0; `_scores` R=1), which a chunk whose row count is not a multiple of 64 would reach:
+the engine never makes one at TP=2 (`TF_GLM_PROMPT_MICROBATCH` halves would, and are off at TP=2).
+
+**Not verified yet (the GPU sweep, `g5`):** the 1M prompt on the pair (time, `TF_TP_TIMEOUT_S`), each Spark's memory
+at the long contexts, eight long prompts at once, and the replies. Until it passes, 131072 stays the default.
+
+**Memory** (estimates from the pair's measurements at 131072, to be checked by the sweep):
+- A token costs a rank 6,204 bytes in the pool and in a kept prompt state (the latent rows, 11 x 528, and the pooled
+  keys, 11 x 36). **One 1M kept state is ~6.1 GiB a Spark** (6.06 GiB plus ~0.1 GiB of fixed recurrent state); with
+  `KV_SHARD=1` the home Spark holds the 6.06 GiB and the other only the pooled keys (~0.4 GiB).
+- The pool starts from one whole window: at `CONTEXT=1048576` it is 1,050,624 rows (6.07 GiB a Spark) plus
+  `KV_POOL_GIB` worth of rows (`KV_POOL_GIB=4`: ~1.74M rows), ~5.3 GiB a Spark more than at 131072. That memory comes
+  out of the prompt cache's budget, which is what is left above `MEMORY_RESERVE_GIB` once the pool is up.
+- So start 1M with `PROMPT_CACHE_GIB=0` (the default). With the prompt cache, the 6.2 GiB budget measured at 131072
+  (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8`) would fall to ~0.9 GiB, and `KV_POOL_GIB=0` (the pool one window) leaves ~4.9 GiB:
+  kept states of up to ~800k tokens, not a whole 1M one. `PROMPT_CACHE_GIB` should be at least the largest state to
+  keep (~6.2 GiB for 1M) and fit what the pool leaves.
+- `KV_SHARD=1`: a conversation lives in one part, so **a part must hold the whole window, 1,050,624 rows** (a sharded
+  pool of at least 2,101,248); with less the engine caps requests and logs "a request holds at most N tokens". The
+  sharded pool is ~1.83x the unsharded one in the same memory (`KV_POOL_GIB=4` at 1M: ~3.2M rows, parts of ~1.6M).
+
 ## Known limits (not the scripts')
 
-- Wider decode `_select_split` cubins are in the AOT set (the long-context branch). Prompts past the captured buckets still fail with `MissingTritonVariant`.
+- Wider decode `_select_split` cubins are in the AOT set (the long-context branch). At TP=2 every lookup up to a
+  1,048,576-token window is in the set (offline, "1M context" above); past that, or at another PARALLEL, a prompt can
+  still fail with `MissingTritonVariant`.
 - TP=2 is what this project runs by default. TP=3 runs on three Sparks cabled as a triangle and TP=4 on four cabled as
   a ring (below); split prefill past two ranks stays unsplit.
 
