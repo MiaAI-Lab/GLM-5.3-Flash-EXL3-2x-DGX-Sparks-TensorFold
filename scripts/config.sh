@@ -144,7 +144,7 @@ VISION_URLS="${VISION_URLS:-0}"
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
 # Four Sparks: 8 as three (not measured there yet).
 if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" != 2 ]]; then _par=8; else _par=4; fi
-# ENGINE=zig: 8 (the captured decode kernels are keyed on the 8-stream arena: docs/zig-engine.md)
+# ENGINE=zig: 8 (the stream count GPU runs have checked; offline the kernel set covers 4 too: zig/aot/glm-aot-coverage.txt)
 [[ "$ENGINE" != zig || "$DRAFTER" != dflash2 ]] || _par=8
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
@@ -160,8 +160,13 @@ export TF_GLM_KV="$KV"
 DENSE="${DENSE:-q4}"
 if [[ "$KV" != bf16 ]]; then _ctx=1048576; elif [[ "$DRAFTER" != dflash2 ]]; then _ctx=524288
 elif [[ "$VISION" == 1 && "$DENSE" != q4 ]]; then _ctx=163840; else _ctx=196608; fi
-# ENGINE=zig: 131072 for now (the captured kernel set holds that arena's shapes; no prompts past ~32k tokens yet)
-[[ "$ENGINE" != zig ]] || _ctx=131072
+# ENGINE=zig: 131072 by default for now. At TP=2 the captured kernel set holds every Triton variant the engine looks up
+# for windows up to 1,048,576 tokens (PARALLEL 4 or 8, KV pools of 0.8M-4M rows), checked offline by the engine's host
+# test (zig/aot/glm-aot-coverage.txt), but only 131072 has been served on the GPU so far. ZIG_CONTEXT_1M=1 makes
+# 1,048,576 the default at TP=2 until the GPU sweep (g5) passes; start.sh warns at a window no GPU run has served, and
+# sets TF_TP_TIMEOUT_S=1500 past 262,144 tokens. Memory at 1M: docs/zig-engine.md "1M context".
+ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-0}"
+if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi
 CONTEXT="${CONTEXT:-$_ctx}"
 DFLASH2_ID="${DFLASH2_ID:-incoai/GLM-5.3-Flash-DFlash2}"
 _rev=""; [[ "$DFLASH2_ID" == incoai/GLM-5.3-Flash-DFlash2 ]] && _rev=bf582e4eacc1810f76656d1811693ff6c6737d2a

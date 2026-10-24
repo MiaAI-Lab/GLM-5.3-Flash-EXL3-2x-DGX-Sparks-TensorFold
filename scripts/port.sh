@@ -42,8 +42,8 @@
 #                      passed as set (unset: the engine's defaults)
 # KV sharding (0118): each conversation's latent cache stored once, on the Spark that owns it, instead of on both
 # (~1.9x the pool's tokens in the same memory on the Python engine; 1.83x measured on the Zig engine: 1,511,424 tokens
-# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts,
-# TF_GLM_MULTI_LONE=0; ENGINE=zig with ZIG_HAS kvshard (with the spill tier: v2 and ZIG_HAS spillshard).
+# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts; ENGINE=zig with ZIG_HAS kvshard
+# (with the spill tier: v2 and ZIG_HAS spillshard). TF_GLM_MULTI_LONE=1 only warns: it does nothing on the Zig engine.
 #   KV_SHARD=1               (TF_GLM_KV_SHARD) on; 0 (the default) off. A fork's default of 1 applies only where the
 #                            Python fork turned it on (TP=2, PARALLEL above 1, TF_GLM_MULTI_LONE=0), silently off elsewhere
 #   TF_GLM_KV_SHARD_CARRY    1 (default): a kept conversation whose part is full is carried into the other part; 0: not
@@ -230,9 +230,11 @@ port_validate() {
       if [[ "$TP" != 2 ]]; then why="it is written for two Sparks (TP=2), not TP=$TP"
       elif [[ ! "$par" =~ ^[0-9]{1,4}$ ]] || (( par < 2 )); then why="it needs more than one stream (PARALLEL above 1), not --parallel $par"
       elif [[ "$DRAFTER" != dflash2 ]]; then why="it does not run with DRAFTER=$DRAFTER (MTP drafts)"
-      elif [[ "${TF_GLM_MULTI_LONE:-0}" != 0 ]]; then why="it does not run with TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE"
       fi
       [[ -z "$why" ]] || die "KV_SHARD=1: $why. Set KV_SHARD=0"
+      # the Python fork refuses its lone-stream decode with sharding; the Zig engine has none, so it only warns
+      [[ "${TF_GLM_MULTI_LONE:-0}" == 0 ]] ||
+        warn "TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE does nothing on the Zig engine (it has no lone-stream decode); KV_SHARD=1 runs as without it"
       if ! port_has kvshard; then
         (( ! PORT_SHARD_EXPLICIT )) || die "KV_SHARD=1: $(port_missing kvshard). Set KV_SHARD=0"
         port_shard_default_off "$(port_missing kvshard)"
@@ -524,3 +526,44 @@ port_spill_check() {
 }
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)
 port_nfs_path() { [[ "${NFS_PATH:-/}" == / ]] || echo "$NFS_PATH"; }
+
+# ---- long contexts on the Zig engine: TF_TP_TIMEOUT_S and what the kernel set is known to cover
+# zig/aot/glm-aot-coverage.txt records the engine's offline host test (cuda_aot_coverage_test: every Triton lookup the
+# engine makes at TP=2, for the contexts, stream counts and KV pools it names, against the captured set) and the
+# contexts a GPU run has served at TP=2 (gpu=). key=value lines; aot= is the sha256 of the set it checked.
+PORT_COVERAGE="${PORT_COVERAGE:-${_cfg_root:-.}/zig/aot/glm-aot-coverage.txt}"
+port_coverage() {
+  [[ -f "$PORT_COVERAGE" ]] || return 0
+  sed -n "s/^$1=\([^#]*\).*/\1/p" "$PORT_COVERAGE" | head -1 | sed 's/[[:space:]]*$//'
+}
+# port_long_context <context> <parallel> (the effective --context and --parallel), ENGINE=zig: past 262,144 tokens
+# TF_TP_TIMEOUT_S=1500 unless set (a rank waits that long for the other's next call; 300 s by default is less than one
+# long prompt's pass: TP=3/4 served ~1M prompts at 1500), and a warning naming what is unverified at this window
+port_long_context() {
+  local ctx=$1 par=$2 set_sha aot_sha top c gpu=0 known=0 streams=0
+  [[ "$ENGINE" == zig ]] || return 0
+  if [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx > 262144 )) && [[ -z "${TF_TP_TIMEOUT_S:-}" ]]; then
+    export TF_TP_TIMEOUT_S=1500
+    log "CONTEXT=$ctx: TF_TP_TIMEOUT_S=1500 (a long prompt's pass outlasts the ranks' default 300 s wait)"
+  fi
+  if [[ "$TP" != 2 ]]; then
+    [[ "$ctx" == 131072 && "$par" == 8 ]] ||
+      warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
+    return 0
+  fi
+  aot_sha=$(cut -c1-64 "${_cfg_root:-.}/zig/aot/glm-aot-sm121.tar.xz.sha256" 2>/dev/null)
+  set_sha=$(port_coverage aot)
+  if [[ -z "$set_sha" || "$set_sha" != "$aot_sha" ]]; then
+    warn "ENGINE=zig: no coverage record for this kernel set (zig/aot/glm-aot-coverage.txt$( [[ -z "$set_sha" ]] || echo " is for set ${set_sha:0:12}, this one is ${aot_sha:0:12}")): CONTEXT=$ctx PARALLEL=$par is unchecked and can fail with MissingTritonVariant"
+    return 0
+  fi
+  for c in $(port_coverage gpu); do [[ "$c" == "$ctx" ]] && gpu=1; done
+  for c in $(port_coverage parallel); do [[ "$c" == "$par" ]] && streams=1; done
+  top=0; for c in $(port_coverage contexts); do (( c > top )) && top=$c; done
+  [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx >= 1 && ctx <= top )) && known=1
+  if (( ! known || ! streams )); then
+    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par is outside what the kernel set's coverage test checked (contexts up to $top, PARALLEL $(port_coverage parallel), KV pools of $(port_coverage pools) rows: zig/aot/glm-aot-coverage.txt): it can fail with MissingTritonVariant"
+  elif (( ! gpu )) || [[ "$par" != "$(port_coverage gpu_parallel)" ]]; then
+    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par: the kernel set holds every Triton variant this window looks up (checked offline: zig/aot/glm-aot-coverage.txt, for KV pools of $(port_coverage pools) rows), but no GPU run has served it yet (GPU-checked: CONTEXT $(port_coverage gpu) at PARALLEL $(port_coverage gpu_parallel)). Unverified: a long prompt's memory on each Spark, TF_TP_TIMEOUT_S=${TF_TP_TIMEOUT_S:-300}, and the replies"
+  fi
+}

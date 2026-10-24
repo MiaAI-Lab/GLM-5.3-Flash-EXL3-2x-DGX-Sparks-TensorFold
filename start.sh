@@ -23,8 +23,8 @@
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
 #            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
-#            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST,
-#            PORT
+#            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), ZIG_CONTEXT_1M (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS,
+#            COMM, SERVED_NAME, HOST, PORT
 #   ported   SPILL_GIB, SPILL_DIR, SPILL_MIN_TOKENS, SPILL_MIN_FREE_GIB, SPILL_HIGHWATER, SPILL_FLUSH_S, SPILL_V2,
 #            SPILL_QUOTA, SPILL_TURNS, KV_SHARD (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
@@ -141,8 +141,6 @@ if [[ "$ENGINE" == zig ]]; then
     [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl (the RoCE ring relay, TF_ROCE_RING, is not ported)"
     warn "ENGINE=zig: TP=4 is experimental (a ring of four, unsplit prefill, COMM=nccl)"
   fi
-  [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
-    warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
   # The Zig image has no Python tower helper. VISION=1 loads the native tower, which dlopens cuDNN.
   [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision --vision-backend zig)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
@@ -170,6 +168,8 @@ arg_value() {
 # Robert's GLM features (scripts/port.sh: the spill tier, spill v2, KV sharding): their settings checked with the
 # effective --parallel and --prompt-cache-gib (the command line's win), before anything is stopped
 port_validate "$(arg_value --parallel)" "$(arg_value --prompt-cache-gib)"
+# ENGINE=zig: TF_TP_TIMEOUT_S past 262,144 tokens, and what the kernel set is known to cover at this window (port.sh)
+port_long_context "$(arg_value --context)" "$(arg_value --parallel)"
 # Where to reach the server from this machine: a wildcard bind answers on loopback.
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
