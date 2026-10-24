@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ ee578fd4237f over glm/zig-engine-base @ 0db3e2f6652b (commits f139cada683a..8455b2cef6de); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits f139cada683a..8455b2cef6de); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: KV shard host side: the part planner and pool parts, switches and their agreement, storage, placement check and telemetry (port of GLM 0118, parts 1-2)
 
 KV sharding as GLM's Python 0118 designs it, not the DeepSeek port's lanes:

@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ ee578fd4237f over glm/zig-engine-base @ 0db3e2f6652b (commits b54a7d4048bb..e4fb5b76cb1b); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits b54a7d4048bb..e4fb5b76cb1b); regenerate with scripts/port-patches.sh, do not edit
 core/spill: the disk block store of spill v2 (port of GLM 0110's store, lifted from the DeepSeek port)
 
 Spill v2's family-neutral, GPU-free store, the DeepSeek port's core/spill/ as

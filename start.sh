@@ -26,7 +26,7 @@
 #            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), ZIG_CONTEXT_1M (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS,
 #            COMM, SERVED_NAME, HOST, PORT
 #   ported   SPILL_GIB, SPILL_DIR, SPILL_MIN_TOKENS, SPILL_MIN_FREE_GIB, SPILL_HIGHWATER, SPILL_FLUSH_S, SPILL_V2,
-#            SPILL_QUOTA, SPILL_TURNS, KV_SHARD (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
+#            SPILL_QUOTA, SPILL_TURNS, KV_SHARD, FILL (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
 #            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks),
 #            WORKER3, FABRIC_PEER3, WORKER_HF_CACHE3 (4 Sparks), NCCL_ALGO (on a ring of 4: Ring)
@@ -118,10 +118,11 @@ if [[ "$ENGINE" == zig ]]; then
   # (spill v2, 0018/0019/0021), kvshard (KV sharding, 0020/0022), spillshard (the two together, 0023) and parked (the
   # engine's budget counts the parked pages, 0014; the memory check below counts them only then). ZIG_HAS can still drop
   # one for a narrower image (zig/patches without it): port_validate (scripts/port.sh, below) then refuses SPILL_V2=1 or
-  # KV_SHARD=1, and the memory check reads MemAvailable alone. mtpcache (kept prompt states with MTP drafts) is named
-  # only for an image built with it (not in the default until zig/patches has it); without it port_validate warns that
-  # PROMPT_CACHE_GIB keeps nothing with DRAFTER=mtp.
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked}"
+  # KV_SHARD=1, and the memory check reads MemAvailable alone. Round 4 (zig/patches/0024-0029): mtpcache (kept prompt
+  # states with MTP drafts, 0025; without it port_validate warns that PROMPT_CACHE_GIB keeps nothing with DRAFTER=mtp),
+  # fill (FILL=1's sliced prompt fills, 0026; without it FILL=1 is refused) and pictures (prompts with pictures kept,
+  # resumed and spilled, 0027-0028; without it VISION=1 with a prompt cache warns that they are not kept).
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv spill2 kvshard spillshard parked mtpcache fill pictures}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
@@ -225,7 +226,7 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
   # the ported features' settings are every rank's at start: a server running with others is not this configuration
   for i in 0 $(worker_ids); do
     [[ "$(port_live "$i")" == "$(port_identity)" ]] ||
-      die "$CONTAINER_NAME is running on $SPARKS with other spill / KV-shard settings (rank $i: $(port_live "$i"); asked: $(port_identity)): run ./start.sh restart to apply them"
+      die "$CONTAINER_NAME is running on $SPARKS with other spill / KV-shard / fill settings (rank $i: $(port_live "$i"); asked: $(port_identity)): run ./start.sh restart to apply them"
   done
   log "$CONTAINER_NAME is already running on $SPARKS (model: $(served_name || echo "not answering yet"), port $PORT): nothing to do."
   log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."

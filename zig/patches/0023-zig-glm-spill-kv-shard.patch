@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ ee578fd4237f over glm/zig-engine-base @ 0db3e2f6652b (commits d0b25f0c94ec..15e06e463cc9); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series-r4 @ 84fd21445827 over glm/zig-engine-base @ 0db3e2f6652b (commits d0b25f0c94ec..15e06e463cc9); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks)
 
 With KV sharding a kept state's latent rows are only on the rank that owned

@@ -13,7 +13,7 @@ yet. The Zig engine's greedy replies equal the Python engine's on two prompts at
 
 | Part | Source |
 | --- | --- |
-| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/` (`0001`-`0023`), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
+| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/` (`0001`-`0029`), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
 | captured Triton kernel set | `zig/aot/glm-aot-sm121.tar.xz` (aot.json and 311 cubins, captured from the Python engine on a GB10; pinned by its sha256), at `TENSORFOLD_CUDA_KERNELS` |
 | runtime libraries | `nvidia/cuda:13.0.2-runtime-ubuntu24.04` (cuBLAS, cuBLASLt), NCCL 2.30.7 (the pip wheel; the Python image runs the same), libibverbs and the mlx5 provider |
 
@@ -53,13 +53,14 @@ would change what is served.
 | continued chats, the shared-cut chat id (no setting) | implemented (`zig/patches/0016`, `0017`; Robert's GLM patch 0111 and a base-engine fix): a request that continues a conversation without resuming its own turn state keeps that conversation (`chats_continued` and `chats_continued_prefill_tokens` on `/health` and `/metrics` with a prompt cache), and a second conversation behind the same kept system prompt is a conversation of its own, so `TF_GLM_KEEP_PER_CHAT` no longer counts both together (measured on the pair: the base engine resumed the second conversation at the shared cut, the fix at its own state) |
 | parked pages (no setting) | implemented (`zig/patches/0014`; `ZIG_HAS=parked`, in the default): the engine's startup budgets (the pool's room and the kept states' budget) count the pages parked on the per-CPU free lists. So does `./start.sh`'s memory check, here and on each worker (`scripts/memavail.sh`, 0119's rule: count - high_min), so that a start right after an image copy is not warned about memory the kernel is about to hand back; without `parked` in `ZIG_HAS` it reads `free -g` as before (`scripts/port.sh`: `port_parked`; `ENGINE=python` counts them with `patches/0119-cuda-budget-parked-pages.patch`). Measured on the pair: no regression (the pool's rows equal the base engine's); the engine's parked line was not seen yet (that needs a cold start right after an image load with the pool memory-sized) |
 | `PREFIX_WAIT`, `TF_GLM_PREFIX_WAIT` | not ported, and not needed: the Zig engine admits and fills one prompt at a time, so no request prefills a prefix another is still filling. Set to anything but 0, it warns and does nothing |
-| `VISION`, `VISION_URLS` | implemented (`--vision --vision-backend zig`, `--vision-urls`). Default `VISION=1` under `ENGINE=zig` at TP=2 (`VISION=0` at TP=3/4, not run there yet): the native tower on rank 0 (the image carries cuDNN; there is no Python helper), ~1.05 GiB of weights and its workspace (~0.4 GiB) taken at start, before the pool and the kept-state budget are sized, so with `PROMPT_CACHE_GIB` above 0 rank 0's kept states get ~1.4 GiB less (estimated; start.sh warns). `VISION=0` keeps that memory for text |
+| `VISION`, `VISION_URLS` | implemented (`--vision --vision-backend zig`, `--vision-urls`). Default `VISION=1` under `ENGINE=zig` at TP=2 (`VISION=0` at TP=3/4, not run there yet): the native tower on rank 0 (the image carries cuDNN; there is no Python helper), ~1.05 GiB of weights and its workspace (~0.4 GiB) taken at start, before the pool and the kept-state budget are sized, so with `PROMPT_CACHE_GIB` above 0 rank 0's kept states get ~1.4 GiB less (estimated; start.sh warns). `VISION=0` keeps that memory for text. With the prompt cache on, a prompt with pictures is kept, resumed and spilled like text (`zig/patches/0027`-`0028`, `ZIG_HAS=pictures`): keyed by each picture's content (two different pictures at the same rows never share a state), a resumed prompt running the tower only for the pictures past its cut; `TF_GLM_IMAGE_CACHE=0` keeps none of them, `TF_GLM_IMAGE_MARK_SNAP=1` keeps no state whose cut falls inside a picture. Not run on the pair yet |
 | `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | implemented. Default off. `ZIG_HAS` includes `displaykv` |
 | `COPY`, `COPY_MAX`, `COPY_CODE`, `DRAFT_POLICY` | TODO: the engine's copy drafts and DFlash2 policy are built in, not settable |
 | `TF_GLM_SIDE` | ported (shared expert on a second stream, decode windows; off by default as in Python), branch `r107-tpf`; passed unchanged |
 | `SPLIT` (`TF_GLM_HC_SPLIT`, `TF_GLM_PREFILL_OVERLAP`), `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PREFILL_ROWS`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` | split prefill, overlap, own-front and microbatch run at TP=2 (`r107-tpf`, on `r107-int`). `TF_GLM_PREFILL_ROWS` sets the chunk size. Past two ranks the chunk runs unsplit (no TP=3/4 ring exchange in this project) |
 | `KDA_CHUNKED` | the chunked kernel is built in |
-| `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time; the verify window is fixed (64 rows shared, 16 a stream) |
+| `FILL` (`TF_GLM_FILL`) | implemented (`zig/patches/0026`, `ZIG_HAS=fill`). Default `0`: a prompt's pass runs whole on the lane thread, so the other streams wait for all of it (an 18.7 s decoder gap behind a 38k-token cold prefill on the pair). `FILL=1`: prompts fill a 2048-row chunk a step between decode rounds (the same chunks, keeps and first token as the whole pass; a prompt with pictures still runs whole at its start); refused with `DRAFTER=mtp` (one MTP head serves every stream). With `KV_SHARD=1` a filling prompt borrows no rows (its history is fetched). Not run on the pair yet |
+| `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time (`FILL=1` above slices them by chunk, not by layer); the verify window is fixed (64 rows shared, 16 a stream) |
 | `STREAM_SMOOTH`, `STREAM_SMOOTH_MS` | TODO |
 | `MAX_QUEUED` | TODO (no 429 admission yet) |
 | `NUCLEUS_UNION` | not needed (the Zig sampler has its own) |
@@ -76,14 +77,15 @@ read fails the start), plus `TF_GLM_ROCE` from `COMM`, `TF_GLM_L2PF` as 0 or 1, 
 spillshard parked`: `spill2`, `kvshard` and `spillshard` for Robert's spill v2, KV sharding and the two together,
 `zig/patches/0018`-`0023`, and `parked` for 0119's port, `0014`) names what the image serves: a narrower `ZIG_HAS` (an
 image built without those patches) refuses their settings, and without `parked` the start memory check reads
-`MemAvailable` alone. `mtpcache` (kept prompt states with MTP drafts, `glm/mtp-cache`) is not in the default until its
-patch is in `zig/patches`: name it for an image built with it, and `PROMPT_CACHE_GIB` then keeps states with
-`DRAFTER=mtp` too.
+`MemAvailable` alone. Round 4's patches add `mtpcache` (kept prompt states with MTP drafts, `0025`: `PROMPT_CACHE_GIB`
+keeps states with `DRAFTER=mtp` too; without it a warning that none is kept), `fill` (`FILL=1`'s sliced prompt fills,
+`0026`; without it `FILL=1` is refused) and `pictures` (prompts with pictures kept, resumed and spilled, `0027`-`0028`;
+without it `VISION=1` with a prompt cache warns that they are not kept), all three in the default.
 
 Robert's GLM features (the spill tier, spill v2, KV sharding) are mapped to the ranks in one place, `scripts/port.sh`
 (`port_map`): with all of them off (the default) it adds no flag, variable, mount or label. Each setting is also taken
-from its `TF_GLM_` name when only that one is set; the two switches (`TF_GLM_KV_SHARD`, `TF_GLM_SPILL_V2`) reach the
-ranks only through it. A fork can turn their defaults on (`PORT_SPILL_DEFAULT_GIB`, `PORT_SPILL_V2_DEFAULT`,
+from its `TF_GLM_` name when only that one is set; the three switches (`TF_GLM_KV_SHARD`, `TF_GLM_SPILL_V2`,
+`TF_GLM_FILL`) reach the ranks only through it. A fork can turn their defaults on (`PORT_SPILL_DEFAULT_GIB`, `PORT_SPILL_V2_DEFAULT`,
 `PORT_SHARD_DEFAULT`, `PORT_SPILL_QUOTA_DEFAULT`): a default that cannot run is turned off with a warning, where the
 same setting given explicitly refuses. Every rank's container carries `tf.recipe.port` (what was mapped; none while all
 is off), and a `./start.sh` that finds the server running refuses when that label differs from what it is asked for

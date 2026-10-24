@@ -355,6 +355,11 @@ export TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH" TF_GLM_STREAM_SMOOTH_MS="$STREAM_SM
 FILL_BUDGET_MS="${FILL_BUDGET_MS:-200}"
 FILL_DRAFTS="${FILL_DRAFTS:-1}"
 export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS"
+# ENGINE=zig: sliced prompt fills (zig/patches/0026, ZIG_HAS fill). FILL=1: a prompt fills a 2048-row chunk a step
+# between decode rounds (TF_GLM_FILL=1 on both ranks), so a long prompt no longer stalls the other streams for its whole
+# pass (an 18.7 s decoder gap behind a 38k-token cold prefill, measured with whole passes); refused with DRAFTER=mtp.
+# 0 (default): whole passes, as before. Not run on the pair yet. Checked and mapped by scripts/port.sh.
+FILL="${FILL:-${TF_GLM_FILL:-0}}"
 # L2 prefetch in decode windows (patch 0046, adapted from jayleaton/glm53-tensorfold-spark's patch 0460): a side stream
 # brings the weights the next kernels read into L2 during each layer's all-gathers. 1 (default): one request's prose
 # 48.36 -> 49.46 tok/s, code 59.54 -> 61.08 (two boots each). Same bits. 0: off.

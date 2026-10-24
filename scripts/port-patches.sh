@@ -21,7 +21,7 @@
 #                                [--name [REV=]SLUG]... [--title TEXT] [--exclude PATH]... [--keep]
 #   --dry-run         build and check the patches in a temporary folder, print what would change, write nothing
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-glm)
-#   --branch REF      what to export (default glm/series: the port's per-feature commits)
+#   --branch REF      what to export (default glm/series-r4: the port's per-feature commits, rounds 1-4)
 #   --base REF        what it is relative to: ZIG_TF_REF plus the hand-written patches (default glm/zig-engine-base)
 #   --mode            commits (default: one patch per first-parent commit) or squash (one patch for BASE..BRANCH)
 #   --name REV=SLUG   commits: the patch of commit REV is NNNN-zig-SLUG.patch (repeatable; a commit without one keeps
@@ -67,7 +67,7 @@ slug() {
 # Sourced with PORT_PATCHES_LIB=1 (scripts/port_test.sh): define the helpers above and stop here
 [[ "${PORT_PATCHES_LIB:-0}" != 1 ]] || return 0
 
-engine="$HOME/GitHub/tensorfold-glm"; branch=glm/series; base=glm/zig-engine-base; mode=commits
+engine="$HOME/GitHub/tensorfold-glm"; branch=glm/series-r4; base=glm/zig-engine-base; mode=commits
 title="GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continued chats, KV sharding, parked pages) by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine"
 dry=0; keep=0; excludes=(zig/tests/cuda/glm_p1/aot docs/glm-port); names=()
 AOT=zig/tests/cuda/glm_p1/aot
