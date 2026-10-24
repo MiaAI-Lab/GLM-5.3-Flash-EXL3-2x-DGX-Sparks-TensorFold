@@ -1,0 +1,307 @@
+# port-patches.sh: glm/series-r5 @ e1352d709873 over glm/zig-engine-base @ 0db3e2f6652b (commits 2a16b14a4903..b42a552e7693); regenerate with scripts/port-patches.sh, do not edit
+core prompt cache: a shared cut no longer joins two conversations
+
+chatOf gave a kept state the conversation of the longest kept state its prompt
+extends, shared cuts included. With the GLM recipe's shared prefixes on, a
+second conversation behind the same system prompt resumed the first one's cut
+and took its id, so TF_GLM_KEEP_PER_CHAT counted both conversations' turns
+together and each evicted the other's (and the entry cap took the other
+conversation's turn as a shorter state of the same one).
+
+chatOf now passes over shared cuts, which every conversation resumes: a turn
+kept after one starts a conversation of its own unless it extends an own
+state. A pass that keeps a cut and then its own turn gives the two different
+ids, so /health's kept_mix lists the cut as a conversation of one state (the
+next patch's lane host keeps both in the request's conversation, as Python
+0089 does).
+
+Switch: none. Tests: two, written first and failing before the fix: the store
+(begin and keep, the chatOf path) and the lane host over the fake lane backend
+with the recipe's policy (per_chat 2). lane_host_reuse_test.zig's event switch
+gains the .logprobs arm it lacked (the engine_api test binary did not build),
+and keepalive.zig's two threaded tests, which then run for the first time,
+stop their ticker in a defer and let a late tick land.
+
+Measured on the pair (g1c/g1d, chat_id_check.py: turns A1 B1 A2 A3 B2 behind
+one 7k-word system prompt, TF_GLM_KEEP_PER_CHAT=2, prompt cache on with
+KV_POOL_GIB=4 and 8 GiB): the base engine's B2 resumed at the shared cut
+(12,160 cached), the bug; with the fix B2 resumed its own state (13,568 cached
+of B1's 13,588).
+
+A base-engine fix, also offered alone (glm/pr-chat-id, the same bytes):
+whichever lands first, the other copy is an exact duplicate.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0016-zig-core-chat-id.patch
+
+diff --git a/zig/src/core/keepalive.zig b/zig/src/core/keepalive.zig
+index 737c99ff91cfee1666c74b360e743499d497dcbe..970e9d4a18ea48081662d528904e754c57cf009b 100644
+--- a/zig/src/core/keepalive.zig
++++ b/zig/src/core/keepalive.zig
+@@ -99,6 +99,10 @@ fn until(value: *const std.atomic.Value(u32), want: u32) !void {
+ test "the ticker commits while idle and holds while a request runs" {
+     var gated = Gated{};
+     const k = try Keepalive.start(testing.allocator, std.testing.io, .{ .ctx = &gated, .tick = Gated.tick }, 900 * std.time.ns_per_s);
++    defer { // a failed check stops the thread too: a tick parked in the gate is let go first
++        gated.gate.store(1, .release);
++        Keepalive.stop(k);
++    }
+     k.interval_ns = 10 * std.time.ns_per_ms;
+     // armed and idle: a commit arrives and parks in the gate
+     try until(&gated.commits, 1);
+@@ -121,8 +125,6 @@ test "the ticker commits while idle and holds while a request runs" {
+     // the request ended: commits resume
+     k.end();
+     try until(&gated.commits, 2);
+-    gated.gate.store(1, .release);
+-    Keepalive.stop(k);
+ }
+ 
+ test "ticks stop once the keep-warm window has passed and resume when a request ends" {
+@@ -133,16 +135,24 @@ test "ticks stop once the keep-warm window has passed and resume when a request
+         }
+     };
+     const k = try Keepalive.start(testing.allocator, std.testing.io, .{ .ctx = &commits, .tick = Count.tick }, 60 * std.time.ns_per_ms);
++    defer Keepalive.stop(k); // a failed check stops the thread too: its ticks write to `commits` on this stack
+     k.interval_ns = 10 * std.time.ns_per_ms;
+     try until(&commits, 1); // the window is open: commits flow
+     std.Io.sleep(std.testing.io, .fromMilliseconds(120), .awake) catch {}; // the window closes at 60 ms
+-    const frozen = commits.load(.acquire);
+-    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+-    try testing.expectEqual(frozen, commits.load(.acquire)); // flat once the window has passed
++    // a tick that found the window open can still land late on a loaded machine: flat is 100 ms without a commit
++    var frozen = commits.load(.acquire);
++    var flat = false;
++    for (0..10) |_| {
++        std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
++        const later = commits.load(.acquire);
++        flat = later == frozen;
++        if (flat) break;
++        frozen = later;
++    }
++    try testing.expect(flat); // flat once the window has passed
+     k.begin(); // a request ran and ended: the window restarts from its end
+     k.end();
+     try until(&commits, frozen + 1);
+-    Keepalive.stop(k);
+ }
+ 
+ test "the window decides due without a thread" {
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 997d904980afb641c53db85e62f0621b8941c05c..c2adcdad8f36489ee365fc636485d1ae8c9a3b9b 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -9,6 +9,127 @@ const Event = api.Event;
+ const Request = api.Request;
+ const Reason = api.Reason;
+ 
++/// A lane host over the fake lane backend with GLM's kept-state policy: two own states a conversation, the host's
++/// shared cuts kept. One request at a time (`run`); `deinit` stops it.
++const RecipeHost = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    store: pc.Store,
++    host: LaneHost,
++
++    const vt: pc.Snapshots.VTable = .{ .bytes = bytes, .save = save, .restore = restore, .drop = drop };
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++
++    fn start(r: *RecipeHost) !void {
++        const gpa = std.testing.allocator;
++        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        r.target = .{ .gpa = gpa };
++        r.clock = .{};
++        r.core = lanes.Engine.init(gpa, &r.cfg, r.target.backend(), r.clock.clock());
++        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &vt }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++        r.store.policy = .{ .recipe = true, .per_chat = 2, .shared_least = 1000 };
++        r.host = LaneHost.init(gpa, std.testing.io, &r.core, .{ .lanes = 2 });
++        r.host.cache = &r.store;
++        try r.host.start();
++    }
++
++    fn deinit(r: *RecipeHost) void {
++        r.host.stop();
++        r.store.deinit();
++        r.core.deinit();
++        r.target.deinit();
++        r.cfg.deinit(std.testing.allocator);
++    }
++
++    /// The conversations of the own states whose ninth token (the first after the system block) is `first`.
++    fn chatOf(r: *RecipeHost, first: u32) u32 {
++        for (r.store.entries.items) |x| if (!x.shared and x.tokens.len > 8 and x.tokens[8] == first) return x.chat;
++        return 0;
++    }
++};
++
++/// One request to its end: a prompt whose last two tokens are the generation prompt, behind the 8-token system block.
++const Turn = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Turn = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .logprobs => {},
++            .tokens => |t| b.tokens.appendSlice(std.testing.allocator, t) catch {},
++            .finished => |f| b.done = f.reason,
++        }
++    }
++
++    fn run(b: *Turn, e: api.Engine, id: Id, prompt: []const u32) !void {
++        const r: Request = .{ .prompt = prompt, .max_tokens = 6, .history_len = @intCast(prompt.len - 2), .shared_prefixes = &.{8} };
++        try e.submit(id, &r, .{ .ctx = b, .event = event });
++        while (true) {
++            b.mutex.lockUncancelable(std.testing.io);
++            const d = b.done;
++            b.mutex.unlock(std.testing.io);
++            if (d) |reason| return std.testing.expectEqual(Reason.length, reason);
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++};
++
++const system = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++
++test "a lane host keeps two conversations behind one kept system-prompt cut apart: per_chat evicts neither's turns" {
++    const gpa = std.testing.allocator;
++    var r: RecipeHost = undefined;
++    try r.start();
++    defer r.deinit();
++    const e = r.host.engine();
++    var turns: [5]Turn = @splat(.{});
++    defer for (&turns) |*t| t.tokens.deinit(gpa);
++    var prompts: [5]std.ArrayList(u32) = @splat(.empty);
++    defer for (&prompts) |*p| p.deinit(gpa);
++    try prompts[0].appendSlice(gpa, &system ++ [_]u32{ 11, 12, 13, 14, 7, 7 }); // A: keeps the cut at 8 and its own 12
++    try turns[0].run(e, 1, prompts[0].items);
++    try prompts[1].appendSlice(gpa, &system ++ [_]u32{ 21, 22, 23, 24, 7, 7 }); // B: resumes the cut, keeps its own 12
++    try turns[1].run(e, 2, prompts[1].items);
++    try std.testing.expectEqual(@as(?u32, 8), turns[1].cached);
++    const chat_a = r.chatOf(11);
++    const chat_b = r.chatOf(21);
++    try std.testing.expect(chat_a != 0 and chat_b != 0 and chat_a != chat_b);
++    for ([_]usize{ 2, 3 }) |k| { // A's next two turns: resumed from its last, a reply and a tool result on each
++        const prev: usize = if (k == 2) 0 else 2;
++        try prompts[k].appendSlice(gpa, prompts[prev].items);
++        try prompts[k].appendSlice(gpa, turns[prev].tokens.items[0..4]);
++        try prompts[k].appendSlice(gpa, &.{ 15, @intCast(k), 7, 7 });
++        try turns[k].run(e, @intCast(k + 1), prompts[k].items);
++        try std.testing.expectEqual(@as(?u32, @intCast(prompts[prev].items.len - 2)), turns[k].cached);
++    }
++    try prompts[4].appendSlice(gpa, prompts[1].items); // B's next turn still resumes its own 12
++    try prompts[4].appendSlice(gpa, turns[1].tokens.items[0..4]);
++    try prompts[4].appendSlice(gpa, &.{ 25, 26, 7, 7 });
++    try turns[4].run(e, 5, prompts[4].items);
++    try std.testing.expectEqual(@as(?u32, 12), turns[4].cached);
++}
++
+ test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+@@ -338,6 +459,7 @@ test "a lane host fills prompts between rounds: requests arriving together fill
+             defer b.mutex.unlock(std.testing.io);
+             switch (e.*) {
+                 .prefilled => b.prefilled = true,
++                .logprobs => {},
+                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                 .finished => |f| b.done = f.reason,
+             }
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 508633b46d9be6b8b9bdb16eb3993484323ac294..59f9de158c9d97ceba82bfff5b1a0fc506074a5c 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -709,7 +709,7 @@ pub const Store = struct {
+     fn chatOf(s: *Store, prompt: []const u32, at: u32) u32 {
+         var best: ?*Entry = null;
+         for (s.entries.items) |e| {
+-            if (e.at >= at or e.tokens.len > prompt.len) continue;
++            if (e.shared or e.at >= at or e.tokens.len > prompt.len) continue;
+             if (best != null and e.at <= best.?.at) continue;
+             if (std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) best = e;
+         }
+diff --git a/zig/src/core/prompt_cache_policy_test.zig b/zig/src/core/prompt_cache_policy_test.zig
+index 9585526ab2659381312ead386320e0d205ca50a1..17032819493249ba3f02288a86957dce1d1a6c74 100644
+--- a/zig/src/core/prompt_cache_policy_test.zig
++++ b/zig/src/core/prompt_cache_policy_test.zig
+@@ -85,6 +85,45 @@ test "a conversation holds at most per_chat own states; a retry that branches ea
+     try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
+ }
+ 
++/// A conversation behind a 16-token system prompt every conversation shares: `n` tokens, `chat` first after it.
++fn behind(buf: []u32, chat: u32, n: usize) []u32 {
++    for (0..16) |i| buf[i] = @intCast(900 + i);
++    buf[16] = chat;
++    for (17..n) |i| buf[i] = @intCast(i);
++    return buf[0..n];
++}
++
++test "two conversations behind one kept system-prompt cut are two: per_chat lets neither evict the other's turns" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 4, .min_prompt = 0, .min_gap = 4 }, 1 << 20);
++    defer s.deinit();
++    s.policy = .{ .recipe = true, .per_chat = 2, .shared_least = 1000 };
++    var bufs: [5][64]u32 = undefined;
++    const a1 = behind(&bufs[0], 1, 25); // A's first turn keeps the system block's cut (16, shared) and its own 24
++    const plan = try s.begin(a, a1, 24, &.{16}, &.{}, null, &.{});
++    try std.testing.expectEqualSlices(u32, &.{ 16, 24 }, plan.marks);
++    _ = f.pass(&s, a1, plan);
++    const b1 = behind(&bufs[1], 2, 25); // B resumes the shared cut and keeps its own 24
++    const plan_b = try s.begin(a, b1, 24, &.{16}, &.{}, null, &.{});
++    try std.testing.expectEqual(@as(u32, 16), plan_b.from);
++    try std.testing.expectEqual(fresh(b1), f.pass(&s, b1, plan_b));
++    var chat_a: u32 = 0;
++    var chat_b: u32 = 0;
++    for (s.entries.items) |e| if (e.at == 24) {
++        if (e.tokens[16] == 1) chat_a = e.chat else chat_b = e.chat;
++    };
++    try std.testing.expect(chat_a != 0 and chat_b != 0 and chat_a != chat_b);
++    _ = try turn(&f, &s, a, behind(&bufs[2], 1, 37), 36); // A's turns 2 and 3: A holds two of its own, its 24 goes
++    _ = try turn(&f, &s, a, behind(&bufs[3], 1, 49), 48);
++    try std.testing.expectEqual(@as(u32, 24), s.find(behind(&bufs[4], 2, 30), &.{}, &.{}).?.at); // B's turn is still kept
++    try std.testing.expectEqual(@as(u32, 16), s.find(behind(&bufs[4], 1, 30), &.{}, &.{}).?.at);
++    try std.testing.expectEqual(@as(usize, 4), s.entries.items.len); // the cut, B's 24, A's 36 and 48
++}
++
+ test "the bytes cap drops by the same order and keeps the newest" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+@@ -122,10 +161,11 @@ test "a shared cut is never superseded, only aged out with the rest, and /health
+     try std.testing.expectEqual(@as(u32, 2), k.prompts);
+     try std.testing.expectEqual(@as(u32, 1), k.own);
+     try std.testing.expectEqual(@as(u32, 1), k.shared);
+-    try std.testing.expectEqual(@as(u32, 1), k.chats);
++    try std.testing.expectEqual(@as(u32, 2), k.chats); // the turn kept after the cut does not take its id: chatOf passes over shared cuts
+     try std.testing.expectEqual(@as(u64, 52), k.rows);
+-    try std.testing.expectEqual(@as(u8, 1), k.by_chat_n);
+-    try std.testing.expectEqual([3]u64{ 1, 2, 36 }, k.by_chat[0]);
++    try std.testing.expectEqual(@as(u8, 2), k.by_chat_n);
++    try std.testing.expectEqual([3]u64{ 1, 1, 16 }, k.by_chat[0]);
++    try std.testing.expectEqual([3]u64{ 2, 1, 36 }, k.by_chat[1]);
+     // the shorter state is the shared one: with the cap at 1 the own, longer one is "superseded"? no: the shared one is
+     // exempt, so the oldest of all (the shared cut, kept first) is what the cap takes
+     s.policy.entries = 1;
