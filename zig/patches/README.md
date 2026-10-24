@@ -78,8 +78,8 @@ its question, and "no temporaries" listed the folders while a state was being wr
 and cancel (not exercised: the restore finished first); two concurrent restores (`0019`), checked against a running server with
 KV sharding and spill v2 both on, both came from disk in 2.28 s while a stream decoded (its worst gap 0.13 s). Decode on
 the pair (`--parallel 8`, short prompts, aggregate tok/s at 1/2/4/8 streams): every feature off 51.4/72.0/91.9/118.2,
-KV sharding + spill v2 + the cache 49.7/65.4/92.5/115.4 (both `PARALLEL=8`, `CONTEXT=131072`); `ENGINE=python` at its
-own defaults (`PARALLEL=4`, the 1M window, so not like-for-like) 50.1/69.4/93.2 at 1/2/4. Cold prefill about 2,000
+KV sharding + spill v2 + the cache 49.7/65.4/92.5/115.4 (both `PARALLEL=8`, `CONTEXT=131072`); `ENGINE=python` at the
+same settings 50.7/72.0/93.0/126.0 (with the 1M window 50.5/72.7/94.2/123.6). Cold prefill about 2,000
 tok/s on all three at 13k and 51k tokens. `0014`, `0015` and `0016` are also offered alone as pull requests
 against this branch, with the same diff: whichever lands first, the other copy is an exact duplicate (`git apply
 --reverse --check` passes). Their headers are the series' messages, not the standalones': `0016`'s leaves out a note
