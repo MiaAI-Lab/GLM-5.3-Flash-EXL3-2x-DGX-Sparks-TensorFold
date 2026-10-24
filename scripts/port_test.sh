@@ -150,6 +150,22 @@ case_ "scripts/config.sh records whether KV_POOL_GIB was set, before it fills in
   a=\$(grep -nF 'PORT_POOL_EXPLICIT=0; [[ -z \"\${KV_POOL_GIB:-}\" ]] || PORT_POOL_EXPLICIT=1' '$here/config.sh' | cut -d: -f1)
   b=\$(grep -nF 'KV_POOL_GIB=\"\${KV_POOL_GIB:-\$_pool}\"' '$here/config.sh' | cut -d: -f1)
   [[ -n \"\$a\" && -n \"\$b\" ]] && (( a < b )) || { echo \"config.sh: recorded at [\$a], defaulted at [\$b]\"; exit 1; }"
+case_ "VISION=1 with PROMPT_CACHE_GIB above 0 warns that rank 0's kept-state budget is ~1.4 GiB smaller; not without vision, a cache, or with ENGINE=python" 0 'PROMPT_CACHE_GIB=8 PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4' '
+  ( VISION=1; expect_out "WARN: VISION=1 with PROMPT_CACHE_GIB=8: .*~1.4 GiB smaller" port_validate 8 8 ) || exit 1
+  ( VISION=1; expect_out "WARN: VISION=1 with PROMPT_CACHE_GIB=2.5: " port_validate 8 2.5 ) || exit 1
+  ( VISION=0; expect_out "!VISION=1 with" port_validate 8 8 ) || exit 1
+  ( unset VISION; expect_out "!VISION=1 with" port_validate 8 8 ) || exit 1
+  ( VISION=1 PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
+  ( VISION=1 ENGINE=python; expect_out "!VISION=1 with" port_validate "" 8 ) || exit 1'
+case_ "scripts/config.sh: VISION defaults to 1 for ENGINE=zig at TP=2 and ENGINE=python, 0 for ENGINE=zig at TP=3/4; a set VISION stays" 0 '' "
+  line=\$(grep -E '^VISION=\"\\\$\\{VISION:-' '$here/config.sh')
+  [[ -n \"\$line\" ]] || { echo 'config.sh: no VISION default line'; exit 1; }
+  for c in 'zig 2 1' 'zig 3 0' 'zig 4 0' 'python 2 1' 'python 3 1'; do
+    set -- \$c
+    got=\$( unset VISION; ENGINE=\$1 TP=\$2; eval \"\$line\"; echo \"\$VISION\" )
+    [[ \"\$got\" == \"\$3\" ]] || { echo \"ENGINE=\$1 TP=\$2: VISION=\$got, wanted \$3\"; exit 1; }
+  done
+  got=\$( VISION=0 ENGINE=zig TP=2; eval \"\$line\"; echo \"\$VISION\" ); [[ \"\$got\" == 0 ]] || { echo \"a set VISION=0 became \$got\"; exit 1; }"
 case_ "refuse: spill with MTP drafts, also where their states are kept (the tier does not store the MTP head yet)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
   expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8
   ( ZIG_HAS="$DEF_HAS mtpcache"; expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8 ) || exit 1

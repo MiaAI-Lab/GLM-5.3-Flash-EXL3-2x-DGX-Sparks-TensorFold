@@ -134,8 +134,9 @@ export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 # Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). A picture
 # takes at most TENSORFOLD_GLM_IMAGE_TOKENS tokens (2048), a clip TENSORFOLD_GLM_VIDEO_TOKENS (16384) over at most
 # TENSORFOLD_GLM_VIDEO_FRAMES frames (128, 2 a second). VISION_URLS=1 also accepts public https URLs (default: data URLs).
-# (ENGINE=zig: off by default so the text server keeps the tower's memory; VISION=1 serves pictures and clips)
-VISION="${VISION:-$([[ "$ENGINE" == zig ]] && echo 0 || echo 1)}"
+# ENGINE=zig: on at TP=2 (the native tower on rank 0, its workspace taken at start; with PROMPT_CACHE_GIB above 0 the
+# kept-state budget is ~1.4 GiB smaller, scripts/port.sh port_vision_check), off at TP=3/4 (not run there yet)
+VISION="${VISION:-$([[ "$ENGINE" == zig && "$TP" != 2 ]] && echo 0 || echo 1)}"
 VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
 # a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only (mtp: 1). Default 4 on two Sparks, 8 on three (v1.5).
