@@ -155,6 +155,16 @@ port_pool_check() {
   warn "PROMPT_CACHE_GIB=$1 with KV_POOL_GIB at its default ($KV_POOL_GIB): the engine sizes the KV pool first and gives the kept prompt states only what is left above MEMORY_RESERVE_GIB, and at the default pool that left nothing on the pair (KV_POOL_GIB=12.5: \"prompt cache: off (budget 0)\"), so no prompt state would be kept. Set KV_POOL_GIB lower with it; the pair ran KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on (its 1,066 MiB of pinned staging is taken before the pool)"
 }
 
+# port_vision_check <prompt cache GiB>: ENGINE=zig with VISION=1 (the default at TP=2) and PROMPT_CACHE_GIB or
+# --prompt-cache-gib above 0. Rank 0's vision tower (~1.05 GiB of bf16 weights, and its workspace for the largest pass,
+# ~0.4 GiB, which the engine takes at start) is loaded before the pool and the kept-state budget are sized, so the
+# budget for kept prompt states on rank 0 is ~1.4 GiB smaller than with VISION=0 (estimated from the tower's sizes,
+# not measured on the pair). Warns; nothing changes.
+port_vision_check() {
+  [[ "$ENGINE" == zig && "${VISION:-0}" == 1 ]] && port_gt0 "$1" || return 0
+  warn "VISION=1 with PROMPT_CACHE_GIB=$1: rank 0's vision tower (~1.05 GiB of weights and ~0.4 GiB of workspace, taken at start) comes out of the memory the kept prompt states are given, so their budget on rank 0 is ~1.4 GiB smaller (estimated); VISION=0 keeps it for text"
+}
+
 # ---------------------------------------------------------------- checks (no ssh, nothing changed)
 # port_validate <parallel> <prompt cache GiB>: every setting's form, and the combinations the engine cannot run, before
 # anything is stopped. The two arguments are the effective --parallel and --prompt-cache-gib (the command line's extra
@@ -250,8 +260,9 @@ port_validate() {
         else port_shard_default_off "the spill tier is on and $why"; fi
       fi
     fi
-    # a prompt cache the default pool leaves no room for
+    # a prompt cache the default pool leaves no room for, and the vision tower's share of what it gets
     port_pool_check "$cache"
+    port_vision_check "$cache"
   else
     # the Python engine (patches/): the v1 tier only
     if port_v2_on; then
