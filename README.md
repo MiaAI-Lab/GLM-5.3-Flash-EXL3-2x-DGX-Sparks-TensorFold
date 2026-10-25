@@ -1053,3 +1053,7 @@ expert loads). Patches 0099-0109 are ported from the
   stop at chunk boundaries ([05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b)) that 0109 follows.
 
 The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+
+## Optional TP4 registered relay
+
+`TP4_NETWORK=registered-rdma` selects an optional registered-memory relay patch for physical four-host rings. Only ring relay is exposed; switched deployments remain unsupported. The transport leaves the prerequisite image unchanged unless selected; this local branch includes pinned PR #214 re-exported after the merged fixes. Read the [profile, required fabric isolation, startup compatibility and historical qualification limits](docs/tp4-registered-relay.md) before deployment. The revised source passed four-host correctness checks and a [matched NCCL/RDMA timing matrix](docs/tp4-registered-relay-20261025/README.md): all 312 requests valid, with descriptive RDMA throughput gains of 1.96%–16.95%. Exact provenance, sample counts and limits are in the compact receipts.

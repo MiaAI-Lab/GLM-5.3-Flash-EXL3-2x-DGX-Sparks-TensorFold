@@ -33,6 +33,7 @@
 #            WORKER_WEIGHTS2, NFS_SERVER2, WORKER_WEIGHTS3, NFS_SERVER3,
 #            STATE_DIR, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 #   engine   ENGINE (python | zig), ZIG_TF_REF, ZIG_VERSION, ZIG_NCCL_VERSION, ZIG_BUILD_IMAGE, ZIG_RUN_IMAGE (zig/Dockerfile)
+#   transport TP4_NETWORK (upstream | registered-rdma; physical ring only)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, GHCR_IMAGE, IMAGE_TAG / IMAGE_DIGEST (the pinned published
 #            image), CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, MIN_FREE_GB, IMAGE_FREE_GB, RSYNC_OPTS, HF_TOKEN (prepare.sh's downloads;
@@ -47,7 +48,7 @@
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
-source ./scripts/config.sh
+source ./scripts/config.sh --validate-tp4-network
 source ./scripts/nodes.sh
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
@@ -113,8 +114,10 @@ if [[ "$ENGINE" == zig ]]; then
   zig_unsupported() { die "ENGINE=zig does not serve $1 yet (docs/zig-engine.md); set ENGINE=python"; }
   # mtp and displaykv are in zig/patches (r107-int). ZIG_HAS can still drop one for a narrower image. parked: the
   # engine's startup budget counts the pages parked on the per-CPU free lists (zig/patches' parked-pages patch), so the
-  # memory check below counts them too
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv parked}"
+  # memory check below counts them too. spill2 (spill v2, 0018/0019/0021), kvshard (KV sharding, 0020/0022) and
+  # spillshard (the two together, 0023) say the image carries them; their engine switches stay off (TF_GLM_SPILL_V2,
+  # TF_GLM_KV_SHARD: docs/zig-engine.md), and nothing here reads these three names yet
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv parked spill2 kvshard spillshard}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
@@ -128,13 +131,17 @@ if [[ "$ENGINE" == zig ]]; then
     warn "ENGINE=zig: TP=3 is experimental (unsplit prefill, COMM=$COMM)"
   fi
   if (( TP == 4 )); then
-    # four Sparks cabled as a ring (./start-tp4-switchless.sh): unsplit prefill over NCCL, whose ring channels run over
-    # the cables (the ring's graph files); the kernel set holds the TP=4 shapes (16 heads a rank), captured from the
-    # Python engine at TP=4 on a ring. A switch (./start-tp4.sh) is not tested, and the RoCE ring relay is not ported.
-    [[ "${FABRIC_EXPECT:-}" == ring ]] || die "ENGINE=zig at TP=4 runs on a ring of four (./start-tp4-switchless.sh)"
+    # The default path retains the captured ring/NCCL recipe. Registered RDMA
+    # opts into registered relay on a physical ring only.
     [[ "$SPLIT" == 0 ]] || die "ENGINE=zig at TP=4 needs SPLIT=0 (split prefill is two ranks)"
-    [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl (the RoCE ring relay, TF_ROCE_RING, is not ported)"
-    warn "ENGINE=zig: TP=4 is experimental (a ring of four, unsplit prefill, COMM=nccl)"
+    if [[ "$TP4_NETWORK" == upstream ]]; then
+      [[ "${FABRIC_EXPECT:-}" == ring ]] || die "ENGINE=zig at TP=4 runs on a ring of four (./start-tp4-switchless.sh)"
+      [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl unless TP4_NETWORK=registered-rdma"
+    else
+      [[ "$COMM" == roce ]] || die "TP4_NETWORK=registered-rdma requires COMM=roce"
+      warn "TP4_NETWORK=registered-rdma requires a known-working NCCL library for fallback collectives. The tested dual-PCI-domain fleet used separately patched NCCL 2.30.7; version alone cannot establish compatibility. This flag does not install that library."
+    fi
+    warn "ENGINE=zig: TP=4 is experimental (unsplit prefill, COMM=$COMM, TP4_NETWORK=$TP4_NETWORK)"
   fi
   [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
     warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
@@ -235,6 +242,7 @@ for i in $(worker_ids); do
 done
 # Compiled kernels are kept per image (its patches hash): a build is found by its extension's name, so another image's
 # build of the same name, older or newer, must never be the one loaded
+require_tp4_image_profile
 KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -d: -f2 | cut -c1-12)
 # (docker creates the folder at the mount: the cache is the containers', so it may not be writable from here)
@@ -396,6 +404,8 @@ env_args() {
   local _skip='^$' name
   ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
+  # Newline-separated grep patterns preserve the existing forwarding pipeline.
+  [[ "$TP4_NETWORK" != registered-rdma ]] || _skip=$'^TF_ROCE_HCA=\n^TF_ROCE_RING='
   if [[ "$ENGINE" == zig ]]; then
     # the Zig engine reads few of them (docs/zig-engine.md): the settings it maps, then any TENSORFOLD_ / TF_ variable you
     # set yourself that it reads, by name; the Python engine's own switches (TF_GLM_*) stay out of its environment

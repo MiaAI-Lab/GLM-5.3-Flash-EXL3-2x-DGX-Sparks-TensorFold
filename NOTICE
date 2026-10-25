@@ -161,3 +161,11 @@ Third-party software in the image
   work only (as described above), not the software in the image.
 
 See CREDITS.md for everyone this project builds on.
+
+TP4 registered-memory RDMA
+  bertholomus/TensorFold, by BertholomusAI (Albert Lee), Apache License, Version 2.0.
+  https://github.com/bertholomus/TensorFold/tree/b8b115e7ed6c86d81b7575caa6f3d4ade52b323c
+  Adapts the registered-host-memory approach (anonymous mmap plus portable/mapped
+  CUDA host registration) to GLM's existing RoCEnante-based physical-ring
+  neighbor relay. Source pins and modifications are recorded in zig/TRANSPORT_SOURCE.json.
+  Existing TensorFold MIT/Apache-2.0 and b12x/RoCEnante notices continue to apply.

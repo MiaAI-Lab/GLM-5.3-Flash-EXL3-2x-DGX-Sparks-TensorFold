@@ -13,13 +13,15 @@ yet. The Zig engine's greedy replies equal the Python engine's on two prompts at
 
 | Part | Source |
 | --- | --- |
-| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus `zig/patches/0001-0005`, built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
+| `tensorfold-native` and `tensorfold` | TensorFold v1.0.7 (`ZIG_TF_REF`, commit `e7c523eb`) plus all 25 shared `zig/patches` patches in this local prerequisite stack (and the separately selected ring-transport patch when enabled), built with Zig 0.17.0 and nvcc (sm_121 fatbins are embedded in the binary) |
 | captured Triton kernel set | `zig/aot/glm-aot-sm121.tar.xz` (aot.json and 311 cubins, captured from the Python engine on a GB10; pinned by its sha256), at `TENSORFOLD_CUDA_KERNELS` |
 | runtime libraries | `nvidia/cuda:13.0.2-runtime-ubuntu24.04` (cuBLAS, cuBLASLt), NCCL 2.30.7 (the pip wheel; the Python image runs the same), libibverbs and the mlx5 provider |
 
-`zig/patches/` is the Zig port against TensorFold v1.0.7, in five patches: the shared engine changes (lane host, native
-CUDA registry, server), the Flash Next Zig CUDA engine the GLM engine builds on, the GLM kernels, the GLM engine, and its
-tests. `tools/make-zig-patches.sh <Zig port checkout>` writes them and checks that they reproduce the branch exactly.
+`zig/patches/0001-0005` establishes the Zig port against TensorFold v1.0.7: shared engine changes (lane host, native
+CUDA registry, server), Flash Next CUDA support, GLM kernels, the GLM engine, and tests. Patches 0006-0013 retain the
+recipe's subsequent fixes. The merged three `0014` patches and display fixes `0015`/`0016` precede pinned #214, re-exported as `0017–0023`. `zig/transports/0024-zig-glm-tp4-registered-relay.patch` adds the separately selected ring relay. `zig/TRANSPORT_SOURCE.json` records its exact native
+source, patch/file checksums and reconstruction limits. `tools/make-zig-patches.sh` refreshes the original port set;
+`tests/verify_tp4_native_patch.py` checks all 25 shared patches plus optional transport `0024` against frozen source.
 The image tag is `zig-v1.0.7-<hash>` of the patches, the kernel set, the Dockerfile and the pins (`IMAGE_TAG`,
 `IMAGE_DIGEST` pin a published one; none yet, so `prepare.sh` builds it, about 10 minutes the first time).
 
@@ -31,14 +33,15 @@ would change what is served.
 
 | Setting | Zig engine |
 | --- | --- |
-| `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, TP=3 on a triangle with `SPLIT=0 COMM=nccl` and TP=4 on a ring of four with `SPLIT=0 COMM=nccl` (both experimental, see below; TP=3 also takes `COMM=roce`). TP=4 on a switch is untested and refused; the RoCE ring relay is not ported (start refuses `COMM=roce` at TP=4) |
+| `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, TP=3 on a triangle with `SPLIT=0 COMM=nccl` and TP=4 on a ring of four with `SPLIT=0 COMM=nccl` (both experimental, see below; TP=3 also takes `COMM=roce`). Upstream Zig TP4 on a switch remains refused; `COMM=roce` at TP=4 also requires that profile |
 | `MODEL_ID`, `MODEL_REVISION`, `ABLIT`, `DFLASH2_ID`, `DFLASH2_REVISION`, `HF_CACHE`, `WORKER_WEIGHTS*`, `NFS_*` | unchanged: the snapshots are mounted at `/root/.cache/huggingface` and passed as `MODEL` and `--drafter` (`ABLIT=1` has the same architecture; not tried yet) |
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
 | `CONTEXT`, `PARALLEL` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`: the captured kernels are keyed on that arena; other values need more captures (TODO; a warning says so) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
 | `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> no `--drafter`; the container gets `DRAFTER=mtp` (PARALLEL=1), which the Zig engine reads from its environment. The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
-| `COMM`, `TF_ROCE_MAX_KB` | `TF_GLM_ROCE` (1 for `roce`, 0 for `nccl`), `TF_ROCE_MAX_KB` |
+| `TP4_NETWORK` | `upstream` (default) retains upstream image inputs and hash. `registered-rdma` selects a separate patch and requires Zig, TP=4, SPLIT=0 and COMM=roce on a physical ring; maps to `TF_GLM_TP4_REGISTERED_RDMA=1`. See [the focused profile](tp4-registered-relay.md) |
+| `COMM`, `TF_ROCE_MAX_KB` | `TF_GLM_ROCE` (1 for `roce`, 0 for `nccl`), `TF_ROCE_MAX_KB` (fixed at 512 for the opt-in profile) |
 | `TF_GLM_L2PF` | `TF_GLM_L2PF` (0 / off: off; anything else: 1) |
 | `MEMORY_RESERVE_GIB`, `KV_POOL_GIB` | `TENSORFOLD_MEMORY_RESERVE_GIB` and `TF_GLM_CACHE_GIB`, passed as for Python; the memory-sized pool is in branch `r107-cx-displaykv` (see `DISPLAY_KV_*` below); the 19.6 GiB default is the Python engine's measurement |
 | `TENSORFOLD_PREPARE_FLOOR_GIB` | `zig/patches/0014-zig-prepare-memory.patch`: the MemAvailable rank 0 keeps while several prompts are rendered and tokenized at once. Each prepare reserves 48 bytes a text byte and waits while the ones in flight and its own would take MemAvailable under the floor. Waiters go in arrival order (a large prepare is not starved by small ones), a prepare that finds none in flight and none waiting goes at once, as before; a waiter queued behind prepares in flight waits for memory at most `TENSORFOLD_PREPARE_WAIT_MS` (default 5000; 0: at once) and then goes as soon as none is in flight, so it only queues concurrent prepares and never changes a reply; past `TENSORFOLD_PREPARE_MAX_WAITING` waiters (default 64; 0: no bound) one more is refused at once with 429 and `Retry-After: 5`, as a request past the lanes is. Default 3 GiB; 0 turns the gate off; a malformed value of any of the three refuses the start. Passed to every rank like every `TENSORFOLD_*` variable (only rank 0 prepares) |
@@ -47,17 +50,18 @@ would change what is served.
 | `KV_POOL_GIB`, `TF_GLM_CACHE_ENTRIES`, `TF_GLM_CACHE_SHARE_PCT`, `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`, `SHARED_PREFIX` | the engine keeps prompt states. `./start.sh` passes `--prompt-cache-gib $PROMPT_CACHE_GIB`, default 0 (the qualified path); raise it to keep states (`PROMPT_CACHE_GIB=8`, or `./start.sh --prompt-cache-gib 8`: the last flag wins). The budget is the asked size, at most what is free at start minus the reserve (`MEMORY_RESERVE_GIB`) and the keep headroom, `TF_GLM_KEEP_HEADROOM_GIB` (2; patch 0012): the kept states stop that far above the reserve, so the prompts' buffers can grow into it. A keep that would take the machine under the reserve is skipped at that mark on every rank (a warning; earlier and later states are unaffected), and a save the engine still refuses is skipped the same way on every rank, the prompt going on from the rows it ran, instead of ending the server |
 | `SPILL_*` | implemented: the same `--spill-gib` / `--snapshot-dir` / `--spill-*` flags as the Python path. Default `SPILL_GIB=0` |
 | shared-cut chat id (no setting) | `zig/patches/0014-zig-chat-id.patch`, a base-engine fix that acts only with a prompt cache: a kept shared system-prompt cut (`SHARED_PREFIX`) no longer gives its conversation to the conversations behind it, so a second conversation behind the same system prompt is a conversation of its own and `TF_GLM_KEEP_PER_CHAT` no longer counts both together (measured on the pair: zig-engine resumed the second conversation at the shared cut, the patch at its own state). Two side effects, neither a reply: `/health`'s `kept_mix` lists a shared cut as a conversation of its own (one state), and the v1 spill tier (`SPILL_GIB` above 0) no longer counts such a cut as superseded by the turn kept after it, so it writes the cut to disk when it is evicted (one more spilled state a shared prompt) |
+| `TF_GLM_SPILL_V2`, `TF_GLM_KV_SHARD` (no recipe setting yet) | in the image, off (`zig/patches/0017`-`0023`, Robert's GLM patches 0110/0111/0118 ported to this engine; each patch's header has its switches, defaults and what was measured). Continued chats (`0017`, no switch, with a prompt cache only): a request that continues a conversation without resuming its own turn state keeps that conversation (`chats_continued` on `/health` and `/metrics`). Spill v2 (`0018`, `0019`, `0021`): `TF_GLM_SPILL_V2=1` with `SPILL_GIB` above 0 and a prompt cache (`./start.sh --prompt-cache-gib 8`) writes kept states to `SPILL_DIR` as shared 2,048-token blocks at keep and restores them beside decoding, after a restart too; it needs the engine's identity on every rank (`TF_GLM_ENGINE_ID`, `TF_GLM_RECIPE_PATCHES`, `TF_GLM_MODEL_REVISION`, and `TF_GLM_DFLASH2_REVISION` with DFlash2 drafts) and refuses to start without it. KV sharding (`0020`, `0022`): `TF_GLM_KV_SHARD=1` keeps each conversation's latent cache once, on its owner Spark (TP=2 only; refused with `--parallel 1`, MTP drafts or `TF_GLM_MULTI_LONE`); `0023` is the two together. Every rank gets these variables as any `TF_GLM_*`; unset, the engine is byte-identical to one without the patches |
 | `VISION`, `VISION_URLS` | implemented (`--vision --vision-backend zig`, `--vision-urls`). Default `VISION=0` under `ENGINE=zig` so the text server keeps the tower's memory; `VISION=1` loads the native tower on rank 0 (the image carries cuDNN; there is no Python helper) |
 | `DISPLAY_KV_MIB`, `DISPLAY_KV_BACKEND` (`TF_GLM_DISPLAY_KV_MIB`, `_BACKEND`, `_CARD`) | implemented. Default off. `ZIG_HAS` includes `displaykv` |
 | `COPY`, `COPY_MAX`, `COPY_CODE`, `DRAFT_POLICY` | TODO: the engine's copy drafts and DFlash2 policy are built in, not settable |
-| `TF_GLM_SIDE` | ported (shared expert on a second stream, decode windows; off by default as in Python), branch `r107-tpf`; passed unchanged |
+| `TF_GLM_SIDE` | shared expert on a second stream during decode; passed unchanged. The existing recipe defaults to 1 at TP=4 and 0 at TP=2/3. The registered-rdma profile respects explicit values; its measured configuration used 1 |
 | `SPLIT` (`TF_GLM_HC_SPLIT`, `TF_GLM_PREFILL_OVERLAP`), `TF_GLM_PROMPT_OWN_FRONT`, `TF_GLM_PROMPT_MICROBATCH`, `TF_GLM_PREFILL_ROWS`, `TF_GLM_PROMPT_PARTIALS`, `TF_GLM_MSA` | split prefill, overlap, own-front and microbatch run at TP=2 (`r107-tpf`, on `r107-int`). `TF_GLM_PREFILL_ROWS` sets the chunk size. Past two ranks the chunk runs unsplit (no TP=3/4 ring exchange in this project) |
 | `KDA_CHUNKED` | the chunked kernel is built in |
 | `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time; the verify window is fixed (64 rows shared, 16 a stream) |
 | `STREAM_SMOOTH`, `STREAM_SMOOTH_MS` | TODO |
 | `MAX_QUEUED` | TODO (no 429 admission yet) |
 | `NUCLEUS_UNION` | not needed (the Zig sampler has its own) |
-| `TF_ROCE_WAIT_S`, `TF_ROCE_IB_TIMEOUT`, `TF_ROCE_RING` | TODO |
+| `TF_ROCE_WAIT_S`, `TF_ROCE_IB_TIMEOUT`, `TF_ROCE_RING` | native RoCE wait timeout, QP ACK timeout, and ring relay selection. The registered-rdma profile requires a physical ring and supplies 1 per rank; explicit 0 and mesh discovery are refused |
 | `TF_GLM_EXL3_LOADS`, `TF_GLM_EXL3_DEC_ORDER` | TODO (its kernels are its own) |
 | `TF_GLM_CLEAR_THINKING`, `TF_GLM_EFFORT_TAIL` | TODO (earlier turns keep their reasoning, as with the Python defaults) |
 | `LOG_*`, `FOREGROUND`, `WAIT_TIMEOUT`, `STOP_TIMEOUT`, `CONTAINER_NAME`, `KERNEL_CACHE`, `STATE_DIR` | unchanged |
@@ -66,8 +70,9 @@ would change what is served.
 A Zig rank gets what a Python rank gets: every `TENSORFOLD_*`, `TF_GLM_*` and `TF_ROCE_*` variable that
 `scripts/config.sh` exports or you set (variables the engine does not read are ignored; a malformed value of one it does
 read fails the start), plus `TF_GLM_ROCE` from `COMM`, `TF_GLM_L2PF` as 0 or 1, and `TF_CUDA_DEVICE`, `TF_GRAPH_LOG`,
-`TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`, `parked`) lifts the
-refusal of a feature once its port is in `zig/patches` (`parked`: `./start.sh`'s memory check counts the parked pages).
+`TF_ROUND_LOG`, `TF_TP_*` when you set them. `ZIG_HAS` (space-separated `mtp`, `displaykv`, `parked`, `spill2`, `kvshard`,
+`spillshard`) lifts the refusal of a feature once its port is in `zig/patches` (`parked`: `./start.sh`'s memory check
+counts the parked pages; the last three name what `0017`-`0023` carry, for the settings that will turn them on).
 
 ## Prefill capture coverage
 
@@ -139,10 +144,19 @@ ring's order in `scripts/local.sh`. The tested start:
 ENGINE=zig SPLIT=0 COMM=nccl DRAFTER=dflash2 PARALLEL=8 CONTEXT=131072 MEMORY_RESERVE_GIB=24 ./start-tp4-switchless.sh
 ```
 
-start.sh refuses the Zig engine at TP=4 on a switch (`./start-tp4.sh`, not tested), with `SPLIT=1`, or with
-`COMM=roce`: the ring's RoCE relay to the Spark across (`TF_ROCE_RING=1`, the Python engine's patch 0099) is not
-ported, so every collective goes over NCCL's ring channels and its graph files (`scripts/nodes.sh`, as for the Python
-engine on a ring).
+With `TP4_NETWORK=upstream` (the default), start.sh requires `COMM=nccl` for the Zig engine at TP=4. The shared patch series, Dockerfile, AOT, pins, image hash and native startup remain upstream-equivalent.
+
+For optional registered-host-memory ring relay:
+
+```bash
+TP4_NETWORK=registered-rdma ENGINE=zig SPLIT=0 ./start-tp4-switchless.sh
+```
+
+This selects a separate transport patch after the shared numbered series. It requires a physical ring, fixed 512 KiB slots and a known-working NCCL fallback; the launcher refuses discovered mesh, and native startup requires relay mode and rejects advertised diagonal subnet routes. Physical cabling and isolation require operator verification. Missing peers and incorrect cable order fail before stopping a service. The selected image versions the existing first settings exchange; it adds no startup round. Use the same selected image on every rank.
+
+Read the [ring profile](tp4-registered-relay.md) for mandatory fabric/control-plane isolation, configuration precedence, startup compatibility, exact revised-source identity, offline checks and historical qualification limits. This revision has CPU validation only; historical GPU results identify their older binaries. `./stop.sh` remains usable with stale profile settings.
+
+The following historical TP4 checks describe the upstream NCCL configuration:
 
 - Kernel set: the TP=3 set's 510 entries first and unchanged, then 72 TP=4 entries captured from the Python engine at
   TP=4 on a ring (16 heads on every rank; the four ranks compiled byte-identical sets). No variant had to be compiled
@@ -157,6 +171,19 @@ engine on a ring).
   Not qualified at TP=4: vision, MTP drafts, other arenas, the prompt cache, and TP=4 against TP=2 or TP=3 numerically.
 
 ## Build and test the Zig side
+
+Offline configuration/forwarding checks (Bash 4+):
+
+```sh
+python3 -m unittest discover -s tests -p test_tp4_network.py -v
+python3 tests/verify_tp4_native_patch.py --upstream-repo <TensorFold-checkout> --native-repo <focused-checkout> --zig <Zig-0.17.0>
+```
+
+The reconstruction check compares all source-file bytes, accounts explicitly for
+six pre-existing executable-mode differences in the frozen baseline, and runs
+host transport tests when `--zig` is supplied. These checks do not build CUDA
+kernels or qualify GPU execution.
+
 
 ```sh
 tools/make-zig-patches.sh <Zig port checkout> [branch] [base]   # refresh zig/patches and zig/aot

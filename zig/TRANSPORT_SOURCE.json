@@ -1,0 +1,197 @@
+{
+  "schema_version": 3,
+  "recipe_base_commit": "cb4f4e661fe28a588b3dc06059d80ea5609aca3b",
+  "tensorfold_base_commit": "e7c523ebfa16b8094cf9e35e3773a7d25befcc5b",
+  "reconstructed_recipe_baseline_commit": "53a3f40891f5e965a95401b81d868eb1d19fe7ac",
+  "focused_native_commit": "a6645bea11fd9a837116c7aafefaa86af2628d9b",
+  "patch": "zig/transports/0024-zig-glm-tp4-registered-relay.patch",
+  "patch_sha256": "e1b5440713c403fcaec07cee56c00698805661ab11bc0365aa8bb923dbe7fe61",
+  "patch_scope": "Optional ring-only transport 0024, selected after the 25 shared patches of the pinned merged-base-plus-PR214 prerequisite stack. Unselected image inputs/hash match that prerequisite stack, not bare upstream 697d8e9.",
+  "result_file_sha256": {
+    "zig/build/cuda.zig": "e8c81734551df201cba24a1682470ed6f0e597b251368f82959cc893588701d5",
+    "zig/src/cuda/roce.zig": "6cd0bbe8c08d7082f2c7b816ccbe097c5b0527bcee825adce6f7d957626dcdff",
+    "zig/src/cuda/roce_proxy.c": "ed643a446321cfb21fe1cef3a4689b934b3dcfe3574fac1d3ee4e0306f85bde8",
+    "zig/src/cuda/roce_region.zig": "2e8ec426b99c225b7ae7208b8fdd26f00a7fe0106d7bfee696a8db277c890ce3",
+    "zig/src/families/glm_cuda/cuda.zig": "30b54ee677414eb2d34022200d448096290f83623192bc274fb78027eca57935",
+    "zig/src/families/glm_cuda/cuda_comm.zig": "4560b7f2dc13defcb54480ceec06084c5fefda5c6de76cae2650b7fa6cb974ba",
+    "zig/src/families/glm_cuda/cuda_engine.zig": "0e3e6cf2d3ad1d46c11f2f139ba7c8288af2035509e4b1db677614361af3476f",
+    "zig/src/families/glm_cuda/cuda_link.zig": "263f611b30b35c8bcdb3a3592df654766157e6e76bcb441976178ecfc5793f37",
+    "zig/src/families/glm_cuda/cuda_native.zig": "3d0847a3a2477cd9a5f781a7ea919ec272e7fc91ee29a73c67671bfcb8ece961",
+    "zig/src/families/glm_cuda/cuda_sampler.zig": "f933eff6ad1fd6f5ba80ff54881f42d91f0877fb198d823c64795c4c56569f82",
+    "zig/tests/cuda/glm_transport_probe.zig": "3182f73f2fb446b783e400f8da36a6be2a35a4e9762324f7610f00d7408422a8"
+  },
+  "prior_patches_sha256": {
+    "zig/patches/0001-zig-shared-engine.patch": "923402e1ec409e43c2d31b59df64559a216b894dc3dfa11eb5f0cc6373f35222",
+    "zig/patches/0002-zig-flashnext-cuda.patch": "3220b61b295745446421e7c7bc5a0146c3c1dcfa653af4afbcd6df6caf770ffb",
+    "zig/patches/0003-zig-glm-kernels.patch": "b6fd1d791dbca19e428186a840ba3973ba0b1d045f30098ade0245b163e78ff2",
+    "zig/patches/0004-zig-glm-engine.patch": "685054c5237f5348f7734a151c86f0073df3e8d1ebbab51c6b122f166763247c",
+    "zig/patches/0005-zig-glm-tests.patch": "9d0e969f4535ab5681ab3ca30945b7ef3ba99fc8a21fa6c250b1b4adf7d4401e",
+    "zig/patches/0006-zig-glm-scores-rows-g128.patch": "b426d1a5cd9009a33abb9dfbc4c3f5d357a47be53b34a51145870d6c65852c51",
+    "zig/patches/0007-zig-flashnext-record-before-long-batch.patch": "f1a7198f4a52c8eff35d75c1119912d5beb18b69b8eb067f1b7c490ec641333f",
+    "zig/patches/0008-zig-aot-log-missing-variant.patch": "cecf342ffbb6453640c5e1e16f5191988df120fe557d39fb9bf70480b1d1136b",
+    "zig/patches/0009-zig-glm-tpn-pool.patch": "33097fb37b714737c327d398e635bf8675bc499f824e2ae02b668dbff2caa4bb",
+    "zig/patches/0010-zig-glm-tpn-roce-probe.patch": "3b50eb61406891aa93ee0dda45f1b522ed5acb912eaa9005b98514133cf061b9",
+    "zig/patches/0011-zig-glm-greedy-draft-probs.patch": "82a65c4b5fdeed13c5ca183c760a72ca0fe5c80de736195ad3340d02734c672b",
+    "zig/patches/0012-zig-glm-cache-reserve.patch": "ff94367831b8c401ea35fdad3ebe2141da9646242a2ecb22dba576c6f71e3432",
+    "zig/patches/0013-zig-glm-round-batching.patch": "7be776fa76a73d9159d867f4e75f62653a35c749925c18cf94c57311e1eb8f96",
+    "zig/patches/0014-zig-chat-id.patch": "cfa09ad2a3adf0d1f2f31451883b1cf81a81b5677a4672e147c16ce08adcaead",
+    "zig/patches/0014-zig-parked-pages.patch": "9c04c8477394e7054c8820c5827309c38140b138e45d8c2bbf7960a60d838b21",
+    "zig/patches/0014-zig-prepare-memory.patch": "bf35353542f4838befab3b3d5bbda5925f184ccafcf25b0f2174756cef7fafc0",
+    "zig/patches/0015-zig-glm-display-kv-zero-per-registration.patch": "f5c56649bf3440e726aa88639ff65698e8d6c6a5fa9a6ab42fc5c65a55b9192b",
+    "zig/patches/0016-zig-glm-display-kv-copy-per-registration.patch": "0bdd3b7bb928fbeae8a9684f2c47a27f8c2b5a3af5eb790c6ab69177beb366d0",
+    "zig/patches/0017-zig-core-chat-continued.patch": "a26ab1d59c3a01df1339f72cb9bd6548061dc870ee4d3e127d0a4b3f7801b4be",
+    "zig/patches/0018-zig-core-spill-store.patch": "6a068fdbcd470ec62bcdd16a49d128ad63b8d03f3063f0805c56f7785be9653b",
+    "zig/patches/0019-zig-core-cache-tier.patch": "624c8aa7674081aa8d43ac26933db6fe091871743c151a68c0fcbaa5c99fa66f",
+    "zig/patches/0020-zig-glm-kv-shard-host.patch": "8ca0f037400dab80fc961da8e16d94872eb14436578d2ec27f3ff5d26768ca36",
+    "zig/patches/0021-zig-glm-spill-blocks.patch": "32f31ac5884bd7c4c109ff24b2ac59c5604cb41151893f8d7af54ee512909a5c",
+    "zig/patches/0022-zig-glm-kv-shard.patch": "f06772b769e0a8883f02c205bc6b5c11dfdfb698c0e1d93f6bcfd209fd617bb5",
+    "zig/patches/0023-zig-glm-spill-kv-shard.patch": "a1b820a50c6b0088fed6ae53bb94ab06d95a705f68fa6b377301dcfa8081d0fe"
+  },
+  "attribution": {
+    "author": "BertholomusAI (Albert Lee)",
+    "repository": "https://github.com/bertholomus/TensorFold",
+    "revision": "b8b115e7ed6c86d81b7575caa6f3d4ade52b323c",
+    "approach": "Anonymous host memory registered with portable/mapped CUDA HostRegister; memory ownership adapted from the credited DeepSeek RDMA work."
+  },
+  "validation_limits": [
+    "2026-10-25: 56 CPU tests, full NVCC build, four-rank NCCL and registered-ring probes, bounded GLM correctness checks and a312-request descriptive timing matrix passed; see hardware_qualification and transport_performance. No statistical significance, full-window quality, sustained-capacity, reboot or long-duration reliability claim.",
+    "Ring-only profile: launcher refuses discovered mesh; native parser requires relay mode, and native route setup rejects advertised diagonal subnet routes. Neither proves physical cabling or isolation.",
+    "The transport leaves shared inputs, Dockerfile, AOT, pins and unselected image hash equal to the pinned local prerequisite stack; adding unmerged PR214 changes the base relative to bare upstream 697d8e9",
+    "Legacy compatibility covers responsive peers implementing the inspected stock/d62 first settings exchange, not arbitrary old images or peer-loss deadlines",
+    "Historical GPU and benchmark results identify be94e919 and its engine; they do not qualify this revised source",
+    "Registered RDMA does not install or qualify NCCL or fabric isolation",
+    "PR214 remains unmerged at the pinned source; a different landed series requires re-export before publication"
+  ],
+  "known_reconstruction_mode_differences": {},
+  "reconstruction_verification": {
+    "status": "PASS (2026-10-25; CPU only; post-review cleanup)",
+    "native_host_tests_passed": 56,
+    "native_load_entry_semantically_checked": true,
+    "host_probe_build": "passed on exact reconstruction",
+    "intentional_document_omission": null,
+    "gpu_checks_run": false,
+    "command": "python3 tests/verify_tp4_native_patch.py --upstream-repo <pinned-TensorFold-checkout> --native-repo <revised-native-checkout> --zig <Zig-0.17.0>",
+    "source_files_compared": 2922,
+    "all_source_file_bytes_equal": true,
+    "all_source_file_modes_equal": true,
+    "offline_launcher_tests_passed": 18,
+    "port_exporter_tests_passed": 15,
+    "parked_memory_tests_passed": 21,
+    "mode_comparison": "No differences; all upstream executable modes preserved",
+    "file_sha256_inventory_digest": "3921e252807759123261e658433b0b667e2a46c8f83b16e7702db51e26c51a3f"
+  },
+  "historical_qualification": {
+    "native_commit": "be94e919e35c628261bd38364b1743a2e4353a26",
+    "patch": "zig/patches/0014-zig-glm-tp4-registered-relay.patch",
+    "patch_sha256": "46111e72fa8432f5477a935a326ab4d8c7122cb7e3d4b29998e5791bb4d6dab2",
+    "engine_sha256": "42408ed8447654e9018d5550db6d4ebde703cf858d03215219323504372bf33a",
+    "archive": "https://github.com/swbiggart/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/921ce7e7ba8ce7ad6767fb0d8a99ef5c05a88cf1/docs/tp4-rdma-focused",
+    "qualification_transfers_to_revision": false
+  },
+  "upstream_recipe_commit": "697d8e9cc84f5b7e45d7cdeb9517bec93f4c6cfb",
+  "pr214_reexport": {
+    "recipe_commit": "2d36adc7d12c547b86af8c15f01f260fe927eea8",
+    "original_native_base": "553e797997a80d767abc0bf707c2e3d61c8af8b3",
+    "original_native_head": "98152c5655f7b8514cf3d975e41b73fcd1abd0f1",
+    "rebased_native_base": "87387c047732a9c0924cbb65ad1b64a313f4b606",
+    "rebased_native_head": "53a3f40891f5e965a95401b81d868eb1d19fe7ac",
+    "range": "0017–0023",
+    "feature_commits": [
+      {
+        "patch": "0015-zig-core-chat-continued.patch",
+        "from": "553e797997a80d767abc0bf707c2e3d61c8af8b3",
+        "to": "ae4bc11976fd6c22e72cdea595e27c1f837594c5",
+        "rebased_commit": "48f6cb9b04d9f2f38d92f46e69fa22dbb54829b9",
+        "new_patch_number": 17,
+        "diff_sha256": "4634868eb8e5aa2bdca907a1c2c0018f5ba2f2f6c12b96ddf36123f7e8ada1d3",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0016-zig-core-spill-store.patch",
+        "from": "ae4bc11976fd6c22e72cdea595e27c1f837594c5",
+        "to": "f361a6326c0ddee8e2189701eec53662bdcb254d",
+        "rebased_commit": "3aed43d2f9c6559f17f84898b0c2602c4010001e",
+        "new_patch_number": 18,
+        "diff_sha256": "29157e44bf0cc81bd075f8bfc29e55e148b448a1f44b361813e795f38d0342c2",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0017-zig-core-cache-tier.patch",
+        "from": "f361a6326c0ddee8e2189701eec53662bdcb254d",
+        "to": "1d43fb9e5f32de8ea52894c1bfe09062d16f1bff",
+        "rebased_commit": "25b2a3405e97d0767c11df0c54e63c4a4223c967",
+        "new_patch_number": 19,
+        "diff_sha256": "ab172394d242c206e1c174da2fe1411740bee0d2cdd3512b2e5091d903635ae4",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0018-zig-glm-kv-shard-host.patch",
+        "from": "1d43fb9e5f32de8ea52894c1bfe09062d16f1bff",
+        "to": "b337611d77164c38e32b3cc7e0c800125001e970",
+        "rebased_commit": "c2ffc3ef07628a201421a362d5b6a8c4e2dc03ab",
+        "new_patch_number": 20,
+        "diff_sha256": "84c16a29cc116ec07a5199363f210f72d686ad2996636b270e2940a2c1c52d92",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0019-zig-glm-spill-blocks.patch",
+        "from": "b337611d77164c38e32b3cc7e0c800125001e970",
+        "to": "7119e682c7dfafdc3a40b60c8ef62c2684309f76",
+        "rebased_commit": "f54fce8c2e17c4310345a9a5c09ad251ba72fb17",
+        "new_patch_number": 21,
+        "diff_sha256": "c34beaeef4736956b19961b83d0cbd9308076e0c711a093e6ed68f8fc207b41c",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0020-zig-glm-kv-shard.patch",
+        "from": "7119e682c7dfafdc3a40b60c8ef62c2684309f76",
+        "to": "260af6686a0ba7971afd79ba23b71bd9944bddfb",
+        "rebased_commit": "4fd208f1746f82d3ed72449301580a2197e665ba",
+        "new_patch_number": 22,
+        "diff_sha256": "df095b49bd0c936564e8d282ce068b2c581f11e5c950314fbdd3a8209b4dd87d",
+        "source_diff_exact": true
+      },
+      {
+        "patch": "0021-zig-glm-spill-kv-shard.patch",
+        "from": "260af6686a0ba7971afd79ba23b71bd9944bddfb",
+        "to": "98152c5655f7b8514cf3d975e41b73fcd1abd0f1",
+        "rebased_commit": "53a3f40891f5e965a95401b81d868eb1d19fe7ac",
+        "new_patch_number": 23,
+        "diff_sha256": "9b5f12921bf31cf6200643e8219f16498f507b31b5a85ed3e5e6d8e9f4e1a145",
+        "source_diff_exact": true
+      }
+    ],
+    "manual_resolution": "cuda_state.zig Caches.initWith: keep PR214 .shard=sh and merged display.zeroRanges per-registration zeroing"
+  },
+  "previous_local_revision": {
+    "recipe_commit": "2c4a30211eebd2e08e92195cc587b5928ec89128",
+    "native_commit": "c384d86529180f808689afa8d9ba5ac5a9632641",
+    "patch_sha256": "7556330d9f5cb104e0520a2b9c0a5b54caa286566de9488419a073cd1a5b152e"
+  },
+  "hardware_qualification": {
+    "date_utc": "2026-10-25",
+    "scope": "Bounded correctness checks; no deployment acceptance. Separate descriptive timing receipt linked in transport_performance.",
+    "native_commit": "a6645bea11fd9a837116c7aafefaa86af2628d9b",
+    "engine_sha256": "230dd3bd1e4135bcc2c30534e264c9ee86477532f2bcfbd65d96c5e186a9762c",
+    "report": "docs/tp4-registered-relay-20261025/qualification.json",
+    "report_sha256": "1a351a4573e61af18bde99b578fce55941750bffd4e6e34b7b1410d27b94f35a",
+    "nccl_and_registered_probes": "PASS; 64 changing-payload graph replays per rank in each mode",
+    "nccl_and_registered_model_checks": "PASS; 31 settled requests each; 12 cross-mode exact-token comparisons identical",
+    "final_state": "At the earlier qualification release receipt: all 16 qualification containers stopped/preserved, GPUs idle, eight locks released and gateways maintenance. Fresh benchmark cleanup is recorded separately."
+  },
+  "transport_performance": {
+    "date_utc": "2026-10-25",
+    "report": "docs/tp4-registered-relay-20261025/performance.json",
+    "report_sha256": "c544b2757e57232370465e2326a78df199204bfe2898dfd5f19a54f2587ed685",
+    "method": "Sequential NCCL then registered RDMA; three measured waves per cell; four completed model lifetimes.",
+    "requests_valid": 312,
+    "measured_requests_per_mode": 117,
+    "complete_cells": 9,
+    "rdma_throughput_change_pct_range": [
+      1.96,
+      16.95
+    ],
+    "limit": "Descriptive synthetic 400-token output samples; time/order confounded; no significance or quality claim.",
+    "release_completed_at": "2026-10-25T18:31:35.153526+00:00"
+  }
+}

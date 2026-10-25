@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "kind": "compact-a664-ring-qualification",
+  "date_utc": "2026-10-25",
+  "source": {
+    "recipe_checkout_commit": "23ac71b7398aedf03dfdc8436da5f37494f29679",
+    "native_commit": "a6645bea11fd9a837116c7aafefaa86af2628d9b",
+    "native_tree": "9015cc1063113a18c3459436ae76272e32b71917",
+    "optional_patch_sha256": "e1b5440713c403fcaec07cee56c00698805661ab11bc0365aa8bb923dbe7fe61",
+    "canonical_image_hash": "b6a5129c7078158c2f40d54bb291cee33f59645e913550f12730ec3776351413",
+    "source_files_verified": 2922,
+    "source_inventory_sha256": "3921e252807759123261e658433b0b667e2a46c8f83b16e7702db51e26c51a3f"
+  },
+  "full_evidence": {
+    "local_git_commit": "70407067440f6ec1c0384577dbc1bf1bfd96662d",
+    "path": "docs/tp4-registered-relay-20261025",
+    "qualification_sha256": "5a7201e8e288025bbeadac60a01fc6ac4dee7c165b6cc1926840d4cd304bcfdc",
+    "lifecycle_repository": "Spark",
+    "lifecycle_commit": "c83957e34618ea2c45399dc4c57de87350c155bb",
+    "lifecycle_path": "docs/experiments/glm-pr204-ring-20261025",
+    "published": false
+  },
+  "binaries": {
+    "cli": "6585dbed75a321128c534817f1a4453e5221b056c205665478e41333669f0017",
+    "engine": "230dd3bd1e4135bcc2c30534e264c9ee86477532f2bcfbd65d96c5e186a9762c",
+    "probe": "ee8a9deb4f6bc1f770afa658ef88defdad6d3ff0cff75d72dcf88ff42aaa9f4d"
+  },
+  "build": {
+    "nvcc": "13.0.88",
+    "sm": 121,
+    "fatbins": 57,
+    "canonical_entries_preserved": 610,
+    "canonical_build_stage_final_engine_equal": true,
+    "canonical_manifest_sha256": "6093f988c33e2c2db53af25c414c9239288e1aeff826abae8bf30b42ea609fbb",
+    "canonical_preservation_sha256": "9e76ccaf152cccd0b0359b757810fd0a67e83215b773f010256989c3f0d8232e"
+  },
+  "images": {
+    "source_index": "sha256:746eeb148586569db4a68b5a81266c3bc47c2e76fd05fd7b05d03bbcac506bb2",
+    "portable_config": "sha256:5f9e1270233cb75e31029f708b270022d9d79331b7253ed3a4d9033adfb652e6",
+    "fingerprint": "2d3f3ee9835cfb81de5b6cbcae5ca4de1e72ecc95c209e827050c04a1b36fa95",
+    "archive_sha256": "0bcc9ec4b7d832dd8253a2727307e080c8442f4306584ef5bd22f2bca4d12039",
+    "host_ids": {
+      "msi-b9dc": "sha256:746eeb148586569db4a68b5a81266c3bc47c2e76fd05fd7b05d03bbcac506bb2",
+      "msi-c21f": "sha256:746eeb148586569db4a68b5a81266c3bc47c2e76fd05fd7b05d03bbcac506bb2",
+      "spark": "sha256:5f9e1270233cb75e31029f708b270022d9d79331b7253ed3a4d9033adfb652e6",
+      "spark-peer": "sha256:5f9e1270233cb75e31029f708b270022d9d79331b7253ed3a4d9033adfb652e6"
+    }
+  },
+  "profile": {
+    "model": "Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold",
+    "model_commit": "078455ffe6472f9a52fbc1139f58b9db2881b25c",
+    "draft": "incoai/GLM-5.3-Flash-DFlash2",
+    "draft_commit": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+    "backend": "native Zig CUDA",
+    "context": 131072,
+    "parallel": 8,
+    "max_tokens": 32768,
+    "prompt_cache_gib": 3,
+    "ring": [
+      "spark",
+      "spark-peer",
+      "msi-b9dc",
+      "msi-c21f"
+    ],
+    "gid": 3,
+    "cutoff_bytes": 524288,
+    "l2pf": 1,
+    "side": 1,
+    "nccl_sha256": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e"
+  },
+  "correctness": {
+    "all_four_ranks_each_mode": true,
+    "probe_replays_per_rank": 64,
+    "nccl_replay_delta": [
+      0,
+      0
+    ],
+    "registered_replay_delta": [
+      128,
+      256
+    ],
+    "counter_units": [
+      "roce_gpu_operations",
+      "relay_stripes"
+    ],
+    "enqueue_counts_unchanged": true,
+    "requests_per_mode": 31,
+    "exact_comparisons_per_mode": 12,
+    "cross_mode_request_and_token_hashes_identical": 12,
+    "both_key_discovery_text_stream_forced_required_auto_tools": "PASS",
+    "eight_client_gateway_each_mode": "8/8 HTTP200; hermes key",
+    "routes": {
+      "supplemental": "http://127.0.0.1:40053 (head administrative loopback)",
+      "tools_and_eight_clients": "authenticated head loopback /v1",
+      "public": "maintenance"
+    },
+    "source_receipt_sha256": {
+      "actual-build-receipt.json": "229a85401f27f49320b2d3bd0c206857696cb20ec8863ef87dfcd29b7e09f6e3",
+      "evidence-nccl-probe/summary.json": "c224d80cada7e79b1644c9c6551a99882ce726c78726e8556bfdd0fd0d882254",
+      "evidence-rdma-probe/summary.json": "95e6accf3021703776b9e7703204c5ac5839f8c1576450a1238489953a33eae5",
+      "smoke-results-nccl-model/accept-nccl-model/report.json": "dacd6a65af30aaf89948ad7be0a38dd5337a22d53a4bfd6269bd617ff276b65e",
+      "smoke-results-rdma-model/accept-rdma-model/report.json": "4bfebacbb97728ac7816cd161fbdd826d07ae70598e0d6984e8a9a17427305aa",
+      "matched-nccl-rdma.json": "56b74c532b8c267b867acddc9d31fc95aa7f338fb699383a2d473a1415620aa8"
+    }
+  },
+  "scope_limits": [
+    "Correctness smoke evidence; the needle prompt was approximately 4K tokens, without full-window quality qualification.",
+    "Eight overlapping clients do not prove eight simultaneous backend decodes.",
+    "SSE closure does not independently verify backend retirement.",
+    "Physical cabling was not independently attested; switched hardware, reboot and long-duration reliability remain unqualified.",
+    "Historical be94 results remain separate. Fresh performance is recorded separately in performance.json.",
+    "The earlier a2 run monitored the launcher parent under the caffeinate label. Sleep-inhibitor PID liveness was not independently verified there; the fresh benchmark corrects that runtime pin and observes the power assertion."
+  ]
+}

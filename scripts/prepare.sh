@@ -17,7 +17,7 @@
 # the captured kernel set zig/aot; docs/zig-engine.md), and step 5 reads the checkpoint with tensorfold-native.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."     # the repository root
-source ./scripts/config.sh
+source ./scripts/config.sh --validate-tp4-network
 source ./scripts/nodes.sh
 
 REBUILD=0
@@ -177,12 +177,13 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   for img in "$ZIG_BUILD_IMAGE" "$ZIG_RUN_IMAGE"; do
     docker image inspect "$img" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $img"; docker pull "$img" >/dev/null; }
   done
-  log "Building $IMAGE (TensorFold ${ZIG_TF_REF:0:12} with Zig $ZIG_VERSION, hash $PATCHES_HASH: $(compgen -G 'zig/patches/*.patch' | wc -l) patches, kernel set ${aot_sha:0:12}; the first build compiles the engine, ~10 min)"
+  log "Building $IMAGE (TensorFold ${ZIG_TF_REF:0:12} with Zig $ZIG_VERSION, hash $PATCHES_HASH: $(zig_patch_files | wc -l) patches, kernel set ${aot_sha:0:12}; the first build compiles the engine, ~10 min)"
   # the build context: zig/Dockerfile, zig/patches and zig/aot only (never the rest of the repository), in a fresh private directory
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/zig/aot"
-  cp -r zig/patches "$ctx/zig/patches"; cp zig/aot/glm-aot-sm121.tar.xz "$ctx/zig/aot/"; cp zig/Dockerfile "$ctx/Dockerfile"
+  zig_stage_patches "$ctx/zig/patches"
+  cp zig/aot/glm-aot-sm121.tar.xz "$ctx/zig/aot/"; cp zig/Dockerfile "$ctx/Dockerfile"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" \
     --build-arg BUILD_IMAGE="$ZIG_BUILD_IMAGE" --build-arg RUN_IMAGE="$ZIG_RUN_IMAGE" \
