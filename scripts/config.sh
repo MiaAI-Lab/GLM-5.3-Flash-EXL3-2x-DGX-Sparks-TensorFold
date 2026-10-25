@@ -346,6 +346,12 @@ _extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; 
   if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
+# Idle trim (patch 0130): after this many seconds without a stream, each rank gives back the memory it only caches (torch's
+# unused CUDA blocks, Python garbage, the C heap's free pages), once per idle spell. A long prompt's prefill scratch stays
+# cached after its request ends, and on the Spark's one memory pool MemAvailable then stays low until a restart (issues
+# #143, #168, #197). The KV pool, kept prompts and weights are untouched; the next request can pay the CUDA allocations
+# the trim freed. 0 (default): off; 120 suits agents that pause between turns. Each trim logs how much it freed.
+export TF_GLM_IDLE_TRIM_S="${TF_GLM_IDLE_TRIM_S:-0}"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
 # (at 27: 10.6 GiB lowest on rank 0, pool 5,257,216 tokens; at 32: 5,959,680).

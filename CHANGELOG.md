@@ -5,6 +5,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Idle trim** (patch `0130-glm-idle-trim`, `TF_GLM_IDLE_TRIM_S=<seconds>`, off by default): reports of `MemAvailable`
+  that stays low after the agents disconnect (#143, #168, #197) and of CUDA memory reserved far above what is in use
+  point at what a long prompt's prefill scratch leaves in torch's cache: free to reuse, but on the Spark's one memory
+  pool not to anything else. A rank that has had no stream for that many seconds now runs `gc.collect()`,
+  `torch.cuda.empty_cache()` and `malloc_trim(0)`, once per idle spell, each rank on its own timer (no new message
+  between the ranks). The KV pool, kept prompts and weights are not touched (`empty_cache` frees only blocks no tensor
+  uses), so replies and cache hits are the same; the next request can pay the CUDA allocations the trim freed. Each
+  trim logs what it freed; `/health` has `idle_trim`. Checked on a GB10 with `tools/idle_trim_check.py`: no trim while
+  busy, one per idle spell, an 8 GiB cache back to the system (`MemAvailable` +8.1 GiB), a held tensor untouched. Not yet
+  run end to end on two Sparks with a model loaded, and not a fix for growth that is not cache (a leak would show as
+  `reserved` staying equal to `allocated` after a trim). The guard that pauses requests when memory runs low stays outside
+  the recipe.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
