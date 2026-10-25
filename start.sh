@@ -23,10 +23,10 @@
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and measured effects in scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, DRAFT_POLICY, COPY, COPY_MAX, COPY_CODE, SPLIT, KDA_CHUNKED,
 #            SHARED_PREFIX, MULTI_PREFILL, STREAM_SMOOTH, STREAM_SMOOTH_MS, FILL_BUDGET_MS, FILL_DRAFTS, KV_POOL_GIB,
-#            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS, COMM, SERVED_NAME, HOST,
-#            PORT
+#            MEMORY_RESERVE_GIB, PROMPT_CACHE_GIB (zig), ZIG_CONTEXT_1M (zig), MAX_TOKENS, THINKING, VISION, VISION_URLS,
+#            COMM, SERVED_NAME, HOST, PORT
 #   ported   SPILL_GIB, SPILL_DIR, SPILL_MIN_TOKENS, SPILL_MIN_FREE_GIB, SPILL_HIGHWATER, SPILL_FLUSH_S, SPILL_V2,
-#            SPILL_QUOTA, SPILL_TURNS, KV_SHARD (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
+#            SPILL_QUOTA, SPILL_TURNS, KV_SHARD, FILL (scripts/port.sh: Robert's GLM features, all off by default; ZIG_HAS)
 #   nodes    WORKER, FABRIC_PEER, WORKER_HF_CACHE, MASTER_PORT, NCCL_RAILS (1: one RoCE device), NCCL_CHANNELS,
 #            NCCL_DEBUG; TP (2), WORKER2, FABRIC_PEER2, WORKER_HF_CACHE2, MASTER_ADDR, SOCKET_IFNAME (3 Sparks),
 #            WORKER3, FABRIC_PEER3, WORKER_HF_CACHE3 (4 Sparks), NCCL_ALGO (on a ring of 4: Ring)
@@ -118,8 +118,11 @@ if [[ "$ENGINE" == zig ]]; then
   # the parked pages, zig/patches' parked-pages patch; the memory check below counts them only then), spill2 (spill v2,
   # 0018/0019/0021), kvshard (KV sharding, 0020/0022) and spillshard (the two together, 0023). ZIG_HAS can still drop
   # one for a narrower image (zig/patches without it): port_validate (scripts/port.sh, below) then refuses SPILL_V2=1 or
-  # KV_SHARD=1, and the memory check reads MemAvailable alone.
-  ZIG_HAS="${ZIG_HAS:-mtp displaykv parked spill2 kvshard spillshard}"
+  # KV_SHARD=1, and the memory check reads MemAvailable alone. Round 4 (zig/patches/0024-0029): mtpcache (kept prompt
+  # states with MTP drafts, 0025; without it port_validate warns that PROMPT_CACHE_GIB keeps nothing with DRAFTER=mtp),
+  # fill (FILL=1's sliced prompt fills, 0026; without it FILL=1 is refused) and pictures (prompts with pictures kept,
+  # resumed and spilled, 0027-0028; without it VISION=1 with a prompt cache warns that they are not kept).
+  ZIG_HAS="${ZIG_HAS:-mtp displaykv parked spill2 kvshard spillshard mtpcache fill pictures prefixwait}"
   [[ "$DRAFTER" == dflash2 || " $ZIG_HAS " == *" mtp "* ]] || zig_unsupported "DRAFTER=$DRAFTER (set ZIG_HAS=mtp)"
   [[ "$KV" == fp8 ]]                     || zig_unsupported "KV=$KV (its KV cache is the FP8 one)"
   [[ "$DENSE" == q4 ]]                   || zig_unsupported "DENSE=$DENSE (its dense weights are the 4-bit ones)"
@@ -141,8 +144,6 @@ if [[ "$ENGINE" == zig ]]; then
     [[ "$COMM" == nccl ]] || die "ENGINE=zig at TP=4 needs COMM=nccl (the RoCE ring relay, TF_ROCE_RING, is not ported)"
     warn "ENGINE=zig: TP=4 is experimental (a ring of four, unsplit prefill, COMM=nccl)"
   fi
-  [[ "$CONTEXT" == 131072 && "$PARALLEL" == 8 ]] ||
-    warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
   # The Zig image has no Python tower helper. VISION=1 loads the native tower, which dlopens cuDNN.
   [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision --vision-backend zig)
   [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
@@ -170,6 +171,8 @@ arg_value() {
 # Robert's GLM features (scripts/port.sh: the spill tier, spill v2, KV sharding): their settings checked with the
 # effective --parallel and --prompt-cache-gib (the command line's win), before anything is stopped
 port_validate "$(arg_value --parallel)" "$(arg_value --prompt-cache-gib)"
+# ENGINE=zig: TF_TP_TIMEOUT_S past 262,144 tokens, and what the kernel set is known to cover at this window (port.sh)
+port_long_context "$(arg_value --context)" "$(arg_value --parallel)"
 # Where to reach the server from this machine: a wildcard bind answers on loopback.
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
@@ -223,7 +226,7 @@ if (( ! DRY )) && [[ "$MODE" == start ]] && all_running; then
   # the ported features' settings are every rank's at start: a server running with others is not this configuration
   for i in 0 $(worker_ids); do
     [[ "$(port_live "$i")" == "$(port_identity)" ]] ||
-      die "$CONTAINER_NAME is running on $SPARKS with other spill / KV-shard settings (rank $i: $(port_live "$i"); asked: $(port_identity)): run ./start.sh restart to apply them"
+      die "$CONTAINER_NAME is running on $SPARKS with other spill / KV-shard / fill settings (rank $i: $(port_live "$i"); asked: $(port_identity)): run ./start.sh restart to apply them"
   done
   log "$CONTAINER_NAME is already running on $SPARKS (model: $(served_name || echo "not answering yet"), port $PORT): nothing to do."
   log "Use ./start.sh restart to restart it (e.g. with new settings), or ./stop.sh to stop it."
@@ -621,9 +624,9 @@ fi
 # the spill tier opened on every rank (scripts/port.sh): each rank's prompt cache budget is its own, and can come out 0.
 # After the smoke test, which every rank followed, so each has set up its prompt cache (rank 0 may answer before)
 if port_spill_on; then
-  PORT_LOGS=("$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open' || true)")
+  PORT_LOGS=("$(docker logs "$CONTAINER_NAME" 2>&1 | grep -E "$PORT_TIER_LOG_RE" || true)")
   for i in $(worker_ids); do
-    PORT_LOGS+=("$(worker "$i" "docker logs '$CONTAINER_NAME' 2>&1 | grep -E 'prompt cache:|spill tier: |spill: cannot open'; true" 2>/dev/null || echo '(unread)')")
+    PORT_LOGS+=("$(worker "$i" "docker logs '$CONTAINER_NAME' 2>&1 | grep -E $(printf %q "$PORT_TIER_LOG_RE"); true" 2>/dev/null || echo '(unread)')")
   done
   port_check_started "${PORT_LOGS[@]}"
 fi

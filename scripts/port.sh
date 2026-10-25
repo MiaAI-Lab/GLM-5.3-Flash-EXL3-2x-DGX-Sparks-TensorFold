@@ -7,8 +7,10 @@
 # on by changing those values (and PORT_SPILL_QUOTA_DEFAULT); a default that cannot run here is turned off with a
 # warning, while the same setting given explicitly refuses.
 # The Zig engine serves the v2 tier and KV sharding from zig/patches/0017-0023 (the port's engine series); ZIG_HAS
-# (start.sh, whose default lists them) names them: spill2, kvshard, and spillshard for the two together. An image
-# without them (a narrower ZIG_HAS) refuses an explicit setting and names the missing patch. ENGINE=python (patches/)
+# (start.sh, whose default lists them) names them: spill2, kvshard, and spillshard for the two together. Round 4's
+# patches 0024-0029 add mtpcache (kept prompt states with MTP drafts, 0025), fill (sliced prompt fills, FILL, 0026) and
+# pictures (prompts with pictures kept, resumed and spilled, 0027-0028). An image without them (a narrower ZIG_HAS)
+# refuses an explicit setting and names the missing patch. ENGINE=python (patches/)
 # has the v1 tier (0088) only. Likewise the start memory check counts the parked pages only where the engine does
 # (scripts/memavail.sh's parked_counted: ZIG_HAS parked, zig/patches/0014-zig-parked-pages; or patches/'s 0119).
 # Kept to bash 3.2 syntax (with scripts/memavail.sh) so that scripts/port_test.sh runs on a Mac too. scripts/config.sh
@@ -17,7 +19,8 @@
 # ---------------------------------------------------------------- the settings
 # Spill tier: kept prompt states written to each Spark's local disk and read back instead of a new prefill, also after
 # a clean restart (README: Spill tier). ENGINE=zig spills the prompt cache's kept states, so it needs PROMPT_CACHE_GIB
-# above 0 (scripts/config.sh) and DFlash2 drafts (MTP drafts turn the Zig prompt cache off).
+# above 0 (scripts/config.sh) and DFlash2 drafts (with MTP drafts the kept states also hold the MTP head's state, which
+# no spill tier stores yet: they stay in memory, ZIG_HAS mtpcache).
 #   SPILL_GIB          the cap a Spark (GiB; 0: off, the default)
 #   SPILL_DIR          the same absolute path on every Spark, mounted at /spill: a folder you can write, on a local disk,
 #                      outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves HF_CACHE to the workers);
@@ -42,15 +45,30 @@
 #                      passed as set (unset: the engine's defaults)
 # KV sharding (0118): each conversation's latent cache stored once, on the Spark that owns it, instead of on both
 # (~1.9x the pool's tokens in the same memory on the Python engine; 1.83x measured on the Zig engine: 1,511,424 tokens
-# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts,
-# TF_GLM_MULTI_LONE=0; ENGINE=zig with ZIG_HAS kvshard (with the spill tier: v2 and ZIG_HAS spillshard).
+# against 825,344 at KV_POOL_GIB=4). Two Sparks, PARALLEL above 1, DFlash2 drafts; ENGINE=zig with ZIG_HAS kvshard
+# (with the spill tier: v2 and ZIG_HAS spillshard). TF_GLM_MULTI_LONE=1 only warns: it does nothing on the Zig engine.
 #   KV_SHARD=1               (TF_GLM_KV_SHARD) on; 0 (the default) off. A fork's default of 1 applies only where the
 #                            Python fork turned it on (TP=2, PARALLEL above 1, TF_GLM_MULTI_LONE=0), silently off elsewhere
 #   TF_GLM_KV_SHARD_CARRY    1 (default): a kept conversation whose part is full is carried into the other part; 0: not
 #   TF_GLM_KV_SHARD_TWINS    1 (default): a prompt that runs from 0 borrows the other part's free rows; 0: it fetches
 #   TF_GLM_KV_SHARD_CHECK    decode rounds between the ranks' placement digest checks (unset: the engine's default)
-# PREFIX_WAIT / TF_GLM_PREFIX_WAIT (the Python fork's 0110): not ported, and not needed: the Zig engine admits and fills
-# one prompt at a time, so no request ever prefills a prefix another one is still filling. Set, it warns and does nothing.
+# Sliced prompt fills (zig/patches/0026): FILL=1 (TF_GLM_FILL on every rank) fills a prompt a 2048-row chunk a step
+# between decode rounds, so a long prompt no longer stalls the other streams for its whole pass; 0 (the default): whole
+# passes, as before. ENGINE=zig with ZIG_HAS fill; refused with DRAFTER=mtp (one MTP head serves every stream).
+# scripts/config.sh sets its default; the line below is for the tests, which source this file alone.
+FILL="${FILL:-${TF_GLM_FILL:-0}}"
+# The prefix wait (the Python fork's 0110, on the Zig engine's lane host from glm/prefix-wait; see below for the patch):
+# with FILL=1, requests that arrive together on one system prompt all start filling at once, and each computed it (g6,
+# prefix_fanout: 31,488 / 85,440 / 199,360 duplicate tokens at 2 / 4 / 8 at once on a 28k-token prompt). With the wait a
+# request whose prompt shares a cut another prompt is still filling waits for that prompt to keep it, holding no lane,
+# then resumes from it: the prefix is computed once. Whole passes (FILL=0) never need it: each ends before the next
+# request is admitted, which finds its cut kept.
+#   PREFIX_WAIT=1           (TF_GLM_PREFIX_WAIT) on, the default; 0 off. Passed only with FILL=1, and it needs the prompt
+#                           cache (PROMPT_CACHE_GIB above 0: the cut is a kept prompt state)
+#   TF_GLM_PREFIX_WAIT_MS   the wait's bound in ms (unset: the engine's 60000; 0 off), passed as set with FILL=1
+# An image whose engine predates the wait ignores both (it reads neither): FILL=1 then runs as before.
+PORT_PW_EXPLICIT=0; [[ -z "${PREFIX_WAIT:-}${TF_GLM_PREFIX_WAIT:-}" ]] || PORT_PW_EXPLICIT=1
+PREFIX_WAIT="${PREFIX_WAIT:-${TF_GLM_PREFIX_WAIT:-1}}"
 PORT_SPILL_DEFAULT_GIB=0   # SPILL_GIB when it is not set (0: off). Robert's fork: 64
 PORT_SPILL_V2_DEFAULT=0    # SPILL_V2 when it is not set (0: v1). Robert's fork: 1
 PORT_SHARD_DEFAULT=0       # KV_SHARD when it is not set, where it can run (0: off). Robert's fork: 1
@@ -86,7 +104,8 @@ port_num()  { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
 port_gt0()  { awk -v x="$1" 'BEGIN {exit !(x + 0 > 0)}'; }
 port_spill_on() { port_num "$SPILL_GIB" && port_gt0 "$SPILL_GIB"; }
 port_v2_on() { port_spill_on && [[ "$SPILL_V2" == 1 ]]; }
-# port_has <feature>: the Zig engine in this image serves it (ZIG_HAS, start.sh: spill2, kvshard, spillshard, parked)
+# port_has <feature>: the Zig engine in this image serves it (ZIG_HAS, start.sh: spill2, kvshard, spillshard, parked,
+# mtpcache, fill, pictures)
 port_has() { [[ "$ENGINE" == zig && " ${ZIG_HAS:-} " == *" $1 "* ]]; }
 # port_missing <feature>: what is missing for it, for a refusal or a warning
 port_missing() {
@@ -95,9 +114,11 @@ port_missing() {
     spill2)     what="the spill v2 port (Robert's GLM patches 0110/0111)" ;;
     kvshard)    what="the KV-shard port (Robert's GLM patch 0118)" ;;
     spillshard) what="the port of spill v2 and KV sharding together" ;;
+    fill)       what="the sliced prompt fills (zig/patches/0026)" ;;
+    pictures)   what="the kept prompts with pictures (zig/patches/0027-0028)" ;;
   esac
   if [[ "$ENGINE" == zig ]]; then
-    echo "this image's tensorfold-native lacks $what: ZIG_HAS does not name it (zig/patches/0018-0023 bring spill2, kvshard and spillshard, which start.sh's default ZIG_HAS lists; now: ${ZIG_HAS:-empty})"
+    echo "this image's tensorfold-native lacks $what: ZIG_HAS does not name it (zig/patches/0017-0030 bring spill2, kvshard, spillshard, mtpcache, fill, pictures and prefixwait, which start.sh's default ZIG_HAS lists; now: ${ZIG_HAS:-empty})"
   else
     echo "the Python engine's patches/ lack $what (Robert's fork, wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, has them for ENGINE=python)"
   fi
@@ -136,15 +157,28 @@ port_shard_default_off() {
 PORT_SPILL_WHY=""
 port_spill_refuse() { (( PORT_SPILL_EXPLICIT )) || { PORT_SPILL_WHY=$1; return 1; }; die "$1"; }
 
-# port_pool_check <prompt cache GiB>: ENGINE=zig with DFlash2 (MTP drafts turn the prompt cache off), PROMPT_CACHE_GIB or
+# port_pool_check <prompt cache GiB>: ENGINE=zig with DFlash2 (or MTP drafts, kept where ZIG_HAS names mtpcache), PROMPT_CACHE_GIB or
 # --prompt-cache-gib above 0 while KV_POOL_GIB was not set. The engine sizes the KV pool first and gives the kept prompt
 # states only what is left above MEMORY_RESERVE_GIB: at the default pool that is nothing (the pair, TP=2 at 12.5:
 # "prompt cache: off (budget 0)"), so no state would be kept. Warns; the pool stays as it is. The pair's sizing:
 # KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8, a 6.2 GiB budget (g1b), 5.1 GiB with spill v2 on (g2: its 1,066 MiB of pinned
 # staging is taken before the pool).
 port_pool_check() {
-  [[ "$ENGINE" == zig && "$DRAFTER" == dflash2 ]] && port_gt0 "$1" && (( ! PORT_POOL_EXPLICIT )) || return 0
+  [[ "$ENGINE" == zig ]] && { [[ "$DRAFTER" == dflash2 ]] || port_has mtpcache; } && port_gt0 "$1" && (( ! PORT_POOL_EXPLICIT )) || return 0
   warn "PROMPT_CACHE_GIB=$1 with KV_POOL_GIB at its default ($KV_POOL_GIB): the engine sizes the KV pool first and gives the kept prompt states only what is left above MEMORY_RESERVE_GIB, and at the default pool that left nothing on the pair (KV_POOL_GIB=12.5: \"prompt cache: off (budget 0)\"), so no prompt state would be kept. Set KV_POOL_GIB lower with it; the pair ran KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on (its 1,066 MiB of pinned staging is taken before the pool)"
+}
+
+# port_vision_check <prompt cache GiB>: ENGINE=zig with VISION=1 (the default at TP=2) and PROMPT_CACHE_GIB or
+# --prompt-cache-gib above 0. Rank 0's vision tower (~1.05 GiB of bf16 weights, and its workspace for the largest pass,
+# ~0.4 GiB, which the engine takes at start) is loaded before the pool and the kept-state budget are sized, so the
+# budget for kept prompt states on rank 0 is ~1.4 GiB smaller than with VISION=0 (estimated from the tower's sizes,
+# not measured on the pair). Warns; nothing changes.
+# An image whose ZIG_HAS does not name pictures keeps no prompt with pictures (only text prompts): said too.
+port_vision_check() {
+  [[ "$ENGINE" == zig && "${VISION:-0}" == 1 ]] && port_gt0 "$1" || return 0
+  warn "VISION=1 with PROMPT_CACHE_GIB=$1: rank 0's vision tower (~1.05 GiB of weights and ~0.4 GiB of workspace, taken at start) comes out of the memory the kept prompt states are given, so their budget on rank 0 is ~1.4 GiB smaller (estimated); VISION=0 keeps it for text"
+  port_has pictures ||
+    warn "VISION=1 with PROMPT_CACHE_GIB=$1: $(port_missing pictures), so a prompt with pictures is never kept or resumed (text prompts are)"
 }
 
 # ---------------------------------------------------------------- checks (no ssh, nothing changed)
@@ -154,15 +188,15 @@ port_pool_check() {
 port_validate() {
   local par=${1:-$PARALLEL} cache=${2:-${PROMPT_CACHE_GIB:-0}} x why
   # the switches' aliases: the recipe's name wins
-  for x in "KV_SHARD TF_GLM_KV_SHARD" "SPILL_V2 TF_GLM_SPILL_V2" "SPILL_QUOTA TF_GLM_SPILL_QUOTA" "SPILL_TURNS TF_GLM_SPILL_TURNS"; do
+  for x in "KV_SHARD TF_GLM_KV_SHARD" "FILL TF_GLM_FILL" "PREFIX_WAIT TF_GLM_PREFIX_WAIT" "SPILL_V2 TF_GLM_SPILL_V2" "SPILL_QUOTA TF_GLM_SPILL_QUOTA" "SPILL_TURNS TF_GLM_SPILL_TURNS"; do
     set -- $x
     [[ -z "${!1:-}" || -z "${!2:-}" || "${!1}" == "${!2}" ]] || warn "$2=${!2} is overridden by $1=${!1} (the recipe's name wins)"
   done
-  for x in PREFIX_WAIT TF_GLM_PREFIX_WAIT; do
-    [[ -z "${!x:-}" || "${!x}" == 0 ]] ||
-      warn "$x=${!x} does nothing: the prefix wait (the Python fork's 0110) is not ported, and not needed by the Zig engine, which admits and fills one prompt at a time"
-  done
   [[ "$KV_SHARD" =~ ^[01]$ ]] || die "KV_SHARD (TF_GLM_KV_SHARD) is 0 or 1, not $KV_SHARD"
+  [[ "$FILL" =~ ^[01]$ ]] || die "FILL (TF_GLM_FILL) is 0 or 1, not $FILL"
+  [[ "$PREFIX_WAIT" =~ ^[01]$ ]] || die "PREFIX_WAIT (TF_GLM_PREFIX_WAIT) is 0 or 1, not $PREFIX_WAIT"
+  [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" || "$TF_GLM_PREFIX_WAIT_MS" =~ ^[0-9]{1,9}$ ]] ||
+    die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds (0: no wait), not $TF_GLM_PREFIX_WAIT_MS"
   [[ "$SPILL_V2" =~ ^[01]$ ]] || die "SPILL_V2 (TF_GLM_SPILL_V2) is 0 or 1, not $SPILL_V2"
   port_num "$SPILL_GIB" || die "SPILL_GIB is a number of GiB (0: off), not $SPILL_GIB"
   [[ -z "${TF_GLM_KV_SHARD_CARRY:-}" || "$TF_GLM_KV_SHARD_CARRY" =~ ^[01]$ ]] || die "TF_GLM_KV_SHARD_CARRY is 0 or 1, not $TF_GLM_KV_SHARD_CARRY"
@@ -199,9 +233,13 @@ port_validate() {
       KV_SHARD=0
   fi
   if [[ "$ENGINE" == zig ]]; then
-    # the spill tier spills the prompt cache's kept states: with none kept it never opens (a silent no-op before)
+    # MTP drafts: kept prompt states hold the MTP head's state too, where the image has that port (else the engine
+    # turns its prompt cache off with them); no spill tier stores it yet, so their states stay in memory
+    if [[ "$DRAFTER" != dflash2 ]] && port_gt0 "$cache" && ! port_has mtpcache; then
+      warn "PROMPT_CACHE_GIB=$cache with DRAFTER=$DRAFTER: this image's engine keeps no prompt state with MTP drafts (ZIG_HAS does not name mtpcache, the port that keeps the MTP head's state with them; now: ${ZIG_HAS:-empty}), so its prompt cache is off. Set DRAFTER=dflash2 to keep prompt states"
+    fi
     if port_spill_on && [[ "$DRAFTER" != dflash2 ]]; then
-      port_spill_refuse "SPILL_GIB=$SPILL_GIB with DRAFTER=$DRAFTER: the Zig engine keeps no prompt states with MTP drafts (its prompt cache is off), so the spill tier would write nothing. Set DRAFTER=dflash2, or SPILL_GIB=0" ||
+      port_spill_refuse "SPILL_GIB=$SPILL_GIB with DRAFTER=$DRAFTER: the Zig engine's spill tier does not store the MTP head's state yet (with MTP drafts the kept prompt states stay in memory), so it would write nothing. Set DRAFTER=dflash2, or SPILL_GIB=0" ||
         port_spill_default_off "$PORT_SPILL_WHY"
     fi
     if port_spill_on && ! port_gt0 "$cache"; then
@@ -222,9 +260,11 @@ port_validate() {
       if [[ "$TP" != 2 ]]; then why="it is written for two Sparks (TP=2), not TP=$TP"
       elif [[ ! "$par" =~ ^[0-9]{1,4}$ ]] || (( par < 2 )); then why="it needs more than one stream (PARALLEL above 1), not --parallel $par"
       elif [[ "$DRAFTER" != dflash2 ]]; then why="it does not run with DRAFTER=$DRAFTER (MTP drafts)"
-      elif [[ "${TF_GLM_MULTI_LONE:-0}" != 0 ]]; then why="it does not run with TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE"
       fi
       [[ -z "$why" ]] || die "KV_SHARD=1: $why. Set KV_SHARD=0"
+      # the Python fork refuses its lone-stream decode with sharding; the Zig engine has none, so it only warns
+      [[ "${TF_GLM_MULTI_LONE:-0}" == 0 ]] ||
+        warn "TF_GLM_MULTI_LONE=$TF_GLM_MULTI_LONE does nothing on the Zig engine (it has no lone-stream decode); KV_SHARD=1 runs as without it"
       if ! port_has kvshard; then
         (( ! PORT_SHARD_EXPLICIT )) || die "KV_SHARD=1: $(port_missing kvshard). Set KV_SHARD=0"
         port_shard_default_off "$(port_missing kvshard)"
@@ -242,8 +282,22 @@ port_validate() {
         else port_shard_default_off "the spill tier is on and $why"; fi
       fi
     fi
-    # a prompt cache the default pool leaves no room for
+    # sliced prompt fills: one MTP head serves every stream, so a fill cannot run beside another stream's drafts
+    if [[ "$FILL" == 1 ]]; then
+      [[ "$DRAFTER" == dflash2 ]] || die "FILL=1: sliced prompt fills do not run with DRAFTER=$DRAFTER (one MTP head serves every stream; the engine refuses it too). Set FILL=0"
+      port_has fill || die "FILL=1: $(port_missing fill). Set FILL=0"
+      # the prefix wait resumes a cut another prompt keeps: a kept prompt state
+      [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) || port_gt0 "$cache" ||
+        warn "PREFIX_WAIT=1 does nothing without a prompt cache (PROMPT_CACHE_GIB=$cache): the cut a request waits for is a kept prompt state"
+    else
+      # whole passes fill one prompt at a time: a request finds the cut of the one before it kept, nothing to wait for
+      [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) ||
+        warn "PREFIX_WAIT=1 does nothing without FILL=1: whole prompt passes fill one prompt at a time, so a request already finds the shared cut of the one before it kept"
+      [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" ]] || warn "TF_GLM_PREFIX_WAIT_MS=$TF_GLM_PREFIX_WAIT_MS does nothing without FILL=1"
+    fi
+    # a prompt cache the default pool leaves no room for, and the vision tower's share of what it gets
     port_pool_check "$cache"
+    port_vision_check "$cache"
   else
     # the Python engine (patches/): the v1 tier only
     if port_v2_on; then
@@ -255,6 +309,12 @@ port_validate() {
       port_shard_default_off "$(port_missing kvshard)"
     fi
     ! port_gt0 "$cache" || warn "PROMPT_CACHE_GIB=$cache does nothing with ENGINE=python, which keeps prompt states in the KV pool (KV_POOL_GIB)"
+    [[ "$PREFIX_WAIT" != 1 ]] || (( ! PORT_PW_EXPLICIT )) ||
+      warn "PREFIX_WAIT=1 does nothing with ENGINE=python (this recipe's v0.6.0 has no prefix wait; the Zig engine's needs FILL=1)"
+    if [[ "$FILL" == 1 ]]; then
+      warn "FILL=1 does nothing with ENGINE=python (the Zig engine's sliced fills); the Python engine fills beside decoding in layer slices (FILL_BUDGET_MS)"
+      FILL=0
+    fi
   fi
   # settings of a feature that is off
   [[ -z "$PORT_SHARD_SET" || "$KV_SHARD" == 1 ]] || warn "${PORT_SHARD_SET# } do nothing without KV_SHARD=1"
@@ -288,15 +348,23 @@ port_check_extra() {
 }
 
 # port_check_started <rank 0's log> [<rank 1's log>...]: with the spill tier on (ENGINE=zig), every rank must have opened
-# it (each log: its "prompt cache:", "spill tier:" and "spill: cannot open" lines; "(unread)" when it could not be read).
-# Rank 0 first needs a prompt cache, which the tier writes from: its budget is what MemAvailable leaves above the reserve
-# once the pool is up, so it can come out 0 even with PROMPT_CACHE_GIB above 0 (Mia PR #187), and no tier opens. Each
-# rank opens its tier from its own budget (cuda_native.zig cacheFor), with no agreement between the ranks: a Spark with
-# a little less memory free can come out with none while rank 0 writes and restores states it cannot follow. Warns; the
-# server runs on.
+# it (each log: its lines matching PORT_TIER_LOG_RE; "(unread)" when it could not be read). The engine's lines
+# (glm_cuda/cuda_native.zig): v1 opens with "spill tier: <dir>, up to ..." and fails with "spill: cannot open <dir>
+# (<error>); no spill tier"; v2 (SPILL_V2=1) opens with "rank N: spill v2 tier: <dir>, up to ..." and fails with "rank N:
+# spill v2's store under <dir> did not open (<error>)". The tier asked for is the one looked for: a rank that logged the
+# other version's line warns too. Rank 0 first needs a prompt cache, which the tier writes from: its budget is what
+# MemAvailable leaves above the reserve once the pool is up, so it can come out 0 even with PROMPT_CACHE_GIB above 0
+# (Mia PR #187), and no tier opens. Each rank opens its v1 tier from its own budget (cuda_native.zig cacheFor), with no
+# agreement between the ranks: a Spark with a little less memory free can come out with none while rank 0 writes and
+# restores states it cannot follow (v2 agrees one budget and fails the start on every rank when a store does not open,
+# so there a missing line means a log that did not get that far). Warns; the server runs on.
+PORT_TIER_LOG_RE="prompt cache:|spill tier: |spill v2 tier: |spill: cannot open|spill v2's store under .* did not open"
 port_check_started() {
   [[ "$ENGINE" == zig ]] && port_spill_on || return 0
-  local line l r=0
+  local line l r=0 want='spill tier: ' other='spill v2 tier: ' failed='spill: cannot open.*' v=v1 ov=v2 name='spill tier'
+  if [[ "$SPILL_V2" == 1 ]]; then
+    want='spill v2 tier: ' other='spill tier: ' failed="spill v2's store under .* did not open.*" v=v2 ov=v1 name='spill v2 tier'
+  fi
   line=$(grep -m1 -o 'prompt cache: off[^"]*' <<<"$1" || true)
   if [[ -n "$line" ]]; then
     warn "the spill tier is not open: rank 0 logged \"$line\", and the tier writes only kept prompt states. Lower KV_POOL_GIB (the pool takes that memory first) or MEMORY_RESERVE_GIB, then ./start.sh restart"
@@ -304,10 +372,13 @@ port_check_started() {
   fi
   for l in "$@"; do
     if [[ "$l" == '(unread)' ]]; then warn "could not read rank $r's log: whether its spill tier opened is not checked"
-    elif ! grep -q 'spill tier: ' <<<"$l"; then
-      line=$(grep -m1 -o 'spill: cannot open.*' <<<"$l" || true)
-      if (( r == 0 )); then warn "rank 0 opened no spill tier${line:+ (it logged \"$line\")}: no kept state is written to disk"
-      else warn "rank $r opened no spill tier${line:+ (it logged \"$line\")}: rank 0 writes and restores kept states that rank $r cannot follow (a restore from disk fails there). Each rank's prompt cache budget is its own: free memory on that Spark (or lower KV_POOL_GIB), then ./start.sh restart"; fi
+    elif grep -q -- "$want" <<<"$l"; then :
+    elif grep -q -- "$other" <<<"$l"; then
+      warn "rank $r opened the $ov spill tier, not $v (SPILL_V2=$SPILL_V2): this image's engine did not take the setting; ./start.sh stop, then check ZIG_HAS and the image"
+    else
+      line=$(grep -m1 -o -- "$failed" <<<"$l" || true)
+      if (( r == 0 )); then warn "rank 0 opened no $name${line:+ (it logged \"$line\")}: no kept state is written to disk"
+      else warn "rank $r opened no $name${line:+ (it logged \"$line\")}: rank 0 writes and restores kept states that rank $r cannot follow (a restore from disk fails there). Each rank's prompt cache budget is its own: free memory on that Spark (or lower KV_POOL_GIB), then ./start.sh restart"; fi
     fi
     r=$((r + 1))
   done
@@ -320,14 +391,16 @@ port_check_started() {
 #                   `tensorfold-native capabilities --json` by scripts/zig_flags.py before anything stops)
 #   PORT_ENV        NAME=value pairs every rank gets, identical (docker -e)
 #   PORT_MAPPED_RE  the variable names port_map owns: an exported variable of these names is not passed a second time.
-#                   The two switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2) always: a switch reaches the ranks only on,
+#                   The three switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2, TF_GLM_FILL) always: a switch reaches the ranks only on,
 #                   and only through here, so a hand-exported one can never turn a feature on past the checks
 # Engine names (the settings contract, sparks/deployments/2026-10-22-glm-zig-port/PORT-STATUS.md): the v1 flags
 # --spill-gib, --snapshot-dir, --spill-highwater, --spill-min-tokens, --spill-min-free-gib (server/cli.zig) and
 # TF_SPILL_FLUSH_S (glm_cuda/cuda_native.zig openSpill); v2 keeps the flags (--spill-highwater is v1's: not passed)
 # and adds TF_GLM_SPILL_V2, TF_GLM_SPILL_QUOTA (a share), TF_GLM_SPILL_TURNS, TF_GLM_SPILL_READ_BLOCKS,
-# TF_GLM_SPILL_STAGE_MIB, TF_GLM_SPILL_LOAD_MS, TF_SPILL_DEFER_MS; KV sharding TF_GLM_KV_SHARD, _CARRY, _TWINS, _CHECK.
-PORT_MAPPED_BASE='TF_GLM_KV_SHARD|TF_GLM_SPILL_V2'
+# TF_GLM_SPILL_STAGE_MIB, TF_GLM_SPILL_LOAD_MS, TF_SPILL_DEFER_MS; KV sharding TF_GLM_KV_SHARD, _CARRY, _TWINS, _CHECK;
+# sliced fills TF_GLM_FILL (cuda_native.zig: 1, or 0/unset; in the ranks' settings text only when on); the prefix wait
+# TF_GLM_PREFIX_WAIT (1 default, 0 off) and TF_GLM_PREFIX_WAIT_MS (native/cuda.zig serve: rank 0's admission alone).
+PORT_MAPPED_BASE='TF_GLM_KV_SHARD|TF_GLM_SPILL_V2|TF_GLM_FILL|TF_GLM_PREFIX_WAIT|TF_GLM_PREFIX_WAIT_MS'
 PORT_MAPPED_SPILL='TF_SPILL_FLUSH_S'
 PORT_MAPPED_V2='TF_GLM_SPILL_QUOTA|TF_GLM_SPILL_TURNS|TF_GLM_SPILL_READ_BLOCKS|TF_GLM_SPILL_STAGE_MIB|TF_GLM_SPILL_LOAD_MS|TF_SPILL_DEFER_MS'
 PORT_MAPPED_SHARD='TF_GLM_KV_SHARD_CARRY|TF_GLM_KV_SHARD_TWINS|TF_GLM_KV_SHARD_CHECK'
@@ -356,6 +429,10 @@ port_map() {
     [[ -z "${TF_GLM_KV_SHARD_CHECK:-}" ]] || PORT_ENV+=("TF_GLM_KV_SHARD_CHECK=$TF_GLM_KV_SHARD_CHECK")
     PORT_MAPPED_RE+="|$PORT_MAPPED_SHARD"
   fi
+  if [[ "$FILL" == 1 ]]; then
+    PORT_ENV+=("TF_GLM_FILL=1" "TF_GLM_PREFIX_WAIT=$PREFIX_WAIT")
+    [[ -z "${TF_GLM_PREFIX_WAIT_MS:-}" ]] || PORT_ENV+=("TF_GLM_PREFIX_WAIT_MS=$TF_GLM_PREFIX_WAIT_MS")
+  fi
   return 0
 }
 
@@ -383,18 +460,20 @@ port_spill_identity() {
 # port_identity: what port_map gave the ranks, as one word (the containers' tf.recipe.port label; start.sh compares a
 # running server's with it): "off" when nothing is on, as containers started before the port (no label) read. Else the
 # features and a checksum of every flag, variable and SPILL_DIR (another folder is another set of kept states).
+# FILL=1 adds ",fill=1" (a label without it is the one before: fills off).
 port_identity() {
-  port_spill_on || [[ "$KV_SHARD" == 1 ]] || { echo off; return 0; }
+  port_spill_on || [[ "$KV_SHARD" == 1 || "$FILL" == 1 ]] || { echo off; return 0; }
   local sp=0 sum
   ! port_spill_on || { sp=v1; [[ "$SPILL_V2" != 1 ]] || sp=v2; }
   sum=$(printf '%s\n' ${PORT_SERVE[@]+"${PORT_SERVE[@]}"} ${PORT_ENV[@]+"${PORT_ENV[@]}"} "$SPILL_DIR" | cksum | awk '{print $1}')
-  echo "spill=$sp,shard=$KV_SHARD,sum=$sum"
+  echo "spill=$sp,shard=$KV_SHARD$( [[ "$FILL" != 1 ]] || echo ",fill=1" ),sum=$sum"
 }
 # port_summary: the words for what is on (empty when nothing is)
 port_summary() {
   local s=""
   ! port_spill_on || s+=" · spill $( [[ "$SPILL_V2" == 1 ]] && echo v2 || echo v1) $SPILL_GIB GiB"
   [[ "$KV_SHARD" != 1 ]] || s+=" · KV shard"
+  [[ "$FILL" != 1 ]] || s+=" · sliced fills$( [[ "$PREFIX_WAIT" == 1 ]] || echo " (no prefix wait)" )"
   echo "$s"
 }
 
@@ -516,3 +595,44 @@ port_spill_check() {
 }
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)
 port_nfs_path() { [[ "${NFS_PATH:-/}" == / ]] || echo "$NFS_PATH"; }
+
+# ---- long contexts on the Zig engine: TF_TP_TIMEOUT_S and what the kernel set is known to cover
+# zig/aot/glm-aot-coverage.txt records the engine's offline host test (cuda_aot_coverage_test: every Triton lookup the
+# engine makes at TP=2, for the contexts, stream counts and KV pools it names, against the captured set) and the
+# contexts a GPU run has served at TP=2 (gpu=). key=value lines; aot= is the sha256 of the set it checked.
+PORT_COVERAGE="${PORT_COVERAGE:-${_cfg_root:-.}/zig/aot/glm-aot-coverage.txt}"
+port_coverage() {
+  [[ -f "$PORT_COVERAGE" ]] || return 0
+  sed -n "s/^$1=\([^#]*\).*/\1/p" "$PORT_COVERAGE" | head -1 | sed 's/[[:space:]]*$//'
+}
+# port_long_context <context> <parallel> (the effective --context and --parallel), ENGINE=zig: past 262,144 tokens
+# TF_TP_TIMEOUT_S=1500 unless set (a rank waits that long for the other's next call; 300 s by default is less than one
+# long prompt's pass: TP=3/4 served ~1M prompts at 1500), and a warning naming what is unverified at this window
+port_long_context() {
+  local ctx=$1 par=$2 set_sha aot_sha top c gpu=0 known=0 streams=0
+  [[ "$ENGINE" == zig ]] || return 0
+  if [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx > 262144 )) && [[ -z "${TF_TP_TIMEOUT_S:-}" ]]; then
+    export TF_TP_TIMEOUT_S=1500
+    log "CONTEXT=$ctx: TF_TP_TIMEOUT_S=1500 (a long prompt's pass outlasts the ranks' default 300 s wait)"
+  fi
+  if [[ "$TP" != 2 ]]; then
+    [[ "$ctx" == 131072 && "$par" == 8 ]] ||
+      warn "ENGINE=zig: the captured kernel set is keyed on the 8-stream, 131072-token arena; other CONTEXT / PARALLEL can fail with MissingTritonVariant"
+    return 0
+  fi
+  aot_sha=$(cut -c1-64 "${_cfg_root:-.}/zig/aot/glm-aot-sm121.tar.xz.sha256" 2>/dev/null)
+  set_sha=$(port_coverage aot)
+  if [[ -z "$set_sha" || "$set_sha" != "$aot_sha" ]]; then
+    warn "ENGINE=zig: no coverage record for this kernel set (zig/aot/glm-aot-coverage.txt$( [[ -z "$set_sha" ]] || echo " is for set ${set_sha:0:12}, this one is ${aot_sha:0:12}")): CONTEXT=$ctx PARALLEL=$par is unchecked and can fail with MissingTritonVariant"
+    return 0
+  fi
+  for c in $(port_coverage gpu); do [[ "$c" == "$ctx" ]] && gpu=1; done
+  for c in $(port_coverage parallel); do [[ "$c" == "$par" ]] && streams=1; done
+  top=0; for c in $(port_coverage contexts); do (( c > top )) && top=$c; done
+  [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx >= 1 && ctx <= top )) && known=1
+  if (( ! known || ! streams )); then
+    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par is outside what the kernel set's coverage test checked (contexts up to $top, PARALLEL $(port_coverage parallel), KV pools of $(port_coverage pools) rows: zig/aot/glm-aot-coverage.txt): it can fail with MissingTritonVariant"
+  elif (( ! gpu )) || [[ "$par" != "$(port_coverage gpu_parallel)" ]]; then
+    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par: the kernel set holds every Triton variant this window looks up (checked offline: zig/aot/glm-aot-coverage.txt, for KV pools of $(port_coverage pools) rows), but no GPU run has served it yet (GPU-checked: CONTEXT $(port_coverage gpu) at PARALLEL $(port_coverage gpu_parallel)). Unverified: a long prompt's memory on each Spark, TF_TP_TIMEOUT_S=${TF_TP_TIMEOUT_S:-300}, and the replies"
+  fi
+}

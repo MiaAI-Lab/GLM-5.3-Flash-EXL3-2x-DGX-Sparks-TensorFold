@@ -1,0 +1,13 @@
+# What the captured kernel set (glm-aot-sm121.tar.xz) is known to cover at TP=2 (start.sh reads it: port_long_context).
+# Offline: the GLM Zig engine's host test zig/src/families/glm_cuda/cuda_aot_coverage_test.zig (glm/ctx-1m) runs the
+# engine's own launch code with no GPU (decode windows of 1-64 rows; prompt chunks of every row count a prompt can have,
+# at every position on the 64-token grid, in every extent up to the context; the row split off and on; both ranks) and
+# finds every Triton lookup in this set: 0 missing for each context, stream count and KV pool below (and their KV-shard
+# parts). A context below the largest looks up a subset of its variants. On the GPU (gpu=): the windows a run served.
+aot=29ad991945a30f3398ae79ba781cb975f499b752a5b5dbc473d1c152e6bdb681
+contexts=131072 262144 524288 1048576
+parallel=4 8
+pools=825344-4194304
+missing=0
+gpu=131072
+gpu_parallel=8

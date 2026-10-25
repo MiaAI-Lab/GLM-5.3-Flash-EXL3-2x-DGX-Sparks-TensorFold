@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ 8f6d9b5aa838 over glm/zig-engine-fixes @ f683a5c3a79a (commits 1d5246d35760..dc4f63df6642); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/pub-r5-on-186 @ 1305bda37155 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3022ee57d656..069c49ffd2dc); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: KV shard device paths: owner-computed decode and glm_shard.cu, a prompt chunk's history fetch, prompt borrowing and kept states' carries; TF_GLM_KV_SHARD=1 on (port of GLM 0118, parts 3-5)
 
 The GPU side of KV sharding on the host side's parts: each stream's latent

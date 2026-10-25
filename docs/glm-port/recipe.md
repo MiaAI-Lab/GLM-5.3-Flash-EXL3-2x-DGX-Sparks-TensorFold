@@ -79,7 +79,9 @@ From the Python fork's recipe:
 - The switches are not exported by `config.sh`; they reach the ranks only through `port_map`, after the checks.
 - The parked-page rule is the engine's (count - high_min, 512 MiB rest without high_min), not the fork's
   `_parked_zone` (high_min + 256 MiB of slack): one rule for the recipe and the engine.
-- `PREFIX_WAIT` is not ported (the Zig engine fills one prompt at a time; GAP.md): it warns.
+- `PREFIX_WAIT` (default 1, as the fork's) is passed as `TF_GLM_PREFIX_WAIT` only with `FILL=1` (engine `glm/prefix-wait`:
+  the lane host's wait for a cut another sliced fill is computing); with whole passes nothing needs it (each ends before
+  the next admission), and set explicitly it warns. `TF_GLM_PREFIX_WAIT_MS` (the bound) passes as set with `FILL=1`.
 - The fork's `parked_pages_check` CI step: this recipe has no CI; `scripts/port_test.sh` runs the synthetic cases, and
   the engine's own 0119 tests come with `glm/base-fixes`.
 
@@ -288,3 +290,27 @@ Tests: `scripts/port_test.sh` 118/118 (113 before; the new F3, F4 and F8 checks 
 `scripts/port_patches_test.sh` 15/15, `tools/selftest.py` 83/83, `bash -n` of every script; `scripts/port-patches.sh
 --dry-run` (no arguments, `--keep`) reproduces `0014`-`0023` byte for byte from `glm/series` 3181fe20 and leaves the
 README's rows as they are.
+
+## Round 4 (2026-10-24): zig-r4
+
+Branch `zig-r4` (worktree `~/GitHub/tf-glm-wt/recipe-r4`) from `zig-port` a92a74b: the round's recipe branches merged
+(`zig-1m` f701c93/c55a05e, `zig-mtp-cache` 5d1c1ba, `zig-vision` 5e4f32b/6f85f97; one conflict, `scripts/port_test.sh`:
+zig-vision's two VISION cases kept, zig-mtp-cache's MTP refusal cases in place of the old case they replace), then one
+commit:
+
+- `zig/patches/0014`-`0029` exported from the engine's `glm/series-r4` 84fd2144 (`scripts/port-patches.sh` with
+  `--name` for the six new commits: `glm-1m-coverage`, `glm-mtp-cache`, `glm-fill-steps`, `glm-pictures`,
+  `glm-spill-pictures`, `glm-tower-workspace`; `0014`-`0023` keep their names and bodies, only their first line moved);
+  the script's default branch is `glm/series-r4`, and `--dry-run` with no arguments reproduces all sixteen byte for
+  byte.
+- `ZIG_HAS`'s default adds `mtpcache fill pictures` (start.sh and port_test's `DEF_HAS`; the check that the default
+  names a feature exactly when `zig/patches` carries it knows the three).
+- `FILL` (`scripts/config.sh`, default 0; also from `TF_GLM_FILL`): `TF_GLM_FILL=1` to both ranks through `port_map`
+  (one of the switches that reach the ranks only through it), `,fill=1` in the container label, "sliced fills" in the
+  summary; refused with `DRAFTER=mtp` and without `ZIG_HAS fill`; a warning with `ENGINE=python`. Docs: README's
+  settings row, `docs/zig-engine.md`'s row and `ZIG_HAS` paragraph, `zig/patches/README.md`'s table.
+- `pictures`: `VISION=1` with a prompt cache on an image without it warns that picture prompts are not kept.
+
+Tests: `scripts/port_test.sh` 133/133 (the FILL cases failed against a port.sh without the mapping and the gate; the
+ZIG_HAS-vs-patches check failed before the export), `scripts/port_patches_test.sh` 15/15, `tools/selftest.py` 88/88,
+`scripts/port-patches.sh --dry-run`. Nothing pushed; not on the pair.

@@ -26,8 +26,8 @@ grep -q '^PORT_SPILL_DEFAULT_GIB=64 ' "$fork_sh" && grep -q '^PORT_SPILL_V2_DEFA
   grep -q '^PORT_SPILL_QUOTA_DEFAULT=0.25 ' "$fork_sh" ||
   { echo "FAIL the fork variant of port.sh (its default lines moved?)"; exit 1; }
 ALL_HAS="mtp displaykv spill2 kvshard spillshard"
-# start.sh's default ZIG_HAS (the image with zig/patches/0014-0023), and an image without the port's patches
-DEF_HAS="mtp displaykv parked spill2 kvshard spillshard"
+# start.sh's default ZIG_HAS (the image with zig/patches/0014-0030), and an image without the port's patches
+DEF_HAS="mtp displaykv parked spill2 kvshard spillshard mtpcache fill pictures prefixwait"
 NO_PORT="mtp displaykv"
 
 # case_ <name> <expected exit 0|1> <script before port.sh> <script after>: runs both in a subshell over a fresh port.sh,
@@ -38,7 +38,7 @@ case_() {
   local name=$1 want=$2 got out
   n=$((n + 1))
   out=$( (
-    for v in $(compgen -v | grep -E '^(SPILL_|KV_SHARD|KV_POOL_GIB|PORT_|TF_GLM_|TF_SPILL_|PREFIX_WAIT|STOP_TIMEOUT|PROMPT_CACHE_GIB|ZIG_HAS|WORKER)'); do
+    for v in $(compgen -v | grep -E '^(SPILL_|KV_SHARD|KV_POOL_GIB|PORT_|TF_GLM_|TF_SPILL_|PREFIX_WAIT|STOP_TIMEOUT|PROMPT_CACHE_GIB|ZIG_HAS|WORKER|FILL$)'); do
       unset "$v"
     done
     ENGINE=zig TP=2 PARALLEL=8 DRAFTER=dflash2 TF_GLM_MULTI_LONE=0 PROMPT_CACHE_GIB=0 KV_POOL_GIB=12.5 ZIG_HAS="$DEF_HAS"
@@ -96,9 +96,9 @@ case_ "defaults: everything off, no flag, variable or label; SPILL_DIR beside th
   expect "${STOP_TIMEOUT:-unset}" unset
   expect "$PORT_MAPPED_RE" "$PORT_MAPPED_BASE"
   expect "$SPILL_DIR" /home/u/.cache/tensorfold-spill'
-case_ "defaults: the ranks' passthrough drops only the two switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2)" 0 '' '
+case_ "defaults: the ranks' passthrough drops only the switches (TF_GLM_KV_SHARD, TF_GLM_SPILL_V2, TF_GLM_FILL, TF_GLM_PREFIX_WAIT and its bound)" 0 '' '
   port_validate 8 0; port_map
-  expect "$(printf "%s\n" TF_GLM_KV_SHARD=0 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60 |
+  expect "$(printf "%s\n" TF_GLM_KV_SHARD=0 TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 TF_GLM_PREFIX_WAIT_MS=9 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_V2=1 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60 |
     grep -vE "^($PORT_MAPPED_RE)=" | paste -sd" " -)" "TF_GLM_KV_SHARD_CARRY=0 TF_GLM_SPILL_QUOTA=0.25 TF_GLM_CACHE_GIB=12.5 TF_SPILL_FLUSH_S=60"'
 case_ "defaults with ENGINE=python: off as well" 0 'ENGINE=python' '
   port_validate "" ""; port_map; expect "${#PORT_ENV[@]} ${#PORT_SERVE[@]} $(port_identity)" "0 0 off"'
@@ -131,18 +131,77 @@ case_ "PROMPT_CACHE_GIB (or --prompt-cache-gib) above 0 with KV_POOL_GIB not set
   expect_out "KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8: a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on" port_validate 8 8
   PROMPT_CACHE_GIB=0; expect_out "WARN: PROMPT_CACHE_GIB=16 with KV_POOL_GIB at its default (12.5)" port_validate 8 16
   ( TP=3 KV_POOL_GIB=32; expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (32)" port_validate 8 8 ) || exit 1'
-case_ "no pool warning with KV_POOL_GIB set (even to 12.5), no cache, MTP drafts (no prompt cache) or ENGINE=python" 0 'PROMPT_CACHE_GIB=8' '
+case_ "no pool warning with KV_POOL_GIB set (even to 12.5), no cache, MTP drafts on an image that keeps no state with them, or ENGINE=python" 0 'PROMPT_CACHE_GIB=8' '
   ( PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
   ( PORT_POOL_EXPLICIT=1; expect_out "!KV_POOL_GIB at its default" port_validate 8 8 ) || exit 1
   ( PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
-  ( DRAFTER=mtp; expect_out "!KV_POOL_GIB at its default" port_validate 1 8 ) || exit 1
+  ( DRAFTER=mtp ZIG_HAS=$NO_PORT; expect_out "!KV_POOL_GIB at its default" port_validate 1 8 ) || exit 1
   ( ENGINE=python; expect_out "!KV_POOL_GIB at its default" port_validate "" 8 ) || exit 1'
+# MTP drafts keep prompt states where the engine has the port (ZIG_HAS mtpcache: kept states with the MTP head's section)
+case_ "MTP drafts with ZIG_HAS mtpcache keep prompt states (the pool warning as with DFlash2); without it, a warning that none is kept" 0 'PROMPT_CACHE_GIB=8 DRAFTER=mtp PARALLEL=1' '
+  ( expect_out "WARN: PROMPT_CACHE_GIB=8 with KV_POOL_GIB at its default (12.5)" port_validate 1 8
+    expect_out "!keeps no prompt state" port_validate 1 8
+    PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4; expect_out "!WARN" port_validate 1 8 ) || exit 1
+  ( ZIG_HAS=$NO_PORT; expect_out "WARN: PROMPT_CACHE_GIB=8 with DRAFTER=mtp: this image.s engine keeps no prompt state with MTP drafts .*mtpcache" port_validate 1 8 ) || exit 1
+  ( PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 1 0 ) || exit 1
+  ( DRAFTER=dflash2 PORT_POOL_EXPLICIT=1; expect_out "!keeps no prompt state" port_validate 8 8 ) || exit 1'
 case_ "scripts/config.sh records whether KV_POOL_GIB was set, before it fills in the default" 0 '' "
   a=\$(grep -nF 'PORT_POOL_EXPLICIT=0; [[ -z \"\${KV_POOL_GIB:-}\" ]] || PORT_POOL_EXPLICIT=1' '$here/config.sh' | cut -d: -f1)
   b=\$(grep -nF 'KV_POOL_GIB=\"\${KV_POOL_GIB:-\$_pool}\"' '$here/config.sh' | cut -d: -f1)
   [[ -n \"\$a\" && -n \"\$b\" ]] && (( a < b )) || { echo \"config.sh: recorded at [\$a], defaulted at [\$b]\"; exit 1; }"
-case_ "refuse: spill with MTP drafts (zig: no prompt cache)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
-  expect_die "DRAFTER=mtp" port_validate 1 8'
+case_ "VISION=1 with PROMPT_CACHE_GIB above 0 warns that rank 0's kept-state budget is ~1.4 GiB smaller; not without vision, a cache, or with ENGINE=python" 0 'PROMPT_CACHE_GIB=8 PORT_POOL_EXPLICIT=1 KV_POOL_GIB=4' '
+  ( VISION=1; expect_out "WARN: VISION=1 with PROMPT_CACHE_GIB=8: .*~1.4 GiB smaller" port_validate 8 8 ) || exit 1
+  ( VISION=1; expect_out "!never kept or resumed" port_validate 8 8 ) || exit 1
+  ( VISION=1 ZIG_HAS=$NO_PORT; expect_out "WARN: VISION=1 with PROMPT_CACHE_GIB=8: .*lacks the kept prompts with pictures .*never kept or resumed" port_validate 8 8 ) || exit 1
+  ( VISION=1; expect_out "WARN: VISION=1 with PROMPT_CACHE_GIB=2.5: " port_validate 8 2.5 ) || exit 1
+  ( VISION=0; expect_out "!VISION=1 with" port_validate 8 8 ) || exit 1
+  ( unset VISION; expect_out "!VISION=1 with" port_validate 8 8 ) || exit 1
+  ( VISION=1 PROMPT_CACHE_GIB=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
+  ( VISION=1 ENGINE=python; expect_out "!VISION=1 with" port_validate "" 8 ) || exit 1'
+case_ "scripts/config.sh: VISION defaults to 1 for ENGINE=zig at TP=2 and ENGINE=python, 0 for ENGINE=zig at TP=3/4; a set VISION stays" 0 '' "
+  line=\$(grep -E '^VISION=\"\\\$\\{VISION:-' '$here/config.sh')
+  [[ -n \"\$line\" ]] || { echo 'config.sh: no VISION default line'; exit 1; }
+  for c in 'zig 2 1' 'zig 3 0' 'zig 4 0' 'python 2 1' 'python 3 1'; do
+    set -- \$c
+    got=\$( unset VISION; ENGINE=\$1 TP=\$2; eval \"\$line\"; echo \"\$VISION\" )
+    [[ \"\$got\" == \"\$3\" ]] || { echo \"ENGINE=\$1 TP=\$2: VISION=\$got, wanted \$3\"; exit 1; }
+  done
+  got=\$( VISION=0 ENGINE=zig TP=2; eval \"\$line\"; echo \"\$VISION\" ); [[ \"\$got\" == 0 ]] || { echo \"a set VISION=0 became \$got\"; exit 1; }"
+case_ "refuse: spill with MTP drafts, also where their states are kept (the tier does not store the MTP head yet)" 0 'SPILL_GIB=64 DRAFTER=mtp PARALLEL=1 PROMPT_CACHE_GIB=8' '
+  expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8
+  ( ZIG_HAS="$DEF_HAS mtpcache"; expect_die "DRAFTER=mtp: .*does not store the MTP head" port_validate 1 8 ) || exit 1
+  ( ZIG_HAS="$DEF_HAS mtpcache" SPILL_V2=1; expect_die "DRAFTER=mtp" port_validate 1 8 ) || exit 1'
+case_ "refuse: KV_SHARD=1 with MTP drafts, also where their states are kept" 0 'ZIG_HAS="$DEF_HAS mtpcache" KV_SHARD=1 DRAFTER=mtp' '
+  expect_die "KV_SHARD=1: it .*DRAFTER=mtp" port_validate 8 0'
+# ---- sliced prompt fills (FILL, zig/patches/0026)
+case_ "FILL=1: TF_GLM_FILL=1 on every rank, the label and summary say so; off (the default) adds nothing" 0 '' '
+  expect "$FILL" 0
+  port_validate 8 0; port_map; expect "${#PORT_ENV[@]} $(port_identity)" "0 off"
+  FILL=1; port_validate 8 0; port_map
+  expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1"
+  [[ "$(port_identity)" =~ ^spill=0,shard=0,fill=1,sum=[0-9]+$ ]] || { port_identity; exit 1; }
+  expect "$(port_summary)" " · sliced fills"
+  [[ "TF_GLM_FILL=1" =~ ^($PORT_MAPPED_RE)= ]] || exit 1'
+case_ "FILL from TF_GLM_FILL when only that is set; FILL wins over it, with a warning" 0 'TF_GLM_FILL=1' '
+  expect "$FILL" 1
+  ( FILL=0; expect_out "WARN: TF_GLM_FILL=1 is overridden by FILL=0" port_validate 8 0 ) || exit 1'
+case_ "FILL=1 with KV sharding and spill v2: every variable together, the label names all three" 0 "ZIG_HAS='$ALL_HAS fill' FILL=1 KV_SHARD=1 SPILL_GIB=8 SPILL_V2=1" '
+  port_validate 8 8; port_map
+  [[ " ${PORT_ENV[*]} " == *" TF_GLM_KV_SHARD=1 "* && " ${PORT_ENV[*]} " == *" TF_GLM_SPILL_V2=1 "* && " ${PORT_ENV[*]} " == *" TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 "* ]] || { echo "${PORT_ENV[*]}"; exit 1; }
+  [[ "$(port_identity)" =~ ^spill=v2,shard=1,fill=1,sum= ]] || { port_identity; exit 1; }'
+case_ "refuse: FILL=2, FILL=1 with DRAFTER=mtp (also with mtpcache), FILL=1 without ZIG_HAS fill (naming the patch)" 0 '' '
+  ( FILL=2; expect_die "FILL .TF_GLM_FILL. is 0 or 1, not 2" port_validate 8 0 ) || exit 1
+  ( FILL=1 DRAFTER=mtp; expect_die "FILL=1: sliced prompt fills do not run with DRAFTER=mtp" port_validate 1 0 ) || exit 1
+  ( FILL=1 DRAFTER=mtp PROMPT_CACHE_GIB=8; expect_die "FILL=1: .*DRAFTER=mtp" port_validate 1 8 ) || exit 1
+  ( FILL=1 ZIG_HAS=$NO_PORT; expect_die "FILL=1: this image.s tensorfold-native lacks the sliced prompt fills .zig/patches/0026.*ZIG_HAS" port_validate 8 0 ) || exit 1'
+case_ "FILL=1 with ENGINE=python: a warning that it does nothing, and nothing passed" 0 'ENGINE=python FILL=1' '
+  expect_out "WARN: FILL=1 does nothing with ENGINE=python" port_validate "" ""
+  port_validate "" "" >/dev/null; port_map; expect "${#PORT_ENV[@]} $(port_identity)" "0 off"'
+case_ "scripts/config.sh: FILL defaults to 0, from TF_GLM_FILL when only that is set" 0 '' "
+  line=\$(grep -E '^FILL=\"\\\$\\{FILL:-' '$here/config.sh')
+  [[ -n \"\$line\" ]] || { echo 'config.sh: no FILL default line'; exit 1; }
+  got=\$( unset FILL TF_GLM_FILL; eval \"\$line\"; echo \"\$FILL\" ); [[ \"\$got\" == 0 ]] || { echo \"default FILL=\$got\"; exit 1; }
+  got=\$( unset FILL; TF_GLM_FILL=1; eval \"\$line\"; echo \"\$FILL\" ); [[ \"\$got\" == 1 ]] || { echo \"from TF_GLM_FILL: \$got\"; exit 1; }"
 case_ "refuse: a relative SPILL_DIR, SPILL_HIGHWATER past 1, SPILL_MIN_TOKENS 8k, SPILL_GIB abc" 0 'PROMPT_CACHE_GIB=8' '
   ( SPILL_GIB=8 SPILL_DIR=spill; PORT_SPILL_EXPLICIT=1; expect_die "SPILL_DIR must be an absolute path" port_validate 8 8 ) || exit 1
   ( SPILL_GIB=8 SPILL_HIGHWATER=1.5; expect_die SPILL_HIGHWATER port_validate 8 8 ) || exit 1
@@ -224,13 +283,17 @@ case_ "KV shard: the variables, carry and twins on by default, the check passed 
   expect "$(port_summary)" " · KV shard"
   TF_GLM_KV_SHARD_CARRY=0 TF_GLM_KV_SHARD_CHECK=1024; port_validate 8 0; port_map
   expect "${PORT_ENV[*]}" "TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=0 TF_GLM_KV_SHARD_TWINS=1 TF_GLM_KV_SHARD_CHECK=1024"'
-case_ "refuse: KV_SHARD=1 at TP=3, --parallel 1, DRAFTER=mtp, TF_GLM_MULTI_LONE=1, ENGINE=python" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
+case_ "refuse: KV_SHARD=1 at TP=3, --parallel 1, DRAFTER=mtp, ENGINE=python" 0 'ZIG_HAS=kvshard KV_SHARD=1' '
   ( TP=3; expect_die "two Sparks .TP=2., not TP=3" port_validate 8 0 ) || exit 1
   expect_die "more than one stream .PARALLEL above 1., not --parallel 1" port_validate 1 0
   ( DRAFTER=mtp; expect_die "DRAFTER=mtp" port_validate 8 0 ) || exit 1
-  ( TF_GLM_MULTI_LONE=1; expect_die "TF_GLM_MULTI_LONE=1" port_validate 8 0 ) || exit 1
   ( ENGINE=python; expect_die "Python engine.s patches/ lack the KV-shard port" port_validate "" "" ) || exit 1
   port_validate 16 0 >/dev/null || exit 1'
+case_ "KV_SHARD=1 with TF_GLM_MULTI_LONE=1: a warning (it does nothing on the Zig engine), sharding on" 0 'ZIG_HAS=kvshard KV_SHARD=1 TF_GLM_MULTI_LONE=1' '
+  expect_out "WARN: TF_GLM_MULTI_LONE=1 does nothing on the Zig engine" port_validate 8 0
+  port_validate 8 0 >/dev/null; port_map; expect "$KV_SHARD ${PORT_ENV[*]}" "1 TF_GLM_KV_SHARD=1 TF_GLM_KV_SHARD_CARRY=1 TF_GLM_KV_SHARD_TWINS=1"
+  ( TF_GLM_MULTI_LONE=0; expect_out "!MULTI_LONE" port_validate 8 0 ) || exit 1
+  ( KV_SHARD=0; expect_out "!MULTI_LONE" port_validate 8 0 ) || exit 1'
 case_ "refuse: KV_SHARD=2, TF_GLM_KV_SHARD_CARRY=yes, TF_GLM_KV_SHARD_CHECK=x" 0 'ZIG_HAS=kvshard' '
   ( KV_SHARD=2; expect_die "KV_SHARD .TF_GLM_KV_SHARD. is 0 or 1" port_validate 8 0 ) || exit 1
   ( TF_GLM_KV_SHARD_CARRY=yes; expect_die TF_GLM_KV_SHARD_CARRY port_validate 8 0 ) || exit 1
@@ -240,6 +303,39 @@ case_ "KV-shard settings without KV_SHARD=1 warn (and pass to the ranks as befor
   port_map; expect "${#PORT_ENV[@]}" 0; [[ ! "TF_GLM_KV_SHARD_TWINS=0" =~ ^($PORT_MAPPED_RE)= ]] || exit 1'
 case_ "KV_SHARD wins over TF_GLM_KV_SHARD, with a warning" 0 'ZIG_HAS=kvshard KV_SHARD=1 TF_GLM_KV_SHARD=0' '
   expect_out "WARN: TF_GLM_KV_SHARD=0 is overridden by KV_SHARD=1" port_validate 8 0; expect "$KV_SHARD" 1'
+
+# ---- long contexts on the Zig engine (port_long_context, zig/aot/glm-aot-coverage.txt)
+LC_PRE="_cfg_root=$root"
+case_ "long context: past 262,144 tokens TF_TP_TIMEOUT_S=1500 unless set; not at 262,144, not with ENGINE=python" 0 "$LC_PRE" '
+  port_long_context 1048576 8 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" 1500
+  ( unset TF_TP_TIMEOUT_S; port_long_context 262144 8 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" unset ) || exit 1
+  ( unset TF_TP_TIMEOUT_S; ENGINE=python; port_long_context 1048576 4 >/dev/null; expect "${TF_TP_TIMEOUT_S:-unset}" unset ) || exit 1
+  ( TF_TP_TIMEOUT_S=900; port_long_context 1048576 8 >/dev/null; expect "$TF_TP_TIMEOUT_S" 900 ) || exit 1
+  ( unset TF_TP_TIMEOUT_S; TP=3; port_long_context 1048576 8 >/dev/null; expect "$TF_TP_TIMEOUT_S" 1500 ) || exit 1'
+case_ "long context: the GPU-checked window is silent, one the coverage test checked warns what is unverified, one past it can miss" 0 "$LC_PRE" '
+  expect_out "!WARN" port_long_context 131072 8
+  expect_out "WARN: ENGINE=zig: CONTEXT=1048576 PARALLEL=8: the kernel set holds every Triton variant.*no GPU run has served it yet.*Unverified: a long prompt.s memory on each Spark, TF_TP_TIMEOUT_S=1500" port_long_context 1048576 8
+  expect_out "no GPU run has served it yet" port_long_context 131072 4
+  expect_out "no GPU run has served it yet" port_long_context 200000 8
+  expect_out "outside what the kernel set.s coverage test checked (contexts up to 1048576" port_long_context 2097152 8
+  expect_out "outside what the kernel set.s coverage test checked" port_long_context 131072 2'
+case_ "long context: a coverage record of another kernel set, or none, leaves every window unchecked; TP=3 keeps the arena warning" 0 "$LC_PRE; tmp=$tmp" '
+  printf "aot=%064d\ncontexts=1048576\nparallel=8\ngpu=131072\ngpu_parallel=8\n" 0 > "$tmp/cov-other.txt"
+  ( PORT_COVERAGE=$tmp/cov-other.txt; expect_out "is for set 000000000000, this one is 29ad991945a3.*unchecked" port_long_context 131072 8 ) || exit 1
+  ( PORT_COVERAGE=$tmp/none.txt; expect_out "no coverage record for this kernel set.*unchecked" port_long_context 131072 8 ) || exit 1
+  ( TP=3; expect_out "keyed on the 8-stream, 131072-token arena" port_long_context 1048576 8; expect_out "!WARN" port_long_context 131072 8 ) || exit 1
+  grep -q "^aot=$(cut -c1-64 "$root/zig/aot/glm-aot-sm121.tar.xz.sha256")$" "$root/zig/aot/glm-aot-coverage.txt" || { echo "the coverage record is not for zig/aot/glm-aot-sm121.tar.xz"; exit 1; }'
+LC_DEFAULT='ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-0}"'
+LC_CTX='if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi'
+case_ "scripts/config.sh: ENGINE=zig defaults to 131072, ZIG_CONTEXT_1M=1 to 1,048,576 at TP=2 only" 0 '' '
+  grep -qxF -- "$LC_DEFAULT" "$here/config.sh" || { echo "no ZIG_CONTEXT_1M default of 0"; exit 1; }
+  grep -qxF -- "$LC_CTX" "$here/config.sh" || { echo "the ENGINE=zig CONTEXT default moved"; exit 1; }
+  for ENGINE in zig python; do for TP in 2 3; do for ZIG_CONTEXT_1M in 0 1; do
+    _ctx=python; eval "$LC_CTX"; want=python
+    [[ "$ENGINE" == zig ]] && want=131072; [[ "$ENGINE" == zig && "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && want=1048576
+    expect "$ENGINE $TP $ZIG_CONTEXT_1M $_ctx" "$ENGINE $TP $ZIG_CONTEXT_1M $want"
+  done; done; done
+  ! grep -q "no prompts past ~32k tokens" "$here/config.sh" || { echo "the stale 32k comment is back"; exit 1; }'
 
 # ---- spill and KV sharding together
 case_ "refuse: KV_SHARD=1 with spill v1 (both explicit)" 0 'ZIG_HAS="kvshard spillshard" KV_SHARD=1 SPILL_GIB=8' '
@@ -287,11 +383,37 @@ case_ "fork default spill with MTP drafts: off with a warning" 0 "PT_FORK=1 ZIG_
   expect_out "WARN: SPILL TIER OFF for this start: SPILL_GIB=64 with DRAFTER=mtp" port_validate 1 8'
 
 # ---- prefix wait: not ported
-case_ "PREFIX_WAIT=1 / TF_GLM_PREFIX_WAIT=1 warn and do nothing; 0 is silent" 0 '' '
-  ( PREFIX_WAIT=1; expect_out "WARN: PREFIX_WAIT=1 does nothing: the prefix wait .* is not ported" port_validate 8 0 ) || exit 1
-  ( TF_GLM_PREFIX_WAIT=1; expect_out "WARN: TF_GLM_PREFIX_WAIT=1 does nothing" port_validate 8 0 ) || exit 1
-  ( PREFIX_WAIT=0 TF_GLM_PREFIX_WAIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
-  port_map; expect "${#PORT_ENV[@]}" 0'
+# ---- the prefix wait (PREFIX_WAIT, the Python fork's 0110; the Zig engine's lane host with FILL=1)
+case_ "PREFIX_WAIT with FILL=1: on by default, TF_GLM_PREFIX_WAIT to every rank (0 when off), TF_GLM_PREFIX_WAIT_MS as set" 0 'FILL=1' '
+  expect "$PREFIX_WAIT" 1
+  port_validate 8 8; port_map
+  expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1"
+  expect "$(port_summary)" " · sliced fills"
+  a=$(port_identity)
+  ( PREFIX_WAIT=0; port_validate 8 8; port_map; expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=0"
+    expect "$(port_summary)" " · sliced fills (no prefix wait)"; [[ "$(port_identity)" != "$a" ]] ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=5000; port_validate 8 8; port_map
+    expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=1 TF_GLM_PREFIX_WAIT_MS=5000" ) || exit 1
+  for x in TF_GLM_PREFIX_WAIT TF_GLM_PREFIX_WAIT_MS; do [[ "$x=1" =~ ^($PORT_MAPPED_RE)= ]] || { echo "$x not mapped"; exit 1; }; done'
+case_ "PREFIX_WAIT from TF_GLM_PREFIX_WAIT when only that is set; PREFIX_WAIT wins over it, with a warning" 0 'FILL=1 TF_GLM_PREFIX_WAIT=0' '
+  expect "$PREFIX_WAIT" 0
+  port_validate 8 8 >/dev/null; port_map; expect "${PORT_ENV[*]}" "TF_GLM_FILL=1 TF_GLM_PREFIX_WAIT=0"
+  ( PREFIX_WAIT=1; expect_out "WARN: TF_GLM_PREFIX_WAIT=0 is overridden by PREFIX_WAIT=1" port_validate 8 8 ) || exit 1'
+case_ "PREFIX_WAIT without FILL=1: nothing passed (whole passes fill one prompt at a time); set, it warns; unset or 0 silent" 0 '' '
+  expect_out "!WARN" port_validate 8 0; port_map; expect "${#PORT_ENV[@]}" 0
+  ( PREFIX_WAIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1
+  ( PORT_PW_EXPLICIT=1 PREFIX_WAIT=1; expect_out "WARN: PREFIX_WAIT=1 does nothing without FILL=1" port_validate 8 0; port_map; expect "${#PORT_ENV[@]}" 0 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=5000; expect_out "WARN: TF_GLM_PREFIX_WAIT_MS=5000 does nothing without FILL=1" port_validate 8 0 ) || exit 1'
+case_ "PREFIX_WAIT=1 set with FILL=1 and no prompt cache warns (nothing is kept to resume); the default does not" 0 'FILL=1 PREFIX_WAIT=1' '
+  expect_out "WARN: PREFIX_WAIT=1 does nothing without a prompt cache" port_validate 8 0
+  ( PORT_PW_EXPLICIT=0; expect_out "!WARN" port_validate 8 0 ) || exit 1'
+case_ "refuse: PREFIX_WAIT=2, TF_GLM_PREFIX_WAIT_MS not a whole number of milliseconds" 0 'FILL=1' '
+  ( PREFIX_WAIT=2; expect_die "PREFIX_WAIT .TF_GLM_PREFIX_WAIT. is 0 or 1, not 2" port_validate 8 8 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=1s; expect_die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds" port_validate 8 8 ) || exit 1
+  ( TF_GLM_PREFIX_WAIT_MS=-5; expect_die "TF_GLM_PREFIX_WAIT_MS is a whole number of milliseconds" port_validate 8 8 ) || exit 1'
+case_ "PREFIX_WAIT=1 with ENGINE=python: a warning that it does nothing, and nothing passed" 0 'ENGINE=python PREFIX_WAIT=1' '
+  expect_out "WARN: PREFIX_WAIT=1 does nothing with ENGINE=python" port_validate "" ""
+  port_validate "" "" >/dev/null; port_map; expect "${#PORT_ENV[@]}" 0'
 
 # ---- after the start: each rank opened its spill tier (rank 0's prompt cache budget above 0; every rank's own budget
 # above 0 too: each rank opens its tier from its own, with no agreement between them)
@@ -312,6 +434,33 @@ case_ "after the start: a rank that opened no spill tier while rank 0 did warns,
   expect_out 'WARN: rank 0 opened no spill tier' port_check_started 'info: prompt cache: 2.0 GiB for kept states' '$r1_ok'
   expect_out 'WARN: could not read rank 1.s log' port_check_started '$r0_ok' '(unread)'
   expect_out '!rank 1 opened' port_check_started '$r0_ok' '(unread)'"
+# spill v2's start lines, as glm_cuda/cuda_native.zig openTier logs them (g3 and g6 with SPILL_V2=1 printed exactly these,
+# and the check above, which knew v1's "spill tier:" only, warned "rank 0 opened no spill tier" for both ranks), and its
+# failure line (one rank's store that did not open fails the start on every rank, so a log that has it has no tier line)
+v2_r0="info: prompt cache: 5.1 GiB for kept states, at most 14 (fixed 102 MiB each)
+info: rank 0: spill v2 tier: /spill, up to 16 GiB, 0 points (0 MiB) found; each kept state written at keep from 8192 tokens, keeping 20 GiB of disk free; its folders given to the spill directory's owner"
+v2_r1="info: rank 1: spill v2 tier: /spill, up to 16 GiB, 3 points (812 MiB) found; each kept state written at keep from 8192 tokens, keeping 20 GiB of disk free; owner-sharded (TF_GLM_KV_SHARD: a point's latent rows on its home part's rank only)"
+v2_bad="error: rank 1: spill v2's store under /spill did not open (AccessDenied)"
+case_ "after the start, spill v2: both ranks' \"spill v2 tier:\" lines say nothing; a missing one warns, with the engine's reason" 0 'SPILL_GIB=16 SPILL_V2=1 PROMPT_CACHE_GIB=8' '
+  port_validate 8 8
+  expect_out "!WARN" port_check_started "$v2_r0" "$v2_r1"
+  expect_out "!WARN" port_check_started "$v2_r0"
+  expect_out "WARN: rank 1 opened no spill v2 tier" port_check_started "$v2_r0" ""
+  expect_out "WARN: rank 0 opened no spill v2 tier" port_check_started "info: prompt cache: 5.1 GiB for kept states" "$v2_r1"
+  expect_out "WARN: rank 1 opened no spill v2 tier (it logged \"spill v2.s store under /spill did not open (AccessDenied)\")" \
+    port_check_started "$v2_r0" "$v2_bad"
+  expect_out "WARN: the spill tier is not open: rank 0 logged \"prompt cache: off (budget 0)\"" port_check_started "info: prompt cache: off (budget 0)" "$v2_r1"'
+case_ "after the start: a rank that opened the other version of the tier than asked warns, naming both" 0 'SPILL_GIB=16 PROMPT_CACHE_GIB=8' '
+  ( SPILL_V2=1; port_validate 8 8; expect_out "WARN: rank 1 opened the v1 spill tier, not v2 (SPILL_V2=1)" port_check_started "$v2_r0" "$r1_ok" ) || exit 1
+  ( port_validate 8 8; expect_out "WARN: rank 0 opened the v2 spill tier, not v1 (SPILL_V2=0)" port_check_started "$v2_r0" "$r1_ok" ) || exit 1
+  ( port_validate 8 8; expect_out "!WARN" port_check_started "$r0_ok" "$r1_ok" ) || exit 1'
+case_ "start.sh reads each rank's tier lines through port.sh's pattern, which keeps v1's, v2's and their failures" 0 '' '
+  for l in "$r0_ok" "$v2_r0" "$v2_r1" "$v2_bad" "error: spill: cannot open /spill (AccessDenied); no spill tier"; do
+    while IFS= read -r x; do grep -qE -- "$PORT_TIER_LOG_RE" <<<"$x" || { echo "the pattern drops: $x"; exit 1; }; done <<<"$l"
+  done
+  ! grep -qE -- "$PORT_TIER_LOG_RE" <<<"info: rank 0: kv shard: two parts" || { echo "the pattern keeps an unrelated line"; exit 1; }
+  grep -qF -- "grep -E \"\$PORT_TIER_LOG_RE\"" "'"$root"'/start.sh" || { echo "start.sh does not grep with PORT_TIER_LOG_RE"; exit 1; }
+  [[ "$(grep -c -- "PORT_TIER_LOG_RE" "'"$root"'/start.sh")" == 2 ]] || { echo "start.sh: rank 0 and the workers both through it"; exit 1; }'
 
 # ---- the label (tf.recipe.port)
 case_ "the label: the same settings give the same word; another folder, quota or carry another" 0 "ZIG_HAS='$ALL_HAS' SPILL_GIB=8 SPILL_V2=1 KV_SHARD=1 PROMPT_CACHE_GIB=8" '
@@ -516,7 +665,8 @@ case_ "start.sh's default ZIG_HAS is these cases' default, and names each of the
   $(declare -f check_start); root='$root'
   check_start 'ZIG_HAS=\"\${ZIG_HAS:-$DEF_HAS}\"' || exit 1
   carries() { cat '$root'/zig/patches/*.patch | grep -qF -- \"\$1\"; }
-  for f in 'parked:+pub fn parkedBytes(' 'spill2:+++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig' 'kvshard:+pub const gpu_paths = true;' 'spillshard:return error.KvShardHomeFull;'; do
+  for f in 'parked:+pub fn parkedBytes(' 'spill2:+++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig' 'kvshard:+pub const gpu_paths = true;' 'spillshard:return error.KvShardHomeFull;' \
+           'mtpcache:+++ b/zig/src/families/glm_cuda/cuda_mtp_keep.zig' 'fill:return error.FillWithMtp;' 'pictures:+++ b/zig/src/core/prompt_media.zig' 'prefixwait:+++ b/zig/src/core/lane_host_prefix_test.zig'; do
     t=\${f%%:*}; m=\${f#*:}
     if [[ ' $DEF_HAS ' == *\" \$t \"* ]]; then carries \"\$m\" || { echo \"ZIG_HAS's default names \$t, but no zig/patches patch adds: \$m\"; exit 1; }
     else ! carries \"\$m\" || { echo \"zig/patches carries \$t (\$m), but ZIG_HAS's default does not name it\"; exit 1; }; fi

@@ -22,10 +22,10 @@
 #                                [--name [REV=]SLUG]... [--title TEXT] [--exclude PATH]... [--keep]
 #   --dry-run         build and check the patches in a temporary folder, print what would change, write nothing
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-glm)
-#   --branch REF      what to export (default glm/series: the port's per-feature commits)
-#   --base REF        what it is relative to: ZIG_TF_REF plus the hand-written patches (default glm/zig-engine-fixes:
-#                     glm/zig-engine-base plus the three hand-written 0014 base fixes, published as wojo/TensorFold
-#                     glm-zig/engine-fixes)
+#   --branch REF      what to export (default glm/pub-r5-on-186: the port's per-feature commits, rounds 1-5)
+#   --base REF        what it is relative to: ZIG_TF_REF plus the hand-written patches (default
+#                     glm/zig-engine-fixes-on-186: glm/zig-engine-base plus the three hand-written 0014 base fixes and
+#                     #186's 0015-0016, the tree of MiaAI-Lab/TensorFold glm-zig/engine-fixes-186)
 #   --mode            commits (default: one patch per first-parent commit) or squash (one patch for BASE..BRANCH)
 #   --name REV=SLUG   commits: the patch of commit REV is NNNN-zig-SLUG.patch (repeatable; a commit without one keeps
 #                     the name of the patch already exported from it, else is named from its subject); squash: --name
@@ -70,7 +70,7 @@ slug() {
 # Sourced with PORT_PATCHES_LIB=1 (scripts/port_test.sh): define the helpers above and stop here
 [[ "${PORT_PATCHES_LIB:-0}" != 1 ]] || return 0
 
-engine="$HOME/GitHub/tensorfold-glm"; branch=glm/series; base=glm/zig-engine-fixes; mode=commits
+engine="$HOME/GitHub/tensorfold-glm"; branch=glm/pub-r5-on-186; base=glm/zig-engine-fixes-on-186; mode=commits
 title="GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continued chats, KV sharding, parked pages) by Robert Wojciechowski (GitHub @wojo, X @rwojo), ported by him to the GLM Zig engine"
 dry=0; keep=0; excludes=(zig/tests/cuda/glm_p1/aot docs/glm-port); names=()
 AOT=zig/tests/cuda/glm_p1/aot
