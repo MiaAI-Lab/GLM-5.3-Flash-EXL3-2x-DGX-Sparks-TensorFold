@@ -1,0 +1,2050 @@
+zig: a long prompt's preparation no longer runs rank 0 out of memory
+
+The template's render and the tokenizer's encode and decode built their
+scratch arenas on the caller's allocator, the server's request arena, so
+nothing they freed went back until the request ended. With the prompt cache
+on, a request is rendered and tokenized three times (the prompt, its history
+and the rewind probe), each after the recipe's history repairs: on a long
+agent conversation with the GLM template the request's arena grew by
+~1,200-1,900 bytes a text byte (4.9 GB for 3.9 MiB of text). Rank 0 shares
+the GB10's memory with its KV pool, so a few long resumes at once could take
+MemAvailable to zero.
+
+- core tokenizer and template: encode's, decode's and render's scratch come
+  from the page allocator and go back as they go; only the ids and the text
+  come from the caller's allocator. Pre-tokenization walks depth first (each
+  step's parts of one piece in that step's own arena, BPE's scratch reset for
+  each word): the same ids, tested against the breadth-first walk on a long
+  text and on GLM's pre-tokenizer.
+- server/prepare_gate.zig: each prepare reserves 48 bytes a text byte and
+  goes when MemAvailable less the reservations in flight stays at the floor
+  with its own, or at once when none is in flight and none waits (as before:
+  no prepare's end could free memory for it). The others wait in arrival
+  order: only the oldest waiter may go, so a large prepare is never starved
+  by a stream of small ones that would each fit beside the ones in flight. A waiter waits for memory at most
+  TENSORFOLD_PREPARE_WAIT_MS, then goes as soon as none is in flight, so the
+  gate never deadlocks and only turns concurrent prepares into queued ones;
+  past TENSORFOLD_PREPARE_MAX_WAITING waiters one more is refused at once as
+  a capacity refusal (429 with Retry-After: 5 under the recipe, as a request
+  past the lanes). A waiting prepare whose client leaves is cancelled and
+  gives up its place; without /proc/meminfo it lets everything through.
+- GLM's kept reasoning (TF_GLM_KEEP_REASONING, on by default) signed each
+  step's whole history again inside every render, into the request's arena:
+  quadratic in the steps (~655 bytes a text byte at 380 KiB, ~1,430 at
+  1 MiB). It now signs a conversation in one pass (the same keys, the Python
+  kept_reasoning.py digests pinned in a test), and chat.prepare puts the
+  reasoning back once, before the gate, which counts it.
+- A kept-alive connection's request arena keeps at most 1 MiB and is reset as
+  soon as its request is answered (it held its largest request's memory until
+  the connection closed).
+
+Switches: TENSORFOLD_PREPARE_FLOOR_GIB, the MemAvailable a prepare leaves
+(default 3 GiB; 0 turns the gate off); TENSORFOLD_PREPARE_WAIT_MS, how long a
+waiter queued behind prepares in flight waits for memory before it goes with
+none in flight (default 5000; 0: at once); TENSORFOLD_PREPARE_MAX_WAITING,
+the prepares that may wait at once (default 64; 0: no bound). A malformed
+value refuses the start. start.sh passes every TENSORFOLD_* variable to every rank;
+only rank 0 prepares prompts.
+
+Measured on the host (no GPU): server/prepare_gate_test.zig runs
+prompt.prepare with the prompt cache on, on the shipped GLM chat template and
+a GLM-like byte-level BPE, over a long synthetic agent conversation, counting
+the request's arena and the render's and the tokenizer's scratch: 30-46 bytes
+a text byte at 384 KiB and 3.9 MiB, thinking on and off, the kept reasoning
+restored or not (1,200-1,900 before; a client that drops every step's
+reasoning took 673.6 before the one-pass signer, 35.7 after). Another test
+holds a reservation and runs chat.prepare: it waits having rendered nothing,
+then prepares and gives its reservation back. The gate's own tests: a large
+prepare behind a stream of four small ones goes before all of them (it went
+last before the arrival order), a prepare under the floor with none in flight and no waiter going at once,
+the wait bound behind a prepare in flight,
+the waiter bound and a cancelled waiter's place, and chat.prepare past the
+bound refused as a capacity refusal having rendered nothing. Replies are unchanged: zig build
+test-golden 309/319 equal to the frozen Python answers, 0 unexpected
+differences. Not measured on the Sparks yet.
+
+This is the DeepSeek recipe's fix (MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks#40,
+24 bytes a text byte for its two renders) adapted to GLM's three renders and
+its kept reasoning. Applies after 0013; independent of the other 0014 fixes
+(any order). Robert's GLM port series carries the same change; whichever
+lands first, the other copy is an exact duplicate (git apply --reverse
+--check passes). Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+
+diff --git a/zig/src/core/template/template.zig b/zig/src/core/template/template.zig
+index fe64adb..1a245c8 100644
+--- a/zig/src/core/template/template.zig
++++ b/zig/src/core/template/template.zig
+@@ -99,8 +99,15 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled
+ }
+ 
+ /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
++/// Only the text (and a refusal's message) comes from `gpa`: the render's scratch is the page allocator's, given back
++/// when it returns, so an arena `gpa` (a server request's) keeps nothing else of it (~28 bytes a prompt byte otherwise).
+ pub fn render(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
+-    var arena = std.heap.ArenaAllocator.init(gpa);
++    return renderWith(gpa, std.heap.page_allocator, t, messages, tools, context, add_generation_prompt, diag);
++}
++
++/// render with its scratch from `scratch` (tests count it, as the tokenizer's encodeWith does).
++pub fn renderWith(gpa: Allocator, scratch: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
++    var arena = std.heap.ArenaAllocator.init(scratch);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var out: std.ArrayList(u8) = .empty;
+@@ -138,6 +145,30 @@ pub fn renderChat(gpa: Allocator, source: []const u8, messages: std.json.Value,
+     return render(gpa, &t, messages, tools, context, add_generation_prompt, diag);
+ }
+ 
++test "a render keeps only its text in the caller's arena" {
++    const gpa = std.testing.allocator;
++    var diag: Diag = .{};
++    var t = try compile(gpa, "{% for m in messages %}<{{ m.role }}>{{ m.content | trim }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}", &diag);
++    defer t.deinit();
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var msgs = std.json.Array.init(a);
++    const body = try a.alloc(u8, 64 << 10);
++    @memset(body, 'x');
++    for (0..64) |i| {
++        var o: std.json.ObjectMap = .empty;
++        try o.put(a, "role", .{ .string = if (i % 2 == 0) "user" else "assistant" });
++        try o.put(a, "content", .{ .string = body });
++        try msgs.append(.{ .object = o });
++    }
++    var request = std.heap.ArenaAllocator.init(gpa);
++    defer request.deinit();
++    const out = try render(request.allocator(), &t, .{ .array = msgs }, .null, .{ .object = .empty }, true, &diag);
++    try std.testing.expectEqual(64 * body.len + 32 * "<user>".len + 33 * "<assistant>".len, out.len);
++    try std.testing.expect(request.queryCapacity() <= 2 * out.len + (64 << 10));
++}
++
+ test {
+     _ = @import("tests.zig");
+     _ = @import("unicode.zig");
+diff --git a/zig/src/core/tokenizer/model.zig b/zig/src/core/tokenizer/model.zig
+index 40716ad..f271422 100644
+--- a/zig/src/core/tokenizer/model.zig
++++ b/zig/src/core/tokenizer/model.zig
+@@ -45,7 +45,7 @@ pub const Model = struct {
+         switch (m.kind) {
+             .bpe => try m.bpe(ctx, vocab, word, out),
+             .wordpiece => try m.wordpiece(ctx, vocab, word, out),
+-            .wordlevel => try out.append(ctx.a, m.id(vocab, word) orelse try m.unk(vocab)),
++            .wordlevel => try out.append(steps.outOf(ctx), m.id(vocab, word) orelse try m.unk(vocab)),
+         }
+     }
+ 
+@@ -63,7 +63,7 @@ pub const Model = struct {
+ 
+     fn bpe(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
+         const a = ctx.a;
+-        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(a, whole);
++        if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(steps.outOf(ctx), whole);
+         var symbols: std.ArrayList(Symbol) = .empty;
+         var pending_unk: ?u32 = null;
+         var piece: std.ArrayList(u8) = .empty;
+@@ -125,12 +125,12 @@ pub const Model = struct {
+             if (s.next >= 0) if (m.pair(s.id, syms[@intCast(s.next)].id)) |hit|
+                 try queue.push(a, .{ .rank = hit.rank, .pos = top.pos, .id = hit.id });
+         }
+-        for (syms) |s| if (s.alive) try out.append(a, s.id);
++        for (syms) |s| if (s.alive) try out.append(steps.outOf(ctx), s.id);
+     }
+ 
+     fn wordpiece(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
+         const a = ctx.a;
+-        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(a, try m.unk(vocab));
++        if ((std.unicode.utf8CountCodepoints(word) catch return error.InvalidTokenizer) > m.max_chars) return out.append(steps.outOf(ctx), try m.unk(vocab));
+         const mark = out.items.len;
+         var piece: std.ArrayList(u8) = .empty;
+         var start: usize = 0;
+@@ -145,9 +145,9 @@ pub const Model = struct {
+                 while (word[end] & 0xC0 == 0x80) end -= 1;
+             } else {
+                 out.shrinkRetainingCapacity(mark);
+-                return out.append(a, try m.unk(vocab));
++                return out.append(steps.outOf(ctx), try m.unk(vocab));
+             };
+-            try out.append(a, found);
++            try out.append(steps.outOf(ctx), found);
+             start = end;
+         }
+     }
+diff --git a/zig/src/core/tokenizer/steps.zig b/zig/src/core/tokenizer/steps.zig
+index d78e9ce..3f6a12a 100644
+--- a/zig/src/core/tokenizer/steps.zig
++++ b/zig/src/core/tokenizer/steps.zig
+@@ -10,6 +10,8 @@ pub const Error = error{ UnsupportedNormalizer, UnsupportedPreTokenizer, Unsuppo
+ /// Per-call scratch: `a` is an arena freed when the call returns.
+ pub const Context = struct {
+     a: Allocator,
++    /// What the model's output list grows in, when it is not `a` (encode's depth-first walk: `a` is reset for each part).
++    out: ?Allocator = null,
+     matcher: regex.Matcher,
+     raw_bytes: bool = false,
+     spans: std.ArrayList(Span) = .empty,
+@@ -17,6 +19,11 @@ pub const Context = struct {
+ };
+ 
+ pub const Span = struct { start: usize, end: usize, matched: bool };
++
++/// The allocator a model's output list grows in (Context.out, else a).
++pub fn outOf(ctx: *const Context) Allocator {
++    return ctx.out orelse ctx.a;
++}
+ pub const Piece = struct { text: []const u8, first: bool };
+ 
+ pub fn field(v: Value, key: []const u8) ?Value {
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index bcb2f5e..7f2c92f 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -80,6 +80,52 @@ const Trie = struct {
+ 
+ const Segment = struct { start: usize, end: usize, id: ?u32 };
+ 
++/// A pre-tokenizer's steps run depth first: step d's parts of one piece in arena d, reset before the next piece, and
++/// the model's scratch for one part in the last arena, reset for each part. Every step maps a piece to its own parts
++/// alone, in order (PreTokenizer.apply's loop), so the parts and their order are those of the steps over every piece
++/// at once; only the scratch is one piece's a step. `n` is 0 when the steps do not fit (nested deeper than max_steps).
++const Walk = struct {
++    backing: Allocator,
++    steps: [max_steps]*const steps.PreTokenizer = undefined,
++    n: usize = 0,
++    arenas: [max_steps + 1]?std.heap.ArenaAllocator = @splat(null),
++
++    const max_steps = 16;
++
++    fn deinit(w: *Walk) void {
++        for (&w.arenas) |*x| if (x.*) |*ar| ar.deinit();
++    }
++
++    /// The steps of `p`, its Sequences flattened; none when they are more than max_steps.
++    fn flatten(w: *Walk, p: *const steps.PreTokenizer) void {
++        if (!w.add(p)) w.n = 0;
++    }
++
++    fn add(w: *Walk, p: *const steps.PreTokenizer) bool {
++        if (p.* == .sequence) {
++            for (p.sequence) |*step| if (!w.add(step)) return false;
++            return true;
++        }
++        if (w.n == max_steps) return false;
++        w.steps[w.n] = p;
++        w.n += 1;
++        return true;
++    }
++
++    /// `piece` through steps d.. and the model, its ids appended to `ids` (grown in `ids_a`).
++    fn run(w: *Walk, t: *const Tokenizer, d: usize, piece: steps.Piece, ids: *std.ArrayList(u32), ids_a: Allocator) Error!void {
++        if (w.arenas[d] == null) w.arenas[d] = .init(w.backing);
++        const ar = &w.arenas[d].?;
++        _ = ar.reset(.retain_capacity);
++        var cx = steps.Context{ .a = ar.allocator(), .matcher = .{ .a = ar.allocator() }, .out = ids_a };
++        if (d == w.n) return t.model.tokenize(&cx, &t.vocab, piece.text, ids);
++        var parts: std.ArrayList(steps.Piece) = .empty;
++        try parts.append(cx.a, piece);
++        try w.steps[d].apply(&cx, &parts);
++        for (parts.items) |x| try w.run(t, d + 1, x, ids, ids_a);
++    }
++};
++
+ pub const Tokenizer = struct {
+     allocator: Allocator,
+     arena: ?*std.heap.ArenaAllocator = null,
+@@ -113,10 +159,25 @@ pub const Tokenizer = struct {
+     }
+ 
+     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
++    /// The call's scratch comes from the page allocator, never from `a`, and is given back when it returns: with an
++    /// arena `a` (a server request's) the scratch of a long prompt would stay with the request (~160 bytes a text
++    /// byte, over a GiB for a prompt of a million tokens). Pre-tokenization walks depth first (Walk), so it holds the
++    /// parts of one piece a step at a time; the ids are those of `apply` over every piece at once.
+     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        return t.encodeWith(a, text, .{});
++    }
++
++    /// How encode works: where its scratch comes from, and whether pre-tokenization walks depth first (tests compare
++    /// the two walks and count the scratch).
++    pub const EncodeOptions = struct { scratch: Allocator = std.heap.page_allocator, depth_first: bool = true };
++
++    pub fn encodeWith(t: *const Tokenizer, a: Allocator, text: []const u8, o: EncodeOptions) Error![]u32 {
++        var arena = std.heap.ArenaAllocator.init(o.scratch);
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
++        var walk: Walk = .{ .backing = o.scratch };
++        defer walk.deinit();
++        if (t.pre_tokenizer) |*p| if (o.depth_first) walk.flatten(p);
+         var valid = text;
+         if (!std.unicode.utf8ValidateSlice(text)) {
+             var fixed: std.ArrayList(u8) = .empty;
+@@ -125,12 +186,12 @@ pub const Tokenizer = struct {
+         }
+         var ids: std.ArrayList(u32) = .empty;
+         for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
+-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, &walk, valid[seg.start..seg.end], seg.start == 0, &ids);
+         }
+         return a.dupe(u32, ids.items);
+     }
+ 
+-    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
++    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, walk: *Walk, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
+         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
+         for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
+@@ -139,10 +200,16 @@ pub const Tokenizer = struct {
+                 continue;
+             }
+             if (seg.end == seg.start) continue;
+-            var pieces: std.ArrayList(steps.Piece) = .empty;
+-            try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
+-            if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
+-            for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
++            const piece: steps.Piece = .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero };
++            if (t.pre_tokenizer != null and walk.n == 0) {
++                // every piece at once (a pre-tokenizer nested past Walk's steps, or depth_first off)
++                var pieces: std.ArrayList(steps.Piece) = .empty;
++                try pieces.append(ctx.a, piece);
++                try t.pre_tokenizer.?.apply(ctx, &pieces);
++                for (pieces.items) |x| try t.model.tokenize(ctx, &t.vocab, x.text, ids);
++                continue;
++            }
++            try walk.run(t, 0, piece, ids, ctx.a);
+         }
+     }
+ 
+@@ -181,7 +248,7 @@ pub const Tokenizer = struct {
+ 
+     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
+     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
+-        var arena = std.heap.ArenaAllocator.init(a);
++        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // (scratch never kept in `a`: see encode)
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
+@@ -467,3 +534,163 @@ test "raw token bytes conservatively refuse context-sensitive decoder kinds" {
+         try std.testing.expect((try t.tokenBytes(a, 0)) == null);
+     }
+ }
++
++/// Counts what an allocator holds now and at most (the tests' measure of encode's scratch).
++const Counting = struct {
++    child: Allocator,
++    live: usize = 0,
++    peak: usize = 0,
++
++    fn allocator(c: *Counting) Allocator {
++        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
++    }
++    fn note(c: *Counting, add: usize, sub: usize) void {
++        c.live = c.live + add - sub;
++        c.peak = @max(c.peak, c.live);
++    }
++    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawAlloc(len, al, ra) orelse return null;
++        c.note(len, 0);
++        return p;
++    }
++    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        if (!c.child.rawResize(m, al, n, ra)) return false;
++        c.note(n, m.len);
++        return true;
++    }
++    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawRemap(m, al, n, ra) orelse return null;
++        c.note(n, m.len);
++        return p;
++    }
++    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        c.child.rawFree(m, al, ra);
++        c.note(0, m.len);
++    }
++};
++
++/// A byte-level BPE tokenizer with DeepSeek-V3/V4's pre-tokenizer (digits, CJK runs, the word regex, ByteLevel), every
++/// byte in the vocabulary and merges that join each of `words` (with and without its leading space) left to right.
++fn deepseekLike(a: Allocator, words: []const []const u8) !Tokenizer {
++    var out: std.Io.Writer.Allocating = .init(a);
++    defer out.deinit();
++    const w = &out.writer;
++    try w.writeAll(
++        \\{"added_tokens":[{"id":0,"content":"<｜User｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false}],
++        \\ "normalizer":null,
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[
++        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
++        \\  {"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},
++        \\  {"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
++        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{
++    );
++    var vocab: std.StringArrayHashMapUnmanaged(void) = .empty;
++    defer vocab.deinit(a);
++    var merges: std.ArrayList([2][]const u8) = .empty;
++    defer merges.deinit(a);
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const aa = arena.allocator();
++    for (0..256) |b| {
++        var buf: [4]u8 = undefined;
++        const n = try std.unicode.utf8Encode(steps.byte_chars[b], &buf);
++        try vocab.put(a, try aa.dupe(u8, buf[0..n]), {});
++    }
++    for (words) |word| for ([_][]const u8{ "", " " }) |lead| {
++        const raw = try std.mem.concat(aa, u8, &.{ lead, word });
++        var cur: []const u8 = "";
++        for (raw) |b| {
++            var buf: [4]u8 = undefined;
++            const sym = try aa.dupe(u8, buf[0..try std.unicode.utf8Encode(steps.byte_chars[b], &buf)]);
++            if (cur.len == 0) {
++                cur = sym;
++                continue;
++            }
++            const next = try std.mem.concat(aa, u8, &.{ cur, sym });
++            if (!vocab.contains(next)) {
++                try vocab.put(a, next, {});
++                try merges.append(a, .{ cur, sym });
++            }
++            cur = next;
++        }
++    };
++    for (vocab.keys(), 1..) |k, id| {
++        if (id > 1) try w.writeAll(",");
++        try w.print("{f}:{d}", .{ std.json.fmt(k, .{}), id });
++    }
++    try w.writeAll("},\"merges\":[");
++    for (merges.items, 0..) |m, i| {
++        if (i > 0) try w.writeAll(",");
++        try w.print("[{f},{f}]", .{ std.json.fmt(m[0], .{}), std.json.fmt(m[1], .{}) });
++    }
++    try w.writeAll("]}}");
++    return parse(a, out.written());
++}
++
++/// A long prompt's text: sentences of `words`, numbers, CJK runs, tabs and blank lines, an added token now and then.
++fn longText(a: Allocator, words: []const []const u8, bytes: usize) ![]u8 {
++    var out: std.ArrayList(u8) = .empty;
++    var rng = std.Random.DefaultPrng.init(17);
++    const r = rng.random();
++    while (out.items.len < bytes) {
++        const n = 4 + r.uintLessThan(usize, 14);
++        for (0..n) |i| {
++            if (i > 0) try out.append(a, ' ');
++            try out.appendSlice(a, words[r.uintLessThan(usize, words.len)]);
++        }
++        switch (r.uintLessThan(u8, 10)) {
++            0 => try out.print(a, " {d}", .{r.uintLessThan(u32, 1_000_000)}),
++            1 => try out.appendSlice(a, " 日本語のテキスト、"),
++            2 => try out.appendSlice(a, "\t(x+y)=z;"),
++            3 => try out.appendSlice(a, "<｜User｜>"),
++            else => {},
++        }
++        try out.appendSlice(a, if (r.uintLessThan(u8, 6) == 0) ".\n\n" else ". ");
++    }
++    return out.toOwnedSlice(a);
++}
++
++const test_words = [_][]const u8{ "the", "model", "reads", "a", "long", "prompt", "of", "many", "tokens", "and", "keeps", "its", "state", "while", "another", "conversation", "resumes", "from", "memory", "There", "Each", "stream", "decodes" };
++
++test "encode's ids are the breadth-first walk's, and it keeps no scratch in the caller's arena" {
++    const gpa = std.testing.allocator;
++    var t = try deepseekLike(gpa, &test_words);
++    defer t.deinit();
++    const text = try longText(gpa, &test_words, 256 << 10);
++    defer gpa.free(text);
++    // the same ids either walk (and on a few short texts with edge cases)
++    for ([_][]const u8{ text, "", " ", "\n\n\n", "<｜User｜>", "12345 6789", "a  b\t\tc \n d", "\xff\xfe broken", "日本語abc123" }) |s| {
++        const deep = try t.encodeWith(gpa, s, .{});
++        defer gpa.free(deep);
++        const wide = try t.encodeWith(gpa, s, .{ .depth_first = false });
++        defer gpa.free(wide);
++        try std.testing.expectEqualSlices(u32, wide, deep);
++        const back = try t.decode(gpa, deep, false);
++        defer gpa.free(back);
++        if (std.unicode.utf8ValidateSlice(s)) try std.testing.expectEqualStrings(s, back);
++    }
++    // a request arena keeps only the ids: the scratch was the page allocator's
++    var held: Counting = .{ .child = gpa };
++    {
++        var request = std.heap.ArenaAllocator.init(held.allocator());
++        defer request.deinit();
++        const ids = try t.encode(request.allocator(), text);
++        try std.testing.expect(ids.len > text.len / 8);
++        try std.testing.expect(held.peak <= 2 * ids.len * 4 + (64 << 10)); // (an arena's buffer for the one dupe)
++    }
++    // the scratch itself, counted: depth first it is a few bytes a text byte (breadth first: ~100)
++    var deep: Counting = .{ .child = gpa };
++    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = deep.allocator() }));
++    var wide: Counting = .{ .child = gpa };
++    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = wide.allocator(), .depth_first = false }));
++    std.debug.print("scratch for {d} text bytes: depth first {d} B, breadth first {d} B\n", .{ text.len, deep.peak, wide.peak });
++    try std.testing.expectEqual(@as(usize, 0), deep.live);
++    try std.testing.expect(deep.peak * 4 < wide.peak);
++    try std.testing.expect(deep.peak < 40 * text.len);
++}
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 1089cde..a9798fc 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -17,6 +17,7 @@ const admission = @import("admission.zig");
+ const glm_calls = @import("glm_calls.zig");
+ const glm_reply = @import("glm_reply.zig");
+ const playout_mod = @import("playout.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -172,7 +173,17 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     if (input.prompt != null) thinking = false;
+     if (f.get("clear_thinking")) |v| cx.clear_thinking = v.truthy(); // chat_template_kwargs.clear_thinking, for every render
+     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
+-    const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
++    // the renders and tokenizations take memory in proportion to the text (prompt and history, and the rewind probe
++    // with the prompt cache on); under the memory floor they wait for the ones in flight (prepare_gate), and hold the
++    // reservation until prepare returns, in arrival order; past the gate's waiter bound a request is refused as one past
++    // the lanes is (429 under the recipe). GLM's kept reasoning goes back first, so the reservation counts it.
++    const sent = try prompt_mod.withKept(srv, a, input);
++    const ticket = srv.gate.enter(io, srv.gate.need(promptBytes(sent)), gone) catch |e| switch (e) {
++        error.Cancelled => return error.Cancelled,
++        error.Full => return cx.fail(.capacity, "{s}", .{prepare_gate.full_message}),
++    };
++    defer srv.gate.leave(io, ticket);
++    const rendered = try prompt_mod.prepare(srv, cx, sent, thinking, effort);
+     if (gone.check()) return error.Cancelled;
+     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
+     const window: i64 = srv.info.context_window;
+@@ -191,7 +202,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         }
+         limit = @min(limit, room);
+     }
+-    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
++    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, sent.messages, input.tools, rendered.ids, thinking, effort);
+     var shared: std.ArrayList(u32) = .empty;
+     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
+         if (cut >= 512) try shared.append(a, @intCast(cut));
+@@ -328,6 +339,17 @@ pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Fail
+     return @import("compact.zig").run(srv, cx, input, sink, gone);
+ }
+ 
++/// The text a request's prepare renders and tokenizes, in bytes (its reservation's measure).
++pub fn promptBytes(input: Input) usize {
++    var n = prepare_gate.textBytes(input.messages);
++    for (input.tools) |t| n +|= prepare_gate.textBytes(t);
++    if (input.prompt) |p| switch (p) {
++        .text => |t| n +|= t.len,
++        .ids => |toks| n +|= 4 * toks.len,
++    };
++    return n;
++}
++
+ /// Give back a foreground request's preparing count: at its submit, or when it is never generated.
+ pub fn release(srv: *Server, preparing: bool) void {
+     if (preparing) _ = srv.preparing.fetchSub(1, .acq_rel);
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 4dd35aa..55d428d 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const api = @import("engine_api");
++const prepare_gate = @import("prepare_gate.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const Kind = enum {
+@@ -461,7 +462,8 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
+         try w.writeAll("}");
+     }
+     try w.writeAll("}}, \"env\": [");
+-    for (env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
++    // (the prepare gate's floor is the server's own: prepare_gate.zig)
++    for (env ++ prepare_gate.env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
+     try w.writeAll("]}\n");
+ }
+ 
+diff --git a/zig/src/server/glm_kept.zig b/zig/src/server/glm_kept.zig
+index c35e8be..dc108a6 100644
+--- a/zig/src/server/glm_kept.zig
++++ b/zig/src/server/glm_kept.zig
+@@ -48,10 +48,13 @@ pub const KeptReasoning = struct {
+     }
+ 
+     /// Keep the `reasoning` of a reply that made `calls` after the request's `messages`.
+-    pub fn remember(k: *KeptReasoning, a: Allocator, messages: Value, calls: []const Value, reasoning: ?[]const u8) Allocator.Error!void {
++    pub fn remember(k: *KeptReasoning, messages: Value, calls: []const Value, reasoning: ?[]const u8) Allocator.Error!void {
+         const text = reasoning orelse return;
+         if (calls.len == 0 or reply_text.pyStrip(text).len == 0 or text.len > k.chars) return;
+-        const found = try keysOf(a, if (messages == .array) messages.array else &.{}, calls);
++        var signer: Signer = .init();
++        defer signer.deinit();
++        if (messages == .array) for (messages.array) |m| try signer.add(m);
++        const found = try signer.keys(calls);
+         var keys: std.ArrayList([]u8) = .empty;
+         errdefer {
+             for (keys.items) |key| k.gpa.free(key);
+@@ -96,27 +99,44 @@ pub const KeptReasoning = struct {
+     }
+ 
+     /// `messages` with the kept reasoning of each assistant step that calls tools and carries none (a copy; the
+-    /// caller's list and messages are left alone).
++    /// caller's list and messages are left alone). One pass: each message is signed once, and `a` takes only what is
++    /// put back.
+     pub fn restore(k: *KeptReasoning, a: Allocator, messages: Value) Allocator.Error!Value {
+         if (messages != .array or k.items.count() == 0) return messages;
++        var last: ?usize = null;
++        for (messages.array, 0..) |m, i| if (bare(m)) {
++            last = i;
++        };
++        const end = (last orelse return messages) + 1;
++        var signer: Signer = .init();
++        defer signer.deinit();
+         var out: ?[]Value = null;
+-        for (messages.array, 0..) |m, i| {
+-            if (m != .object or !std.mem.eql(u8, m.strField("role") orelse "", "assistant")) continue;
+-            const calls = m.get("tool_calls") orelse continue;
+-            if (!calls.truthy()) continue;
+-            if (reply_text.pyStrip(textOf(m.get("reasoning_content"))).len > 0 or reply_text.pyStrip(textOf(m.get("reasoning"))).len > 0) continue;
+-            if (std.mem.indexOf(u8, textOf(m.get("content")), "</think>") != null) continue;
+-            const found = try keysOf(a, messages.array[0..i], if (calls == .array) calls.array else &.{});
+-            const kept = try k.find(a, found) orelse continue;
+-            if (out == null) out = try a.dupe(Value, messages.array);
+-            const copy = try json.copyObject(a, m.object);
+-            try copy.put(a, "reasoning_content", .{ .string = kept });
+-            out.?[i] = .{ .object = copy };
++        for (messages.array[0..end], 0..) |m, i| {
++            if (bare(m)) if (try k.find(a, try signer.keys(callList(m.get("tool_calls").?)))) |kept| {
++                if (out == null) out = try a.dupe(Value, messages.array);
++                const copy = try json.copyObject(a, m.object);
++                try copy.put(a, "reasoning_content", .{ .string = kept });
++                out.?[i] = .{ .object = copy };
++            };
++            try signer.add(m);
+         }
+         return if (out) |o| .{ .array = o } else messages;
+     }
+ };
+ 
++/// An assistant step that calls tools and carries no reasoning of its own (restore's to fill).
++fn bare(m: Value) bool {
++    if (m != .object or !std.mem.eql(u8, m.strField("role") orelse "", "assistant")) return false;
++    const calls = m.get("tool_calls") orelse return false;
++    if (!calls.truthy()) return false;
++    if (reply_text.pyStrip(textOf(m.get("reasoning_content"))).len > 0 or reply_text.pyStrip(textOf(m.get("reasoning"))).len > 0) return false;
++    return std.mem.indexOf(u8, textOf(m.get("content")), "</think>") == null;
++}
++
++fn callList(calls: Value) []const Value {
++    return if (calls == .array) calls.array else &.{};
++}
++
+ /// A content as text: a string, or the text parts of a list joined.
+ fn textOf(content: ?Value) []const u8 {
+     const c = content orelse return "";
+@@ -206,37 +226,76 @@ fn canonical(a: Allocator, w: *std.ArrayList(u8), v: Value) Allocator.Error!void
+     }
+ }
+ 
++/// A message's part of a signature: its role, its text (stripped, as the template renders it) and an assistant's calls,
++/// without ids or reasoning.
++fn entryOf(a: Allocator, m: Value) Allocator.Error!Value {
++    var e: std.ArrayList(Value) = .empty;
++    try e.append(a, .{ .string = m.strField("role") orelse "" });
++    try e.append(a, .{ .string = reply_text.pyStrip(try textJoined(a, m.get("content"))) });
++    if (std.mem.eql(u8, m.strField("role") orelse "", "assistant")) if (m.get("tool_calls")) |tc| if (tc.truthy() and tc == .array)
++        try e.append(a, try callsOf(a, tc.array));
++    return .{ .array = e.items };
++}
++
++/// The signatures after each message of a conversation, in one pass: `[shape, calls]`'s canonical text is hashed as
++/// it goes, each message's entry once, and a step's key finishes a copy of the hash with its calls. Signing each
++/// step's whole history again was quadratic in the steps, and kept every history's text in the request's arena; here
++/// a message's text is built in scratch that the next one reuses.
++const Signer = struct {
++    hash: Sha256,
++    entries: usize = 0,
++    scratch: std.heap.ArenaAllocator,
++
++    fn init() Signer {
++        var hash = Sha256.init(.{});
++        hash.update("[[");
++        return .{ .hash = hash, .scratch = .init(std.heap.page_allocator) };
++    }
++
++    fn deinit(s: *Signer) void {
++        s.scratch.deinit();
++    }
++
++    /// `m` joins the history (a message that is not an object has no entry).
++    fn add(s: *Signer, m: Value) Allocator.Error!void {
++        if (m != .object) return;
++        _ = s.scratch.reset(.retain_capacity);
++        const a = s.scratch.allocator();
++        var text: std.ArrayList(u8) = .empty;
++        if (s.entries > 0) try text.append(a, ',');
++        try canonical(a, &text, try entryOf(a, m));
++        s.hash.update(text.items);
++        s.entries += 1;
++    }
++
++    /// The keys of `calls` written after the history so far: the ids the server made, then the signature (in the
++    /// scratch, until the next add or keys).
++    fn keys(s: *Signer, calls: []const Value) Allocator.Error![]const []const u8 {
++        _ = s.scratch.reset(.retain_capacity);
++        const a = s.scratch.allocator();
++        var out: std.ArrayList([]const u8) = .empty;
++        for (calls) |c| if (c == .object) if (c.strField("id")) |id| if (isOurId(id)) try out.append(a, id);
++        var text: std.ArrayList(u8) = .empty;
++        try text.appendSlice(a, "],");
++        try canonical(a, &text, try callsOf(a, calls));
++        try text.append(a, ']');
++        var hash = s.hash;
++        hash.update(text.items);
++        var digest: [32]u8 = undefined;
++        hash.final(&digest);
++        try out.append(a, try std.fmt.allocPrint(a, "sig:{x}", .{&digest}));
++        return out.items;
++    }
++};
++
+ /// The key of `calls` written after `history`: each message's role, text (stripped, as the template renders it) and
+ /// calls, without ids or reasoning, then the calls.
+ pub fn signature(a: Allocator, history: []const Value, calls: []const Value) Allocator.Error![]const u8 {
+-    var shape: std.ArrayList(Value) = .empty;
+-    for (history) |m| {
+-        if (m != .object) continue;
+-        const entry: std.ArrayList(Value) = blk: {
+-            var e: std.ArrayList(Value) = .empty;
+-            try e.append(a, .{ .string = m.strField("role") orelse "" });
+-            try e.append(a, .{ .string = reply_text.pyStrip(try textJoined(a, m.get("content"))) });
+-            if (std.mem.eql(u8, m.strField("role") orelse "", "assistant")) if (m.get("tool_calls")) |tc| if (tc.truthy() and tc == .array)
+-                try e.append(a, try callsOf(a, tc.array));
+-            break :blk e;
+-        };
+-        try shape.append(a, .{ .array = entry.items });
+-    }
+-    const top = try a.alloc(Value, 2);
+-    top[0] = .{ .array = shape.items };
+-    top[1] = try callsOf(a, calls);
+-    var text: std.ArrayList(u8) = .empty;
+-    try canonical(a, &text, .{ .array = top });
+-    var digest: [32]u8 = undefined;
+-    Sha256.hash(text.items, &digest, .{});
+-    return std.fmt.allocPrint(a, "sig:{x}", .{&digest});
+-}
+-
+-fn keysOf(a: Allocator, history: []const Value, calls: []const Value) Allocator.Error![]const []const u8 {
+-    var out: std.ArrayList([]const u8) = .empty;
+-    for (calls) |c| if (c == .object) if (c.strField("id")) |id| if (isOurId(id)) try out.append(a, id);
+-    try out.append(a, try signature(a, history, calls));
+-    return out.items;
++    var signer: Signer = .init();
++    defer signer.deinit();
++    for (history) |m| try signer.add(m);
++    const found = try signer.keys(calls);
++    return a.dupe(u8, found[found.len - 1]);
+ }
+ 
+ test "a kept reply's reasoning returns to the step whose client dropped it" {
+@@ -247,7 +306,7 @@ test "a kept reply's reasoning returns to the step whose client dropped it" {
+     defer k.deinit();
+     const history = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"go\"}]")).ok;
+     const calls = (try json.parse(a, "[{\"id\":\"call_0123456789abcdef01234567\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]")).ok;
+-    try k.remember(a, history, calls.array, "I should call f.");
++    try k.remember(history, calls.array, "I should call f.");
+     // the next request: the client renumbered the id and dropped the reasoning; the signature finds it
+     const next = (try json.parse(a,
+         \\[{"role":"user","content":" go "},{"role":"assistant","content":"","tool_calls":[{"id":"x1","type":"function","function":{"name":"f","arguments":{"a":1}}}]},{"role":"tool","tool_call_id":"x1","content":"ok"}]
+@@ -282,13 +341,62 @@ test "the oldest replies go first, by count and by size" {
+     for (0..4) |i| {
+         const history = (try json.parse(a, try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":\"q{d}\"}}]", .{i}))).ok;
+         const c = (try json.parse(a, try std.fmt.allocPrint(a, "[{{\"id\":\"x\",\"function\":{{\"name\":\"f\",\"arguments\":{{\"n\":{d}}}}}}}]", .{i}))).ok;
+-        try k.remember(a, history, c.array, "reason");
++        try k.remember(history, c.array, "reason");
+     }
+     try std.testing.expectEqual(@as(usize, 2), k.items.count());
+     _ = calls;
+     // a reply longer than the whole budget is not kept
+     var tiny = KeptReasoning.init(std.testing.allocator, std.testing.io, 8, 0);
+     defer tiny.deinit();
+-    try tiny.remember(a, .{ .array = &.{} }, (try json.parse(a, "[{\"function\":{\"name\":\"f\"}}]")).ok.array, "x");
++    try tiny.remember(.{ .array = &.{} }, (try json.parse(a, "[{\"function\":{\"name\":\"f\"}}]")).ok.array, "x");
+     try std.testing.expectEqual(@as(usize, 0), tiny.items.count());
+ }
++
++test "the signatures are kept_reasoning.py's" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // signature(messages[:i], messages[i]["tool_calls"]) from kept_reasoning.py for each step: text parts joined and
++    // stripped, a message that is not an object skipped, arguments parsed (or kept as text), keys sorted, non-ASCII as is
++    const messages = (try json.parse(a,
++        \\[{"role":"system","content":"  You read files.  "},{"role":"user","content":[{"type":"text","text":"Read "},{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"a.zig, ünïcode ✓"}]},{"role":"assistant","content":"","tool_calls":[{"id":"call_0123456789abcdef01234567","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.zig\",\"z\":[1,2],\"b\":{\"y\":true,\"x\":null}}"}}]},{"role":"tool","tool_call_id":"call_0123456789abcdef01234567","content":"const a = \"q\";\n\ttab"},7,{"role":"assistant","content":"Next.","reasoning_content":"kept apart","tool_calls":[{"id":"r1","type":"function","function":{"name":"grep","arguments":{"pattern":"fn ","n":3}}},{"id":"r2","type":"function","function":{"name":"ls","arguments":""}}]},{"role":"tool","tool_call_id":"r1","content":"ok"},{"role":"tool","tool_call_id":"r2","content":"not json {"},{"role":"assistant","content":"x","tool_calls":[{"id":"r3","type":"function","function":{"name":"write","arguments":"not json {"}}]}]
++    )).ok.array;
++    const python = [_]struct { usize, []const u8 }{
++        .{ 2, "sig:675ffa5ec9bb9dbed6704ec676468ace78556cec250c524bd9ea082316a6444b" },
++        .{ 5, "sig:41682446462895adf60e7fffee858764cf0d65502fc19a9f61d3ed0d1b3e48a0" },
++        .{ 8, "sig:2071534fd7f899c59640044d014c7eddc473946aedba57784334be514283183e" },
++    };
++    for (python) |p| try std.testing.expectEqualStrings(p[1], try signature(a, messages[0..p[0]], messages[p[0]].get("tool_calls").?.array));
++    const lone = (try json.parse(a, "[{\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]")).ok.array;
++    try std.testing.expectEqualStrings("sig:043f90839f1551cd19205713623501d3da4dc9b47dfdc47e1c1cf7c8976d8075", try signature(a, &.{}, lone));
++}
++
++test "one pass puts back each step's own reasoning, and takes nothing from the caller's allocator when none is kept" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var k = KeptReasoning.init(std.testing.allocator, std.testing.io, 64, 1);
++    defer k.deinit();
++    // a tool loop of steps whose ids the client renumbered: only the signatures find them
++    var list: std.ArrayList(Value) = .empty;
++    try list.append(a, (try json.parse(a, "{\"role\":\"user\",\"content\":\"go\"}")).ok);
++    for (0..6) |i| {
++        const step = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{{\"id\":\"c{d}\",\"type\":\"function\",\"function\":{{\"name\":\"f\",\"arguments\":{{\"n\":{d}}}}}}}]}}", .{ i, i }))).ok;
++        if (i % 2 == 0) try k.remember(.{ .array = list.items }, step.get("tool_calls").?.array, try std.fmt.allocPrint(a, "thought {d}", .{i}));
++        try list.append(a, step);
++        try list.append(a, (try json.parse(a, try std.fmt.allocPrint(a, "{{\"role\":\"tool\",\"tool_call_id\":\"c{d}\",\"content\":\"out {d}\"}}", .{ i, i }))).ok);
++    }
++    const restored = try k.restore(a, .{ .array = list.items });
++    for (0..6) |i| {
++        const step = restored.array[1 + 2 * i];
++        if (i % 2 == 0) {
++            try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "thought {d}", .{i}), step.strField("reasoning_content").?);
++        } else try std.testing.expect(!step.has("reasoning_content"));
++    }
++    // a conversation none of whose steps is kept: every step is looked up, the caller's allocator is never touched
++    // (the signatures' text lives in the restore's own scratch)
++    const other = try a.dupe(Value, list.items);
++    other[0] = (try json.parse(a, "{\"role\":\"user\",\"content\":\"another\"}")).ok;
++    const same = try k.restore(std.testing.failing_allocator, .{ .array = other });
++    try std.testing.expect(same.array.ptr == other.ptr);
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 99bc4bd..4fcccf3 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -328,7 +328,7 @@ const Run = struct {
+             reply.content = try r.plan.policy.content(r.a, reply.content);
+             // the calls' reasoning, for a client that will not send it back (TF_GLM_KEEP_REASONING)
+             if (reply.calls != null and std.mem.eql(u8, reply.finish_reason, "tool_calls")) if (r.srv.kept_reasoning) |k|
+-                try k.remember(r.a, r.plan.input.messages, reply.calls.?, reply.reasoning);
++                try k.remember(r.plan.input.messages, reply.calls.?, reply.reasoning);
+             return reply.calls;
+         }
+         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+diff --git a/zig/src/server/prepare_gate.zig b/zig/src/server/prepare_gate.zig
+new file mode 100644
+index 0000000..085ce78
+--- /dev/null
++++ b/zig/src/server/prepare_gate.zig
+@@ -0,0 +1,589 @@
++//! The memory gate before a prompt is rendered and tokenized (rank 0's host side). A conversation's text is rendered
++//! and tokenized three times with the prompt cache on (prompt.prepare: the prompt, its history and the rewind probe,
++//! each after GLM's history repairs), so a resumed conversation of a million tokens needs memory in proportion to its
++//! text while it prepares, and on a unified-memory machine (a GB10, where the KV pool leaves a few GiB free) eight of
++//! them at once can take MemAvailable to zero. Each prepare reserves `per_byte` bytes for every byte of its text and
++//! goes when MemAvailable, less what the ones in flight reserved, stays at the floor or over with its own reservation.
++//! Prepares that cannot go wait in arrival order: only the oldest waiter may go, so a large prepare is never starved by
++//! a stream of small ones that would each fit beside the ones in flight (they queue behind it). A prepare that arrives
++//! with none in flight and no earlier waiter always goes at once, as before the order (no prepare's end could free
++//! memory for it). A waiter waits for memory at most `TENSORFOLD_PREPARE_WAIT_MS`; past it, it goes as soon as none is
++//! in flight (it can never wait on itself, so the gate never deadlocks; 0 gives that rule at once). At most
++//! `TENSORFOLD_PREPARE_MAX_WAITING` prepares wait; one more is refused (`error.Full`, which chat.prepare answers as a
++//! capacity refusal: 429 with `Retry-After` under the GLM recipe, else 503). The gate only ever turns concurrent
++//! prepares into queued ones; it changes no reply. Off with a floor of 0, and where MemAvailable cannot be read (no
++//! /proc/meminfo).
++const std = @import("std");
++const json = @import("json");
++const log = @import("log.zig");
++const Value = json.Value;
++
++/// The variables that set it (serve.zig reads them; capabilities lists them beside cli.env).
++pub const env = [_][]const u8{ "TENSORFOLD_PREPARE_FLOOR_GIB", "TENSORFOLD_PREPARE_WAIT_MS", "TENSORFOLD_PREPARE_MAX_WAITING" };
++/// TENSORFOLD_PREPARE_FLOOR_GIB unset: the MemAvailable a prepare leaves at least, in GiB.
++pub const default_floor_gib: f64 = 3;
++/// TENSORFOLD_PREPARE_WAIT_MS unset: how long a waiter (one queued behind prepares in flight) waits for memory before
++/// it goes with none in flight. Long enough for what frees rank 0's memory beside the prepares (a restore's staging, a
++/// finished request's arena), short enough that on a GB10 already under its floor a queued request waits seconds, not
++/// for good. A prepare that finds the gate empty never waits.
++pub const default_wait_ms: u64 = 5000;
++/// TENSORFOLD_PREPARE_MAX_WAITING unset: the prepares that may wait at once (0: no bound). Every lane's request and
++/// a queue of the same size several times over; past it a client is told to retry rather than held unseen.
++pub const default_max_waiting: u32 = 64;
++/// Bytes reserved a text byte, measured on a long GLM agent conversation (prepare_gate_test.zig): a render's or a
++/// tokenization's transient scratch (~16-19 and ~12-13 bytes a text byte, one at a time) over what the request holds
++/// meanwhile (its body and parsed messages, ~3; three renders' repaired and normalized messages, texts and id lists,
++/// ~11-25 by the arena's steps): 30-46, with room to spare. DeepSeek's two renders take 24.
++pub const default_per_byte: u64 = 48;
++/// A prepare refused for the waiter bound: the request's capacity refusal (errors.Kind.capacity).
++pub const full_message = "too many prompts are waiting for memory to be prepared; retry shortly";
++/// How often the oldest waiter reads MemAvailable again (memory frees outside the gate too, so it polls).
++const poll_ms = 10;
++
++pub const Gate = struct {
++    mutex: std.Io.Mutex = .init,
++    floor: u64 = 0, // bytes; 0: off
++    per_byte: u64 = default_per_byte,
++    /// How long a waiter waits for memory before it goes with none in flight (ns; 0: at once).
++    max_wait_ns: u64 = default_wait_ms * std.time.ns_per_ms,
++    /// The waiters allowed at once (0: no bound).
++    max_waiting: u32 = default_max_waiting,
++    reserved: u64 = 0,
++    inflight: u32 = 0,
++    /// The waiters in arrival order (each a waiting prepare's own stack node), and how many there are.
++    first: ?*Waiter = null,
++    last: ?*Waiter = null,
++    waiting: u32 = 0,
++    /// Prepares that had to wait, the longest wait (ns), those that went with none in flight past the maximum wait,
++    /// and those refused for the waiter bound: for the log and the tests.
++    waited: u64 = 0,
++    longest_ns: u64 = 0,
++    overdue: u64 = 0,
++    refused: u64 = 0,
++    /// MemAvailable in bytes, null when it cannot be read (the gate lets everything through then).
++    avail: *const fn (io: std.Io) ?u64 = memAvailable,
++
++    pub const Ticket = struct { need: u64 = 0, held: bool = false };
++    pub const Error = error{ Cancelled, Full };
++
++    const Waiter = struct {
++        bytes: u64,
++        since: i96,
++        prev: ?*Waiter = null,
++        next: ?*Waiter = null,
++    };
++
++    /// A gate leaving `floor_gib` GiB (0: off), with the default wait and waiter bound.
++    pub fn init(floor_gib: f64) Gate {
++        return .{ .floor = if (floor_gib > 0) @intFromFloat(floor_gib * (1 << 30)) else 0 };
++    }
++
++    /// A gate with its three settings (TENSORFOLD_PREPARE_FLOOR_GIB, _WAIT_MS, _MAX_WAITING).
++    pub fn configured(floor_gib: f64, wait_ms: u64, max_waiting: u32) Gate {
++        var g = init(floor_gib);
++        g.max_wait_ns = std.math.mul(u64, wait_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
++        g.max_waiting = max_waiting;
++        return g;
++    }
++
++    /// The reservation of a prepare of `text_bytes` bytes of text.
++    pub fn need(g: *const Gate, text_bytes: usize) u64 {
++        return std.math.mul(u64, text_bytes, g.per_byte) catch std.math.maxInt(u64);
++    }
++
++    /// Waits its turn (arrival order) until a prepare reserving `bytes` fits, or, past the maximum wait, until none is
++    /// in flight; then holds its reservation until leave. error.Cancelled when `gone` says the client left while it
++    /// waited (it leaves the queue, so the next waiter moves up); error.Full, at once, when the waiter bound is reached.
++    pub fn enter(g: *Gate, io: std.Io, bytes: u64, gone: anytype) Error!Ticket {
++        if (g.floor == 0) return .{};
++        var me: Waiter = .{ .bytes = bytes, .since = std.Io.Clock.awake.now(io).toNanoseconds() };
++        g.mutex.lockUncancelable(io);
++        // uncontended (none in flight, no earlier waiter): it goes at once, as before the order, even under the floor:
++        // no prepare's end can free memory for it, so waiting would only add latency
++        if (g.first == null and (g.inflight == 0 or g.goes(io, &me) != .wait)) return g.take(io, &me, null);
++        if (g.max_waiting > 0 and g.waiting >= g.max_waiting) {
++            g.refused += 1;
++            const n = g.waiting;
++            g.mutex.unlock(io);
++            log.line("prepare refused: {d} prepares already wait for memory (TENSORFOLD_PREPARE_MAX_WAITING={d}); the client is told to retry", .{ n, g.max_waiting });
++            return error.Full;
++        }
++        g.push(&me);
++        const ahead = g.waiting - 1;
++        const queued = g.inflight;
++        const reserved = g.reserved;
++        g.mutex.unlock(io);
++        log.line("prepare waits for memory: {d} MiB reserved for it, {d} prepares in flight hold {d} MiB, {d} wait before it, floor {d} MiB", .{ bytes >> 20, queued, reserved >> 20, ahead, g.floor >> 20 });
++        while (true) {
++            if (gone.check()) {
++                g.mutex.lockUncancelable(io);
++                g.unlink(&me);
++                g.mutex.unlock(io);
++                return error.Cancelled;
++            }
++            std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake) catch {};
++            g.mutex.lockUncancelable(io);
++            if (g.first == &me) {
++                const how = g.goes(io, &me);
++                if (how != .wait) {
++                    g.unlink(&me);
++                    return g.take(io, &me, how);
++                }
++            }
++            g.mutex.unlock(io);
++        }
++    }
++
++    const Go = enum { wait, fits, overdue };
++
++    /// (locked) Whether `w` may go now: .fits when its reservation leaves MemAvailable, less every reservation in
++    /// flight, at the floor or over; .overdue when it does not but `w` has waited the maximum and none is in flight.
++    fn goes(g: *Gate, io: std.Io, w: *const Waiter) Go {
++        if (g.avail(io)) |avail| {
++            if (avail >= g.reserved +| w.bytes +| g.floor) return .fits;
++        } else return .fits;
++        if (g.inflight == 0 and waitedNs(io, w) >= g.max_wait_ns) return .overdue;
++        return .wait;
++    }
++
++    fn waitedNs(io: std.Io, w: *const Waiter) u64 {
++        return @intCast(@max(0, std.Io.Clock.awake.now(io).toNanoseconds() - w.since));
++    }
++
++    /// (locked; unlocks) `w`'s reservation is held from here until leave; `how` it went after waiting (null: at once).
++    fn take(g: *Gate, io: std.Io, w: *const Waiter, how: ?Go) Ticket {
++        g.reserved +|= w.bytes;
++        g.inflight += 1;
++        var ns: u64 = 0;
++        if (how) |h| {
++            ns = waitedNs(io, w);
++            g.waited += 1;
++            g.longest_ns = @max(g.longest_ns, ns);
++            if (h == .overdue) g.overdue += 1;
++        }
++        g.mutex.unlock(io);
++        if (how == .overdue) log.line("prepare goes after {d} ms with none in flight (TENSORFOLD_PREPARE_WAIT_MS): its {d} MiB would take MemAvailable under the floor", .{ ns / std.time.ns_per_ms, w.bytes >> 20 });
++        return .{ .need = w.bytes, .held = true };
++    }
++
++    /// (locked) `w` joins the queue's end.
++    fn push(g: *Gate, w: *Waiter) void {
++        w.prev = g.last;
++        w.next = null;
++        if (g.last) |l| l.next = w else g.first = w;
++        g.last = w;
++        g.waiting += 1;
++    }
++
++    /// (locked) `w` leaves the queue, wherever it is.
++    fn unlink(g: *Gate, w: *Waiter) void {
++        if (w.prev) |p| p.next = w.next else g.first = w.next;
++        if (w.next) |n| n.prev = w.prev else g.last = w.prev;
++        w.prev = null;
++        w.next = null;
++        g.waiting -= 1;
++    }
++
++    pub fn leave(g: *Gate, io: std.Io, t: Ticket) void {
++        if (!t.held) return;
++        g.mutex.lockUncancelable(io);
++        defer g.mutex.unlock(io);
++        g.reserved -|= t.need;
++        g.inflight -|= 1;
++    }
++
++    /// The waiters now (for the tests).
++    pub fn waiters(g: *Gate, io: std.Io) u32 {
++        g.mutex.lockUncancelable(io);
++        defer g.mutex.unlock(io);
++        return g.waiting;
++    }
++};
++
++/// TENSORFOLD_PREPARE_FLOOR_GIB: GiB, 0 turns the gate off; unset or blank: the default.
++pub fn floorGib(raw: ?[]const u8) error{BadPrepareFloor}!f64 {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return default_floor_gib;
++    const v = std.fmt.parseFloat(f64, t) catch return error.BadPrepareFloor;
++    if (!(v >= 0) or v > 1 << 20) return error.BadPrepareFloor;
++    return v;
++}
++
++/// TENSORFOLD_PREPARE_WAIT_MS: milliseconds (0: a waiter goes as soon as none is in flight); unset or blank: the
++/// default. At most a day.
++pub fn waitMs(raw: ?[]const u8) error{BadPrepareWait}!u64 {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return default_wait_ms;
++    const v = std.fmt.parseInt(u64, t, 10) catch return error.BadPrepareWait;
++    if (v > 24 * 3600 * 1000) return error.BadPrepareWait;
++    return v;
++}
++
++/// TENSORFOLD_PREPARE_MAX_WAITING: a count (0: no bound); unset or blank: the default.
++pub fn maxWaiting(raw: ?[]const u8) error{BadPrepareWaiting}!u32 {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return default_max_waiting;
++    return std.fmt.parseInt(u32, t, 10) catch error.BadPrepareWaiting;
++}
++
++/// The bytes of text a request renders: every string in `v` (message contents, tool specs, names), keys included.
++pub fn textBytes(v: Value) usize {
++    return switch (v) {
++        .string => |s| s.len,
++        .int => |s| s.len,
++        .array => |items| blk: {
++            var n: usize = 0;
++            for (items) |x| n +|= textBytes(x);
++            break :blk n;
++        },
++        .object => |o| blk: {
++            var n: usize = 0;
++            for (o.keys(), o.values()) |k, x| n +|= k.len +| textBytes(x);
++            break :blk n;
++        },
++        else => 8,
++    };
++}
++
++/// /proc/meminfo's MemAvailable in bytes (null where there is none, or it does not parse).
++pub fn memAvailable(io: std.Io) ?u64 {
++    var buf: [4096]u8 = undefined;
++    const text = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return null;
++    return parseAvailable(text);
++}
++
++pub fn parseAvailable(text: []const u8) ?u64 {
++    var lines = std.mem.splitScalar(u8, text, '\n');
++    while (lines.next()) |line| {
++        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
++        var it = std.mem.tokenizeAny(u8, line["MemAvailable:".len..], " \t");
++        const n = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
++        const unit = it.next() orelse return null;
++        if (!std.mem.eql(u8, unit, "kB")) return null;
++        return std.math.mul(u64, n, 1024) catch null;
++    }
++    return null;
++}
++
++const Never = struct {
++    pub fn check(_: Never) bool {
++        return false;
++    }
++};
++
++test "MemAvailable from /proc/meminfo's text" {
++    try std.testing.expectEqual(@as(?u64, 6 << 30), parseAvailable("MemTotal:       127535424 kB\nMemFree:         1048576 kB\nMemAvailable:    6291456 kB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemTotal: 1 kB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemAvailable: 12 MB\n"));
++    try std.testing.expectEqual(@as(?u64, null), parseAvailable("MemAvailable: x kB\n"));
++}
++
++test "the floor's setting" {
++    try std.testing.expectEqual(default_floor_gib, try floorGib(null));
++    try std.testing.expectEqual(default_floor_gib, try floorGib(" "));
++    try std.testing.expectEqual(@as(f64, 0), try floorGib("0"));
++    try std.testing.expectEqual(@as(f64, 2.5), try floorGib("2.5"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("-1"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("nan"));
++    try std.testing.expectError(error.BadPrepareFloor, floorGib("lots"));
++    try std.testing.expectEqual(@as(u64, 0), Gate.init(0).floor);
++    try std.testing.expectEqual(@as(u64, 3 << 30), Gate.init(3).floor);
++    try std.testing.expectEqual(default_wait_ms, try waitMs(null));
++    try std.testing.expectEqual(@as(u64, 0), try waitMs(" 0 "));
++    try std.testing.expectEqual(@as(u64, 250), try waitMs("250"));
++    try std.testing.expectError(error.BadPrepareWait, waitMs("-1"));
++    try std.testing.expectError(error.BadPrepareWait, waitMs("1.5"));
++    try std.testing.expectError(error.BadPrepareWait, waitMs("86400001"));
++    try std.testing.expectEqual(default_max_waiting, try maxWaiting(""));
++    try std.testing.expectEqual(@as(u32, 0), try maxWaiting("0"));
++    try std.testing.expectEqual(@as(u32, 8), try maxWaiting("8"));
++    try std.testing.expectError(error.BadPrepareWaiting, maxWaiting("-8"));
++    try std.testing.expectError(error.BadPrepareWaiting, maxWaiting("many"));
++    const c = Gate.configured(2, 250, 8);
++    try std.testing.expectEqual(@as(u64, 2 << 30), c.floor);
++    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), c.max_wait_ns);
++    try std.testing.expectEqual(@as(u32, 8), c.max_waiting);
++}
++
++test "a request's text bytes" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const parsed = try json.parse(a, "[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi there\"}]}]");
++    try std.testing.expect(parsed == .ok);
++    // keys and strings: role+user, content+hello; role+assistant, content, type+text, text+hi there
++    try std.testing.expectEqual(@as(usize, 4 + 4 + 7 + 5 + 4 + 9 + 7 + 4 + 4 + 4 + 8), textBytes(parsed.ok));
++}
++
++var fake_avail: std.atomic.Value(u64) = .init(0);
++fn fakeAvail(_: std.Io) ?u64 {
++    return fake_avail.load(.acquire);
++}
++fn noAvail(_: std.Io) ?u64 {
++    return null;
++}
++
++test "with a wait of 0 the first prepare always goes; a second waits while it would take MemAvailable under the floor" {
++    const io = std.testing.io;
++    var g = Gate.configured(3, 0, default_max_waiting);
++    g.avail = fakeAvail;
++    fake_avail.store(4 << 30, .release);
++    // the first goes whatever MemAvailable says: none is in flight, and it need not wait for memory (wait 0)
++    const a = try g.enter(io, 2 << 30, Never{});
++    try std.testing.expect(a.held);
++    // a second of 1 GiB fits only with 2 (reserved) + 1 + 3 (floor) = 6 GiB available
++    const Waiter = struct {
++        fn run(gate: *Gate, done: *std.atomic.Value(bool), t: *Gate.Ticket) void {
++            t.* = gate.enter(std.testing.io, 1 << 30, Never{}) catch unreachable;
++            done.store(true, .release);
++        }
++    };
++    var done: std.atomic.Value(bool) = .init(false);
++    var second: Gate.Ticket = .{};
++    const th = try std.Thread.spawn(.{}, Waiter.run, .{ &g, &done, &second });
++    std.Io.sleep(io, .fromMilliseconds(5 * poll_ms), .awake) catch {};
++    try std.testing.expect(!done.load(.acquire));
++    // the first leaves: the second goes (none in flight)
++    g.leave(io, a);
++    th.join();
++    try std.testing.expect(done.load(.acquire) and second.held);
++    try std.testing.expectEqual(@as(u64, 1), g.waited);
++    try std.testing.expectEqual(@as(u64, 1 << 30), g.reserved);
++    // with room, a third goes beside it at once
++    fake_avail.store(16 << 30, .release);
++    const third = try g.enter(io, 1 << 30, Never{});
++    try std.testing.expectEqual(@as(u32, 2), g.inflight);
++    g.leave(io, third);
++    g.leave(io, second);
++    try std.testing.expectEqual(@as(u64, 0), g.reserved);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++}
++
++test "a waiting prepare whose client leaves is cancelled; off and unreadable gates never wait" {
++    const io = std.testing.io;
++    var g = Gate.configured(3, 0, default_max_waiting);
++    g.avail = fakeAvail;
++    fake_avail.store(1 << 30, .release);
++    const a = try g.enter(io, 1 << 30, Never{});
++    const Left = struct {
++        pub fn check(_: @This()) bool {
++            return true;
++        }
++    };
++    try std.testing.expectError(error.Cancelled, g.enter(io, 1 << 30, Left{}));
++    try std.testing.expectEqual(@as(u32, 1), g.inflight);
++    try std.testing.expectEqual(@as(u32, 0), g.waiting);
++    try std.testing.expect(g.first == null and g.last == null);
++    g.leave(io, a);
++    var off = Gate.init(0);
++    off.avail = fakeAvail;
++    const x = try off.enter(io, 1 << 40, Never{});
++    const y = try off.enter(io, 1 << 40, Never{});
++    try std.testing.expect(!x.held and !y.held);
++    off.leave(io, x);
++    var blind = Gate.init(3);
++    blind.avail = noAvail;
++    const p = try blind.enter(io, 1 << 40, Never{});
++    const q = try blind.enter(io, 1 << 40, Never{});
++    blind.leave(io, p);
++    blind.leave(io, q);
++    try std.testing.expectEqual(@as(u32, 0), blind.inflight);
++}
++
++/// A prepare that takes its place in a test's order when it goes, then leaves at once.
++const Ordered = struct {
++    fn run(gate: *Gate, bytes: u64, order: *std.atomic.Value(u32), at: *u32) void {
++        const t = gate.enter(std.testing.io, bytes, Never{}) catch unreachable;
++        at.* = order.fetchAdd(1, .acq_rel);
++        gate.leave(std.testing.io, t);
++    }
++};
++
++test "a large prepare behind a stream of small ones goes in its turn, before every one that came after it" {
++    const io = std.testing.io;
++    var g = Gate.init(3);
++    g.avail = fakeAvail;
++    // 3 GiB over the floor: a small one (1 GiB) fits beside another, the large one (2.5 GiB) fits only alone
++    fake_avail.store(6 << 30, .release);
++    const first = try g.enter(io, 1 << 30, Never{});
++    var order: std.atomic.Value(u32) = .init(0);
++    var large_at: u32 = 99;
++    const large = try std.Thread.spawn(.{}, Ordered.run, .{ &g, 5 << 29, &order, &large_at });
++    std.Io.sleep(io, .fromMilliseconds(5 * poll_ms), .awake) catch {};
++    // small ones keep arriving while the first is in flight: each would fit beside it
++    var small_at: [4]u32 = .{ 99, 99, 99, 99 };
++    var small: [4]std.Thread = undefined;
++    for (&small, &small_at) |*th, *at| {
++        th.* = try std.Thread.spawn(.{}, Ordered.run, .{ &g, 1 << 30, &order, at });
++        std.Io.sleep(io, .fromMilliseconds(5 * poll_ms), .awake) catch {};
++    }
++    g.leave(io, first);
++    large.join();
++    for (small) |th| th.join();
++    try std.testing.expectEqual(@as(u32, 0), large_at);
++    for (small_at) |at| try std.testing.expect(at > large_at and at < 5);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++    try std.testing.expectEqual(@as(u64, 0), g.reserved);
++}
++
++/// A client that leaves when the test says so.
++const Flag = struct {
++    left: *std.atomic.Value(bool),
++    pub fn check(f: Flag) bool {
++        return f.left.load(.acquire);
++    }
++};
++
++/// A prepare on its own thread: its outcome, and its place in the order when it went (it leaves at once then).
++const Prep = struct {
++    bytes: u64,
++    left: std.atomic.Value(bool) = .init(false),
++    done: std.atomic.Value(bool) = .init(false),
++    result: Gate.Error!void = {},
++    at: u32 = 99,
++
++    fn run(p: *Prep, gate: *Gate, order: *std.atomic.Value(u32)) void {
++        defer p.done.store(true, .release);
++        const t = gate.enter(std.testing.io, p.bytes, Flag{ .left = &p.left }) catch |e| {
++            p.result = e;
++            return;
++        };
++        p.at = order.fetchAdd(1, .acq_rel);
++        gate.leave(std.testing.io, t);
++    }
++};
++
++/// Polls until the gate has `n` waiters (at most 2 s).
++fn untilWaiting(g: *Gate, n: u32) !void {
++    for (0..200) |_| {
++        if (g.waiters(std.testing.io) == n) return;
++        std.Io.sleep(std.testing.io, .fromMilliseconds(poll_ms), .awake) catch {};
++    }
++    return error.TestUnexpectedResult;
++}
++
++test "a waiter queued behind a prepare in flight waits for memory at most TENSORFOLD_PREPARE_WAIT_MS, and then goes only with none in flight" {
++    const io = std.testing.io;
++    var g = Gate.configured(3, 100, default_max_waiting);
++    g.avail = fakeAvail;
++    var order: std.atomic.Value(u32) = .init(0);
++    // past the maximum, a waiter still waits while the one in flight is there, and goes once it has left
++    fake_avail.store(16 << 30, .release);
++    const a = try g.enter(io, 1 << 20, Never{});
++    fake_avail.store(1 << 30, .release); // under the floor whatever goes
++    var b: Prep = .{ .bytes = 1 << 20 };
++    const tb = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
++    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
++    try std.testing.expect(!b.done.load(.acquire));
++    g.leave(io, a);
++    tb.join();
++    try b.result;
++    try std.testing.expectEqual(@as(u64, 1), g.waited);
++    try std.testing.expectEqual(@as(u64, 1), g.overdue);
++    // the one in flight leaves at once: the waiter, memory still short, waits out the maximum (never for good)
++    fake_avail.store(16 << 30, .release);
++    const c = try g.enter(io, 1 << 20, Never{});
++    fake_avail.store(1 << 30, .release);
++    var d: Prep = .{ .bytes = 1 << 20 };
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    const td = try std.Thread.spawn(.{}, Prep.run, .{ &d, &g, &order });
++    try untilWaiting(&g, 1);
++    g.leave(io, c);
++    td.join();
++    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
++    try d.result;
++    try std.testing.expect(took >= 100 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
++    try std.testing.expectEqual(@as(u64, 2), g.overdue);
++    // uncontended again: at once, not counted as a wait
++    const e = try g.enter(io, 1 << 20, Never{});
++    try std.testing.expectEqual(@as(u64, 2), g.waited);
++    g.leave(io, e);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++    try std.testing.expectEqual(@as(u64, 0), g.reserved);
++}
++
++test "past TENSORFOLD_PREPARE_MAX_WAITING waiters a prepare is refused at once, and a waiter that leaves makes room" {
++    const io = std.testing.io;
++    var g = Gate.configured(3, 60_000, 2);
++    g.avail = fakeAvail;
++    fake_avail.store(16 << 30, .release);
++    const a = try g.enter(io, 1 << 30, Never{});
++    fake_avail.store(1 << 30, .release); // nothing more fits
++    var order: std.atomic.Value(u32) = .init(0);
++    var b: Prep = .{ .bytes = 1 << 30 };
++    var c: Prep = .{ .bytes = 1 << 30 };
++    const tb = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
++    try untilWaiting(&g, 1);
++    const tc = try std.Thread.spawn(.{}, Prep.run, .{ &c, &g, &order });
++    try untilWaiting(&g, 2);
++    // a third waiter: refused, without waiting
++    try std.testing.expectError(error.Full, g.enter(io, 1 << 20, Never{}));
++    try std.testing.expectEqual(@as(u64, 1), g.refused);
++    // b's client leaves: b is cancelled, and a new one may wait in its place
++    b.left.store(true, .release);
++    tb.join();
++    try std.testing.expectError(error.Cancelled, b.result);
++    try std.testing.expectEqual(@as(u32, 1), g.waiters(io));
++    var d: Prep = .{ .bytes = 1 << 30 };
++    const td = try std.Thread.spawn(.{}, Prep.run, .{ &d, &g, &order });
++    try untilWaiting(&g, 2);
++    // memory comes back and a leaves: c, then d, in arrival order
++    fake_avail.store(16 << 30, .release);
++    g.leave(io, a);
++    tc.join();
++    td.join();
++    try c.result;
++    try d.result;
++    try std.testing.expect(c.at < d.at);
++    try std.testing.expectEqual(@as(u64, 1), g.refused);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++    try std.testing.expectEqual(@as(u32, 0), g.waiting);
++}
++
++test "a waiter whose client leaves gives up its place: the one behind it moves up and goes" {
++    const io = std.testing.io;
++    var g = Gate.configured(3, 60_000, default_max_waiting);
++    g.avail = fakeAvail;
++    fake_avail.store(6 << 30, .release); // 3 GiB over the floor
++    const a = try g.enter(io, 1 << 30, Never{});
++    var order: std.atomic.Value(u32) = .init(0);
++    // a large one (2.5 GiB) waits beside a; a small one (1 GiB) would fit beside a, but waits behind it
++    var large: Prep = .{ .bytes = 5 << 29 };
++    var small: Prep = .{ .bytes = 1 << 30 };
++    const tl = try std.Thread.spawn(.{}, Prep.run, .{ &large, &g, &order });
++    try untilWaiting(&g, 1);
++    const ts = try std.Thread.spawn(.{}, Prep.run, .{ &small, &g, &order });
++    try untilWaiting(&g, 2);
++    std.Io.sleep(io, .fromMilliseconds(5 * poll_ms), .awake) catch {};
++    try std.testing.expect(!small.done.load(.acquire));
++    // the large one's client leaves: the small one goes beside a, which is still in flight
++    large.left.store(true, .release);
++    tl.join();
++    ts.join();
++    try std.testing.expectError(error.Cancelled, large.result);
++    try small.result;
++    try std.testing.expectEqual(@as(u32, 0), small.at);
++    try std.testing.expectEqual(@as(u32, 1), g.inflight);
++    g.leave(io, a);
++    try std.testing.expectEqual(@as(u32, 0), g.inflight);
++    try std.testing.expectEqual(@as(u64, 0), g.reserved);
++    try std.testing.expect(g.first == null and g.last == null);
++}
++
++test "uncontended: with nothing in flight and no waiter a prepare goes at once, even under the floor, and nothing counts it as waiting" {
++    const io = std.testing.io;
++    var g = Gate.init(3); // the default wait (5000 ms) and waiter bound
++    g.avail = fakeAvail;
++    fake_avail.store(1 << 30, .release); // MemAvailable under the 3 GiB floor
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    const a = try g.enter(io, 1 << 30, Never{});
++    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
++    try std.testing.expect(a.held);
++    try std.testing.expect(took < 50 * std.time.ns_per_ms);
++    // it never joined the queue: no wait counted, nothing overdue, so no "prepare waits" or "goes after" line
++    try std.testing.expectEqual(@as(u64, 0), g.waited);
++    try std.testing.expectEqual(@as(u64, 0), g.overdue);
++    try std.testing.expectEqual(@as(u32, 0), g.waiting);
++    try std.testing.expectEqual(@as(u32, 1), g.inflight);
++    g.leave(io, a);
++}
+diff --git a/zig/src/server/prepare_gate_test.zig b/zig/src/server/prepare_gate_test.zig
+new file mode 100644
+index 0000000..02f48e7
+--- /dev/null
++++ b/zig/src/server/prepare_gate_test.zig
+@@ -0,0 +1,475 @@
++//! The prepare gate's reservation measured on GLM (prepare_gate.default_per_byte): a long agent conversation through
++//! prompt.prepare with the prompt cache on, as rank 0 prepares it. GLM renders and tokenizes it three times there (the
++//! prompt, its history and the rewind probe), each render after glm_history's repairs and the normalized copy; the
++//! system prefix probe renders a short fourth. Counted: the request's body and parsed messages, what its arena grows
++//! by in prepare, and the render's and the tokenizer's scratch at their largest (one of them runs at a time).
++const std = @import("std");
++const tokenizer = @import("tokenizer");
++const template = @import("template");
++const json = @import("json");
++const server = @import("root.zig");
++const prompt = @import("prompt.zig");
++const chat = @import("chat.zig");
++const errors = @import("errors.zig");
++const messages_mod = @import("messages.zig");
++const glm_history = @import("glm_history.zig");
++const hf_text = @import("hf_text.zig");
++const prepare_gate = @import("prepare_gate.zig");
++const rig = @import("glm_rig.zig");
++const Allocator = std.mem.Allocator;
++const Value = json.Value;
++
++const source = @embedFile("fixtures_glm_chat.jinja");
++
++/// Counts what an allocator holds now and at most.
++const Counting = struct {
++    child: Allocator,
++    live: usize = 0,
++    peak: usize = 0,
++
++    fn allocator(c: *Counting) Allocator {
++        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
++    }
++    fn note(c: *Counting, add: usize, sub: usize) void {
++        c.live = c.live + add - sub;
++        c.peak = @max(c.peak, c.live);
++    }
++    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawAlloc(len, al, ra) orelse return null;
++        c.note(len, 0);
++        return p;
++    }
++    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        if (!c.child.rawResize(m, al, n, ra)) return false;
++        c.note(n, m.len);
++        return true;
++    }
++    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        const p = c.child.rawRemap(m, al, n, ra) orelse return null;
++        c.note(n, m.len);
++        return p;
++    }
++    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
++        const c: *Counting = @ptrCast(@alignCast(ctx));
++        c.child.rawFree(m, al, ra);
++        c.note(0, m.len);
++    }
++};
++
++const specials = [_][]const u8{ "[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "<tool_response>", "</tool_response>" };
++
++/// GPT-2's byte-to-character alphabet (the tokenizer's steps.byte_chars), for the vocabulary's byte symbols.
++const byte_chars: [256]u21 = blk: {
++    var table: [256]u21 = undefined;
++    var next: u21 = 256;
++    for (0..256) |b| {
++        const printable = (b >= '!' and b <= '~') or (b >= 0xA1 and b <= 0xAC) or b >= 0xAE;
++        table[b] = if (printable) b else next;
++        if (!printable) next += 1;
++    }
++    break :blk table;
++};
++
++const words = [_][]const u8{ "the", "file", "function", "returns", "error", "test", "build", "memory", "prompt", "server", "rank", "token", "cache", "read", "write", "line", "value", "const", "var", "try", "if", "else", "for", "while", "struct", "pub", "fn", "self", "and", "of", "to", "in", "a", "is", "that", "it", "with", "this", "we", "should", "check", "change", "call", "path", "list", "count", "bytes", "page", "arena", "allocator", "There", "Each", "When", "return" };
++
++/// Punctuation runs, indents and suffixes the text below splits into (GLM's pre-tokenizer keeps them whole).
++const pieces = [_][]const u8{ ".", ".\n\n", ",", " (", ");\n", " {\n", "}\n", " =", " >", " *", " !", ";\n", ":", "`)", " `", "   ", "       ", "           ", ".zig", "!void" };
++
++/// A byte-level BPE tokenizer with GLM's pre-tokenizer (the word regex, then ByteLevel), GLM's chat tokens as added
++/// specials, every byte in the vocabulary and merges that join each of `words` (alone and after a space, an underscore,
++/// a dot, a parenthesis, a backquote or a slash), `pieces` and the numbers below 1000: about 0.37 ids a text byte on
++/// conversation()'s text (GLM's own tokenizer gives ~0.3 on English and code, so the per-id parts are if anything
++/// overstated here).
++fn glmLike(a: Allocator) !tokenizer.Tokenizer {
++    var out: std.Io.Writer.Allocating = .init(a);
++    defer out.deinit();
++    const w = &out.writer;
++    try w.writeAll("{\"added_tokens\":[");
++    for (specials, 0..) |s, i| try w.print("{s}{{\"id\":{d},\"content\":{f},\"special\":true,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"single_word\":false}}", .{ if (i > 0) "," else "", i, std.json.fmt(s, .{}) });
++    try w.writeAll(
++        \\],"normalizer":null,
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[
++        \\  {"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
++        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{
++    );
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const aa = arena.allocator();
++    var vocab: std.StringArrayHashMapUnmanaged(void) = .empty;
++    var merges: std.ArrayList([2][]const u8) = .empty;
++    for (0..256) |b| {
++        var buf: [4]u8 = undefined;
++        const n = try std.unicode.utf8Encode(byte_chars[b], &buf);
++        try vocab.put(aa, try aa.dupe(u8, buf[0..n]), {});
++    }
++    const Bpe = struct {
++        a: Allocator,
++        vocab: *std.StringArrayHashMapUnmanaged(void),
++        merges: *std.ArrayList([2][]const u8),
++
++        /// The merge of `x` and `y` (in that rank order), and its token.
++        fn join(b: @This(), x: []const u8, y: []const u8) ![]const u8 {
++            const next = try std.mem.concat(b.a, u8, &.{ x, y });
++            if (!b.vocab.contains(next)) {
++                try b.vocab.put(b.a, next, {});
++                try b.merges.append(b.a, .{ x, y });
++            }
++            return next;
++        }
++
++        /// `raw`'s bytes joined left to right; its token.
++        fn chain(b: @This(), raw: []const u8) ![]const u8 {
++            var cur: []const u8 = "";
++            for (raw) |byte| {
++                var buf: [4]u8 = undefined;
++                const sym = try b.a.dupe(u8, buf[0..try std.unicode.utf8Encode(byte_chars[byte], &buf)]);
++                cur = if (cur.len == 0) sym else try b.join(cur, sym);
++            }
++            return cur;
++        }
++    };
++    const bpe: Bpe = .{ .a = aa, .vocab = &vocab, .merges = &merges };
++    var whole: [words.len][]const u8 = undefined;
++    for (words, &whole) |word, *t| t.* = try bpe.chain(word);
++    // a word after its lead joins last, as a trained BPE ranks the longer pieces after their parts
++    for ([_][]const u8{ " ", "_", ".", "(", "`", "/" }) |lead| for (whole) |t| {
++        _ = try bpe.join(try bpe.chain(lead), t);
++    };
++    for (pieces) |piece| _ = try bpe.chain(piece);
++    for (0..1000) |n| _ = try bpe.chain(try std.fmt.allocPrint(aa, "{d}", .{n}));
++    for (vocab.keys(), specials.len..) |k, id| try w.print("{s}{f}:{d}", .{ if (id > specials.len) "," else "", std.json.fmt(k, .{}), id });
++    try w.writeAll("},\"merges\":[");
++    for (merges.items, 0..) |m, i| try w.print("{s}[{f},{f}]", .{ if (i > 0) "," else "", std.json.fmt(m[0], .{}), std.json.fmt(m[1], .{}) });
++    try w.writeAll("]}}");
++    return tokenizer.parse(a, out.written());
++}
++
++/// About `bytes` of prose: sentences of `words`, a number or a path now and then, blank lines.
++fn prose(a: Allocator, r: std.Random, bytes: usize) ![]u8 {
++    var out: std.ArrayList(u8) = .empty;
++    while (out.items.len < bytes) {
++        const n = 5 + r.uintLessThan(usize, 12);
++        for (0..n) |i| {
++            if (i > 0) try out.append(a, ' ');
++            try out.appendSlice(a, words[r.uintLessThan(usize, words.len)]);
++        }
++        switch (r.uintLessThan(u8, 8)) {
++            0 => try out.print(a, " {d}", .{r.uintLessThan(u32, 100_000)}),
++            1 => try out.appendSlice(a, " (see `src/server/prompt.zig:109`)"),
++            else => {},
++        }
++        try out.appendSlice(a, if (r.uintLessThan(u8, 5) == 0) ".\n\n" else ". ");
++    }
++    return out.items;
++}
++
++/// About `bytes` of code, as a file read back by a tool: indented lines of names, calls, numbers and braces.
++fn code(a: Allocator, r: std.Random, bytes: usize) ![]u8 {
++    var out: std.ArrayList(u8) = .empty;
++    while (out.items.len < bytes) {
++        for (0..r.uintLessThan(usize, 4) * 4) |_| try out.append(a, ' ');
++        const x = words[r.uintLessThan(usize, words.len)];
++        const y = words[r.uintLessThan(usize, words.len)];
++        switch (r.uintLessThan(u8, 4)) {
++            0 => try out.print(a, "const {s}_{s} = try self.{s}({s}, {d});\n", .{ x, y, y, x, r.uintLessThan(u32, 4096) }),
++            1 => try out.print(a, "if ({s}.len > {d}) return error.{s};\n", .{ x, r.uintLessThan(u32, 64), y }),
++            2 => try out.print(a, "pub fn {s}({s}: *const {s}) !void {{\n", .{ x, y, x }),
++            else => try out.appendSlice(a, "}\n"),
++        }
++    }
++    return out.items;
++}
++
++/// A chat request's body: a system prompt, turns of a user, an assistant's reasoning, reply and file read, and the
++/// tool's answer, until about `bytes`; a last user message; eight tools. Without `reasoning` the steps carry none (a
++/// client that drops it), the rest unchanged (the same turns).
++fn conversation(a: Allocator, bytes: usize, reasoning: bool) ![]const u8 {
++    var prng = std.Random.DefaultPrng.init(23);
++    const r = prng.random();
++    var out: std.Io.Writer.Allocating = .init(a);
++    const w = &out.writer;
++    try w.print("{{\"model\":\"glm5_next\",\"messages\":[{{\"role\":\"system\",\"content\":{f}}}", .{std.json.fmt(try prose(a, r, 8 << 10), .{})});
++    var turn: usize = 0;
++    var dropped: usize = 0;
++    while (out.written().len + dropped < bytes) : (turn += 1) {
++        try w.print(",{{\"role\":\"user\",\"content\":{f}}}", .{std.json.fmt(try prose(a, r, 600), .{})});
++        const args = try std.fmt.allocPrint(a, "{{\"path\":\"src/{s}/{s}.zig\",\"line\":{d}}}", .{ words[turn % words.len], words[(turn * 7) % words.len], turn });
++        const reply = try prose(a, r, 500);
++        const thought = try prose(a, r, 1500);
++        try w.print(",{{\"role\":\"assistant\",\"content\":{f}", .{std.json.fmt(reply, .{})});
++        const field = try std.fmt.allocPrint(a, ",\"reasoning_content\":{f}", .{std.json.fmt(thought, .{})});
++        if (reasoning) try w.writeAll(field) else dropped += field.len;
++        try w.print(",\"tool_calls\":[{{\"id\":\"call_{d}\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":{f}}}}}]}}", .{ turn, std.json.fmt(args, .{}) });
++        try w.print(",{{\"role\":\"tool\",\"tool_call_id\":\"call_{d}\",\"content\":{f}}}", .{ turn, std.json.fmt(try code(a, r, 4000), .{}) });
++    }
++    try w.print(",{{\"role\":\"user\",\"content\":{f}}}],\"tools\":[", .{std.json.fmt(try prose(a, r, 400), .{})});
++    for (0..8) |i| try w.print("{s}{{\"type\":\"function\",\"function\":{{\"name\":\"{s}_{d}\",\"description\":{f},\"parameters\":{{\"type\":\"object\",\"properties\":{{\"path\":{{\"type\":\"string\",\"description\":\"the file\"}},\"line\":{{\"type\":\"integer\"}}}},\"required\":[\"path\"]}}}}}}", .{ if (i > 0) "," else "", words[i], i, std.json.fmt(try prose(a, r, 400), .{}) });
++    try w.writeAll("]}");
++    return out.written();
++}
++
++/// A GLM server over the fixture template and glmLike, the prompt cache on (prepare renders the rewind probe).
++const Glm = struct {
++    hf: hf_text.HfText = undefined,
++    backend: rig.Script = .{},
++    srv: *server.Server = undefined,
++
++    fn start(g: *Glm, gpa: Allocator) !void {
++        g.hf = .{ .gpa = gpa, .arena = .init(gpa), .tok = try glmLike(gpa), .glm = true, .source = source, .compiled = try template.compile(gpa, source, null) };
++        var c = rig.default_config;
++        c.recipe.glm = true;
++        g.srv = try server.Server.init(gpa, std.testing.io, g.backend.engine(), g.hf.text(), c, null);
++        g.srv.info.prompt_cache = true;
++    }
++
++    fn finish(g: *Glm) void {
++        g.srv.deinit();
++        g.hf.compiled.?.deinit();
++        g.hf.tok.deinit();
++        g.hf.arena.deinit();
++    }
++};
++
++/// Bytes a prepare holds, by what holds them (prepare_gate.textBytes is the measure of the text).
++const Measured = struct {
++    text: usize,
++    body: usize,
++    parsed: usize,
++    prepared: usize, // the request arena's growth in prompt.prepare and systemPrefixLen
++    render: usize, // one render's scratch at its largest
++    encode: usize, // one tokenization's scratch at its largest
++    ids: usize,
++
++    fn perByte(m: Measured, n: usize) f64 {
++        return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(m.text));
++    }
++
++    /// What a prepare holds at most a text byte: what the request holds, and the larger scratch on top of it.
++    fn need(m: Measured) f64 {
++        return m.perByte(m.body + m.parsed + m.prepared + @max(m.render, m.encode));
++    }
++};
++
++fn measure(g: *Glm, gpa: Allocator, bytes: usize, thinking: bool, reasoning: bool) !Measured {
++    var side = std.heap.ArenaAllocator.init(gpa);
++    defer side.deinit();
++    const sa = side.allocator();
++    const body = try conversation(sa, bytes, reasoning);
++    var held: Counting = .{ .child = std.heap.page_allocator };
++    var request = std.heap.ArenaAllocator.init(held.allocator());
++    defer request.deinit();
++    const a = request.allocator();
++    const parsed = switch (try json.parse(a, body)) {
++        .ok => |v| v,
++        .err => return error.BadBody,
++    };
++    const parsed_bytes = held.peak;
++    const tools = parsed.get("tools").?.array;
++    var cx: errors.Cx = .{ .a = a };
++    // as chat.prepare: the kept reasoning back (when the client dropped it), the gate's measure, the renders
++    const input = try prompt.withKept(g.srv, a, .{ .messages = parsed.get("messages").?, .tools = tools, .fields = parsed });
++    const messages = input.messages;
++    const text_bytes = chat.promptBytes(input);
++    const rendered = try prompt.prepare(g.srv, &cx, input, thinking, null);
++    try std.testing.expect(rendered.history_len > 0 and rendered.rewind_len > rendered.history_len / 2); // three renders
++    _ = prompt.systemPrefixLen(g.srv, &cx, messages, tools, rendered.ids, thinking, null);
++    // one render and one tokenization again, as renderIds makes them, their scratch counted
++    var sx: errors.Cx = .{ .a = sa };
++    const sent = try glm_history.agentHistory(sa, try glm_history.promoteReasoning(sa, messages));
++    const normalized = try messages_mod.toolArguments(&sx, try messages_mod.normalize(&sx, sent, g.srv.late_system, g.srv.needs_user_after_tool));
++    var context: std.json.ObjectMap = .empty;
++    try context.put(sa, "clear_thinking", .{ .bool = false });
++    try context.put(sa, "enable_thinking", .{ .bool = thinking });
++    try context.put(sa, "thinking_mode", .{ .string = if (thinking) "thinking" else "chat" });
++    var render_scratch: Counting = .{ .child = std.heap.page_allocator };
++    const text = try template.renderWith(sa, render_scratch.allocator(), &g.hf.compiled.?, try hf_text.toStd(sa, normalized), try hf_text.toStd(sa, .{ .array = tools }), .{ .object = context }, true, null);
++    var encode_scratch: Counting = .{ .child = std.heap.page_allocator };
++    const ids = try g.hf.tok.encodeWith(sa, text, .{ .scratch = encode_scratch.allocator() });
++    if (thinking) try std.testing.expectEqualSlices(u32, rendered.ids, ids); // the render prepare made (thinking off cuts it)
++    // the tokenizer's depth-first walk gives the breadth-first walk's ids on GLM's pre-tokenizer
++    try std.testing.expectEqualSlices(u32, try g.hf.tok.encodeWith(sa, text, .{ .depth_first = false }), ids);
++    return .{ .text = text_bytes, .body = body.len, .parsed = parsed_bytes, .prepared = held.peak - parsed_bytes, .render = render_scratch.peak, .encode = encode_scratch.peak, .ids = rendered.ids.len };
++}
++
++test "the prepare gate's reservation covers a long GLM agent conversation's prepare (three renders)" {
++    const gpa = std.testing.allocator;
++    var g: Glm = .{};
++    try g.start(gpa);
++    defer g.finish();
++    for ([_]bool{ true, false }) |thinking| {
++        const m = try measure(&g, gpa, 384 << 10, thinking, true);
++        std.debug.print("GLM prepare, thinking {}: {d} text bytes, {d} ids; a text byte: body {d:.1}, parsed {d:.1}, prepare's arena {d:.1}, render scratch {d:.1}, encode scratch {d:.1}; needs {d:.1} of {d}\n", .{ thinking, m.text, m.ids, m.perByte(m.body), m.perByte(m.parsed), m.perByte(m.prepared), m.perByte(m.render), m.perByte(m.encode), m.need(), prepare_gate.default_per_byte });
++        try std.testing.expect(m.need() <= @as(f64, @floatFromInt(prepare_gate.default_per_byte)));
++    }
++}
++
++/// The prompt prepare renders for `body` (thinking on), its kept reasoning put back as chat.prepare does.
++fn promptOf(g: *Glm, a: Allocator, body: []const u8) ![]const u32 {
++    const parsed = (try json.parse(a, body)).ok;
++    var cx: errors.Cx = .{ .a = a };
++    const input = try prompt.withKept(g.srv, a, .{ .messages = parsed.get("messages").?, .tools = parsed.get("tools").?.array, .fields = parsed });
++    return (try prompt.prepare(g.srv, &cx, input, true, null)).ids;
++}
++
++test "the reservation covers a resume whose client drops the reasoning while replies are kept (TF_GLM_KEEP_REASONING)" {
++    const gpa = std.testing.allocator;
++    var g: Glm = .{};
++    try g.start(gpa);
++    defer g.finish();
++    const k = g.srv.kept_reasoning.?;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // another conversation's reply: every step of this one is looked up, none is found
++    const other = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"unrelated\"}]")).ok;
++    const call = (try json.parse(a, "[{\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":{}}}]")).ok;
++    try k.remember(other, call.array, "reason");
++    const none = try measure(&g, gpa, 384 << 10, true, false);
++    std.debug.print("GLM prepare, reasoning dropped, none kept for it: {d} text bytes; a text byte: prepare's arena {d:.1}; needs {d:.1} of {d}\n", .{ none.text, none.perByte(none.prepared), none.need(), prepare_gate.default_per_byte });
++    try std.testing.expect(none.need() <= @as(f64, @floatFromInt(prepare_gate.default_per_byte)));
++    // every step's reply kept, as the server keeps them (the ids are not the server's: the signatures find them)
++    const with = try conversation(a, 384 << 10, true);
++    const messages = (try json.parse(a, with)).ok.get("messages").?.array;
++    var kept: usize = 0;
++    for (messages, 0..) |m, i| if (m.get("tool_calls")) |calls| {
++        try k.remember(.{ .array = messages[0..i] }, calls.array, m.strField("reasoning_content").?);
++        kept += 1;
++    };
++    // the client drops it all: prepare renders the prompt the reasoning makes, and the gate counts the reasoning
++    try std.testing.expectEqualSlices(u32, try promptOf(&g, a, with), try promptOf(&g, a, try conversation(a, 384 << 10, false)));
++    for ([_]bool{ true, false }) |thinking| {
++        const m = try measure(&g, gpa, 384 << 10, thinking, false);
++        std.debug.print("GLM prepare, thinking {}, reasoning dropped, {d} steps' kept: {d} text bytes; a text byte: prepare's arena {d:.1}, render scratch {d:.1}, encode scratch {d:.1}; needs {d:.1} of {d}\n", .{ thinking, kept, m.text, m.perByte(m.prepared), m.perByte(m.render), m.perByte(m.encode), m.need(), prepare_gate.default_per_byte });
++        try std.testing.expect(m.text >= none.text + 1500 * kept); // the restored reasoning is in the measure
++        try std.testing.expect(m.need() <= @as(f64, @floatFromInt(prepare_gate.default_per_byte)));
++    }
++}
++
++/// Counts the bytes allocated through it; another thread may read the count meanwhile.
++const Tally = struct {
++    child: Allocator,
++    bytes: std.atomic.Value(usize) = .init(0),
++
++    fn allocator(t: *Tally) Allocator {
++        return .{ .ptr = t, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = Allocator.noFree } };
++    }
++    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
++        const t: *Tally = @ptrCast(@alignCast(ctx));
++        const p = t.child.rawAlloc(len, al, ra) orelse return null;
++        _ = t.bytes.fetchAdd(len, .monotonic);
++        return p;
++    }
++};
++
++var fake_avail: std.atomic.Value(u64) = .init(0);
++fn fakeAvail(_: std.Io) ?u64 {
++    return fake_avail.load(.acquire);
++}
++
++const Never = struct {
++    pub fn check(_: Never) bool {
++        return false;
++    }
++};
++
++test "a chat request waits at the gate before it renders anything, and gives its reservation back when prepared" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var g: Glm = .{};
++    try g.start(gpa);
++    defer g.finish();
++    g.srv.gate = .configured(3, 0, prepare_gate.default_max_waiting);
++    g.srv.gate.avail = fakeAvail;
++    fake_avail.store(4 << 30, .release); // under the 2 GiB held, the request's own and the 3 GiB floor
++    var request = std.heap.ArenaAllocator.init(gpa);
++    defer request.deinit();
++    const body = (try json.parse(request.allocator(), try conversation(request.allocator(), 64 << 10, true))).ok;
++    var tally: Tally = .{ .child = request.allocator() };
++    // a prepare in flight holds 2 GiB
++    const first = try g.srv.gate.enter(io, 2 << 30, Never{});
++    const Run = struct {
++        fn run(srv: *server.Server, a: Allocator, parsed: json.Value, out: *?chat.Prepared, done: *std.atomic.Value(bool)) void {
++            var cx: errors.Cx = .{ .a = a };
++            out.* = chat.prepare(srv, &cx, .{ .messages = parsed.get("messages").?, .tools = parsed.get("tools").?.array, .fields = parsed }, Never{}) catch null;
++            done.store(true, .release);
++        }
++    };
++    var prepared: ?chat.Prepared = null;
++    var done: std.atomic.Value(bool) = .init(false);
++    const th = try std.Thread.spawn(.{}, Run.run, .{ g.srv, tally.allocator(), body, &prepared, &done });
++    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
++    const waits = !done.load(.acquire);
++    const before = tally.bytes.load(.monotonic);
++    g.srv.gate.leave(io, first);
++    th.join();
++    // it waited, and had rendered nothing (a render of its 64 KiB takes several times that)
++    try std.testing.expect(waits);
++    try std.testing.expect(before < 4 << 10);
++    const p = prepared orelse return error.TestUnexpectedResult;
++    defer chat.release(g.srv, p.preparing);
++    try std.testing.expect(p.prompt_len > 0 and tally.bytes.load(.monotonic) > 64 << 10);
++    try std.testing.expectEqual(@as(u64, 1), g.srv.gate.waited);
++    try std.testing.expectEqual(@as(u32, 0), g.srv.gate.inflight);
++    try std.testing.expectEqual(@as(u64, 0), g.srv.gate.reserved);
++}
++
++test "a chat request past the gate's waiter bound is refused as a capacity refusal (429 under the recipe), having rendered nothing" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var g: Glm = .{};
++    try g.start(gpa);
++    defer g.finish();
++    g.srv.gate = .configured(3, 60_000, 1);
++    g.srv.gate.avail = fakeAvail;
++    fake_avail.store(16 << 30, .release);
++    const first = try g.srv.gate.enter(io, 2 << 30, Never{});
++    fake_avail.store(1 << 30, .release); // nothing more fits
++    // one waits (the bound)
++    const Waits = struct {
++        fn run(gate: *prepare_gate.Gate, left: *std.atomic.Value(bool), out: *?anyerror) void {
++            const F = struct {
++                l: *std.atomic.Value(bool),
++                pub fn check(f: @This()) bool {
++                    return f.l.load(.acquire);
++                }
++            };
++            const t = gate.enter(std.testing.io, 1 << 20, F{ .l = left }) catch |e| {
++                out.* = e;
++                return;
++            };
++            gate.leave(std.testing.io, t);
++        }
++    };
++    var left: std.atomic.Value(bool) = .init(false);
++    var waited: ?anyerror = null;
++    const th = try std.Thread.spawn(.{}, Waits.run, .{ &g.srv.gate, &left, &waited });
++    for (0..200) |_| {
++        if (g.srv.gate.waiters(io) == 1) break;
++        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
++    }
++    try std.testing.expectEqual(@as(u32, 1), g.srv.gate.waiters(io));
++    var request = std.heap.ArenaAllocator.init(gpa);
++    defer request.deinit();
++    const body = (try json.parse(request.allocator(), try conversation(request.allocator(), 4 << 10, true))).ok;
++    var tally: Tally = .{ .child = request.allocator() };
++    var cx: errors.Cx = .{ .a = tally.allocator() };
++    const before = tally.bytes.load(.monotonic);
++    try std.testing.expectError(error.Refused, chat.prepare(g.srv, &cx, .{ .messages = body.get("messages").?, .tools = body.get("tools").?.array, .fields = body }, Never{}));
++    try std.testing.expectEqual(errors.Kind.capacity, cx.kind);
++    try std.testing.expectEqual(errors.capacity_status, cx.status());
++    try std.testing.expectEqualStrings(prepare_gate.full_message, cx.message);
++    // the refusal's message is all it allocated: no render ran
++    try std.testing.expect(tally.bytes.load(.monotonic) - before < 4 << 10);
++    try std.testing.expectEqual(@as(u64, 1), g.srv.gate.refused);
++    try std.testing.expectEqual(@as(i64, 0), g.srv.preparing.load(.acquire));
++    left.store(true, .release);
++    th.join();
++    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), waited);
++    g.srv.gate.leave(io, first);
++    try std.testing.expectEqual(@as(u32, 0), g.srv.gate.inflight);
++}
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 60df5a0..e619fa3 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -96,6 +96,16 @@ pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]c
+     return spans.items;
+ }
+ 
++/// `input` with GLM's kept reasoning back in its messages (glm_kept.zig), once for all of prepare's renders: theirs
++/// find nothing left to put back, and the prepare gate counts the text they render.
++pub fn withKept(srv: *Server, a: std.mem.Allocator, input: chat.Input) std.mem.Allocator.Error!chat.Input {
++    if (!srv.config.recipe.glm or input.prompt != null or input.media != null) return input;
++    const k = srv.kept_reasoning orelse return input;
++    var out = input;
++    out.messages = try k.restore(a, input.messages);
++    return out;
++}
++
+ /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
+ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+     if (input.prompt) |p| switch (p) {
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 1d5204c..129b2b4 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -74,4 +74,6 @@ test {
+     _ = @import("slide_teacher.zig");
+     _ = @import("slide_pick.zig");
+     _ = @import("startup.zig");
++    _ = @import("prepare_gate.zig");
++    _ = @import("prepare_gate_test.zig");
+ }
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 257d0df..cc0826b 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -9,6 +9,7 @@ const live = @import("live.zig");
+ const listener_mod = @import("listener.zig");
+ const model_text = @import("model_text.zig");
+ const server_mod = @import("server.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Allocator = std.mem.Allocator;
+ const posix = std.posix;
+ 
+@@ -127,6 +128,18 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
+         .compact_keep = args.compact_keep,
+         .compact_memory = args.compact_memory,
++        .prepare_floor_gib = prepare_gate.floorGib(env(s, "TENSORFOLD_PREPARE_FLOOR_GIB")) catch {
++            std.debug.print("tensorfold: TENSORFOLD_PREPARE_FLOOR_GIB={s}: a number of GiB, 0 for no gate\n", .{env(s, "TENSORFOLD_PREPARE_FLOOR_GIB").?});
++            return 1;
++        },
++        .prepare_wait_ms = prepare_gate.waitMs(env(s, "TENSORFOLD_PREPARE_WAIT_MS")) catch {
++            std.debug.print("tensorfold: TENSORFOLD_PREPARE_WAIT_MS={s}: whole milliseconds, at most a day\n", .{env(s, "TENSORFOLD_PREPARE_WAIT_MS").?});
++            return 1;
++        },
++        .prepare_max_waiting = prepare_gate.maxWaiting(env(s, "TENSORFOLD_PREPARE_MAX_WAITING")) catch {
++            std.debug.print("tensorfold: TENSORFOLD_PREPARE_MAX_WAITING={s}: a count of prepares, 0 for no bound\n", .{env(s, "TENSORFOLD_PREPARE_MAX_WAITING").?});
++            return 1;
++        },
+         .slide_graph = args.slide_graph,
+     };
+     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 615bcbb..7ddf5ff 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -23,10 +23,14 @@ const live = @import("live.zig");
+ const slide_graph = @import("slide_graph.zig");
+ const slide_lesson = @import("slide_lesson.zig");
+ const recipe_mod = @import("recipe.zig");
++const prepare_gate = @import("prepare_gate.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
++/// A kept-alive connection's arena keeps at most this much between its requests.
++const connection_keep: usize = 1 << 20;
++
+ /// auto compacts near the window. fraction compacts past that share of it.
+ pub const CompactAt = union(enum) { auto, fraction: f64 };
+ 
+@@ -58,6 +62,13 @@ pub const Config = struct {
+     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
+     slide_graph: ?[]const u8 = null,
+     timeouts: http_conn.Timeouts = .{},
++    /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
++    /// are in flight (prepare_gate); 0: no gate.
++    prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
++    /// TENSORFOLD_PREPARE_WAIT_MS: how long a waiting prepare waits for memory before it goes with none in flight.
++    prepare_wait_ms: u64 = prepare_gate.default_wait_ms,
++    /// TENSORFOLD_PREPARE_MAX_WAITING: the prepares that may wait at once (0: no bound); one more is refused (capacity).
++    prepare_max_waiting: u32 = prepare_gate.default_max_waiting,
+     /// The GLM recipe's switches (TF_GLM_*), read at start; `recipe.glm` turns its server behaviours on.
+     recipe: recipe_mod.Recipe = .{},
+ };
+@@ -92,6 +103,8 @@ pub const Server = struct {
+     kept_reasoning: ?*@import("glm_kept.zig").KeptReasoning = null,
+     /// Requests the engine holds now, running or waiting, background ones included (admission.zig).
+     in_system: std.atomic.Value(u32) = .init(0),
++    /// Concurrent prompt preparations held under the memory floor (prepare_gate).
++    gate: prepare_gate.Gate = .{},
+     arena: std.heap.ArenaAllocator,
+     /// --vision: the helper that prepares picture and clip prompts (null: text only)
+     vision: ?*@import("vision_server.zig").Vision = null,
+@@ -109,7 +122,7 @@ pub const Server = struct {
+         @import("glm_keys.zig").enabled = config.recipe.glm; // a missing <arg_key> is put back by the end parser
+         errors.capacity_status = if (config.recipe.glm) 429 else 503; // the recipe: 429 + Retry-After: 5, not a bare 503 (patch 0081)
+         const srv = try gpa.create(Server);
+-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
++        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .configured(config.prepare_floor_gib, config.prepare_wait_ms, config.prepare_max_waiting), .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
+             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
+                 log.line("idle keepalive off: {s}", .{@errorName(e)});
+@@ -336,7 +349,9 @@ pub const Server = struct {
+         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+         defer arena.deinit();
+         while (true) {
+-            _ = arena.reset(.retain_capacity);
++            // a kept-alive connection keeps at most this much of its last request between requests (a long prompt's
++            // text and ids are tens of MiB, and retain_capacity held them until the connection closed)
++            _ = arena.reset(.{ .retain_with_limit = connection_keep });
+             const a = arena.allocator();
+             const outcome = conn.readRequest(a, true) catch break;
+             switch (outcome) {
+@@ -348,6 +363,7 @@ pub const Server = struct {
+             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
+             routes.dispatch(srv, &conn, a);
+             if (conn.close or conn.broken) break;
++            _ = arena.reset(.{ .retain_with_limit = connection_keep }); // (before waiting for the next request)
+         }
+     }
+ 

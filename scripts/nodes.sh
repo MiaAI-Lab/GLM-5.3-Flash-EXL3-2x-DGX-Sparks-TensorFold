@@ -57,6 +57,10 @@ worker_save_log() {
   worker "$1" "$(declare -f save_log); save_log \"\$HOME/.cache/tensorfold-glm53/logs\" $1 '$CONTAINER_NAME' '$LOG_KEEP'"
 }
 
+# mem_counting, mem_avail_gb, parked_counted: MemAvailable plus the pages parked on the per-CPU free lists, as the
+# engine's startup budget counts them (scripts/memavail.sh; start.sh's memory check sends the first two to the workers)
+source "${_cfg_root:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/memavail.sh"
+
 need_worker() {
   local i=$1 v h
   v=$(wvar WORKER "$i"); h=$(worker_host "$i")
