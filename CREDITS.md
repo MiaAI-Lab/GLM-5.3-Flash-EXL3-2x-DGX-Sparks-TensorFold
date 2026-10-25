@@ -172,6 +172,17 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   `TF_GLM_KEEP_PER_CHAT`): authored by Thomas Wade ([ThomasWadeZ](https://github.com/ThomasWadeZ)) in
   [PR #65](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/65) (Apache 2.0); rebased
   onto the current patches, with both limits off by default and their drops kept out of the spill tier, by MiaAI-Lab.
+- `0101-glm-prompt-select-floor` (a prompt chunk's pool selection from one pass over the scores): by [BadAd84](https://github.com/BadAd84).
+- `0105-glm-prompt-scores-cuda` (a prompt chunk's indexer scoring in CUDA, Triton's instruction order): by [BadAd84](https://github.com/BadAd84).
+- `0106-glm-sparse-onepass-cuda` (a prompt chunk's sparse attention in CUDA, Triton's instruction order):
+  by [BadAd84](https://github.com/BadAd84).
+- `0107-glm-decode-indexer` (a decode window's indexer: the scoring in CUDA, the selection in one pass): by [BadAd84](https://github.com/BadAd84).
+- `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
+- `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
+- `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
+  `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
+- `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
+- `0103-glm-qmm-decode-noclusters` (decode matmuls reduce through the partials buffer at few rows): by [BadAd84](https://github.com/BadAd84).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
@@ -204,14 +215,3 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   128 GB unified memory), two of them linked by their ConnectX-7 ports: every number in the README was measured there.
 
 If you believe something here is missing or credited wrongly, please open an issue.
-- `0101-glm-prompt-select-floor` (a prompt chunk's pool selection from one pass over the scores): by
-- `0105-glm-prompt-scores-cuda` (a prompt chunk's indexer scoring in CUDA, Triton's instruction order): by
-- `0106-glm-sparse-onepass-cuda` (a prompt chunk's sparse attention in CUDA, Triton's instruction order):
-  by [BadAd84](https://github.com/BadAd84).
-- `0107-glm-decode-indexer` (a decode window's indexer: the scoring in CUDA, the selection in one pass): by
-- `0104-glm-seg-attention-tp3-tiles` (32-head tiles from 5 rows at 17-24 heads): by [BadAd84](https://github.com/BadAd84).
-- `0108-glm-seg-chunks-cuda` (a decode window's latent attention chunk pass in CUDA): by [BadAd84](https://github.com/BadAd84).
-- `0100-glm-draft-prelaunch` (the next round's DFlash2 block pass launched at a decode round's end,
-  `TF_GLM_DRAFT_PRELAUNCH`): by [BadAd84](https://github.com/BadAd84).
-- `0102-glm-prompt-matmul-tile` (a prompt chunk's dense projections on tile 9 or 3): by [BadAd84](https://github.com/BadAd84).
-- `0103-glm-qmm-decode-noclusters` (decode matmuls reduce through the partials buffer at few rows): by
