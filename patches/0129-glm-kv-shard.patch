@@ -7,7 +7,7 @@
 # recompute, an eviction or a pause (TF_GLM_KV_SHARD_CARRY, on), never to even out the parts.
 # Builds on 0128 (the spill tier's blocks) and 0119 (chat-continued). By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
-index fd866fa..ab22614 100644
+index 5170f0a..cbb5d65 100644
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
 @@ -12,7 +12,8 @@ snapshot fields: recurrences, windows, a head row; ``spill.encode``). On disk:
@@ -20,7 +20,7 @@ index fd866fa..ab22614 100644
  - a point a state: ``points/<key>.ids`` (its ids; with pictures its keyed ids and its tokens), ``points/<key>.st``
    (its small state, safetensors), then ``points/<key>.json`` naming its blocks with a CRC-32 of each, written LAST, so
    a point with its json is complete. Every file goes to a temporary name, is fsynced and renamed; the folders are
-@@ -199,6 +200,18 @@ def fork(lineage: str, name: str, at: int) -> str:
+@@ -200,6 +201,18 @@ def fork(lineage: str, name: str, at: int) -> str:
      return f"{lineage}|{name}@{int(at)}"
  
  
@@ -39,16 +39,23 @@ index fd866fa..ab22614 100644
  def _segments(lineage: str) -> tuple[bytes, list[tuple[int, bytes]]]:
      head, *rest = (lineage or "").split("|")
      forks = []
-@@ -832,7 +845,7 @@ class BlockStore:
+@@ -835,13 +848,13 @@ class BlockStore:
          items, layer = _sp.encode(obj, skip=skip)
-         items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
-         small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
+         small_host = sum(t.numel() * t.element_size() for _, t in items)   # (copied to the host below, if it fits)
+         small_n = small_host + 4096
 -        size = sum(_span_bytes(self.planes, s, e) for s, e, _ in new)
 +        size = sum(self._span(extent.base, s, e) for s, e, _ in new)
          need = size + small_n + 8 * n * (2 if tokens is not None else 1)
-         pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
-                    [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
-@@ -872,6 +885,24 @@ class BlockStore:
+         # the block the state's end cuts (a tail): its last pooled-key row is still filling, and the stream goes on
+         # writing it in place, so its rows are copied to the host at the keep (at most one block). That copy and the
+         # small state's count against the release cap before either is made, and before any room is made for them
+         tail = [(s, e, h) for s, e, h in new[-1:] if e - s < self.block]
+-        host = small_host + sum(_span_bytes(self.planes, s, e) for s, e, _ in tail)
++        host = small_host + sum(self._span(extent.base, s, e) for s, e, _ in tail)
+         with self.lock:
+             if self.host_bytes + host > self.release_cap:  # (host memory past TF_GLM_SPILL_RELEASE_MIB): not stored
+                 self.stats["release_dropped"] += 1
+@@ -894,6 +907,24 @@ class BlockStore:
          self.stats["keep_s"] += time.perf_counter() - t0
          return "queued"
  
@@ -73,7 +80,7 @@ index fd866fa..ab22614 100644
      def _parts(self, where, s: int, e: int) -> list[torch.Tensor]:
          """Tokens [s, e) as each plane's rows, where the extent is NOW (it may have moved)."""
  
-@@ -879,8 +910,9 @@ class BlockStore:
+@@ -901,8 +932,9 @@ class BlockStore:
          out = []
          for p in self.planes:
              a, b = _rows(p, s, e)
@@ -85,7 +92,16 @@ index fd866fa..ab22614 100644
          return out
  
      def pump(self, limit: int | None = PUMP_BLOCKS) -> None:
-@@ -1504,7 +1536,7 @@ class BlockStore:
+@@ -990,7 +1022,7 @@ class BlockStore:
+             if job.where is not extent or job.point.n <= keep or job.next >= len(job.new):
+                 continue
+             left = job.new[job.next:]
+-            need = sum(_span_bytes(self.planes, s, e) for s, e, _ in left)
++            need = sum(self._span(job.where.base, s, e) for s, e, _ in left)
+             with self.lock:
+                 fits = self.host_bytes + need <= self.release_cap
+                 if fits:
+@@ -1527,7 +1559,7 @@ class BlockStore:
              b = self._slot(lj)
              if b is None:
                  return
@@ -94,7 +110,7 @@ index fd866fa..ab22614 100644
              fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)
              with lj.cond:
                  lj.queued[i] = (b, nb, fut, s, e, h)
-@@ -1614,7 +1646,9 @@ class BlockStore:
+@@ -1637,7 +1669,9 @@ class BlockStore:
          at = 0
          for p in self.planes:
              a, z = _rows(p, s, e)
@@ -464,7 +480,7 @@ index bbae712..e86b556 100644
  
  def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index ef76005..26244ba 100644
+index 916bf51..7b6016b 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -25,7 +25,7 @@ are balanced within the budget without adding rounds; GPU layer cost, finalizati

@@ -437,10 +437,10 @@ How it stores (`PARALLEL` above 1):
   other rows go to disk a few blocks between rounds (4; 2 and 8 measured the same) through a pinned ring (`TF_GLM_SPILL_STAGE_MIB`, 256 MiB),
   written with O_DIRECT (the page cache shares a GB10's memory). A conversation resumes from disk after an eviction, a clean restart, a `kill -9` or a
   watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s). Rows freed or overwritten before
-  their write (a full pool, a stream taking over an extent) are copied to host memory first, at most
-  `SPILL_RELEASE_MIB` of them at once (default an eighth of `MEMORY_RESERVE_GIB`: 1.8 GiB at 14.5; on a GB10 that
-  memory is the pool's and the reserve's); a state past it is not stored (`/health` `spill.release_dropped`,
-  `host_mb`).
+  their write (a full pool, a stream taking over an extent) are copied to host memory first. Those copies and a keep's
+  own (its small state and the block its end cuts) hold at most `SPILL_RELEASE_MIB` at once, checked before they are
+  made (default an eighth of `MEMORY_RESERVE_GIB`: 1.8 GiB at 14.5; on a GB10 that memory is the pool's and the
+  reserve's); a state past it is not stored (`/health` `spill.release_dropped`, `host_mb`).
 - **Reads beside decoding.** A restore reads its blocks ahead on 8 threads (2 were slower, 4 to 16 the same) into pinned slots
   (`TF_GLM_SPILL_READ_BLOCKS`, 16 blocks: on two Sparks the read buffers pinned at start hold the first ten and the
   rest is pinned before the pool is sized, in power-of-two pieces, so the pool pays for those (~14k tokens at
@@ -701,7 +701,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
 | `SPILL_GIB` / `SPILL_DIR` | `0` / `~/.cache/tensorfold-spill` | the spill tier: kept prompt states on local disk, written when kept, up to `SPILL_GIB` GiB a Spark (0: off) ([Spill tier](#spill-tier-optional)) |
 | `SPILL_QUOTA` / `SPILL_TURNS` | `0` / `4` | the spill tier's share of `SPILL_GIB` one conversation may hold before it trims its own old turns and forks (0: no quota), and the newest states kept on a conversation's path, older turns trimmed as each one is written (2: heavy agent loops or a small disk; 8+: chats with deep edits; 0: every turn until room is needed) |
-| `SPILL_RELEASE_MIB` | an eighth of `MEMORY_RESERVE_GIB` | the most MiB of rows the spill tier copies to host memory while they wait to be written (rows freed or overwritten first); a state past it is not stored |
+| `SPILL_RELEASE_MIB` | an eighth of `MEMORY_RESERVE_GIB` | the most MiB the spill tier copies to host memory while it waits to be written (rows freed or overwritten first, and each kept state's small state and cut block); a state past it is not stored, so `0` stores none |
 | `PREFIX_WAIT` | `0` | a request whose prompt starts with what another request is still prefilling (a shared system prompt) waits for that state instead of prefilling it too ([A system prompt prefilled once](#a-system-prompt-prefilled-once-for-every-agent)) |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
