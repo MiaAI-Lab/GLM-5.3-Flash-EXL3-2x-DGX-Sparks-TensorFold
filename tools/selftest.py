@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Self-test of the port's client tools against tools/fake_server.py, on any machine (no GPU, no model, no Sparks):
 
-    python3 -I tools/selftest.py [--only compile,creds,kinds,counters,exact,spill,resume,prefix] [--keep]
+    python3 -I tools/selftest.py [--only compile,creds,kinds,fsops,counters,exact,spill,resume,prefix] [--keep]
 
 Each tool must PASS against a correct fake and FAIL against a fake with the fault it exists to catch (--mutate), so a
 check that cannot fail is caught too. Exit 1 when any expectation is not met. Logs and receipts go to a temporary folder
@@ -299,6 +299,63 @@ def t_kinds(work):
     expect("checklib: a clean spill root with the marker has no temporaries but its real one", temps == ["points/k.man.tmp"], temps)
 
 
+def t_fsops(work):
+    """checklib.FSOPS (RankDir: spill_check's corrupt / truncate / remove / list, run as root with --sudo): a path is
+    joined to the spill root, resolved, and refused unless it is a regular file inside the root; files are opened with
+    O_NOFOLLOW, so neither a symlink in the folder nor `..` reaches a file outside it."""
+    sys.path.insert(0, HERE)
+    import checklib as C
+    base = os.path.join(work, "fsops")
+    root, out = os.path.join(base, "root"), os.path.join(base, "out")
+    os.makedirs(os.path.join(root, "points"))
+    os.makedirs(out)
+    victim = os.path.join(out, "victim")
+    keep = bytes(range(64))
+
+    def reset():
+        with open(victim, "wb") as f:
+            f.write(keep)
+        with open(os.path.join(root, "points", "k.st"), "wb") as f:
+            f.write(bytes(64))
+        for name, to in (("link", victim), ("dirlink", out)):
+            p = os.path.join(root, name)
+            if not os.path.lexists(p):
+                os.symlink(to, p)
+
+    def intact():
+        return os.path.isfile(victim) and not os.path.islink(victim) and open(victim, "rb").read() == keep
+
+    d = C.RankDir(root)
+    reset()
+    r = d.run("corrupt", path="points/k.st", at=5)
+    with open(os.path.join(root, "points", "k.st"), "rb") as f:
+        got = f.read()
+    expect("checklib: FSOPS still corrupts a file inside the spill root", r.get("at") == 5 and got[5] == 0xFF
+           and got[:5] == bytes(5), r)
+    reset()
+    r = d.run("truncate", path="points/k.st", to=10)
+    expect("checklib: FSOPS still truncates a file inside the spill root",
+           os.path.getsize(os.path.join(root, "points", "k.st")) == 10, r)
+    reset()
+    d.run("remove", path="points/k.st")
+    expect("checklib: FSOPS still removes a file inside the spill root",
+           not os.path.exists(os.path.join(root, "points", "k.st")), "removed")
+    for op, kw in (("corrupt", {"at": 3}), ("truncate", {"to": 1}), ("remove", {})):
+        for path in ("link", "dirlink/victim", "../out/victim", victim, "points/../../out/victim"):
+            reset()
+            try:
+                r = d.run(op, path=path, **kw)
+                refused = False
+            except RuntimeError as e:
+                r, refused = str(e)[-120:], True
+            expect(f"checklib: FSOPS {op} refuses {path!r} (outside the spill root or through a symlink)",
+                   refused and intact() and os.path.islink(os.path.join(root, "link")), r)
+    reset()
+    names = d.list()
+    expect("checklib: FSOPS list names regular files only, never one reached through a symlink",
+           sorted(names) == ["points/k.st"], sorted(names))
+
+
 def t_parked(work):
     """The parked gauge (requests waiting on a restore: the one reading it and every coalesced one) is non-zero while a
     coalesced restore is in flight and back to 0 after, which spill_check's settled check waits for."""
@@ -405,7 +462,7 @@ def t_prefix(work):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--only", default="compile,creds,kinds,counters,exact,spill,resume,prefix")
+    ap.add_argument("--only", default="compile,creds,kinds,fsops,counters,exact,spill,resume,prefix")
     ap.add_argument("--keep", action="store_true")
     a = ap.parse_args()
     work = tempfile.mkdtemp(prefix="tf-tools-selftest-")
@@ -424,7 +481,7 @@ def main() -> int:
               if all(ok for _, ok in results) else "FAIL  py_compile", flush=True)
     if "creds" in only:
         run(work, "checklib: API key rules (test_checklib_credentials.py)", tool("test_checklib_credentials.py"))
-    for name, fn in (("kinds", t_kinds), ("counters", t_counters), ("exact", t_exact), ("spill", t_spill),
+    for name, fn in (("kinds", t_kinds), ("fsops", t_fsops), ("counters", t_counters), ("exact", t_exact), ("spill", t_spill),
                      ("resume", t_resume), ("prefix", t_prefix)):
         if name in only:
             try:

@@ -572,42 +572,78 @@ class Receipt:
 
 # ---------------------------------------------------------------------- a rank's spill directory
 # Operations run as `[shell...] [sudo -n] python3 -c FSOPS <json>`: the same code here and on the worker, and under
-# sudo when the engine's containers wrote the files as root. Nothing but these four operations is ever run.
+# sudo when the engine's containers wrote the files as root. Nothing but these four operations is ever run, and only
+# inside the spill root: a path is joined to the resolved root and refused unless it names a regular file inside it
+# reached through no symlink (no `..` out, no absolute path), and the file is opened with O_NOFOLLOW (list skips
+# anything but regular files). With --sudo that keeps a symlink or a crafted name in the folder from turning a check
+# into a root write elsewhere.
 FSOPS = r'''
-import json, os, sys
+import json, os, stat, sys
 a = json.loads(sys.argv[1])
-op, root = a["op"], a["root"]
+op = a["op"]
+root = os.path.realpath(a["root"])
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+def inside(p):
+    return p != root and os.path.commonpath([root, p]) == root
+def target(rel):
+    # the joined path, resolved: refused unless it names a regular file inside the root, reached through no symlink
+    if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+        raise SystemExit("refused: not a path inside the spill root: %r" % (rel,))
+    p = os.path.normpath(os.path.join(root, rel))
+    parent = os.path.realpath(os.path.dirname(p))
+    if not inside(p) or (parent != root and not inside(parent)) or os.path.join(parent, os.path.basename(p)) != p:
+        raise SystemExit("refused: %r resolves outside the spill root %s or through a symlink" % (rel, root))
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit("refused: %r is not a regular file" % (rel,))
+    return p
+def opened(p, flags):
+    fd = os.open(p, flags | NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise SystemExit("refused: %s is not a regular file" % p)
+    return fd
 def files():
     out = {}
     for d, _, fs in os.walk(root):
         for f in fs:
             p = os.path.join(d, f)
             try:
-                st = os.stat(p)
+                st = os.lstat(p)
             except OSError:
                 continue
-            out[os.path.relpath(p, root)] = [st.st_size, st.st_mtime]
+            if stat.S_ISREG(st.st_mode):
+                out[os.path.relpath(p, root)] = [st.st_size, st.st_mtime]
     return out
 if op == "list":
     r = files()
 elif op == "corrupt":
-    p = os.path.join(root, a["path"])
-    with open(p, "r+b") as f:
-        f.seek(0, 2); n = f.tell()
+    fd = opened(target(a["path"]), os.O_RDWR)
+    try:
+        n = os.fstat(fd).st_size
         at = min(max(0, a.get("at", n // 2)), max(0, n - 1))
-        f.seek(at); b = f.read(1)
-        f.seek(at); f.write(bytes([(b[0] if b else 0) ^ 0xFF]))
-        f.flush(); os.fsync(f.fileno())
+        b = os.pread(fd, 1, at)
+        os.pwrite(fd, bytes([(b[0] if b else 0) ^ 0xFF]), at)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     r = {"path": a["path"], "size": n, "at": at}
 elif op == "truncate":
-    p = os.path.join(root, a["path"])
-    n = os.path.getsize(p)
-    to = a.get("to", n // 2)
-    os.truncate(p, to)
+    fd = opened(target(a["path"]), os.O_WRONLY)
+    try:
+        n = os.fstat(fd).st_size
+        to = a.get("to", n // 2)
+        os.ftruncate(fd, to)
+    finally:
+        os.close(fd)
     r = {"path": a["path"], "size": n, "to": to}
 elif op == "remove":
-    p = os.path.join(root, a["path"])
-    os.remove(p)
+    p = target(a["path"])
+    dfd = os.open(os.path.dirname(p), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW)
+    try:
+        os.unlink(os.path.basename(p), dir_fd=dfd)
+    finally:
+        os.close(dfd)
     r = {"path": a["path"]}
 elif op == "statvfs":
     s = os.statvfs(root)
