@@ -131,7 +131,9 @@ bertholomus/TensorFold (a TensorFold fork; design only)
 Contributions to this project (Apache-2.0, through its issues and pull requests)
   scripts/port.sh and scripts/port_test.sh (ENGINE=zig: the settings of zig/patches/0017 to 0023 mapped to the ranks):
   by Robert Wojciechowski (GitHub @wojo, X @rwojo), from his port of the same features to the DeepSeek-V4.1-Flash
-  recipe; the PROMPT_CACHE_GIB setting it maps is ezoushen's (pull request #187).
+  recipe; the PROMPT_CACHE_GIB setting it maps is ezoushen's (pull request #187). The tools checklib.py,
+  spill_check.py, resume_bench.py, prefix_fanout.py, selftest.py and fake_server.py are by him, from the same port;
+  tools/exact.py is that recipe's (MiaAI-Lab), with his changes.
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.
   patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by MiaAI-Lab.
   patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).

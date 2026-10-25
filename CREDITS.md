@@ -51,7 +51,9 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   `docs/glm-port/recipe.md`): the settings of the spill tier, spill v2 and KV sharding (`zig/patches/0017`-`0023`) mapped
   to the ranks, their checks and the `tf.recipe.port` label, by
   **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**, from his port of the same
-  features to the DeepSeek-V4.1-Flash recipe. `PROMPT_CACHE_GIB`, which it maps and warns about, is
+  features to the DeepSeek-V4.1-Flash recipe. The client tools `tools/checklib.py`, `spill_check.py`, `resume_bench.py`,
+  `prefix_fanout.py`, `selftest.py` and `fake_server.py` are his too, from the same port; `tools/exact.py` is the
+  DeepSeek recipe's (MiaAI-Lab), with his eight-stream cases. `PROMPT_CACHE_GIB`, which it maps and warns about, is
   **[ezoushen](https://github.com/ezoushen)**'s setting
   ([pull request #187](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/187)).
 - **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE

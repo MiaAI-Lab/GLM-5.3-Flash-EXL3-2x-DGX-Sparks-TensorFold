@@ -23,7 +23,7 @@
 #                      outside HF_CACHE and outside any NFS export (WORKER_WEIGHTS=nfs serves HF_CACHE to the workers);
 #                      start.sh checks it on every Spark and creates it (as you) when missing. The ranks run as root: the
 #                      Zig engine's v1 tier (cuda_spill.zig) writes its tfspill-<hash> folders and files as root, readable
-#                      by root only (0700 / 0600), so removing them takes sudo; its v2 tier
+#                      by root only (0700 / 0600), so removing them takes sudo (tools/spill_check.py: --sudo); its v2 tier
 #                      hands its glm-spill-<hash> folders to SPILL_DIR's owner (the files in them stay root's); the
 #                      Python engine's (0088) hands its files to SPILL_DIR's owner
 #   SPILL_MIN_TOKENS   shorter kept states are not written (8192)
