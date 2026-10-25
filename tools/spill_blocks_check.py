@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks for patch 0110 (the spill tier's block store, tensorfold/cuda/spill_blocks.py, and its hooks in multi.py),
+"""Checks for patch 0128 (the spill tier's block store, tensorfold/cuda/spill_blocks.py, and its hooks in multi.py),
 CPU only, run inside the image that scripts/prepare.sh built (no GPU, no model, no server); its files go to a scratch
 folder under $TMPDIR:
 
@@ -31,12 +31,33 @@ rows), with a stand-in small state, and MultiDecoder's own load and move paths o
   buffers hold the first ten and 9 fits them, so the pool pays nothing for 9) keeps spill.preallocate's read buffers
   and pins only the rest before the pool is sized, in power-of-two pieces of at most spill.CHUNK (torch's pinned
   allocator rounds an allocation up to one), the bytes it returns (the pool's cost) those pieces only; ring carves
-  at least that many stored blocks out of them and pins none later.
+  at least that many stored blocks out of them and pins none later;
+- the room, files first: each eviction step deletes the files it should (an old turn its point files only, a fork
+  and a whole conversation their own blocks too, never a block another point names) and goes in the order old turns,
+  abandoned forks, whole conversations least recently used, shared prefixes last; a point being read is never taken,
+  nor a block the state being written names;
+- old turns trimmed as newer ones are written (SPILL_TURNS: the newest on the path stay, forks off it and shared
+  prefixes untouched, a turn being read kept; 0 keeps every turn), the quota (a conversation over its share trims its
+  own old turns and forks, no other's), the free-disk floor (a disk full of other things refuses without evicting;
+  short of the floor, room made in the eviction order);
+- a restart: temporary names, points without their json, with damaged ids or a missing block, blocks no point names
+  and foreign files go, the complete point reads back; older builds lose this rank's folder (the newest other stays);
+  a failed write leaves no temporary file;
+- temporary files are opened O_EXCL | O_NOFOLLOW (a symlink planted at the name is not written through, a leftover
+  file replaced); one engine a folder and rank (``spill.hold``: a second engine, of any build, the one-stream store
+  too, gets ``Busy`` before it prunes anything, the engine then runs with the tier off; a kill -9 lets it go);
+- release has its own cap (TF_GLM_SPILL_RELEASE_MIB, by default an eighth of the memory reserve): past it a state's
+  rows are not copied and it is not stored; the host copies (and the block a keep cuts) are let go once written;
+- the prefix wait is off unless TF_GLM_PREFIX_WAIT=1; what it waits for and what not, when it lets go, and the
+  scheduler (the spill tier off) holding the request apart while the queue goes on.
 Exit code 1 when a check fails; tools/spill_blocks_mutants.sh runs it on faithful mutants of each fix.
 """
 import inspect
 import json
 import os
+import queue
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,12 +69,16 @@ import torch
 from tensorfold.cuda import health as H
 from tensorfold.cuda import spill as SP
 from tensorfold.cuda import spill_blocks as S
+from tensorfold.cuda.scheduler import Waiting
 from tensorfold.families.glm5_next.cuda import multi as M
 from tensorfold.families.glm5_next.cuda.pool import ALIGN, Arena, Plane, Pool, align_up
 from tensorfold.server import metrics as MT
 
 ROWS = 8 * ALIGN
-TIMEOUT = float(os.environ.get("TEST_TIMEOUT_S", "60"))
+# TEST_TIMEOUT_S: the whole run's watchdog (a hang prints a FAIL and exits), and the longest single wait is half of it.
+# 900 s by default: one run takes ~15-60 s, and a slower CPU went past the old 60 s (tools/spill_blocks_mutants.sh
+# sets 120 for its runs).
+TIMEOUT = float(os.environ.get("TEST_TIMEOUT_S", "900"))
 fails: list[str] = []
 ROOT = tempfile.mkdtemp(prefix="spill-blocks-check-")
 
@@ -69,7 +94,9 @@ def _hung() -> None:
     os._exit(1)
 
 
-threading.Timer(TIMEOUT, _hung).start()
+_watchdog = threading.Timer(TIMEOUT, _hung)
+_watchdog.daemon = True                               # (a crash ends the run at once)
+_watchdog.start()
 
 
 class Snap:
@@ -95,10 +122,21 @@ def arena(seed: int) -> Arena:
     return Arena(ROWS, [Plane(lat, 1), Plane(pk, 4, 2)])
 
 
-def store(ar: Arena, name: str, rank: int = 0) -> S.BlockStore:
-    cfg = SP.SpillConfig(root=os.path.join(ROOT, name), gib=1.0, min_tokens=1, min_free_gib=0.0)
+OPEN: dict = {}                                      # (folder, rank) -> the store holding it (``spill.hold``)
+
+
+def store(ar: Arena, name: str, rank: int = 0, gib: float = 1.0, floor: float = 0.0, **kw) -> S.BlockStore:
+    """A store on ``ROOT/name``; one already open there for ``rank`` is closed first (the engine before it ended: a
+    restart)."""
+
+    cfg = SP.SpillConfig(root=os.path.join(ROOT, name), gib=gib, min_tokens=1, min_free_gib=floor)
     os.makedirs(cfg.root, exist_ok=True)
-    return S.BlockStore(cfg, planes=ar.planes, block=ALIGN, rank=rank, device="cpu", classes=CLASSES, quiet=True)
+    old = OPEN.pop((cfg.root, rank), None)
+    if old is not None:
+        old.close()
+    st = S.BlockStore(cfg, planes=ar.planes, block=ALIGN, rank=rank, device="cpu", classes=CLASSES, quiet=True, **kw)
+    OPEN[(cfg.root, rank)] = st
+    return st
 
 
 def rows(ar: Arena, base: int, n: int) -> list[torch.Tensor]:
@@ -734,5 +772,625 @@ SP.CHUNK = chunk
 os.environ.pop("TF_GLM_SPILL_READ_BLOCKS", None)
 if env is not None:
     os.environ["TF_GLM_SPILL_READ_BLOCKS"] = env
+
+
+# == the store's room, files and settings (review 2026-10-24): files deleted first, then the order, quota, turns, floor
+os.environ["TF_GLM_SPILL_STAGE_MIB"] = "2"            # (a small write ring a store: these make many stores)
+def fill(ar: Arena, base: int, n: int, seed: int) -> None:
+    """Rows of their own for tokens [base, base + n) (no two states' blocks the same bytes: no dedup links)."""
+
+    g = torch.Generator().manual_seed(1000 + seed)
+    for p in ar.planes:
+        a, b = base // p.div, (base + align_up(n)) // p.div
+        p.tensor[a:b] = torch.randint(-2**15, 2**15 - 1, tuple(p.tensor[a:b].shape), generator=g,
+                                      dtype=torch.int32).to(p.tensor.dtype)
+
+
+SEEDS = iter(range(10_000))
+BANK: dict = {}                                        # a block's name -> its rows (one computation: the same rows)
+
+
+def put(st: S.BlockStore, ar: Arena, ids: list, lineage: str, shared: bool = False, used: float | None = None):
+    """A state of ``ids`` kept at base 0 and written: rows of their own for blocks no state named before, the same
+    rows for a block named before (what a later turn or a fork computes there); its key, its rows as kept, what
+    persist said."""
+
+    fill(ar, 0, len(ids), next(SEEDS))
+    for s0, e0, h in S.block_hashes(np.asarray(ids, dtype=np.int64), B, lineage):
+        for p, t in zip(ar.planes, BANK.setdefault(h, span(ar, s0, e0))):
+            p.tensor[s0 // p.div:e0 // p.div] = t
+    x = Pool(ROWS).add(0, align_up(len(ids)))
+    kept = rows(ar, 0, len(ids))
+    r = st.persist(ids, snap(ids, shared), extent=x, lineage=lineage, shared=shared, skip=M.MultiDecoder._SPILL_SKIP)
+    st.drain(TIMEOUT / 4)
+    key = S.point_key(ids)
+    if used is not None and key in st.index:
+        st.index[key].used = used
+    return key, kept, r
+
+
+def files_of(st: S.BlockStore, key: str) -> list[str]:
+    return [sfx for sfx in (".ids", ".st", ".json") if os.path.exists(st._point_path(key, sfx))]
+
+
+def block_files(st: S.BlockStore) -> set[str]:
+    return {f[:-4] for f in os.listdir(st.blocks_dir) if f.endswith(".bin")}
+
+
+def reads_back(st: S.BlockStore, ar: Arena, key: str, ids: list, kept) -> bool:
+    st.ring()                                           # (the engine makes it at start)
+    fill(ar, 0, len(ids), 9999)                         # (other rows there first)
+    y = Pool(ROWS).add(0, align_up(len(ids)))
+    _, _, got = load_rows(st, ar, key, y, len(ids))
+    return got is not None and same(got, kept)
+
+
+B = ALIGN
+SYS = ids_of(B, 500)                                   # a shared system prompt, one block
+LA, LB = S.fork("sys", "a", B), S.fork("sys", "b", B)  # two conversations that resumed from it
+TA = [SYS + ids_of(k * B, 501) for k in (1, 2, 3)]     # conversation A: three turns, one block more each
+FA = TA[1] + ids_of(B, 502)                            # a fork of A's second turn (an edited last message)
+TB = [SYS + ids_of(k * B, 503) for k in (1, 2)]        # conversation B: two turns
+
+
+def tree(name: str, **kw):
+    """S (shared), A1-A3, A2f (a fork off A2), B1, B2 written, each its own rows; used: S, B1, B2, A1, A2, A2f, A3."""
+
+    ar = arena(200)
+    st = store(ar, name, **kw)
+    k = {}
+    k["S"], _, _ = put(st, ar, SYS, "sys", shared=True, used=1.0)
+    k["B1"], _, _ = put(st, ar, TB[0], LB, used=2.0)
+    k["B2"], _, _ = put(st, ar, TB[1], LB, used=3.0)
+    k["A1"], _, _ = put(st, ar, TA[0], LA, used=4.0)
+    k["A2"], _, _ = put(st, ar, TA[1], LA, used=5.0)
+    k["A2f"], _, _ = put(st, ar, FA, S.fork(LA, "f", 3 * B), used=6.0)
+    k["A3"], _, _ = put(st, ar, TA[2], LA, used=7.0)
+    return ar, st, k
+
+
+# -- eviction: one victim at a time, each one's files gone, the blocks another point names kept ---------------------
+ar, st, k = tree("order", turns=0)
+name = {v: n for n, v in k.items()}
+check("room: seven points written, nothing trimmed (turns 0)", len(st.index) == 7 and st.stats["trimmed_turns"] == 0)
+check("room: the victims in order: old turns (least recently used first), the abandoned fork, whole conversations "
+      "(least recently used first), the shared prefix last",
+      [(name[key], why) for key, why in st._victims()] ==
+      [("B1", "pruned_turns"), ("A1", "pruned_turns"), ("A2", "pruned_turns"), ("A2f", "pruned_forks"),
+       ("B2", "pruned_conversations"), ("A3", "pruned_conversations"), ("S", "pruned_shared")])
+blk = {n: set(st.index[key].blocks) for n, key in k.items()}
+gone: list = []
+for step in range(7):
+    before = set(st.index)
+    st._make_room(1)                                   # (any shortfall: the next victim alone goes)
+    gone += [name[key] for key in before - set(st.index)]
+check("room: _make_room takes one at a time; once A1 and A2 are gone the fork is a conversation of its own (B2, "
+      "least recently used, goes before it)", gone == ["B1", "A1", "A2", "B2", "A2f", "A3", "S"])
+ar, st, k = tree("files", turns=0)
+st._make_room(1)
+check("files: an old turn's files go (.ids, .st, .json)", not files_of(st, k["B1"]))
+check("files: ... its blocks stay (the newer turn names them all)", blk["B1"] <= block_files(st))
+st._make_room(1)
+st._make_room(1)
+check("files: two more old turns' files go, no block", not files_of(st, k["A1"]) and not files_of(st, k["A2"])
+      and blk["A2"] <= block_files(st))
+st._make_room(1)
+check("files: a whole conversation's files and own blocks go", not files_of(st, k["B2"])
+      and not (blk["B2"] - blk["S"]) & block_files(st))
+check("files: ... the shared prefix's block stays", blk["S"] <= block_files(st))
+st._make_room(1)
+check("files: the fork goes with its own block", not (blk["A2f"] - blk["A2"]) & block_files(st)
+      and not files_of(st, k["A2f"]))
+check("files: ... the blocks it shared with the newest turn stay", blk["A2"] <= block_files(st)
+      and len(files_of(st, k["A3"])) == 3)
+check("files: the counters say why", (st.stats["pruned_turns"], st.stats["pruned_conversations"]) == (3, 2))
+check("files: stored bytes match the blocks left on disk",
+      st.block_bytes_on_disk == sum(os.stat(st._block_path(b)).st_size for b in block_files(st)))
+
+# -- a point being read is never evicted; making room never takes a block a state being written names ------------
+ar, st, k = tree("reading", turns=0)
+st.reading.add(k["B1"])
+st._make_room(st.stored())                             # (more than everything)
+check("reading: a point being read stays while everything else goes", set(st.index) == {k["B1"]}
+      and len(files_of(st, k["B1"])) == 3 and blk["B1"] <= block_files(st))
+st.reading.clear()
+ar = arena(201)
+st = store(ar, "pinned", gib=1.0, turns=0)
+ka, kept_a, _ = put(st, ar, TA[2], LA, used=1.0)        # conversation A's state (older)
+kb, _, _ = put(st, ar, TB[1], LB, used=2.0)             # conversation B's (newer)
+st.cap = st.stored() + st.block_bytes                   # room for one block more, not for C's block and small part
+ids_c = TA[2] + ids_of(B, 504)                          # C extends A's state (its lineage: names A's four blocks)
+wrote = st.stats["written_blocks"]
+kc, kept_c, r = put(st, ar, ids_c, LA)
+check("pinned: C is written once room is made", r == "queued" and kc in st.index)
+check("pinned: A's point went first (least recently used conversation)", ka not in st.index)
+check("pinned: ... but not the blocks C names", all(b in block_files(st) for b in st.index[kc].blocks))
+check("pinned: C wrote only its new block", st.stats["written_blocks"] == wrote + 1)
+check("pinned: C reads back whole", reads_back(st, ar, kc, ids_c, kept_c))
+
+# -- old turns trimmed as newer ones are written (SPILL_TURNS) -------------------------------------------------------
+ar = arena(202)
+st = store(ar, "turns", turns=2)
+ks, _, _ = put(st, ar, SYS, "sys", shared=True)
+k1, _, _ = put(st, ar, TA[0], LA)
+k2, kept2, _ = put(st, ar, TA[1], LA)
+kf, keptf, _ = put(st, ar, FA, S.fork(LA, "f", 3 * B))
+check("turns: a fork's own path counts too (A2f, A2 kept: A1 trimmed)", k1 not in st.index and k2 in st.index
+      and st.stats["trimmed_turns"] == 1)
+k3, _, _ = put(st, ar, TA[2], LA)
+check("turns: A3 written, A2 still among the newest two of its path", k2 in st.index)
+before_blocks = block_files(st)
+ids4 = TA[2] + ids_of(B, 505)
+k4, kept4, _ = put(st, ar, ids4, LA)
+check("turns: A4 written, A2 trimmed (the newest 2 on the path stay: A4, A3)", k2 not in st.index
+      and k3 in st.index and k4 in st.index and st.stats["trimmed_turns"] == 2)
+check("turns: a trimmed turn's files go", not files_of(st, k1) and not files_of(st, k2))
+check("turns: ... and no block (the newest turn names them)", before_blocks <= block_files(st))
+check("turns: the fork off the path is untouched, and still reads back", kf in st.index
+      and reads_back(st, ar, kf, FA, keptf))
+check("turns: the shared prefix is never trimmed", ks in st.index)
+check("turns: the newest turn reads back whole", reads_back(st, ar, k4, ids4, kept4))
+check("turns: a restart finds the same points", set(store(ar, "turns", turns=2).index) == {ks, kf, k3, k4})
+ar = arena(203)
+st = store(ar, "turns0", turns=0)
+for ids in [SYS] + TA:
+    put(st, ar, ids, "sys" if ids is SYS else LA, shared=ids is SYS)
+check("turns: SPILL_TURNS 0 keeps every turn until room is needed", len(st.index) == 4
+      and st.stats["trimmed_turns"] == 0)
+ar = arena(204)
+st = store(ar, "turnsread", turns=1)
+put(st, ar, SYS, "sys", shared=True)
+k1, _, _ = put(st, ar, TA[0], LA)
+st.reading.add(k1)
+put(st, ar, TA[1], LA)
+check("turns: a turn being read is not trimmed", k1 in st.index)
+st.reading.clear()
+env = os.environ.pop("TF_GLM_SPILL_TURNS", None)
+for raw, want in (("0", 0), ("2", 2), (None, 4)):
+    if raw is None:
+        os.environ.pop("TF_GLM_SPILL_TURNS", None)
+    else:
+        os.environ["TF_GLM_SPILL_TURNS"] = raw
+    got = int(os.environ.get("TF_GLM_SPILL_TURNS") or 4)    # (multi._spill_store's reading of it)
+    check(f"turns: TF_GLM_SPILL_TURNS={raw} reads as {want}", got == want)
+os.environ.pop("TF_GLM_SPILL_TURNS", None)
+if env is not None:
+    os.environ["TF_GLM_SPILL_TURNS"] = env
+check("turns: multi reads TF_GLM_SPILL_TURNS that way", 'int(os.environ.get("TF_GLM_SPILL_TURNS") or 4)'
+      in inspect.getsource(M.MultiDecoder._spill_store))
+
+# -- the quota: a conversation over its share trims its own old turns and forks first -------------------------------
+ar, st, k = tree("quota", turns=0, quota=0.0)
+own_a = st._conv_bytes([k["A1"], k["A2"], k["A2f"], k["A3"]])
+st.quota = (own_a - 1) / st.cap                        # A holds just over its share, B well under
+ids4 = TA[2] + ids_of(B, 506)
+k4, _, r = put(st, ar, ids4, LA, used=8.0)
+check("quota: A's next turn is written", r == "queued" and k4 in st.index)
+check("quota: A's own old turns and its fork went first", st.stats["quota_trims"] == 1
+      and not {k["A1"], k["A2"], k["A2f"]} & set(st.index))
+check("quota: A's newest state before the write stays", k["A3"] in st.index)
+check("quota: the other conversation and the shared prefix are untouched",
+      {k["B1"], k["B2"], k["S"]} <= set(st.index))
+ar, st, k = tree("quota-under", turns=0)
+st.quota = 0.9
+put(st, ar, TA[2] + ids_of(B, 507), LA)
+check("quota: under its share nothing is trimmed", st.stats["quota_trims"] == 0 and len(st.index) == 8)
+
+# -- the free-disk floor ----------------------------------------------------------------------------------------------
+ar = arena(205)
+st = store(ar, "floor", floor=1.0 / 1024)               # 1 MiB floor
+k1, _, _ = put(st, ar, TA[0], LA)
+files0 = set(os.listdir(st.points_dir)), block_files(st)
+st.disk_free = lambda: 0                               # the disk full of other things
+k2, _, r = put(st, ar, TB[0], LB)
+check("floor: a disk full of other things refuses the write", r == "no_space" and st.stats["no_space"] == 1)
+check("floor: ... without evicting anything", set(st.index) == {k1})
+check("floor: ... and leaves no file behind", (set(os.listdir(st.points_dir)), block_files(st)) == files0)
+ar, st, k = tree("floor-room", turns=0, floor=1.0 / 1024)
+start = st.stored()
+need = 2 * st.block_bytes                              # what a write of one new block needs, about
+st.disk_free = lambda: st.floor + need - 4096 + (start - st.stored())   # (what goes comes back as free space)
+k4, _, r = put(st, ar, TA[2] + ids_of(B, 508), LA)
+check("floor: short of the floor, room is made in the eviction order and the write goes on", r == "queued"
+      and k4 in st.index and st.stats["no_space"] == 0)
+check("floor: ... the first victim went, the rest stayed", k["B1"] not in st.index
+      and {k["A3"], k["B2"], k["S"]} <= set(st.index))
+
+# -- a restart with torn, orphaned and foreign files: only complete points stay ------------------------------------------
+ar = arena(206)
+st = store(ar, "torn", turns=0)
+ks, kept_s, _ = put(st, ar, SYS, "sys", shared=True)
+k1, _, _ = put(st, ar, TA[0], LA)
+k2, _, _ = put(st, ar, TB[0], LB)
+k3, _, _ = put(st, ar, TB[0] + ids_of(B, 509), LB)
+ids_p = ids_of(B, 530)                                  # a picture prompt: its ids are keyed, its tokens after them
+fill(ar, 0, B, 531)
+st.persist(ids_p, snap(ids_p), extent=Pool(ROWS).add(0, B), lineage="pic", tokens=ids_of(B, 532),
+           skip=M.MultiDecoder._SPILL_SKIP)
+st.drain(TIMEOUT / 4)
+kp = S.point_key(ids_p)
+own1 = set(st.index[k1].blocks) - set(st.index[ks].blocks)
+own3 = set(st.index[k3].blocks) - set(st.index[k2].blocks)
+os.remove(st._point_path(k1, ".json"))                 # a write cut before its json: incomplete
+with open(st._point_path(k2, ".ids"), "r+b") as fh:    # its ids damaged (their CRC-32 in its json)
+    fh.write(b"\x00" * 8)
+with open(st._point_path(kp, ".ids"), "r+b") as fh:    # a picture point's tokens damaged (its keyed ids intact):
+    fh.seek(8 * B)                                      # only the CRC-32 tells
+    fh.write(b"\x01" * 8)
+os.remove(st._block_path(sorted(own3)[0]))             # a block of k3 gone
+for d in (st.points_dir, st.blocks_dir):
+    open(os.path.join(d, ".left-over.tmp"), "wb").write(b"x")      # temporary names a crash left
+orphan = st._block_path("0" * 32)
+open(orphan, "wb").write(b"y" * 100)                   # a block no point names
+foreign = st._point_path("feedfacefeedface-7", ".json")
+open(foreign, "w").write(json.dumps({"format": "another", "key": "feedfacefeedface-7"}))
+st = store(ar, "torn", turns=0)
+check("torn: only the complete point stays", set(st.index) == {ks})
+check("torn: a point without its json loses its other files", not files_of(st, k1))
+check("torn: ... and the blocks only it named", not own1 & block_files(st))
+check("torn: a point whose ids fail their CRC goes with its files", not files_of(st, k2))
+check("torn: ... also when only a picture point's tokens are damaged (its key still matches)", kp not in st.index
+      and not files_of(st, kp))
+check("torn: a point missing a block goes with its files and its other blocks", not files_of(st, k3)
+      and not own3 & block_files(st))
+check("torn: temporary names left by a crash go", not [f for d in (st.points_dir, st.blocks_dir)
+                                                     for f in os.listdir(d) if f.startswith(".")])
+check("torn: a block no point names goes", not os.path.exists(orphan))
+check("torn: a json of another format goes", not os.path.exists(foreign))
+check("torn: the counts match what is left", len(st.have) == len(st.index[ks].blocks) == len(block_files(st)))
+check("torn: the complete point reads back", reads_back(st, ar, ks, SYS, kept_s))
+
+# -- older builds' folders pruned (this rank's only), the newest other kept -------------------------------------------
+ar = arena(207)
+root = os.path.join(ROOT, "builds")
+for i, (age, ranks) in enumerate(((300, (0, 1)), (200, (0,)), (100, (0,)))):
+    for r in ranks:
+        os.makedirs(os.path.join(root, f"spill-{i:016x}", f"rank{r}"), exist_ok=True)
+        open(os.path.join(root, f"spill-{i:016x}", f"rank{r}", "f"), "wb").write(b"z")
+    t = time.time() - age
+    os.utime(os.path.join(root, f"spill-{i:016x}"), (t, t))
+st = store(ar, "builds")
+check("builds: the newest other build stays", os.path.isdir(os.path.join(root, f"spill-{2:016x}", "rank0")))
+check("builds: older builds lose this rank's folder", not os.path.exists(os.path.join(root, f"spill-{1:016x}"))
+      and not os.path.exists(os.path.join(root, f"spill-{0:016x}", "rank0")))
+check("builds: ... not another rank's", os.path.exists(os.path.join(root, f"spill-{0:016x}", "rank1", "f")))
+
+# -- a failed write leaves no temporary file ------------------------------------------------------------------------------
+d = os.path.join(ROOT, "failed")
+os.makedirs(d, exist_ok=True)
+fsync = S.os.fsync
+
+
+def full(fd):
+    raise OSError(28, "No space left on device")
+
+
+S.os.fsync = full
+try:
+    S._put(os.path.join(d, "x.json"), b"{}" * 100, None)
+    raised = False
+except OSError:
+    raised = True
+finally:
+    S.os.fsync = fsync
+check("failed write: raises, and leaves neither the file nor its temporary name", raised and not os.listdir(d))
+
+# -- temporary files: made new (O_EXCL), never through a symlink (O_NOFOLLOW) ----------------------------------------------
+check("tmp: temporary files are opened O_CREAT | O_EXCL | O_NOFOLLOW",
+      bool(S._NEW & os.O_EXCL and S._NEW & os.O_CREAT and S._NEW & os.O_NOFOLLOW))
+d = os.path.join(ROOT, "symlink")
+os.makedirs(d, exist_ok=True)
+victim = os.path.join(ROOT, "victim.txt")
+open(victim, "w").write("not yours")
+for direct in (False, True):
+    path = os.path.join(d, f"p{int(direct)}.json")
+    os.symlink(victim, os.path.join(d, f".p{int(direct)}.json"))           # planted at the temporary name
+    S._put(path, b"mine", None, direct=direct)
+    check(f"tmp: a symlink planted at the temporary name is not written through (direct={direct})",
+          open(victim).read() == "not yours" and open(path, "rb").read() == b"mine"
+          and not os.path.islink(path) and not os.path.lexists(os.path.join(d, f".p{int(direct)}.json")))
+open(os.path.join(d, ".left.json"), "wb").write(b"old bytes, longer than the new ones")
+S._put(os.path.join(d, "left.json"), b"new", None)
+check("tmp: a temporary file left at the name is replaced, not appended to or reused",
+      open(os.path.join(d, "left.json"), "rb").read() == b"new")
+ar = arena(208)
+st = store(ar, "symlink-block")
+ids = ids_of(B, 510)
+h0 = S.block_hashes(np.asarray(ids), B, "sl")[0][2]
+os.symlink(victim, os.path.join(st.blocks_dir, f".{h0}.bin"))
+fill(ar, 0, B, 511)
+kept = rows(ar, 0, B)
+st.persist(ids, snap(ids), extent=Pool(ROWS).add(0, B), lineage="sl", skip=M.MultiDecoder._SPILL_SKIP)
+st.drain(TIMEOUT / 4)
+check("tmp: a block written over a symlink planted at its temporary name leaves the target alone",
+      open(victim).read() == "not yours" and not os.path.islink(st._block_path(h0)))
+check("tmp: ... and the block reads back", reads_back(st, ar, S.point_key(ids), ids, kept))
+
+# -- one engine a folder (and rank): flock on .lock-rank<r> --------------------------------------------------------------
+ar = arena(209)
+st = store(ar, "lock")
+ids_l = ids_of(B, 512)
+kl, _, _ = put(st, ar, ids_l, "l")
+cfg = SP.SpillConfig(root=os.path.join(ROOT, "lock"), gib=1.0, min_tokens=1, min_free_gib=0.0)
+try:
+    S.BlockStore(cfg, planes=ar.planes, block=ALIGN, rank=0, device="cpu", classes=CLASSES, quiet=True)
+    msg = ""
+except SP.Busy as exc:
+    msg = str(exc)
+check("lock: a second engine on the folder, same rank, is refused (Busy)", bool(msg))
+check("lock: ... saying which folder and which process holds it", cfg.root in msg and f"pid {os.getpid()}" in msg)
+old_build = os.path.join(cfg.root, "spill-00000000000000ab", "rank0")   # an older build's folder the other
+os.makedirs(old_build, exist_ok=True)                                   # engine would prune (it keeps the newest:
+open(os.path.join(old_build, "f"), "wb").write(b"z")                    # this engine's)
+t = time.time() - 1000
+os.utime(os.path.dirname(old_build), (t, t))
+try:
+    S.BlockStore(cfg, planes=ar.planes, block=ALIGN, rank=0, device="cpu", classes=CLASSES, quiet=True,
+                 signature="another build")
+    other = False
+except SP.Busy:
+    other = True
+check("lock: an engine of another build is refused too, before it prunes anything", other
+      and st.has(kl) and os.path.isdir(st.dir) and len(files_of(st, kl)) == 3
+      and os.path.exists(os.path.join(old_build, "f")))
+r1 = S.BlockStore(cfg, planes=ar.planes, block=ALIGN, rank=1, device="cpu", classes=CLASSES, quiet=True)
+check("lock: another rank on the same folder is not", r1 is not None)
+r1.close()
+try:
+    SP.SpillStore(SP.SpillConfig(root=cfg.root, gib=1.0, min_tokens=1, min_free_gib=0.0), device="cpu", quiet=True)
+    one = False
+except SP.Busy:
+    one = True
+check("lock: the one-stream store (PARALLEL=1) is refused on a folder in use", one)
+st = store(ar, "lock")                                  # (the first closed: a restart)
+check("lock: once the first engine ended, the folder opens again with its points", kl in st.index)
+code = ("import sys, time; from tensorfold.cuda import spill as SP; SP.hold(sys.argv[1], 0); "
+        "print('held', flush=True); time.sleep(60)")
+st.close()
+OPEN.pop((cfg.root, 0), None)
+proc = subprocess.Popen([sys.executable, "-c", code, cfg.root], stdout=subprocess.PIPE, text=True)
+line = proc.stdout.readline().strip()
+try:
+    store(ar, "lock")
+    held = False
+except SP.Busy as exc:
+    held = f"pid {proc.pid}" in str(exc)
+proc.kill()
+proc.wait()
+check("lock: held by another process (its pid named)", line == "held" and held)
+check("lock: a kill -9 of that process lets it go", kl in store(ar, "lock").index)
+
+
+class _BusyStore:
+    def __init__(self, *a, **kw):
+        raise SP.Busy("/spill is in use by another engine as rank 0 (pid 1)")
+
+
+dec = object.__new__(M.MultiDecoder)
+dec.g = NS(spill_cfg=cfg, model_dir=ROOT, drafter_dir=None, drafter=None, agreed=(), _gather_ints=None)
+dec.arena, dec.w, dec.grid, dec.drafts, dec.rank, dec.pool = ar, NS(world=1, device="cpu"), 0, None, 0, Pool(ROWS)
+saved = S.BlockStore, SP.build_id, SP.weights_id
+S.BlockStore, SP.build_id, SP.weights_id = _BusyStore, (lambda *a: "b"), (lambda *a: "w")
+try:
+    off = dec._spill_store()
+except SP.Busy:
+    off = "raised"
+finally:
+    S.BlockStore, SP.build_id, SP.weights_id = saved
+check("lock: the engine runs with the tier off (Busy on every rank alike)", off is None)
+
+# -- release: rows copied to host memory have their own cap (TF_GLM_SPILL_RELEASE_MIB) ----------------------------------
+env = {k: os.environ.pop(k, None) for k in ("TF_GLM_SPILL_RELEASE_MIB", "TENSORFOLD_MEMORY_RESERVE_GIB")}
+os.environ["TENSORFOLD_MEMORY_RESERVE_GIB"] = "4"     # (two Sparks: 14.5, so 1.8 GiB; 4 fits any test machine)
+check("release cap: by default an eighth of the memory reserve (4 GiB: 512 MiB)", S.release_cap() == 512 << 20)
+os.environ.pop("TENSORFOLD_MEMORY_RESERVE_GIB")
+check("release cap: without a reserve set, an eighth of TensorFold's (at least 4 GiB: 512 MiB or more)",
+      S.release_cap() >= 512 << 20 and S.release_cap() < S.BACKLOG)
+os.environ["TENSORFOLD_MEMORY_RESERVE_GIB"] = "100000"
+check("release cap: a reserve TensorFold would refuse falls back to its default, not an error at start",
+      S.release_cap() >= 512 << 20)
+os.environ.pop("TENSORFOLD_MEMORY_RESERVE_GIB")
+os.environ["TF_GLM_SPILL_RELEASE_MIB"] = "64"
+check("release cap: TF_GLM_SPILL_RELEASE_MIB=64 is 64 MiB", S.release_cap() == 64 << 20)
+os.environ["TF_GLM_SPILL_RELEASE_MIB"] = "0"
+check("release cap: 0 is allowed (release copies nothing)", S.release_cap() == 0)
+bad = []
+for raw in ("-1", "lots"):
+    os.environ["TF_GLM_SPILL_RELEASE_MIB"] = raw
+    try:
+        S.release_cap()
+    except ValueError:
+        bad.append(raw)
+check("release cap: a negative or non-number value is refused", bad == ["-1", "lots"])
+for kk, v in env.items():
+    os.environ.pop(kk, None)
+    if v is not None:
+        os.environ[kk] = v
+
+
+def stalled(st: S.BlockStore):
+    """The writer held at its next block until the returned event (a slow disk)."""
+
+    gate, orig = threading.Event(), st._write_block
+
+    def slow(*a):
+        gate.wait(TIMEOUT)
+        return orig(*a)
+
+    st._write_block = slow
+    return gate
+
+
+ar = arena(210)
+st = store(ar, "release")
+st.release_cap = 4 * st.block_bytes                    # room for four blocks
+gate = stalled(st)
+m = decoder(ar, st)
+ids1, ids2 = ids_of(3 * B, 513), ids_of(2 * B, 514)
+x1 = m.pool.add(0, 3 * B)
+fill(ar, 0, 3 * B, 515)
+kept1 = rows(ar, 0, 3 * B)
+st.persist(ids1, snap(ids1), extent=x1, lineage="r1", skip=M.MultiDecoder._SPILL_SKIP)
+x2 = m.pool.add(3 * B, 2 * B)
+fill(ar, 3 * B, 2 * B, 516)
+st.persist(ids2, snap(ids2), extent=x2, lineage="r2", skip=M.MultiDecoder._SPILL_SKIP)
+m.pool.remove(x1)                                       # (its rows go before they are written: the pool's guard)
+check("release: rows within the cap are copied to the host", st.stats["released_blocks"] == 3
+      and st.host_bytes == 3 * st.block_bytes)
+m.pool.remove(x2)
+check("release: past the cap a state's rows are not copied, the state is dropped", st.stats["released_blocks"] == 3
+      and st.stats["release_dropped"] == 1 and st.host_bytes == 3 * st.block_bytes)
+fill(ar, 0, 5 * B, 517)                                 # (other streams write those rows now)
+gate.set()
+st.drain(TIMEOUT / 4)
+check("release: the copied state is stored as it was kept", reads_back(st, ar, S.point_key(ids1), ids1, kept1))
+check("release: the dropped one is not stored, and wrote nothing", S.point_key(ids2) not in st.index
+      and st.stats["write_failed"] == 1 and len(block_files(st)) == 3)
+check("release: the host copies are let go once written", st.host_bytes == 0 and st.backlog == 0)
+check("release: /health shows the cap and what it holds", st.info()["release_cap_mb"] == (4 * st.block_bytes) >> 20
+      and "host_mb" in st.info() and "release_dropped" in st.info())
+ar = arena(211)
+st = store(ar, "release-tail")
+gate = stalled(st)
+n = B + 6
+fill(ar, 0, n, 518)
+st.persist(ids_of(n, 519), snap(ids_of(n, 519)), extent=Pool(ROWS).add(0, align_up(n)), lineage="t",
+           skip=M.MultiDecoder._SPILL_SKIP)
+tail = S._span_bytes(ar.planes, B, n)
+check("release: the block a kept state's end cuts counts in the same host bytes", st.host_bytes == tail)
+gate.set()
+st.drain(TIMEOUT / 4)
+check("release: ... until it is written", st.host_bytes == 0)
+
+# -- the prefix wait: off by default (it changes admission with the spill tier off too) ---------------------------------
+probe = "from tensorfold.families.glm5_next.cuda import multi as M; print(M.PREFIX_WAIT)"
+seen = {}
+for raw in (None, "0", "1"):
+    e = {kk: v for kk, v in os.environ.items() if kk != "TF_GLM_PREFIX_WAIT"}
+    if raw is not None:
+        e["TF_GLM_PREFIX_WAIT"] = raw
+    seen[raw] = subprocess.run([sys.executable, "-c", probe], env=e, capture_output=True, text=True).stdout.strip()
+check("prefix wait: off unless TF_GLM_PREFIX_WAIT=1", seen == {None: "False", "0": "False", "1": "True"})
+
+
+def waiter(lanes, hit=0):
+    d = object.__new__(M.MultiDecoder)
+    d.g = NS(shared=B, serial_only=False)
+    d.drafts, d.prefix_waits, d.prefix_wait_tokens = None, 0, 0
+    d._resume = lambda prompt: NS(ids=prompt[:hit]) if hit else None
+    d.lanes = {ln.sid: ln for ln in lanes}
+    return d
+
+
+def lane(sid, key, shared, pos, **kw):
+    return NS(sid=sid, decoding=False, s=NS(done=False), key=list(key), images=None, dflash=True, shared=set(shared),
+              st=NS(pos=pos), **kw)
+
+
+sysp = ids_of(3 * B, 520)                              # a 6k-token system prompt another request is prefilling
+prompt = sysp + ids_of(B, 521)
+req = NS(prompt=prompt, draft=True, vision=None)
+filling = lane(1, sysp + ids_of(B, 522), {3 * B}, B)  # at token 2048 of 6144, its shared point ahead
+saved_pw = M.PREFIX_WAIT
+M.PREFIX_WAIT = False
+check("prefix wait: off, a request never waits", waiter([filling]).prefix_wait(req) is None)
+M.PREFIX_WAIT = True
+d = waiter([filling])
+check("prefix wait: on, it waits for the shared point another request is still prefilling",
+      d.prefix_wait(req) == (1, 3 * B) and d.prefix_waits == 1 and d.prefix_wait_tokens == 3 * B)
+check("prefix wait: not for a point already kept (what it adds is under the shared-prefix minimum)",
+      waiter([filling], hit=3 * B - 100).prefix_wait(req) is None)
+check("prefix wait: not when its prompt leaves the other's before the point",
+      waiter([filling]).prefix_wait(NS(prompt=sysp[:2 * B] + ids_of(2 * B, 523), draft=True, vision=None)) is None)
+check("prefix wait: not when its prompt ends at the point (nothing left to prefill)",
+      waiter([filling]).prefix_wait(NS(prompt=sysp, draft=True, vision=None)) is None)
+past, pics = lane(1, filling.key, {3 * B}, B), lane(1, filling.key, {3 * B}, B)
+past.decoding, pics.images = True, [1]
+check("prefix wait: not for a stream past its prompt (decoding) or with pictures",
+      waiter([past]).prefix_wait(req) is None and waiter([pics]).prefix_wait(req) is None)
+done = lane(1, filling.key, {3 * B}, B)
+done.s.done = True
+check("prefix wait: not for a stream that ended", waiter([done]).prefix_wait(req) is None)
+check("prefix wait: not for a point it has passed", waiter([lane(1, filling.key, {3 * B}, 3 * B)]).prefix_wait(req)
+      is None)
+check("prefix wait: not for a request without drafts or with pictures",
+      waiter([filling]).prefix_wait(NS(prompt=prompt, draft=False, vision=None)) is None
+      and waiter([filling]).prefix_wait(NS(prompt=prompt, draft=True, vision=object())) is None)
+nodf = waiter([lane(1, filling.key, {3 * B}, B)])
+nodf.drafts = object()
+nodf.lanes[1].dflash = False
+check("prefix wait: not for a stream whose states keep no DFlash2 window", nodf.prefix_wait(req) is None)
+d = waiter([filling])
+w = (1, 3 * B)
+check("prefix wait: not released while the point is still ahead", not d.prefix_ready(w))
+filling.st.pos = 3 * B
+check("prefix wait: released once the point is kept", d.prefix_ready(w))
+filling.st.pos = B
+filling.decoding = True
+check("prefix wait: released when the stream left its prompt", d.prefix_ready(w))
+filling.decoding = False
+check("prefix wait: released when the stream went", waiter([]).prefix_ready(w))
+
+# the scheduler with the spill tier off (no prestage): a waiting request is held apart while the queue goes on
+
+class SchedDecoder:
+    def __init__(self, w):
+        self.w, self.admitted, self.streams = w, [], {}
+
+    def live(self):
+        return len(self.streams)
+
+    def fits(self, s):
+        return True
+
+    def admit(self, s):
+        self.admitted.append(s)
+        self.streams[id(s)] = s
+
+    def prefix_wait(self, s):
+        return self.w.prefix_wait(s)
+
+    def prefix_ready(self, p):
+        return self.w.prefix_ready(p)
+
+
+def sched(w):
+    o = object.__new__(M.GlmScheduler)
+    o.decoder, o.max_streams = SchedDecoder(w), 4
+    o.waiting, o.held, o.boxes, o.yields, o.gather_s = Waiting(), None, {}, 0, 0
+    o.flushing, o.flush_lock, o.loading, o.ready, o.staged, o.prefix = None, threading.Lock(), [], [], set(), []
+    o.max_in_system = None
+    return o
+
+
+def item(p):
+    return (NS(prompt=p, draft=True, vision=None, background=False, done=False, emit=NS()), queue.Queue())
+
+
+filling = lane(1, sysp + ids_of(B, 522), {3 * B}, B)
+for on in (False, True):
+    M.PREFIX_WAIT = on
+    o = sched(waiter([filling]))
+    a, b = item(prompt), item(ids_of(2 * B, 524))
+    o.waiting.put(a)
+    o.waiting.put(b)
+    o._admit()
+    if not on:
+        check("prefix wait off: both requests admitted at once (admission as without the patch)",
+              o.decoder.admitted == [a[0], b[0]] and not o.prefix)
+        continue
+    check("prefix wait on: the request sharing the prefix is held apart, the next one admitted",
+          o.decoder.admitted == [b[0]] and [it for _, it in o.prefix] == [a])
+    o._admit()
+    check("prefix wait on: still held while the point is ahead", o.decoder.admitted == [b[0]])
+    filling.st.pos = 3 * B
+    o._admit()
+    check("prefix wait on: admitted once the point is kept, before the queue", o.decoder.admitted == [b[0], a[0]]
+          and not o.prefix and getattr(a[0], "prefix_waited", False))
+M.PREFIX_WAIT = saved_pw
+conf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "config.sh")
+if os.path.exists(conf):                                # (the recipe's tree; not when the check is run alone)
+    check("prefix wait: config.sh defaults PREFIX_WAIT to 0", 'PREFIX_WAIT="${PREFIX_WAIT:-0}"' in open(conf).read())
+
 print("all passed" if not fails else f"FAILED: {fails}", flush=True)
 os._exit(1 if fails else 0)

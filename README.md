@@ -391,7 +391,7 @@ or more is written to that directory on each Spark when it is kept, and a later 
 instead of prefilling (patch `0088-glm-spill-tier`, authored by
 Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X),
 in [PR #78](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/78); with `PARALLEL` above 1
-its block store, patch `0110-glm-spill-blocks`, carries over the NVMe KV tier of
+its block store, patch `0128-glm-spill-blocks`, carries over the NVMe KV tier of
 [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
 [BadAd84](https://github.com/BadAd84)).
 
@@ -406,7 +406,11 @@ How it stores (`PARALLEL` above 1):
   and the block its end cuts (whose last pooled-key row is still filling) are copied off the GPU when it is kept; its
   other rows go to disk a few blocks between rounds (4; 2 and 8 measured the same) through a pinned ring (`TF_GLM_SPILL_STAGE_MIB`, 256 MiB),
   written with O_DIRECT (the page cache shares a GB10's memory). A conversation resumes from disk after an eviction, a clean restart, a `kill -9` or a
-  watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s).
+  watchdog restart. A clean stop writes what still waits (`SPILL_FLUSH_S`, 60 s). Rows freed or overwritten before
+  their write (a full pool, a stream taking over an extent) are copied to host memory first, at most
+  `SPILL_RELEASE_MIB` of them at once (default an eighth of `MEMORY_RESERVE_GIB`: 1.8 GiB at 14.5; on a GB10 that
+  memory is the pool's and the reserve's); a state past it is not stored (`/health` `spill.release_dropped`,
+  `host_mb`).
 - **Reads beside decoding.** A restore reads its blocks ahead on 8 threads (2 were slower, 4 to 16 the same) into pinned slots
   (`TF_GLM_SPILL_READ_BLOCKS`, 16 blocks: on two Sparks the read buffers pinned at start hold the first ten and the
   rest is pinned before the pool is sized, in power-of-two pieces, so the pool pays for those (~14k tokens at
@@ -418,6 +422,10 @@ How it stores (`PARALLEL` above 1):
   prompt is prefilled. Rank 0 asks every Spark before a read; a read happens only when all hold the state.
 - **Pictures** (`PARALLEL` above 1): stored under their content keys, so a request resumes one only with the same
   pictures in the same places.
+- **One engine a folder.** Each Spark's engine holds `SPILL_DIR/.lock-rank<N>` (flock, let go when the process ends,
+  `kill -9` too). A second engine on the same folder (another checkout, a test run) is told so and runs without the
+  tier, rather than writing the same files and pruning the other's build. Files go to a temporary name opened
+  `O_EXCL | O_NOFOLLOW` (never an existing file, never through a symlink), are fsynced and renamed.
 
 Old turns. Every turn keeps its own small part (~91 MB a Spark: the recurrent state and DFlash2 window at that
 point, the same size at any length), while the rows are shared, so a long agent loop would store one small part a
@@ -471,7 +479,7 @@ Agents that start at the same moment on a system prompt the server has not kept 
 harness version, a changed tool list or instructions) would each prefill it, side by side. A request whose prompt
 starts with a point another request is still prefilling (its system block's end, a shared-prefix point) now waits for
 that state, apart from the queue, and resumes from it: the system prompt is prefilled once, and every agent's first
-token comes sooner (`PREFIX_WAIT`, on; `PREFIX_WAIT=0` turns it off). Six agents at once on a fresh 12k-token system
+token comes sooner (`PREFIX_WAIT=1`; off by default, since it changes admission also with the spill tier off). Six agents at once on a fresh 12k-token system
 prompt, two Sparks, `PARALLEL=8`, every reply equal to its own fresh `draft: false` one:
 
 | | Without | With |
@@ -662,7 +670,8 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SHARED_PREFIX` | `1` | conversations that share a system prompt reuse its prompt state |
 | `SPILL_GIB` / `SPILL_DIR` | `0` / `~/.cache/tensorfold-spill` | the spill tier: kept prompt states on local disk, written when kept, up to `SPILL_GIB` GiB a Spark (0: off) ([Spill tier](#spill-tier-optional)) |
 | `SPILL_QUOTA` / `SPILL_TURNS` | `0` / `4` | the spill tier's share of `SPILL_GIB` one conversation may hold before it trims its own old turns and forks (0: no quota), and the newest states kept on a conversation's path, older turns trimmed as each one is written (2: heavy agent loops or a small disk; 8+: chats with deep edits; 0: every turn until room is needed) |
-| `PREFIX_WAIT` | `1` | a request whose prompt starts with what another request is still prefilling (a shared system prompt) waits for that state instead of prefilling it too ([A system prompt prefilled once](#a-system-prompt-prefilled-once-for-every-agent)) |
+| `SPILL_RELEASE_MIB` | an eighth of `MEMORY_RESERVE_GIB` | the most MiB of rows the spill tier copies to host memory while they wait to be written (rows freed or overwritten first); a state past it is not stored |
+| `PREFIX_WAIT` | `0` | a request whose prompt starts with what another request is still prefilling (a shared system prompt) waits for that state instead of prefilling it too ([A system prompt prefilled once](#a-system-prompt-prefilled-once-for-every-agent)) |
 | `MAX_TOKENS` | `32768` | the reply budget (reasoning and answer) of a request that sets no `max_tokens`; TensorFold's own default is 4,096 |
 | `THINKING` | `1` (`0` with `ABLIT=1`) | think before answering by default; `0` answers directly unless a request asks to think |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video input; `1` also accepts public `https://` URLs |
@@ -826,7 +835,7 @@ applied with `patch -p0` in filename order); `start.sh` rebuilds or re-pulls the
 | Anthropic Messages | `0084-anthropic-messages` | Anthropic's `/v1/messages` (also `/messages`, with `/count_tokens` suffixes), translated to the same chat completion the OpenAI route serves — text and image blocks, `tool_use` / `tool_result`, thinking, `stop_sequences`, `output_config` effort/JSON schema — with Anthropic SSE streaming and bodies capped at 32 MiB (upstream v0.6.3, by [evilpsycho42](https://github.com/evilpsycho42) and [ashhart](https://github.com/ashhart), request bodies by [Jordi Posthumus](https://github.com/JordiPosthumus); backported by [Eduardo Florencio](https://github.com/eduffd)) | Claude Code and the Anthropic SDKs work against the server directly, without a translating proxy |
 | Checked draft candidates | `0092-glm-draft-candidates-checked` | the drafter checks each block pass's candidate ids against the vocabulary; on an id outside it (issue #80: a float's bits read as an id) it logs the value, copies the rows again once the device is idle, and fails only if they are still bad | a rare drafter `IndexError` is retried (and its cause logged) instead of killing a rank |
 | Spill tier | `0088-glm-spill-tier` | kept prompt states on local disk on every Spark, read back beside decoding streams, also after a restart; the one-stream engine (`PARALLEL=1`) writes one file a state when memory drops it (`SPILL_GIB`, off by default; authored by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), #78) | [Spill tier](#spill-tier-optional) |
-| Spill tier, blocks | `0110-glm-spill-blocks` | with `PARALLEL` above 1: every kept state written when kept, in 2,048-token blocks later turns share (equal bytes linked), so it survives a crash; room by conversation (old turns, forks, whole conversations, shared prefixes last), `SPILL_QUOTA`; a request waits for a prefix another one is prefilling (`PREFIX_WAIT`) (block layout, lineage, write-at-keep ring, release and fsync order from #118 by [BadAd84](https://github.com/BadAd84); eviction by conversation for #122, reported by [xiepengqi](https://github.com/xiepengqi); the rest by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)) | [Spill tier](#spill-tier-optional) |
+| Spill tier, blocks | `0128-glm-spill-blocks` | with `PARALLEL` above 1: every kept state written when kept, in 2,048-token blocks later turns share (equal bytes linked), so it survives a crash; room by conversation (old turns, forks, whole conversations, shared prefixes last), `SPILL_QUOTA`; a request can wait for a prefix another one is prefilling (`PREFIX_WAIT=1`, off by default) (block layout, lineage, write-at-keep ring, release and fsync order from #118 by [BadAd84](https://github.com/BadAd84); eviction by conversation for #122, reported by [xiepengqi](https://github.com/xiepengqi); the rest by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)) | [Spill tier](#spill-tier-optional) |
 | Kept-state count | `0097-glm-kept-entries-share` | `TF_GLM_CACHE_SHARE_PCT` (the kept-state count as a share of the pool's memory; a ceiling at three quarters of it, so the reservation stays inside the estimate) and the kept states' key arrays built once, not at every admission (issue #84, @jdecker76) |
 | Kept-state limits | `0089-glm-kept-state` | `TF_GLM_KEPT_BYTES_GIB` (a byte budget for the kept states, with the freed blocks handed back to the driver) and `TF_GLM_KEEP_PER_CHAT` (a per-conversation quota of turn-boundary states), both off by default; `/health` `kept_bytes`, `kept_mix` (authored by Thomas Wade, [ThomasWadeZ](https://github.com/ThomasWadeZ), #65) | with both at 0, nothing changes |
 | Conversation ids | `0119-glm-chat-continued` | a stream that continues its conversation without resuming from that conversation's own turn state (an in-turn rewind before the kept turns, issue #104; a state read back from disk; dropped states) keeps the conversation's id instead of starting a new one, so `TF_GLM_KEEP_PER_CHAT` counts the conversation once; `/health` `chats_continued`, `chats_continued_prefill_tokens`, and a log line for one prefilling 4096 tokens or more, with where it left the kept state; two sessions with an identical opening message and an identical (temperature 0) first reply cannot be told apart by this match and share one id (by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)) | with `TF_GLM_KEEP_PER_CHAT=0` (the default) only the counters and the log line |

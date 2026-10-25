@@ -1,5 +1,5 @@
 #!/bin/bash
-# spill_blocks_mutants.sh <dir> [names]   CPU only: tools/spill_blocks_check.py must pass on patch 0110 as it is and
+# spill_blocks_mutants.sh <dir> [names]   CPU only: tools/spill_blocks_check.py must pass on patch 0128 as it is and
 # FAIL on each faithful mutant of its fixes (the code before the fix, or one of its parts taken out). <dir> holds the
 # patched tensorfold/ package; each run works on a copy of it with $PYTHON (default python3). In the image
 # scripts/prepare.sh built:
@@ -40,7 +40,8 @@ run() {   # name, then (file under tensorfold/, old, new) for each edit (name "p
   rm -rf "$SCRATCH/t" && mkdir -p "$SCRATCH/t" && cp -r "$TARGET/tensorfold" "$SCRATCH/t/" &&
   find "$SCRATCH/t" -name __pycache__ -type d -prune -exec rm -rf {} + &&
   env "${env[@]}" TREE="$SCRATCH/t/tensorfold" "$PYTHON" -c "$MUTATE" > "$OUT" 2>&1 &&
-  (cd "$SCRATCH" && PYTHONPATH="$SCRATCH/t" CUDA_VISIBLE_DEVICES= timeout 300 "$PYTHON" "$C") >> "$OUT" 2>&1
+  (cd "$SCRATCH" && PYTHONPATH="$SCRATCH/t" CUDA_VISIBLE_DEVICES= TEST_TIMEOUT_S=${TEST_TIMEOUT_S:-120} timeout 300 "$PYTHON" "$C") \
+    >> "$OUT" 2>&1
   rc=$?
   set -- "$name"
   if grep -q "^ANCHOR" "$OUT"; then echo "ERROR $1: $(grep ANCHOR "$OUT")"; bad=1
@@ -118,6 +119,47 @@ run read-ahead-replaces-preallocate $B "    bufs = _sp._PINNED.setdefault(\"read
 run read-ahead-charges-preallocate $B "    want = read_blocks() * per - sum(b.numel() for b in bufs)\n" "    want = read_blocks() * per\n"
 run read-ahead-one-piece $B "        size = 1 << (max(min(want, _sp.CHUNK), per) - 1).bit_length()\n" "        size = max(want, per)\n"
 run read-ahead-per-slot $B "        size = 1 << (max(min(want, _sp.CHUNK), per) - 1).bit_length()\n" "        size = per\n"
+# the room (review 2026-10-24): the eviction order, what goes with a point, the quota, the turns, the floor, a restart
+run victims-forks-first $B "        out = [(k, \"pruned_turns\") for k in sorted(turns, key=by_used)]\n        out += [(k, \"pruned_forks\") for k in sorted(forks, key=by_used)]\n" "        out = [(k, \"pruned_forks\") for k in sorted(forks, key=by_used)]\n        out += [(k, \"pruned_turns\") for k in sorted(turns, key=by_used)]\n"
+run victims-shared-early $B "        for _, keys, _, path in sorted(whole, key=lambda g: g[0]):\n" "        out += [(k, \"pruned_shared\") for k, c in conv.items() if c is None]\n        for _, keys, _, path in sorted(whole, key=lambda g: g[0]):\n"
+run remove-keeps-files $B "        self.small_on_disk -= pt.small_bytes\n        for suffix in (\".json\", \".st\", \".ids\"):\n            try:\n                os.remove(self._point_path(key, suffix))\n" "        self.small_on_disk -= pt.small_bytes\n        for suffix in ():\n            try:\n                os.remove(self._point_path(key, suffix))\n"
+run remove-keeps-blocks $B "        self.stats[why] += 1\n        self._gc(pt.blocks)\n" "        self.stats[why] += 1\n"
+run room-takes-read $B "                if key in protect or key not in self.index or key in self.reading:\n" "                if key in protect or key not in self.index:\n"
+run room-takes-pinned $B "            if b in self.have and b not in self.refs and b not in self.inflight and b not in self.pinned:\n" "            if b in self.have and b not in self.refs and b not in self.inflight:\n"
+run no-trim $B "        for k in path[self.turns:]:\n" "        for k in path[len(path):]:\n"
+run trim-reading $B "            if k not in self.reading and k not in self.inflight:\n                self._remove(k, \"trimmed_turns\")\n" "            if k not in self.inflight:\n                self._remove(k, \"trimmed_turns\")\n"
+run trim-shared $B "        while cur is not None and cur in self.index and not self.index[cur].shared:\n" "        while cur is not None and cur in self.index:\n"
+run no-quota $B "        if self.quota > 0:\n            self._trim_own(pt, need)\n" ""
+run quota-takes-others $B "            for key, why in self._victims(only=c):\n" "            for key, why in self._victims():\n"
+run floor-evicts-for-nothing $B "        if max(short, over) > self.stored():                # (the disk is full of other things): nothing to evict for\n" "        if False:\n"
+run floor-ignored $B "        short = self.floor + need + self.backlog - self.disk_free()\n        over =" "        short = 0\n        over ="
+run scan-keeps-temporary $B "                if f.startswith(\".\"):                       # a write cut off before its rename\n" "                if False:\n"
+run scan-keeps-orphans $B "        for b in present - self.have.keys():\n" "        for b in ():\n"
+run scan-keeps-incomplete-files $B "        for f in os.listdir(self.points_dir):\n            if f.split(\".\")[0] not in self.index:\n" "        for f in ():\n            if f.split(\".\")[0] not in self.index:\n"
+run scan-no-ids-crc $B "                if zlib.crc32(raw) != m[\"ids_crc\"] or not os.path.exists(self._point_path(key, \".st\")):\n" "                if not os.path.exists(self._point_path(key, \".st\")):\n"
+run prune-other-ranks $B "            mine = os.path.join(d, f\"rank{self.rank}\")\n            if os.path.isdir(mine):\n                shutil.rmtree(mine, ignore_errors=True)\n" "            if os.path.isdir(d):\n                shutil.rmtree(d, ignore_errors=True)\n"
+run failed-put-leaves-tmp $B "    except BaseException:\n        try:\n            os.remove(tmp)\n        except OSError:\n            pass\n        raise\n    return crc\n" "    except BaseException:\n        raise\n    return crc\n"
+# hardening: temporary files made new, never through a symlink; one engine a folder
+run tmp-truncates $B "_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW\n" "_NEW = os.O_WRONLY | os.O_CREAT | os.O_TRUNC\n" \
+    $B "    except FileExistsError:\n        os.unlink(tmp)\n" "    except FileExistsError:\n        pass\n"
+run tmp-no-excl $B "_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW\n" "_NEW = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW\n"
+run no-lock cuda/spill.py "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n" "        pass\n"
+run lock-after-prune $B "            self._held = _sp.hold(cfg.root, self.rank)    # (before any file of it is read, pruned or written)\n" "" \
+    $B "            pruned_builds = self._prune_builds()\n            self._scan()\n        except _sp.Busy" "            pruned_builds = self._prune_builds()\n            self._scan()\n            self._held = _sp.hold(cfg.root, self.rank)\n        except _sp.Busy"
+run busy-stops-engine $MU "        except Busy as exc:                     # (raised on every rank alike: the tier is off on all of them)\n            print(f\"[tensorfold] spill rank {self.rank}: {exc}: the spill tier is off" "        except KeyError as exc:\n            print(f\"[tensorfold] spill rank {self.rank}: {exc}: the spill tier is off"
+run one-stream-unlocked cuda/spill.py "            self._held = hold(cfg.root, self.rank)\n" ""
+# release: its own cap on the rows it copies to host memory
+run release-uncapped $B "                fits = self.host_bytes + need <= self.release_cap\n" "                fits = True\n"
+run release-not-counted $B "                if fits:\n                    self.host_bytes += need\n" ""
+run release-never-let-go $B "                    with self.lock:\n                        self.host_bytes -= item.numel() * item.element_size()\n" "                    pass\n"
+run release-cap-backlog $B "    return reserve // RELEASE_SHARE\n" "    return BACKLOG\n"
+run cut-not-counted $B "            self.host_bytes += sum(t.numel() * t.element_size() for _, t in cut)   # (at most a block a state)\n" ""
+# the prefix wait: off by default
+run prefix-wait-default-on $MU "PREFIX_WAIT = os.environ.get(\"TF_GLM_PREFIX_WAIT\", \"0\") not in (\"\", \"0\")" "PREFIX_WAIT = os.environ.get(\"TF_GLM_PREFIX_WAIT\", \"1\") != \"0\""
+run prefix-wait-ignores-flag $MU "        if not PREFIX_WAIT or not s.draft" "        if not s.draft"
+run prefix-wait-no-minimum $MU "                if p <= m and p < len(prompt) and p - have >= self.g.shared and" "                if p <= m and p < len(prompt) and"
+run prefix-never-ready $MU "        return lane is None or lane.decoding or lane.s.done or lane.st.pos >= p\n" "        return lane is None or lane.s.done\n"
+run prefix-wait-blocks-queue $MU "                    stream.prefix_waited = True\n                    self.prefix.append((w, item))\n                    continue\n" "                    stream.prefix_waited = True\n                    self.prefix.append((w, item))\n                    break\n"
 rm -f "$OUT"
 echo "exit $bad"
 exit $bad

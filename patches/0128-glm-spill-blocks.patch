@@ -4,18 +4,103 @@
 # pinned ring between rounds, so it survives an eviction, a restart and a crash. Room goes by conversation: old turns,
 # abandoned forks, whole conversations, shared prefixes last; an optional per-conversation quota; the free-disk
 # floor. Reads beside decoding, after every rank says it holds the state (HAS): reader threads read and check blocks
-# into pinned slots, the engine copies them between rounds (TF_GLM_SPILL_LOAD_MS; LOADPART takes rank 1 as far). A
-# request whose prefix another one is still prefilling waits for that state (TF_GLM_PREFIX_WAIT). New
-# tensorfold/cuda/spill_blocks.py (no model code).
+# into pinned slots, the engine copies them between rounds (TF_GLM_SPILL_LOAD_MS; LOADPART takes rank 1 as far). Rows
+# copied to host memory before they go have their own cap (TF_GLM_SPILL_RELEASE_MIB); one engine a folder and rank
+# (a flock: a second runs without the tier, the one-stream store's too); temporary files O_EXCL | O_NOFOLLOW. A
+# request whose prefix another one is still prefilling can wait for that state (TF_GLM_PREFIX_WAIT=1, off by
+# default). New tensorfold/cuda/spill_blocks.py (no model code).
 # Block layout, lineage, write-at-keep ring, release and fsync order: PR #118 by @BadAd84; eviction by conversation
 # for issue #122, reported by @xiepengqi; the rest by Robert Wojciechowski (GitHub @wojo, X @rwojo). Builds on
 # 0088-glm-spill-tier. Apache-2.0.
+diff --git tensorfold/cuda/spill.py tensorfold/cuda/spill.py
+index 40ed4e6..a1c471e 100644
+--- tensorfold/cuda/spill.py
++++ tensorfold/cuda/spill.py
+@@ -71,6 +71,47 @@ def _up(x: int) -> int:
+     return -(-x // ALIGN) * ALIGN
+ 
+ 
++class Busy(RuntimeError):
++    """``--snapshot-dir`` is in use by another engine for this rank (``hold``): this one runs without the tier."""
++
++
++def hold(root: str, rank: int) -> int:
++    """An exclusive lock on ``root`` for ``rank``: ``.lock-rank<rank>`` in it, flock'ed for as long as the engine runs
++    (the kernel lets it go when the process ends, ``kill -9`` too). Two engines on one folder would write the same
++    files and prune each other's builds (``_prune_builds``), so the second gets ``Busy``. Its descriptor, for
++    ``unhold``."""
++
++    import fcntl
++
++    path = os.path.join(root, f".lock-rank{int(rank)}")
++    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError:
++        try:
++            who = os.pread(fd, 64, 0).decode(errors="replace").strip() or "?"
++        except OSError:
++            who = "?"
++        os.close(fd)
++        raise Busy(f"{root} is in use by another engine as rank {rank} (pid {who}; {path})") from None
++    except BaseException:
++        os.close(fd)
++        raise
++    with contextlib.suppress(OSError):
++        st = os.stat(root)
++        if os.geteuid() == 0 and st.st_uid != 0:          # (the folder's owner's, like every file in it)
++            os.fchown(fd, st.st_uid, st.st_gid)
++    os.ftruncate(fd, 0)
++    os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
++    return fd
++
++
++def unhold(fd: int | None) -> None:
++    if fd is not None and fd >= 0:
++        with contextlib.suppress(OSError):
++            os.close(fd)                                  # (closing the descriptor drops the flock)
++
++
+ @dataclass
+ class SpillConfig:
+     """``tensorfold serve`` flags of the tier (every rank must be started with the same values)."""
+@@ -484,17 +525,28 @@ class SpillStore:
+         self._dirty = False
+         self._last_dir_sync = 0.0
+         self._dir_lock = threading.Lock()
+-        problem, pruned_builds = "", 0
++        problem, pruned_builds, busy = "", 0, ""
++        self._held = None                                     # the folder's lock for this rank (``hold``)
+         try:
++            os.makedirs(cfg.root, exist_ok=True)
++            self._held = hold(cfg.root, self.rank)
+             for d in (self.top, self.dir):                    # prompts' token ids: this user's only
+                 os.makedirs(d, mode=0o700, exist_ok=True)
+                 os.chmod(d, 0o700)
+                 self._own(d)
+             pruned_builds = self._prune_builds()
+             self._scan()
++        except Busy as exc:
++            busy = str(exc)
+         except OSError as exc:
+             problem = repr(exc)
+-        flags = gather([int(bool(problem))]) if self.world > 1 and gather is not None else [[int(bool(problem))]]
++        code = 2 if busy else int(bool(problem))
++        flags = gather([code]) if self.world > 1 and gather is not None else [[code]]
++        held = [r for r, row in enumerate(flags) if row[0] == 2]
++        if held:                                              # every rank alike: the tier off on all of them
++            unhold(self._held)
++            self._held = None
++            raise Busy(busy or f"{cfg.root}: rank(s) {held} found it in use by another engine")
+         bad = [r for r, row in enumerate(flags) if row[0]]
+         if bad:                                               # every rank stops alike: none waits on another
+             raise RuntimeError(f"--snapshot-dir {cfg.root}: rank(s) {bad} cannot use it"
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..30b9cbe
+index 0000000..fd866fa
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1714 @@
+@@ -0,0 +1,1804 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -49,6 +134,12 @@ index 0000000..30b9cbe
 +
 +Every rank keeps its own disk and decides alone what to keep there; the engine asks every rank before a read
 +(``has``) and drops a state everywhere when any rank's read fails its checks.
++
++One engine a folder and rank: the store holds ``spill.hold``'s lock on ``<root>/.lock-rank<rank>`` while it runs; a
++second engine there (any build) gets ``spill.Busy`` before it reads, prunes or writes anything, and runs without the
++tier. Temporary files are opened O_EXCL | O_NOFOLLOW (``_open_new``). Rows ``release`` copies to pageable host memory
++(and the block a keep cuts) count against ``release_cap`` (TF_GLM_SPILL_RELEASE_MIB): on a unified-memory GPU that
++memory is the pool's and the reserve's, so past it a state whose rows go before they are written is not stored.
 +
 +Room. The tier holds at most ``--spill-gib`` a rank and never leaves less than ``--spill-min-free-gib`` free on its
 +file system. When either needs room, points go in this order (blocks go once no point names them):
@@ -146,6 +237,37 @@ index 0000000..30b9cbe
 +BACKLOG = 16 << 30             # bytes of rows waiting to be written past which a new state is not queued
 +TURNS = 4                      # newest states kept on a conversation's path; older turns go once a newer one is written
 +LOAD_WAIT_S = 60.0             # a read of a point still being written waits this long for it
++RELEASE_SHARE = 8              # TF_GLM_SPILL_RELEASE_MIB unset: rows ``release`` may hold in host memory, this share of
++                               # the memory reserve the start-up budget leaves free (14.5 GiB on two Sparks: 1.8 GiB)
++
++
++def release_cap() -> int:
++    """TF_GLM_SPILL_RELEASE_MIB: the most bytes of rows copied to pageable host memory that wait for the writer
++    (``release``, and the block a kept state's end cuts). On a unified-memory GPU that memory is the pool's and the
++    reserve's, so by default an eighth of ``capacity.reserve_bytes`` (``TENSORFOLD_MEMORY_RESERVE_GIB``, else a tenth of
++    the memory, at least 4 GiB). 0: ``release`` copies nothing (a state whose rows go before they are written is not
++    stored)."""
++
++    raw = str(os.environ.get("TF_GLM_SPILL_RELEASE_MIB", "") or "").strip()
++    if raw:
++        try:
++            mib = float(raw)
++        except ValueError:
++            mib = -1.0
++        if not mib >= 0:
++            raise ValueError(f"TF_GLM_SPILL_RELEASE_MIB: MiB >= 0, not {raw!r}")
++        return int(mib * (1 << 20))
++    from .capacity import reserve_bytes
++
++    try:
++        total = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
++    except (ValueError, OSError, AttributeError):
++        total = 128 << 30
++    try:
++        reserve = reserve_bytes(total, host=True)
++    except ValueError:                                  # (a reserve the start-up budget refuses: its own default)
++        reserve = max(4 << 30, total // 10)
++    return reserve // RELEASE_SHARE
 +
 +
 +def _up(x: int) -> int:
@@ -248,7 +370,7 @@ index 0000000..30b9cbe
 +
 +# -- small files -----------------------------------------------------------------------------------------------------
 +def _fsync_dir(path) -> None:
-+    fd = os.open(path, os.O_RDONLY)
++    fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
 +    try:
 +        os.fsync(fd)
 +    finally:
@@ -293,6 +415,22 @@ index 0000000..30b9cbe
 +    return raw[at:at + _up(n)]
 +
 +
++_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
++_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW
++
++
++def _open_new(tmp: str, extra: int = 0) -> int:
++    """A temporary file made new: O_EXCL never opens one already at that name, so never through a symlink planted
++    there either (O_NOFOLLOW besides). A leftover at the name (an earlier write a crash cut short; an O_DIRECT open the
++    file system refused after creating it) is removed first, the name itself, never what it points to."""
++
++    try:
++        return os.open(tmp, _NEW | extra, 0o600)
++    except FileExistsError:
++        os.unlink(tmp)
++        return os.open(tmp, _NEW | extra, 0o600)
++
++
 +def _drop_cache(fd: int) -> None:
 +    try:
 +        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -315,7 +453,7 @@ index 0000000..30b9cbe
 +        fd = -1
 +        if direct and hasattr(os, "O_DIRECT"):
 +            try:
-+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600)
++                fd = _open_new(tmp, os.O_DIRECT)
 +            except OSError as exc:
 +                if exc.errno != errno.EINVAL:
 +                    raise
@@ -333,14 +471,14 @@ index 0000000..30b9cbe
 +                    k = os.write(fd, out)
 +                    if k != len(out) and k % _sp.ALIGN:     # (a partial O_DIRECT write: the rest, buffered)
 +                        os.close(fd)
-+                        fd = os.open(tmp, os.O_WRONLY, 0o600)
++                        fd = os.open(tmp, os.O_WRONLY | _NOFOLLOW)
 +                        os.lseek(fd, k - k % _sp.ALIGN, os.SEEK_SET)
 +                        out = out[k - k % _sp.ALIGN:]
 +                        continue
 +                    out = out[k:]
 +                os.ftruncate(fd, total)
 +            else:
-+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++                fd = _open_new(tmp)
 +                for mv in parts:
 +                    crc = zlib.crc32(mv, crc)
 +                    while len(mv):
@@ -485,28 +623,41 @@ index 0000000..30b9cbe
 +        self.jobs: queue.Queue = queue.Queue()            # the writer's work
 +        self.reads: queue.Queue = queue.Queue()
 +        self.backlog = 0
++        self.release_cap = release_cap()                  # host bytes of rows waiting for the writer, at most
++        self.host_bytes = 0                               # host bytes of rows waiting for the writer now
 +        self.stats = {k: 0 for k in (
 +            "written", "written_blocks", "written_bytes", "dedup_blocks", "dedup_bytes", "skipped", "no_space",
 +            "backlog_skipped", "write_failed", "pruned_turns", "pruned_forks", "pruned_conversations",
 +            "pruned_shared", "quota_trims", "loaded", "loaded_tokens", "loaded_bytes", "load_failed", "crc_failed",
 +            "load_unfit", "staged_blocks", "released_blocks", "unwritten_evicted", "dropped", "trimmed_turns",
-+            "written_small_bytes", "disk_lookups", "disk_hits", "has_refused")}
++            "written_small_bytes", "disk_lookups", "disk_hits", "has_refused", "release_dropped")}
 +        self.stats.update(write_s=0.0, load_s=0.0, keep_s=0.0, pump_s=0.0, load_small_s=0.0)
 +        self.unwritten_by: dict[str, int] = {}
 +        self.restore_ms: list[float] = []
 +        self.direct = bool(getattr(cfg, "direct", True)) and hasattr(os, "O_DIRECT")
 +        self.small_direct = self.direct                     # small states: O_DIRECT through their own aligned buffer
-+        problem, pruned_builds = "", 0
++        problem, pruned_builds, busy = "", 0, ""
++        self._held = None                                 # the folder's lock for this rank (``spill.hold``)
 +        try:
++            os.makedirs(cfg.root, exist_ok=True)
++            self._held = _sp.hold(cfg.root, self.rank)    # (before any file of it is read, pruned or written)
 +            for d in (self.top, self.dir, self.points_dir, self.blocks_dir):
 +                os.makedirs(d, mode=0o700, exist_ok=True)
 +                os.chmod(d, 0o700)
 +                _chown(d, self.owner)
 +            pruned_builds = self._prune_builds()
 +            self._scan()
++        except _sp.Busy as exc:
++            busy = str(exc)
 +        except OSError as exc:
 +            problem = repr(exc)
-+        flags = gather([int(bool(problem))]) if self.world > 1 and gather is not None else [[int(bool(problem))]]
++        code = 2 if busy else int(bool(problem))
++        flags = gather([code]) if self.world > 1 and gather is not None else [[code]]
++        held = [r for r, row in enumerate(flags) if row[0] == 2]
++        if held:                                          # every rank alike: the tier off on all of them
++            _sp.unhold(self._held)
++            self._held = None
++            raise _sp.Busy(busy or f"{cfg.root}: rank(s) {held} found it in use by another engine")
 +        bad = [r for r, row in enumerate(flags) if row[0]]
 +        if bad:                                           # every rank stops alike: none waits on another
 +            raise RuntimeError(f"--snapshot-dir {cfg.root}: rank(s) {bad} cannot use it"
@@ -530,6 +681,12 @@ index 0000000..30b9cbe
 +                  + (f"; pruned {pruned_builds} older builds" if pruned_builds else ""), flush=True)
 +
 +    # -- housekeeping --------------------------------------------------------------------------------------------------
++    def close(self) -> None:
++        """Let the folder go (``spill.hold``): another engine may use it now. Only once nothing is written or read."""
++
++        _sp.unhold(self._held)
++        self._held = None
++
 +    def _prune_builds(self) -> int:
 +        """Folders of other compatibility hashes (other builds, formats, layouts): the newest ``keep_builds`` stay."""
 +
@@ -804,6 +961,7 @@ index 0000000..30b9cbe
 +                self.stats["backlog_skipped"] += 1
 +                return "backlog"
 +            self.backlog += size
++            self.host_bytes += sum(t.numel() * t.element_size() for _, t in cut)   # (at most a block a state)
 +            self.inflight.add(key)
 +            self.inflight.update(h for _, _, h in new)
 +            ids_bytes = ids.tobytes() + (b"" if tokens is None else np.asarray(tokens, dtype=np.int64).tobytes())
@@ -912,7 +1070,20 @@ index 0000000..30b9cbe
 +        for job in self.pending:
 +            if job.where is not extent or job.point.n <= keep or job.next >= len(job.new):
 +                continue
-+            for s, e, h in job.new[job.next:]:
++            left = job.new[job.next:]
++            need = sum(_span_bytes(self.planes, s, e) for s, e, _ in left)
++            with self.lock:
++                fits = self.host_bytes + need <= self.release_cap
++                if fits:
++                    self.host_bytes += need
++            if not fits:                                    # (host memory past TF_GLM_SPILL_RELEASE_MIB): not stored
++                job.failed = RuntimeError(f"its {need / (1 << 20):.1f} MiB of rows were to go before they were written, "
++                                          f"past the {self.release_cap / (1 << 20):.1f} MiB of host memory "
++                                          "TF_GLM_SPILL_RELEASE_MIB allows")
++                job.next = len(job.new)
++                self.stats["release_dropped"] += 1
++                continue
++            for s, e, h in left:
 +                data = _host(torch.cat(self._parts(job.where, s, e)))
 +                self.jobs.put(("rows", job, h, data))
 +                self.stats["released_blocks"] += 1
@@ -948,24 +1119,23 @@ index 0000000..30b9cbe
 +                    self.stats["dedup_blocks"] += 1
 +                    self.stats["dedup_bytes"] += nb
 +                return
-+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
 +            fd, direct = -1, False
 +            if self.direct and room:
 +                try:
-+                    fd, direct = os.open(tmp, flags | os.O_DIRECT, 0o600), True
++                    fd, direct = _open_new(tmp, os.O_DIRECT), True
 +                except OSError as exc:
 +                    if exc.errno != errno.EINVAL:
 +                        raise
 +                    self.direct = False
 +            if fd < 0:
-+                fd = os.open(tmp, flags, 0o600)
++                fd = _open_new(tmp)
 +            try:
 +                out = mv[:_up(nb)] if direct else data
 +                while len(out):
 +                    k = os.write(fd, out)
 +                    if direct and k != len(out):            # (a partial O_DIRECT write: the rest, buffered)
 +                        os.close(fd)
-+                        fd = os.open(tmp, os.O_WRONLY | os.O_TRUNC, 0o600)
++                        fd = os.open(tmp, os.O_WRONLY | os.O_TRUNC | _NOFOLLOW)
 +                        out, direct = data, False
 +                        continue
 +                    out = out[k:]
@@ -1024,6 +1194,10 @@ index 0000000..30b9cbe
 +                        self._write_block(h, memoryview(raw.numpy()), raw.numel(), False)
 +                except Exception as exc:                    # noqa: BLE001
 +                    job.failed = exc
++                finally:
++                    with self.lock:
++                        self.host_bytes -= item.numel() * item.element_size()
++                    del item
 +                self.stats["write_s"] += time.perf_counter() - t0
 +                continue
 +            self._write_point(job)
@@ -1361,13 +1535,13 @@ index 0000000..30b9cbe
 +        fd = -1
 +        if direct:
 +            try:
-+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++                fd = os.open(path, os.O_RDONLY | _NOFOLLOW | os.O_DIRECT)
 +            except OSError as exc:
 +                if exc.errno != errno.EINVAL:
 +                    raise
 +                direct = False
 +        if fd < 0:
-+            fd = os.open(path, os.O_RDONLY)
++            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
 +        try:
 +            if os.fstat(fd).st_size != nb:
 +                raise Corrupt(f"{h}: {os.fstat(fd).st_size} bytes, the planes take {nb}")
@@ -1380,7 +1554,7 @@ index 0000000..30b9cbe
 +                got += k
 +                if direct and got < nb and got % _sp.ALIGN:     # (a partial O_DIRECT read: the rest, buffered)
 +                    os.close(fd)
-+                    fd = os.open(path, os.O_RDONLY)
++                    fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
 +                    direct = False
 +                    mv = mv[:nb]
 +            if zlib.crc32(mv[:nb]) != crc:
@@ -1581,12 +1755,12 @@ index 0000000..30b9cbe
 +        fd, direct = -1, False
 +        if self.small_direct:
 +            try:
-+                fd, direct = os.open(path, os.O_RDONLY | os.O_DIRECT), True
++                fd, direct = os.open(path, os.O_RDONLY | _NOFOLLOW | os.O_DIRECT), True
 +            except OSError as exc:
 +                if exc.errno != errno.EINVAL:
 +                    raise
 +        if fd < 0:
-+            fd = os.open(path, os.O_RDONLY)
++            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
 +        try:
 +            buf = _aligned_buffer(size) if direct else np.empty(size, dtype=np.uint8)
 +            mv = memoryview(buf)
@@ -1598,7 +1772,7 @@ index 0000000..30b9cbe
 +                got += k
 +                if direct and got < size and got % _sp.ALIGN:   # (a partial O_DIRECT read: the rest, buffered)
 +                    os.close(fd)
-+                    fd, direct = os.open(path, os.O_RDONLY), False
++                    fd, direct = os.open(path, os.O_RDONLY | _NOFOLLOW), False
 +            _drop_cache(fd)
 +        finally:
 +            os.close(fd)
@@ -1720,6 +1894,7 @@ index 0000000..30b9cbe
 +        p = (lambda q: round(lat[min(len(lat) - 1, int(q * len(lat)))], 1)) if lat else (lambda q: 0.0)
 +        return {"format": "blocks", "block_tokens": self.block, "direct": self.direct, "entries": points,
 +                "blocks": blocks, "pending": waiting, "backlog_mb": self.backlog >> 20,
++                "host_mb": self.host_bytes >> 20, "release_cap_mb": self.release_cap >> 20,
 +                "stored_gib": round(stored / (1 << 30), 2), "stored_bytes": stored,
 +                "disk_free_bytes": self.disk_free(),
 +                **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in s.items()},
@@ -1731,7 +1906,7 @@ index 0000000..30b9cbe
 +                "restore_ms_p50": p(0.5), "restore_ms_p95": p(0.95),
 +                **{f"unwritten_{k}": v for k, v in sorted(self.unwritten_by.items())}}
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 4fab28d..1f131ca 100644
+index 4fab28d..84bcf63 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -741,6 +741,10 @@ class GlmEngine:
@@ -1745,8 +1920,39 @@ index 4fab28d..1f131ca 100644
              # TF_GLM_DISPLAY_KV_MIB: the display reservation's bytes too, which free memory never counted
              display = display_kv.credit()
              # one kept state's fixed cost outside the pool, the largest of any rank's: every rank derives the same count
+@@ -1064,7 +1068,7 @@ class GlmEngine:
+     _SPILL_SKIP = ("ids", "ids_array", "nbytes", "key", "kid", "extent", "images", "shared")
+ 
+     def _spill_store(self):
+-        from tensorfold.cuda.spill import SpillStore, build_id, weights_id
++        from tensorfold.cuda.spill import Busy, SpillStore, build_id, weights_id
+ 
+         from .decode import _row_views
+ 
+@@ -1072,11 +1076,16 @@ class GlmEngine:
+         sig = "|".join(["single", build_id(self.model_dir, self.drafter_dir), os.environ.get("TF_GLM_KV", ""),
+                         os.environ.get("TF_GLM_DENSE", ""), f"tp{self.w.world}", repr(shapes), repr(self.agreed)])
+         self.spill_jobs: list = []
+-        return SpillStore(self.spill_cfg, rank=self.rank, world=self.w.world, device=self.w.device, signature=sig,
+-                          weights=weights_id(self.model_dir, self.drafter_dir),
+-                          classes=["tensorfold.families.glm5_next.cuda.decode:Snapshot"],
+-                          model_id=os.path.basename(str(self.model_dir)), share=self._share,
+-                          gather=self._gather_ints)
++        try:
++            return SpillStore(self.spill_cfg, rank=self.rank, world=self.w.world, device=self.w.device,
++                              signature=sig, weights=weights_id(self.model_dir, self.drafter_dir),
++                              classes=["tensorfold.families.glm5_next.cuda.decode:Snapshot"],
++                              model_id=os.path.basename(str(self.model_dir)), share=self._share,
++                              gather=self._gather_ints)
++        except Busy as exc:                     # (raised on every rank alike: the tier is off on all of them)
++            print(f"[tensorfold] spill rank {self.rank}: {exc}: the spill tier is off for this engine (give each "
++                  "engine its own SPILL_DIR)", flush=True)
++            return None
+ 
+     def _spill_rows(self, snap) -> None:
+         """Materialize: a snapshot without saved rows gets views of the live caches it owns (``_saved_views``)."""
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 06f33e7..57f6aa6 100644
+index 06f33e7..cd50b45 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -34,6 +34,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
@@ -1786,7 +1992,7 @@ index 06f33e7..57f6aa6 100644
      next_copy: Any = None        # ((copies length, room), proposal, proposed) the round's end worked out
  
  
-+PREFIX_WAIT = os.environ.get("TF_GLM_PREFIX_WAIT", "1") != "0"
++PREFIX_WAIT = os.environ.get("TF_GLM_PREFIX_WAIT", "0") not in ("", "0")    # off unless 1
 +
 +
  class NoRoom(RuntimeError):
@@ -1811,19 +2017,19 @@ index 06f33e7..57f6aa6 100644
                  # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
                  "iteration_s": round(time.monotonic() - since, 1)
                  if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
-@@ -985,6 +997,12 @@ class MultiDecoder:
-             chat = self.next_chat
-         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
+@@ -987,6 +999,12 @@ class MultiDecoder:
                      constraint=constraint, images=a["images"], chat=chat)
+         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
+             lane.key = a["keyed"]
 +        # the computation its rows belong to: its kept state's up to the resume point (rows copied or taken over are
 +        # those bits), its own from there; a new one for a fresh prefill
 +        from tensorfold.cuda.spill_blocks import fork
 +
 +        own = f"{self.boot}-{a['sid']}"
 +        lane.lineage = fork(hit.lineage, own, cut) if getattr(hit, "lineage", "") else own
-         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
-             lane.key = a["keyed"]
          self.next_sid = max(self.next_sid, a["sid"] + 1)
+         self.next_order += 1
+         s.sid, s.cached = a["sid"], cut
 @@ -1077,14 +1095,17 @@ class MultiDecoder:
          # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
          for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
@@ -1867,7 +2073,7 @@ index 06f33e7..57f6aa6 100644
          held = 0
          if self.kept_bytes_cap:
              from .decode import snapshot_bytes
-@@ -1163,23 +1182,66 @@ class MultiDecoder:
+@@ -1163,23 +1182,67 @@ class MultiDecoder:
          self._emit(EVICT, [c.kid, int(spill)])
          self._drop(c, spill=spill)
  
@@ -1881,7 +2087,8 @@ index 06f33e7..57f6aa6 100644
 +    # a share of the GPU. A request whose prompt starts with a shared-prefix point another one still prefilling keeps
 +    # on its way (its system block's end) waits for that state instead (the scheduler holds it apart, the queue goes
 +    # on), then resumes from it like any kept prompt: one prefill of the shared tokens for all of them, and every first
-+    # token sooner. TF_GLM_PREFIX_WAIT=0 turns it off.
++    # token sooner. Off by default; TF_GLM_PREFIX_WAIT=1 turns it on (it changes admission with the spill tier off
++    # too).
 +    def prefix_wait(self, s: Stream):
 +        """Rank 0, before ``s`` is admitted: (sid, position) of a shared-prefix point a stream still prefilling keeps on
 +        the way (its system block's end, where it stops sharing a kept prompt) that ``s``'s prompt starts with and that
@@ -1935,7 +2142,7 @@ index 06f33e7..57f6aa6 100644
          if cfg is None:
              return None
 -        from tensorfold.cuda.spill import SpillStore, build_id, weights_id
-+        from tensorfold.cuda.spill import build_id, weights_id
++        from tensorfold.cuda.spill import Busy, build_id, weights_id
 +        from tensorfold.cuda.spill_blocks import BlockStore
  
 -        for p in self.arena.planes:
@@ -1944,7 +2151,7 @@ index 06f33e7..57f6aa6 100644
          planes = [(tuple(p.tensor.shape[1:]), str(p.tensor.dtype), p.div, p.pad) for p in self.arena.planes]
          drafter = getattr(self.g, "drafter", None)
          model = os.path.basename(str(getattr(self.g, "model_dir", "")).rstrip("/"))
-@@ -1190,14 +1252,17 @@ class MultiDecoder:
+@@ -1190,14 +1253,22 @@ class MultiDecoder:
                                os.environ.get("TF_GLM_KV", ""), os.environ.get("TF_GLM_DENSE", ""),
                                f"tp{self.w.world}", repr(planes), str(self.grid), str(self.drafts is not None),
                                repr(self.g.agreed)])
@@ -1959,16 +2166,21 @@ index 06f33e7..57f6aa6 100644
 +        self.load_budget = float(os.environ.get("TF_GLM_SPILL_LOAD_MS") or LOAD_MS_DEFAULT) / 1000.0
 +        quota = float(os.environ.get("TF_GLM_SPILL_QUOTA", "0") or 0)
 +        turns = int(os.environ.get("TF_GLM_SPILL_TURNS") or 4)       # (0: every turn kept until room is needed)
-+        store = BlockStore(cfg, planes=self.arena.planes, block=ALIGN, rank=self.rank, world=self.w.world,
-+                           device=self.w.device, signature=signature,
-+                           weights=weights_id(self.g.model_dir, self.g.drafter_dir), model_id=model,
-+                           gather=self.g._gather_ints, classes=["tensorfold.families.glm5_next.cuda.decode:Snapshot"],
-+                           turns=turns, quota=quota)
++        try:
++            store = BlockStore(cfg, planes=self.arena.planes, block=ALIGN, rank=self.rank, world=self.w.world,
++                               device=self.w.device, signature=signature,
++                               weights=weights_id(self.g.model_dir, self.g.drafter_dir), model_id=model,
++                               gather=self.g._gather_ints,
++                               classes=["tensorfold.families.glm5_next.cuda.decode:Snapshot"], turns=turns, quota=quota)
++        except Busy as exc:                     # (raised on every rank alike: the tier is off on all of them)
++            print(f"[tensorfold] spill rank {self.rank}: {exc}: the spill tier is off for this engine (give each "
++                  "engine its own SPILL_DIR)", flush=True)
++            return None
 +        store.ring()                            # the pinned ring now, not on the engine loop later
          self._guard_pool()
          return store
  
-@@ -1216,7 +1281,7 @@ class MultiDecoder:
+@@ -1216,7 +1287,7 @@ class MultiDecoder:
              return remove(x)
  
          def g_move(x, base, size=None):
@@ -1977,7 +2189,7 @@ index 06f33e7..57f6aa6 100644
              return move(x, base, size)
  
          def g_resize(x, size):
-@@ -1225,75 +1290,40 @@ class MultiDecoder:
+@@ -1225,75 +1296,40 @@ class MultiDecoder:
  
          pool.remove, pool.move, pool.resize = g_remove, g_move, g_resize
  
@@ -2068,7 +2280,7 @@ index 06f33e7..57f6aa6 100644
              return "short"
          if self.grid and n % self.grid:
              return "off_grid"
-@@ -1303,97 +1333,37 @@ class MultiDecoder:
+@@ -1303,97 +1339,37 @@ class MultiDecoder:
              return "no_draft_window"
          return None
  
@@ -2187,7 +2399,7 @@ index 06f33e7..57f6aa6 100644
      # the request resumes from; else it goes, the entry is forgotten, and the request prefills.
      def prestage(self, s: Stream):
          """Rank 0, before a request is admitted: a read of the stored prompt its prompt extends, or None (nothing to
-@@ -1416,22 +1386,29 @@ class MultiDecoder:
+@@ -1416,22 +1392,29 @@ class MultiDecoder:
              if len(prompt) >= h.n and prompt[:h.n] == h.ids:
                  return h
          hit = self._resume(prompt)
@@ -2226,7 +2438,7 @@ index 06f33e7..57f6aa6 100644
          return h
  
      def _start_load(self, hi: int, lo: int, n: int, base: int, size: int, lid: int):
-@@ -1444,49 +1421,93 @@ class MultiDecoder:
+@@ -1444,32 +1427,76 @@ class MultiDecoder:
          h = types.SimpleNamespace(lid=lid, key=(hi, lo), n=n, x=x, lj=None, err=None, done=False, ids=None)
          x.loading = h
  
@@ -2310,23 +2522,21 @@ index 06f33e7..57f6aa6 100644
 -        self._emit(LOADED, [h.lid])
 +        shared = int(h.lj is not None and h.lj.point is not None and bool(h.lj.point.shared))
 +        self._emit(LOADED, [h.lid, shared])
++        h.shared = shared
          self._flush()
          try:
--            return self._finish_load(h.lid)
-+            return self._finish_load(h.lid, shared)
-         except Exception as exc:              # a failed all-gather: the ranks may no longer agree
-             self.broken = exc
-             raise
+             return self._finish_load(h.lid)
+@@ -1479,14 +1506,16 @@ class MultiDecoder:
  
--    def _finish_load(self, lid: int) -> bool:
-+    def _finish_load(self, lid: int, shared: int = 0) -> bool:
+     def _finish_load(self, lid: int) -> bool:
          """Both ranks: wait for this rank's read, agree through one all-gather that every read worked, then the
 -        extent holds a kept prompt; else the extent goes and the entry is forgotten on both."""
-+        extent holds a kept prompt (a shared-prefix one when rank 0's point is: ``shared``); else the extent goes and
-+        the entry is forgotten on both."""
++        extent holds a kept prompt (a shared-prefix one when rank 0's point is: ``h.shared``, LOADED's flag); else the
++        extent goes and the entry is forgotten on both."""
  
          h = self.loads.pop(lid)
 -        ok, snap, meta = 0, None, None
++        shared = getattr(h, "shared", 0)
 +        ok, snap, pt = 0, None, None
          if h.err is None:
              try:
@@ -2337,7 +2547,7 @@ index 06f33e7..57f6aa6 100644
              except Exception as exc:             # noqa: BLE001  (a failed read: every rank prefills)
                  print(f"[tensorfold] spill rank {self.rank}: restore failed: {exc!r}", flush=True)
          else:
-@@ -1497,19 +1518,28 @@ class MultiDecoder:
+@@ -1497,19 +1526,28 @@ class MultiDecoder:
          h.done = True
          h.ok = all(r[0] for r in every)
          if not h.ok:
@@ -2371,7 +2581,7 @@ index 06f33e7..57f6aa6 100644
          snap.own, snap.chat = False, 0           # a restored state counts against no conversation's quota
          snap.extent = x
          x.kept.append(snap)
-@@ -1519,50 +1549,32 @@ class MultiDecoder:
+@@ -1519,50 +1557,32 @@ class MultiDecoder:
          return True
  
      def flush_spill(self, budget: float | None = None) -> None:
@@ -2431,7 +2641,7 @@ index 06f33e7..57f6aa6 100644
          if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
              used = max(used, x.loading.n)
          if x.owner is not None:
-@@ -1572,11 +1584,14 @@ class MultiDecoder:
+@@ -1572,11 +1592,14 @@ class MultiDecoder:
          return used
  
      def _move(self, x, base: int, size: int) -> None:
@@ -2449,7 +2659,7 @@ index 06f33e7..57f6aa6 100644
          if x.owner is not None:
              self.lanes[x.owner].st.bind(x.base, x.size)
  
-@@ -1666,10 +1681,7 @@ class MultiDecoder:
+@@ -1666,10 +1689,7 @@ class MultiDecoder:
          _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
          self.iteration_since = time.monotonic()           # /health's iteration_s
          try:
@@ -2461,7 +2671,7 @@ index 06f33e7..57f6aa6 100644
              return self._iterate()
          except Exception as exc:
              self.broken = exc
-@@ -2102,6 +2114,11 @@ class MultiDecoder:
+@@ -2102,6 +2122,11 @@ class MultiDecoder:
          if prof is not None:
              prof.gpu_start()
          v = forward_streams(verify, segments)
@@ -2473,7 +2683,7 @@ index 06f33e7..57f6aa6 100644
          if prof is not None:
              prof.gpu_stop()
              prof.mark("verify")
-@@ -2244,6 +2261,8 @@ class MultiDecoder:
+@@ -2244,6 +2269,8 @@ class MultiDecoder:
              self._emit(IDLE, [])
              self._flush()
              self.idle = True
@@ -2482,7 +2692,7 @@ index 06f33e7..57f6aa6 100644
          _unwatch(self.watchdog)
          self.iteration_since = None
  
-@@ -2324,6 +2343,7 @@ class MultiDecoder:
+@@ -2324,6 +2351,7 @@ class MultiDecoder:
              _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
              self.apply(unseal(self.g._share(None), self.received, self.rank))
              self.received = (self.received + 1) % SEAL_MOD
@@ -2490,12 +2700,18 @@ index 06f33e7..57f6aa6 100644
              _unwatch(self.watchdog)
              if once:
                  return
-@@ -2357,12 +2377,14 @@ class MultiDecoder:
+@@ -2355,14 +2383,18 @@ class MultiDecoder:
+                 self._drop(self._kept_by_id(p[0]), spill=bool(p[1]) if len(p) > 1 else True)
+             elif op == LOAD:
                  self._start_load(*p)
-             elif op == LOADED:
-                 self._finish_load(*p)
+-            elif op == LOADED:
+-                self._finish_load(*p)
 -            elif op == TOUCH:
 -                self.disk.touch_key((p[0], p[1]))
++            elif op == LOADED:                     # (rank 0's shared-prefix flag of the point: ``_finish_load``)
++                if len(p) > 1 and p[0] in self.loads:
++                    self.loads[p[0]].shared = int(p[1])
++                self._finish_load(p[0])
 +            elif op == LOADPART:
 +                self._load_part(*p)
 +            elif op == HAS:
@@ -2509,7 +2725,7 @@ index 06f33e7..57f6aa6 100644
              elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
              elif op == GROW:
-@@ -2405,6 +2427,8 @@ class MultiDecoder:
+@@ -2405,6 +2437,8 @@ class MultiDecoder:
                  if self.lanes:
                      raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
                  self.idle = True
@@ -2518,7 +2734,7 @@ index 06f33e7..57f6aa6 100644
              else:
                  raise RuntimeError(f"rank 1: unknown op {op}")
  
-@@ -2431,6 +2455,7 @@ class GlmScheduler(Scheduler):
+@@ -2431,6 +2465,7 @@ class GlmScheduler(Scheduler):
          self.flush_lock = threading.Lock()
          self.loading: list = []          # (read, item): requests waiting for a stored prompt read (--spill-gib)
          self.ready: list = []            # items whose read ended: admitted before the queue
@@ -2526,7 +2742,7 @@ index 06f33e7..57f6aa6 100644
          self.staged: set = set()         # streams a read was looked for already
          # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
          # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
-@@ -2512,7 +2537,7 @@ class GlmScheduler(Scheduler):
+@@ -2512,7 +2547,7 @@ class GlmScheduler(Scheduler):
  
          if background or self.max_in_system is None:
              return
@@ -2535,7 +2751,7 @@ index 06f33e7..57f6aa6 100644
          if held + self.waiting.foreground_count() >= self.max_in_system:
              raise CapacityError("all serving lanes are busy; retry shortly")
  
-@@ -2526,6 +2551,7 @@ class GlmScheduler(Scheduler):
+@@ -2526,6 +2561,7 @@ class GlmScheduler(Scheduler):
          import heapq
  
          self.ready = [it for it in self.ready if not self._cancel_item(it)]   # their stored prompts read (--spill-gib)
@@ -2543,7 +2759,7 @@ index 06f33e7..57f6aa6 100644
          self.loading = [(read, None if it is None or self._cancel_item(it) else it) for read, it in self.loading]
          if self.held is not None and self._cancel_item(self.held):
              self.held = None
-@@ -2556,6 +2582,11 @@ class GlmScheduler(Scheduler):
+@@ -2556,6 +2592,11 @@ class GlmScheduler(Scheduler):
                  self.decoder.flush_spill()
              finally:
                  flush.set()
@@ -2555,10 +2771,10 @@ index 06f33e7..57f6aa6 100644
          for it in [it for it in self.loading if self.decoder.load_ready(it[0])]:
              self.loading.remove(it)
              try:
-@@ -2601,6 +2632,13 @@ class GlmScheduler(Scheduler):
-                     self.loading.append((read, item))
-                     continue
-             self.staged.discard(id(stream))
+@@ -2588,6 +2629,13 @@ class GlmScheduler(Scheduler):
+             if not self.decoder.fits(stream):
+                 self.held = item                     # waits, first in line, for room
+                 break
 +            waiter = getattr(self.decoder, "prefix_wait", None)
 +            if waiter is not None and not getattr(stream, "prefix_waited", False):
 +                w = waiter(stream)
@@ -2566,10 +2782,10 @@ index 06f33e7..57f6aa6 100644
 +                    stream.prefix_waited = True
 +                    self.prefix.append((w, item))
 +                    continue
-             self.boxes[id(stream)] = box
-             try:
-                 self.decoder.admit(stream)
-@@ -2669,7 +2707,7 @@ class GlmScheduler(Scheduler):
+             prestage = getattr(self.decoder, "prestage", None)
+             if prestage is not None and id(stream) not in self.staged:
+                 self.staged.add(id(stream))
+@@ -2669,7 +2717,7 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()
@@ -2579,7 +2795,7 @@ index 06f33e7..57f6aa6 100644
          if reading and not self.decoder.live():
              time.sleep(0.002)                    # only reads in flight: poll them
 diff --git tensorfold/server/metrics.py tensorfold/server/metrics.py
-index c96a9a8..b3fb39c 100644
+index c96a9a8..c456261 100644
 --- tensorfold/server/metrics.py
 +++ tensorfold/server/metrics.py
 @@ -175,7 +175,8 @@ def send(handler: Any, app: Any) -> None:
@@ -2606,7 +2822,7 @@ index c96a9a8..b3fb39c 100644
 +_SPILL_GAUGES = {"entries", "pending", "stored_bytes", "disk_free_bytes", "highwater", "writers", "blocks",
 +                 "backlog_mb", "block_tokens", "stored_gib", "cap_bytes", "turns", "quota", "conversations",
 +                 "conversation_bytes_max", "conversation_share_max", "conversation_tokens_max", "shared_states",
-+                 "shared_bytes", "forks", "fork_bytes", "turns_kept_max"}
++                 "shared_bytes", "forks", "fork_bytes", "turns_kept_max", "host_mb", "release_cap_mb"}
  _HEALTH_GAUGES = (
      ("context_length", "Tokens a request's prompt and reply may hold (the server's effective window)."),
      ("streams_max", "Streams the concurrent engine decodes at most (--parallel)."),

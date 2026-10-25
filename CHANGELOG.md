@@ -171,7 +171,7 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
-- **Spill tier, blocks** (patch `0110-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
+- **Spill tier, blocks** (patch `0128-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
   every kept prompt state is written to local disk when it is kept, in blocks of 2,048 tokens that later turns and forks
   of the same conversation share, so a conversation resumes from disk after an eviction, a clean restart, a `kill -9` or
   a watchdog restart, and a turn writes only its new rows (a 10.4k-token turn of a 50k conversation: 68 MiB, not the
@@ -200,16 +200,24 @@ Every change to this recipe, newest first. Each release names the image it serve
   prompt is computed again: a Spark with more blocks left than read slots (above ~65k tokens) waited for ever for the
   slots its own copies held (a ~100k-token conversation with damaged blocks on two Sparks: the request hung until the
   client gave up after 15 minutes; now answered in 50 s, its prompt recomputed). CPU check: `hang` in
-  `tools/spill_blocks_check.py`.
-- **A system prompt prefilled once for every agent** (patch `0110`, `PREFIX_WAIT`, on): a request whose prompt starts
+  `tools/spill_blocks_check.py`. Rows copied to host memory before they go (`release`) have their own cap,
+  `SPILL_RELEASE_MIB` (an eighth of `MEMORY_RESERVE_GIB` by default, not the 16 GiB write backlog); a state past it is
+  not stored. One engine a `SPILL_DIR` (a flock on `.lock-rank<N>`: a second engine runs without the tier and says
+  why), and temporary files opened `O_EXCL | O_NOFOLLOW`.
+- **A system prompt prefilled once for every agent** (patch `0128`, `PREFIX_WAIT=1`, off by default: it changes
+  admission also with `SPILL_GIB=0`): a request whose prompt starts
   with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
   agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
   first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies. Counted in `/health` (`prefix_waits`,
   `prefix_wait_tokens`) and `/metrics` (`prefix_waits_total`, `prefix_wait_tokens_total`).
 - `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
   `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
-  block store and its hooks in `multi.py` (a read only reads; the engine copies, rank 1 as far as LOADPART says);
-  `tools/spill_blocks_mutants.sh` runs it on faithful mutants of each fix.
+  block store and its hooks in `multi.py` (a read only reads; the engine copies, rank 1 as far as LOADPART says), the
+  room (the files each eviction step deletes, the eviction order, a point being read, blocks a new state names), old
+  turns trimmed (`SPILL_TURNS`), the quota, the floor, a restart with torn, orphaned and foreign files, older builds
+  pruned, the release cap, temporary files and the folder lock, and the prefix wait (off by default; what it waits
+  for, its release, the scheduler holding a request apart); `tools/spill_blocks_mutants.sh` runs it on faithful
+  mutants of each fix. Its whole-run watchdog is 900 s by default (`TEST_TIMEOUT_S`).
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
