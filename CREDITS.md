@@ -211,6 +211,18 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   upstream TensorFold's prompt stop at chunk boundaries by [Ash Hart (ashhart)](https://github.com/ashhart), commit
   [05dfb7b](https://github.com/ashhart/TensorFold/commit/05dfb7b) (Apache 2.0); the multi-rank prompt vote and the
   scheduler's cancelled fills are our code.
+- `zig/patches/0014-zig-chat-id`, `zig/patches/0014-zig-parked-pages`, `zig/patches/0014-zig-prepare-memory`
+  (`ENGINE=zig`: a shared prompt cut no longer joins two conversations; the startup budgets count the pages parked on the
+  per-CPU free lists; a long prompt's preparation waits for memory in arrival order): by Robert Wojciechowski
+  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull requests
+  [#213](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/213),
+  [#212](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/212) and
+  [#211](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/211), applied as contributed.
+- `zig/patches/0015-zig-glm-display-kv-zero-per-registration`, `zig/patches/0016-zig-glm-display-kv-copy-per-registration`
+  (`ENGINE=zig` with `DISPLAY_KV_MIB`: the display span is zeroed, and each kept-state copy cut, one host registration at
+  a time): by [ezoushen](https://github.com/ezoushen),
+  [pull request #186](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/186), applied as
+  contributed. They fix the zero and the copy that `0072` (above) needs on the Zig engine.
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
@@ -243,3 +255,11 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   128 GB unified memory), two of them linked by their ConnectX-7 ports: every number in the README was measured there.
 
 If you believe something here is missing or credited wrongly, please open an issue.
+
+## TP4 registered-memory RDMA
+
+- **BertholomusAI (Albert Lee), [bertholomus](https://github.com/bertholomus)**: the DeepSeek v4.1 neighbor RDMA implementation and registered-host-memory approach in [bertholomus/TensorFold](https://github.com/bertholomus/TensorFold/tree/b8b115e7ed6c86d81b7575caa6f3d4ade52b323c). The registered-memory ownership approach is adapted to GLM's existing physical-ring neighbor relay; source pins are recorded in `zig/TRANSPORT_SOURCE.json`. This work builds on his earlier GLM prompt-attention and side-stream contributions already credited above.
+- BertholomusAI also authored the pinned public mixed-workload client (SHA-256 `f5f24b1e105e6d073e26b780983be3f4654219b986290e1f6a106c1955232bc5`) used for the final 90-second load, from [deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10/tree/9af1f4567ee49ec2a31f68975982093277e7090d), Apache-2.0.
+- **Hector Isaza ([hecisaza](https://github.com/hecisaza))**: the upstream Zig TP4 enablement/kernel set and reported comparison in [PR #200](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/200). MiaAI-Lab, Ash Hart, Jürgen Schmied, TensorFold contributors, and b12x/RoCEnante retain their original credit.
+- **PlotArmor**: [TheGrill](https://github.com/plotarmordev/thegrill/tree/755859a084471a17c6f153088fc78ffadc04606e), the unmodified C1/exact400 comparison protocol used for the speed receipts.
+- **Scott Biggart ([swbiggart](https://github.com/swbiggart))**: GLM integration, four-GB10 transport/configuration exploration, exact-token/graph/failure qualification and publication of the retained evidence.

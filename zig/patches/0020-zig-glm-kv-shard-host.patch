@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits 1d43fb9e5f32..b337611d7716); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits 25b2a3405e97..c2ffc3ef0762); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: KV shard host side: the part planner and pool parts, switches and their agreement, storage, placement check and telemetry (port of GLM 0118, parts 1-2)
 
 KV sharding as GLM's Python 0118 designs it, not the DeepSeek port's lanes:
@@ -48,7 +48,7 @@ KV shard patch see there.
 
 Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); GLM patch 0118,
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#152.
-Apply from the checkout root with: git apply 0018-zig-glm-kv-shard-host.patch
+Apply from the checkout root with: git apply 0020-zig-glm-kv-shard-host.patch
 
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
 index 13f284bcf8a22f1e24e279befece99b2f69de772..cfd45f405a0bd323b4340657fa27295329c280b2 100644
@@ -364,7 +364,7 @@ index 2236625ca84188c297e566dbc995d380b765f9da..c97a3a40571acca8be7bee1b2e2f1b29
      _ = kda;
      _ = triton;
 diff --git a/zig/src/families/glm_cuda/cuda_display_kv.zig b/zig/src/families/glm_cuda/cuda_display_kv.zig
-index 025a55b5c00d7bc652f3f79a482fd0e08745f0f8..2a9951732a57ae544e968a38185d3603ea12886e 100644
+index c2e586d2314147e266e898e44085c168ba753da2..90931cf1b92dd84495f1b89758c105c670d889c4 100644
 --- a/zig/src/families/glm_cuda/cuda_display_kv.zig
 +++ b/zig/src/families/glm_cuda/cuda_display_kv.zig
 @@ -34,6 +34,15 @@ pub fn planes(count: usize, plane: usize, display: usize) !usize {
@@ -383,7 +383,7 @@ index 025a55b5c00d7bc652f3f79a482fd0e08745f0f8..2a9951732a57ae544e968a38185d3603
  pub const Config = struct {
      bytes: usize = 0,
      kind: Backend = .drm,
-@@ -227,6 +236,15 @@ test "display configuration and fewest latent planes match reference boundaries"
+@@ -250,6 +259,15 @@ test "display configuration and fewest latent planes match reference boundaries"
      try std.testing.expectEqual(@as(usize, 2), try planes(11, 1024, 1025));
      try std.testing.expectEqual(@as(usize, 1), try planes(11, 1024, 1024));
      try std.testing.expectError(error.DisplayTooLarge, planes(2, 1024, 2049));
@@ -400,7 +400,7 @@ index 025a55b5c00d7bc652f3f79a482fd0e08745f0f8..2a9951732a57ae544e968a38185d3603
  
  const Fake = struct {
 diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
-index 1f38521407b2e67ca16d2ceb1635bc76f35a56f4..e06a6b9cc21fb7348add23b1057bd1570b7877b3 100644
+index f91c16826b31e996e4068c1909db4c6dcd020d93..a322aeb3c82dbf17fc0b596c0b0b9edde3585a92 100644
 --- a/zig/src/families/glm_cuda/cuda_engine.zig
 +++ b/zig/src/families/glm_cuda/cuda_engine.zig
 @@ -40,6 +40,7 @@ const G = state.Geometry;
@@ -601,7 +601,7 @@ index 1f38521407b2e67ca16d2ceb1635bc76f35a56f4..e06a6b9cc21fb7348add23b1057bd157
      /// HTTP threads read the published count, never the lane thread's mutable extent list.
      pub fn poolStatus(e: *const Engine) struct { pool_tokens: usize, pool_free_tokens: usize } {
          return .{ .pool_tokens = e.pool.rows, .pool_free_tokens = e.pool_free.load(.acquire) };
-@@ -1289,6 +1376,51 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
+@@ -1293,6 +1380,51 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
      try std.testing.expect(!e.committed[1]);
  }
  
@@ -653,7 +653,7 @@ index 1f38521407b2e67ca16d2ceb1635bc76f35a56f4..e06a6b9cc21fb7348add23b1057bd157
  /// The pool every rank can hold: the smallest of the ranks' proposals (one per rank, in rank order).
  fn agreedPool(proposals: []const u64) u64 {
      var m: u64 = std.math.maxInt(u64);
-@@ -1302,3 +1434,45 @@ test "the agreed pool is the smallest proposal of every rank, whichever rank mak
+@@ -1306,3 +1438,45 @@ test "the agreed pool is the smallest proposal of every rank, whichever rank mak
      try std.testing.expectEqual(@as(u64, 2048), agreedPool(&.{ 2048, 6144, 8192 }));
      try std.testing.expectEqual(@as(u64, 1024), agreedPool(&.{ 8192, 6144, 4096, 1024 })); // rank 3 at TP=4
  }
@@ -3472,7 +3472,7 @@ index 08f32ad29295a938e43a781ea81697982a666bd5..eac3d4de7f8cfb30f3d16c1cdd7124ee
      const g = try G.init(2, 0);
      const s = sections(g, 4096, 2112, 22 << 20);
 diff --git a/zig/src/families/glm_cuda/cuda_state.zig b/zig/src/families/glm_cuda/cuda_state.zig
-index 7875209f52568949b3a467185a2ebcd8643c16d2..c420faf25b477c8137e096111c87b45d21de3eaf 100644
+index 9e51c5c5d8c17573d928571fdec5137ab68ea3e4..12461e69f7e3f99572df82849da0561c55408870 100644
 --- a/zig/src/families/glm_cuda/cuda_state.zig
 +++ b/zig/src/families/glm_cuda/cuda_state.zig
 @@ -5,6 +5,7 @@ const cuda = @import("cuda");
@@ -3564,9 +3564,9 @@ index 7875209f52568949b3a467185a2ebcd8643c16d2..c420faf25b477c8137e096111c87b45d
          errdefer a.deinit();
 -        var c: Caches = .{ .arena = undefined, .rows = rows, .streams = streams, .ring = ring, .latent = undefined, .pooled = undefined, .keys = undefined, .gates = undefined };
 +        var c: Caches = .{ .arena = undefined, .rows = rows, .streams = streams, .ring = ring, .latent = undefined, .pooled = undefined, .keys = undefined, .gates = undefined, .shard = sh };
-         for (0..11) |i| {
-             c.latent[i] = if (i < count) span.?.ptr + i * plane else a.take(sizes[4 * i]);
-             if (i < count) {
+         if (span) |v| for (try display.zeroRanges(v, count * plane)) |r| {
+             const part: cuda.DeviceBuffer = .{ .d = d, .ptr = r.ptr, .len = r.len };
+             try part.fill8(0, null);
 @@ -143,10 +182,26 @@ pub const Caches = struct {
          if (c.span) |*v| v.deinit();
      }

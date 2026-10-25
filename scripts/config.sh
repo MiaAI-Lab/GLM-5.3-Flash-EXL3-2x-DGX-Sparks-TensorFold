@@ -36,6 +36,36 @@ FABRIC_PEER="${FABRIC_PEER:-}"       # the worker's CX7 address when WORKER is r
 WORKER_HF_CACHE="${WORKER_HF_CACHE:-}"  # the worker's Hugging Face cache when it is not its HF_HOME (absolute path)
 WORKER2="${WORKER2:-}"; FABRIC_PEER2="${FABRIC_PEER2:-}"; WORKER_HF_CACHE2="${WORKER_HF_CACHE2:-}"   # rank 2, as WORKER / FABRIC_PEER / WORKER_HF_CACHE
 WORKER3="${WORKER3:-}"; FABRIC_PEER3="${FABRIC_PEER3:-}"; WORKER_HF_CACHE3="${WORKER_HF_CACHE3:-}"   # rank 3, the same
+# One public selector for optional registered-host-memory TP4 neighbour relay.
+# Only physical rings are supported. Launch entry
+# points validate before discovery/live operations; stop.sh skips launch validation.
+TP4_NETWORK="${TP4_NETWORK-upstream}"
+_tp4_registered=0
+[[ "$TP4_NETWORK" != registered-rdma ]] || _tp4_registered=1
+if [[ "${1:-}" == --validate-tp4-network ]]; then
+  _tp4_network_error() { echo "config.sh: TP4_NETWORK: $*" >&2; exit 1; }
+  case "$TP4_NETWORK" in
+    upstream) _tp4_registered=0 ;;
+    registered-rdma)
+      _tp4_registered=1
+      [[ "${ENGINE:-zig}" == zig && "$TP" == 4 && "${SPLIT:-1}" == 0 ]] ||
+        _tp4_network_error "registered-rdma requires ENGINE=zig TP=4 SPLIT=0"
+      [[ "${FABRIC_EXPECT:-}" =~ ^(ring)?$ ]] ||
+        _tp4_network_error "registered-rdma requires a physical ring; FABRIC_EXPECT must be ring or unset (switched mesh unsupported)"
+      [[ "${COMM:-roce}" == roce ]] || _tp4_network_error "registered-rdma requires COMM=roce (or unset), not $COMM"
+      [[ "${TF_GLM_ROCE-1}" == 1 ]] || _tp4_network_error "registered-rdma conflicts with TF_GLM_ROCE=$TF_GLM_ROCE"
+      [[ "${TF_ROCE_RING-1}" == 1 ]] || _tp4_network_error "registered-rdma requires TF_ROCE_RING=1 or unset (physical ring only)"
+      [[ "${TF_ROCE_MAX_KB-512}" == 512 ]] || _tp4_network_error "registered-rdma requires TF_ROCE_MAX_KB=512 (or unset)"
+      ;;
+    *) _tp4_network_error "expected upstream or registered-rdma, not $TP4_NETWORK" ;;
+  esac
+  [[ "${TF_GLM_TP4_REGISTERED_RDMA-$_tp4_registered}" == "$_tp4_registered" ]] ||
+    _tp4_network_error "TF_GLM_TP4_REGISTERED_RDMA conflicts with TP4_NETWORK=$TP4_NETWORK; use the public setting"
+  unset -f _tp4_network_error
+fi
+export TP4_NETWORK TF_GLM_TP4_REGISTERED_RDMA="$_tp4_registered"
+unset _tp4_registered
+
 MASTER_PORT="${MASTER_PORT:-29551}"  # TensorFold's rendezvous port between the ranks (keep it on the private link)
 # The rendezvous address (rank 0's, --master): at TP=2 the head's address on the link to the worker; at TP>2 this
 # node's LAN address (what its hostname resolves to), which every worker reaches. SOCKET_IFNAME (TP>2): the netdev of
@@ -107,9 +137,24 @@ if [[ "$ENGINE" == zig ]]; then
   ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-nvidia/cuda:13.0.2-devel-ubuntu24.04}"
   ZIG_RUN_IMAGE="${ZIG_RUN_IMAGE:-nvidia/cuda:13.0.2-runtime-ubuntu24.04}"
   TAG_BASE="zig-v1.0.7"
+  # Optional transport source is outside the shared numbered patch series.
+  # Its 0024 basename follows the current series through 0023; re-export/renumber it when that series grows.
+  zig_patch_files() {
+    printf '%s\n' "$_cfg_root"/zig/patches/*.patch
+    if [[ "$TP4_NETWORK" == registered-rdma ]]; then
+      printf '%s\n' "$_cfg_root/zig/transports/0024-zig-glm-tp4-registered-relay.patch"
+    fi
+  }
+  zig_stage_patches() {
+    local dest=$1 patch
+    mkdir -p "$dest"
+    while IFS= read -r patch; do
+      cp -- "$patch" "$dest/${patch##*/}" || return 1
+    done < <(zig_patch_files)
+  }
   image_hash() {
     ( cd "$_cfg_root" || exit 1
-      cat zig/patches/*.patch 2>/dev/null
+      while IFS= read -r patch; do cat "$patch" || exit 1; done < <(zig_patch_files)
       sha256sum zig/aot/glm-aot-sm121.tar.xz 2>/dev/null
       cat zig/Dockerfile
       echo "$TF_REPO $ZIG_TF_REF zig-$ZIG_VERSION $ZIG_SHA256 nccl-$ZIG_NCCL_VERSION $ZIG_BUILD_IMAGE $ZIG_RUN_IMAGE"
@@ -190,7 +235,7 @@ export TF_GLM_DENSE="$DENSE"
 # two neighbours, which relay to the Spark across (patch 0099, TF_ROCE_RING=1); decode at one stream prose 85.7 -> 96.2
 # tok/s, code 131.3 -> 145.3, four streams +11-15%, prefill unchanged (one boot each, 2026-10-08). Same bits.
 # TF_ROCE_IB_TIMEOUT (1-31, default 20; patch 0100) is the queue pairs' ACK timeout.
-_comm=nccl; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) ]] && _comm=roce
+_comm=nccl; [[ "$TP" == 2 || ( "$TP" == 4 && "${FABRIC_EXPECT:-}" == ring ) || "$TP4_NETWORK" == registered-rdma ]] && _comm=roce
 COMM="${COMM:-$_comm}"
 export TF_GLM_COMM="$COMM"
 # The largest all-gather in KiB that goes over RoCE (patch 0006 reads it; a setting, no patch of its own): 512 (default;
@@ -279,7 +324,8 @@ export TF_GLM_MULTI_LONE="${TF_GLM_MULTI_LONE:-0}"
 # with it (64 rows: 1024) unless you set it. Exact at any size; 64 rows add ~250 MiB a Spark to the estimate.
 if (( PARALLEL > 4 )); then _win=64; else _win=32; fi
 export TF_GLM_MULTI_WINDOW="${TF_GLM_MULTI_WINDOW:-$_win}"
-if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 ]]; then
+# The opt-in native relay is fixed at 512 KiB; larger gathers stay on NCCL.
+if (( TF_GLM_MULTI_WINDOW > 32 )) && [[ "$TF_ROCE_MAX_KB" == 512 && "$TP4_NETWORK" == upstream ]]; then
   export TF_ROCE_MAX_KB=$(( TF_GLM_MULTI_WINDOW * 16 ))
 fi
 # Kept prompt states (TensorFold's TF_GLM_CACHE_ENTRIES, 8 by default): the oldest is dropped past this count, however
@@ -479,6 +525,14 @@ prepared_state() {
   done
   echo "$line"
 }
+
+# ENGINE=zig: kept prompt states, in GiB (--prompt-cache-gib; 0, the default, keeps none: the qualified path). The engine
+# gives them at most what is free once the pool is up, less MEMORY_RESERVE_GIB and TF_GLM_KEEP_HEADROOM_GIB (2; patch
+# 0012), so a large pool leaves them little or nothing: a smaller KV_POOL_GIB leaves them room. Measured on two Sparks
+# (1M window, PARALLEL=8, DISPLAY_KV_MIB=1792, PROMPT_CACHE_GIB=16): KV_POOL_GIB=4 gives a 0.1 GiB budget (one state);
+# KV_POOL_GIB=0.5 gives the pool 1,435,648 tokens and the cache 3.7 GiB (27 states), and the same 50k / 100k prompt
+# again answers in 0.18 / 0.26 s instead of 27 / 55 s. ENGINE=python keeps states in the pool.
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
 
 # Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
 # back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same

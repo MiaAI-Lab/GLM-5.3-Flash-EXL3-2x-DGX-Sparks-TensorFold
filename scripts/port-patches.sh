@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Export the GLM engine's port commits (the GLM-5.3-Flash patches 0088/0110/0111/0118/0119 by
 # Robert Wojciechowski (GitHub @wojo, X @rwojo), spill v2, continued chats, KV sharding and parked pages, ported to this
-# Zig engine) as zig/patches/NNNN-zig-<name>.patch, numbered after the last hand-written patch (here 0015 and later,
-# after the three 0014 base fixes), which zig/Dockerfile applies with `git apply` after the hand-written ones in filename
+# Zig engine) as zig/patches/NNNN-zig-<name>.patch, numbered after the last hand-written patch (here 0017 and later,
+# after the three 0014 base fixes and the 0015/0016 display fixes), which zig/Dockerfile applies with `git apply` after the hand-written ones in filename
 # order. Nothing is written unless every step holds:
 #   1. a clean checkout of ZIG_TF_REF (the engine pin, scripts/config.sh) gets the hand-written zig/patches in filename
 #      order, exactly as the Dockerfile applies them, and must then equal BASE outside the excluded paths
@@ -24,8 +24,8 @@
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-glm)
 #   --branch REF      what to export (default glm/series: the port's per-feature commits)
 #   --base REF        what it is relative to: ZIG_TF_REF plus the hand-written patches (default glm/zig-engine-fixes:
-#                     glm/zig-engine-base plus the three hand-written 0014 base fixes, published as wojo/TensorFold
-#                     glm-zig/engine-fixes)
+#                     ZIG_TF_REF plus every hand-written patch here; the original three-0014 base is published as
+#                     wojo/TensorFold glm-zig/engine-fixes and must also include the newer display fixes)
 #   --mode            commits (default: one patch per first-parent commit) or squash (one patch for BASE..BRANCH)
 #   --name REV=SLUG   commits: the patch of commit REV is NNNN-zig-SLUG.patch (repeatable; a commit without one keeps
 #                     the name of the patch already exported from it, else is named from its subject); squash: --name

@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits ae4bc11976fd..f361a6326c0d); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits 48f6cb9b04d9..3aed43d2f9c6); regenerate with scripts/port-patches.sh, do not edit
 core/spill: the disk block store of spill v2 (port of GLM 0110's store, lifted from the DeepSeek port)
 
 Spill v2's family-neutral, GPU-free store, the DeepSeek port's core/spill/ as
@@ -34,7 +34,7 @@ design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync
 order): BadAd84 (https://github.com/BadAd84),
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patches 0088
 and 0110, MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#78 and #124.
-Apply from the checkout root with: git apply 0016-zig-core-spill-store.patch
+Apply from the checkout root with: git apply 0018-zig-core-spill-store.patch
 
 diff --git a/zig/src/core/root.zig b/zig/src/core/root.zig
 index 1a4a18b623add365ff29bb94b331188f9500ded7..b755e96046a205a55bf2c2e50e53a90ee70cf7a2 100644

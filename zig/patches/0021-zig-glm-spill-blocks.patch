@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits b337611d7716..7119e682c7df); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits c2ffc3ef0762..f54fce8c2e17); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 for GLM: kept-state packing, the rank protocol, the compatibility fingerprint and the GLM tier behind TF_GLM_SPILL_V2=1 (port of GLM 0110)
 
 The GLM family's half of spill v2, on the core store and the prompt cache's
@@ -66,7 +66,7 @@ design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync
 order): BadAd84 (https://github.com/BadAd84),
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patch 0110,
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#124.
-Apply from the checkout root with: git apply 0019-zig-glm-spill-blocks.patch
+Apply from the checkout root with: git apply 0021-zig-glm-spill-blocks.patch
 
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
 index 31e9bc187354f447259c1b686b9fb90e6192e8c1..544b4ad9db0cf637375ddc658302655c4a646386 100644
@@ -461,7 +461,7 @@ index c97a3a40571acca8be7bee1b2e2f1b29aa2f9133..7f085d75830791de756932b353a0959a
  test {
      _ = l2pf;
 diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
-index e06a6b9cc21fb7348add23b1057bd1570b7877b3..0c0dacc84e2a956df57122f9cdf303625857adb9 100644
+index a322aeb3c82dbf17fc0b596c0b0b9edde3585a92..d06f08962f0b1fcebc1be00afbebbc6eebf38b74 100644
 --- a/zig/src/families/glm_cuda/cuda_engine.zig
 +++ b/zig/src/families/glm_cuda/cuda_engine.zig
 @@ -31,6 +31,8 @@ const draft_pkg = @import("cuda_dflash_package.zig");
@@ -614,7 +614,7 @@ index e06a6b9cc21fb7348add23b1057bd1570b7877b3..0c0dacc84e2a956df57122f9cdf30362
 +
      fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {
          const e: *Engine = @ptrCast(@alignCast(ptr));
-         try e.stream.d.check(e.stream.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, e.stream.handle), "cuMemcpyDtoDAsync");
+         // a DRM display span is two host registrations, and rows of a latent plane can lie on both sides of the cut
 diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
 index 8c6da91c27a3c26db929c9af41095f91d989ea15..0a4f39fb7fc19b142cedb66189a08fc5bac4e10a 100644
 --- a/zig/src/families/glm_cuda/cuda_lanes.zig

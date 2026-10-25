@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits 553e797997a8..ae4bc11976fd); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits 87387c047732..48f6cb9b04d9); regenerate with scripts/port-patches.sh, do not edit
 core prompt cache + lane host: a request keeps its conversation when it continues it without its own turn state (port of GLM 0111)
 
 v1.0.7's store gave each kept state the conversation of the longest kept state
@@ -42,7 +42,7 @@ the base's).
 
 Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); GLM patch 0111,
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#128.
-Apply from the checkout root with: git apply 0015-zig-core-chat-continued.patch
+Apply from the checkout root with: git apply 0017-zig-core-chat-continued.patch
 
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
 index fac425acd50ada209d01582f0b6b7f649940fe43..c9166233f8b926d173e256d4ce60927173da44cc 100644

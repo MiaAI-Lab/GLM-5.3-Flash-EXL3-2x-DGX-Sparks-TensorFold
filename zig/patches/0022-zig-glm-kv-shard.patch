@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits 7119e682c7df..260af6686a0b); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits f54fce8c2e17..4fd208f1746f); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: KV shard device paths: owner-computed decode and glm_shard.cu, a prompt chunk's history fetch, prompt borrowing and kept states' carries; TF_GLM_KV_SHARD=1 on (port of GLM 0118, parts 3-5)
 
 The GPU side of KV sharding on the host side's parts: each stream's latent
@@ -55,7 +55,7 @@ Sparks' nvcc 13.0 for sm_121.
 
 Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); GLM patch 0118,
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#152.
-Apply from the checkout root with: git apply 0020-zig-glm-kv-shard.patch
+Apply from the checkout root with: git apply 0022-zig-glm-kv-shard.patch
 
 diff --git a/tools/glm_shard_emulate/cuda_runtime.h b/tools/glm_shard_emulate/cuda_runtime.h
 new file mode 100644
@@ -575,7 +575,7 @@ index 1b6517b27f91c545258f171f23fbde1cd32b88e7..0cfd1b324e8672cd3e9d254286ef8c96
      pub fn roceFailure(c: *const Comm, buf: []u8) ?[]const u8 {
          const x = c.extra orelse return null;
 diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
-index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4ef3ee019c 100644
+index d06f08962f0b1fcebc1be00afbebbc6eebf38b74..9ecbf6dcc046fdbcd9a651a2e99a3f314e31f948 100644
 --- a/zig/src/families/glm_cuda/cuda_engine.zig
 +++ b/zig/src/families/glm_cuda/cuda_engine.zig
 @@ -43,6 +43,9 @@ const pool_mod = @import("cuda_pool.zig");
@@ -813,7 +813,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
      pub fn snapBytes(e: *const Engine, at: usize) usize {
          return e.sectionsFor(at).total;
      }
-@@ -838,10 +966,11 @@ pub const Engine = struct {
+@@ -842,10 +970,11 @@ pub const Engine = struct {
          return cache_plan.fits(m.available, e.keep_reserve, bytes);
      }
  
@@ -827,7 +827,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
          if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
          const snap = try e.gpa.create(Snap);
          errdefer e.gpa.destroy(snap);
-@@ -852,17 +981,26 @@ pub const Engine = struct {
+@@ -856,17 +985,26 @@ pub const Engine = struct {
          try snapshot.save(e.copier(), e.g, sec, buf.ptr, &s.st, draft);
          try e.stream.synchronize();
          e.snap_next += 1;
@@ -856,7 +856,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
          try e.stream.synchronize();
          s.st.pos = snap.pos;
          s.tag = snap.id;
-@@ -1485,6 +1623,107 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
+@@ -1489,6 +1627,107 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
      try std.testing.expect(!e.committed[1]);
  }
  
@@ -964,7 +964,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
  /// One u64 from every rank (`mine` this rank's), in rank order, over the pool agreement's all-gather.
  fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream, mine: u64) ![comm.max_world]u64 {
      const w: usize = c.world;
-@@ -1499,29 +1738,62 @@ fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream
+@@ -1503,29 +1742,62 @@ fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream
      return all;
  }
  
@@ -1030,7 +1030,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
      out.twins_made = counts.twins_made;
      out.twins_revoked = counts.twins_revoked;
      for (out.part[0..n], 0..) |*q, i| {
-@@ -1530,6 +1802,15 @@ pub fn kvPartsOf(p: *const pool_mod.Pool, counts: KvCounts, out: *lanes.kv_parts
+@@ -1534,6 +1806,15 @@ pub fn kvPartsOf(p: *const pool_mod.Pool, counts: KvCounts, out: *lanes.kv_parts
      }
  }
  
@@ -1046,7 +1046,7 @@ index 0c0dacc84e2a956df57122f9cdf303625857adb9..ca259d65f801de580d5483442d55dc4e
  /// The pool every rank can hold: the smallest of the ranks' proposals (one per rank, in rank order).
  fn agreedPool(proposals: []const u64) u64 {
      var m: u64 = std.math.maxInt(u64);
-@@ -1580,8 +1861,16 @@ test "TF_GLM_KV_SHARD: /health's parts from the pool, a stream's share of the la
+@@ -1584,8 +1865,16 @@ test "TF_GLM_KV_SHARD: /health's parts from the pool, a stream's share of the la
      e.shard = try shard_mod.Shard.init(0, 2, 1 << 20, shard_mod.trash);
      try std.testing.expectEqual(plain - 11 * 131072 * 528 / 2, e.seqBytes(131072));
      // the sizing's layouts are cuda_state's, the scratch alike
@@ -4441,7 +4441,7 @@ index 3d94a4955271c6b6cbf95d820d2de386164b2f1d..957f37da1d16bfcb0b57a29237af8fb6
      var fk = try live.keep(&l);
      defer fk.deinit(gpa);
 diff --git a/zig/src/families/glm_cuda/cuda_state.zig b/zig/src/families/glm_cuda/cuda_state.zig
-index c420faf25b477c8137e096111c87b45d21de3eaf..825043a35cfe1f08c77ef71a9258633b9b2c7905 100644
+index 12461e69f7e3f99572df82849da0561c55408870..c36c60a4e9f09b86bda05511e9d3ba1cd9f1e33c 100644
 --- a/zig/src/families/glm_cuda/cuda_state.zig
 +++ b/zig/src/families/glm_cuda/cuda_state.zig
 @@ -79,7 +79,9 @@ pub const Slots = struct {

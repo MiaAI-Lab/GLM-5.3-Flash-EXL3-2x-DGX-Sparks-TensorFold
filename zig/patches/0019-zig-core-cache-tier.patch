@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits f361a6326c0d..1d43fb9e5f32); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits 3aed43d2f9c6..25b2a3405e97); regenerate with scripts/port-patches.sh, do not edit
 core prompt cache + lane host: spill v2's Tier, restore jobs and the restore service beside decoding (port of GLM 0110's host side)
 
 The prompt cache's half of spill v2, re-implemented on v1.0.7's store and lane
@@ -54,7 +54,7 @@ design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync
 order): BadAd84 (https://github.com/BadAd84),
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patch 0110,
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#124.
-Apply from the checkout root with: git apply 0017-zig-core-cache-tier.patch
+Apply from the checkout root with: git apply 0019-zig-core-cache-tier.patch
 
 diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
 index f395c7475e7ca55507f7ce235fe937fb391de8d1..13f284bcf8a22f1e24e279befece99b2f69de772 100644

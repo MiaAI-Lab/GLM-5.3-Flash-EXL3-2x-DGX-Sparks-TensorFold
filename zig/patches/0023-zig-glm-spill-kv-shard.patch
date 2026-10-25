@@ -1,4 +1,4 @@
-# port-patches.sh: glm/series @ a5d8cdcdcc71 over glm/zig-engine-fixes @ 553e797997a8 (commits 260af6686a0b..98152c5655f7); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/series @ 53a3f40891f5 over glm/zig-engine-fixes @ 87387c047732 (commits 4fd208f1746f..53a3f40891f5); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks)
 
 With KV sharding a kept state's latent rows are only on the rank that owned
@@ -47,7 +47,7 @@ design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync
 order): BadAd84 (https://github.com/BadAd84),
 MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patches 0110
 and 0118, MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#124 and #152.
-Apply from the checkout root with: git apply 0021-zig-glm-spill-kv-shard.patch
+Apply from the checkout root with: git apply 0023-zig-glm-spill-kv-shard.patch
 
 diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
 index 71ae408c7f1d43cf509ab77064bce059d13ef5df..fd9415c8ea669b0310b744026e8bbf7b1f8e4bbf 100644
@@ -197,7 +197,7 @@ index eae2be8c7ac933e8806dd55ac4bc078ffda9c198..8df3bb172590c61fbe725b09e494fd94
      try ensure(hit.part == 1 and std.mem.eql(u8, &hit.key, &other), @src());
      // a rank owning part 1 with these files: the sizes are not its own, both points damaged
 diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
-index ca259d65f801de580d5483442d55dc4ef3ee019c..c0ae93291b52418655f767cb7a2b7bd87dd487d0 100644
+index 9ecbf6dcc046fdbcd9a651a2e99a3f314e31f948..bbb9f63ce3fe7a2d831bcb7ddc42a326e2f65048 100644
 --- a/zig/src/families/glm_cuda/cuda_engine.zig
 +++ b/zig/src/families/glm_cuda/cuda_engine.zig
 @@ -395,6 +395,8 @@ pub const Engine = struct {
@@ -262,8 +262,8 @@ index ca259d65f801de580d5483442d55dc4ef3ee019c..c0ae93291b52418655f767cb7a2b7bd8
 +
      fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {
          const e: *Engine = @ptrCast(@alignCast(ptr));
-         try e.stream.d.check(e.stream.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, e.stream.handle), "cuMemcpyDtoDAsync");
-@@ -1705,7 +1719,12 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
+         // a DRM display span is two host registrations, and rows of a latent plane can lie on both sides of the cut
+@@ -1709,7 +1723,12 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
          try std.testing.expectEqual(@as(usize, 4 * G.extent), s.st.base);
          e.kv_switches.carry = false;
          try std.testing.expect(!try e.placeResume(s, &home0));
@@ -276,7 +276,7 @@ index ca259d65f801de580d5483442d55dc4ef3ee019c..c0ae93291b52418655f767cb7a2b7bd8
          try std.testing.expect(!try e.placeResume(s, &.{ .pos = shard_keep.carry_min - 64, .home = 0 }));
          try std.testing.expectEqual(@as(u64, 1), e.kv_counts.refused_small);
          try std.testing.expectError(error.KvShardNoHome, e.placeResume(s, &.{ .pos = 4096 }));
-@@ -1720,6 +1739,7 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
+@@ -1724,6 +1743,7 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
      plain.shard = null;
      var q: Seq = .{ .slot = 0, .st = undefined, .eid = 0 };
      try std.testing.expect(try plain.placeResume(&q, &home0));
