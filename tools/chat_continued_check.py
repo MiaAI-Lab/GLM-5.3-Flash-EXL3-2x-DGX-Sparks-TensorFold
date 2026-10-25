@@ -106,6 +106,7 @@ def admitting(entries=8):
     m.next_sid = m.next_kid = m.next_order = m.next_chat = 0
     m.chat_roots, m.chats_continued, m.chats_continued_prefill = {}, 0, 0
     m._kept_by_id = lambda kid: None
+    m.boot = "check"                                 # (the spill tier's blocks name a stream's lineage after it)
     return m
 
 
