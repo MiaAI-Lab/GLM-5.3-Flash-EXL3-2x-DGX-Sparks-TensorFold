@@ -39,7 +39,8 @@
 #            TF_GLM_MULTI_WINDOW (32)
 #   ranks    every TENSORFOLD_*, TF_GLM_* and TF_ROCE_* variable goes to every rank (TP>2: TF_ROCE_HCA per node, found),
 #            e.g.
-#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS (scripts/config.sh: MAX_IMAGES x
+#            IMAGE_TOKENS), TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh

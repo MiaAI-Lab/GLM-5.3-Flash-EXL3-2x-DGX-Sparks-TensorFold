@@ -5,6 +5,37 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **`prepare.sh` warns when a node's NVIDIA CDI device cannot be confirmed** (by
+  [SvangenStudios](https://github.com/SvangenStudios), [pull request #207](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/207),
+  issue #150): without the host's CDI spec, a `systemctl daemon-reload` can remove the GPU from a running container's
+  cgroup and the next kernel load fails with `operation not permitted`. `prepare.sh` now runs `nvidia-ctk cdi list`
+  on the head and on each worker and warns, with the fix, when `nvidia.com/gpu=all` is not listed (an ssh failure is
+  reported as such). A warning only; nothing is changed on the node. The README's Requirements say the same.
+- **README: `/no_think` in prompt text does not disable thinking** (by
+  [travellingsoldier85](https://github.com/travellingsoldier85), [pull request #193](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/193)):
+  the template does not read a `/no_think` or `/think` suffix, so a request that sends one keeps the server's
+  default; the README names the settings that do work and says an empty `content` with `finish_reason: "length"` is
+  a reply to retry.
+- **README: static addresses for the link (issue #196) and the Ablit weights' drafter (issue #83)**: a moved RoCE
+  GID is not noticed by a running engine, so the Requirements ask for static addresses; the Ablit section records
+  why the stock DFlash2 drafter stays for `ABLIT=1`, with the two controlled runs by
+  [troshab](https://github.com/troshab) and [gulldan](https://github.com/gulldan) that measured the refitted one.
+- **CREDITS: four patch credits that had lost their name** (0101, 0103, 0105, 0107, by
+  [BadAd84](https://github.com/BadAd84)) are complete again and sit in the Patches section.
+- **A chat's pictures keep their size past the 8th, so it still resumes from its kept prompt state**
+  (`TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`, by [abadawe-dev](https://github.com/abadawe-dev)): TensorFold caps a picture
+  at min(`IMAGE_TOKENS`, the request's picture budget / its pictures), and its own budget of 16,384 holds 8 pictures at
+  2,048. From the 9th on, every new picture shrank all the earlier ones: their rows and content keys changed, the
+  kept state matched only up to the chat's first picture, and the rest was read again on every turn that brought a
+  picture. An agent session reading screenshots at ~420k tokens waited 150-167 s (187-191k tokens) after each one.
+  `scripts/config.sh` now sets the budget to `MAX_IMAGES` x `IMAGE_TOKENS` (50 x 2,048 = 102,400, at most 262,144),
+  so the cap is the same for any number of pictures a request can carry, and reserves the feature rows that adds in
+  the tower's workspace (`TENSORFOLD_VISION_WORKSPACE_MIB` 768 -> 1,440 MiB: rank 0's startup estimate 88.09 ->
+  88.74 GiB, the pool 2,582,528 -> 2,537,472 tokens on two Sparks at `PARALLEL=4`). `tools/picture_turns.py`, a
+  48k-token chat, pictures 9 to 11: 16.4-16.6k tokens read and 13.0-13.3 s a turn before, 2.1k and 2.5-2.8 s now; a
+  cold request of 50 full-size pictures (102,118 tokens) answers and resumes. Pictures past the 8th are no longer
+  downscaled, so they cost up to 2,048 tokens each. `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS=16384` restores the shared
+  budget. No patch and no image change. CPU check: `tools/picture_budget_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

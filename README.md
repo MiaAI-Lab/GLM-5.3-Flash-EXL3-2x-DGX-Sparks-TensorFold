@@ -90,6 +90,14 @@ prompt. Two Sparks therefore stay at 4 by default; three Sparks default to 8 ([3
 
 Details on the [model card](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold).
 
+**Quality and precision trade-off:** The default `DENSE=q4 KV=fp8` configuration prioritizes throughput, memory
+efficiency, and the full 1M-token context window. Both 4-bit dense-weight quantization and FP8 KV-cache quantization
+introduce numerical loss. Compared with `DENSE=fp8 KV=bf16`, the defaults are expected to have lower numerical fidelity
+and may produce more quality regressions, particularly on sensitive tasks or long-context workloads. The
+higher-precision configuration reduces these sources of quantization error, at the cost of speed, memory, and available
+context. This is an expected trade-off, not evidence of an implementation defect. Actual quality differences depend on
+the workload and require comparative benchmarking.
+
 ### Independent Mac Studio / MCDMA qualification
 
 An independent community experiment extended the two-Spark setup with an M3 Ultra Mac Studio over
@@ -110,10 +118,18 @@ part of this recipe. See the [qualification note](docs/MCDMA_MAC_STUDIO_QUALIFIC
   subnet or each in its own (NVIDIA's two-Spark playbook gives them different ones): both are then used, as is a second
   cabled port in the link's subnet. A prompt chunk's all-gather is ~1.8x faster on two rails; one rail is one x4
   (~112 Gb/s of the port's 200).
+  Give the link's addresses statically (no DHCP, no NetworkManager "shared" mode) and do not re-activate the
+  connection while the server runs: the RoCE GID index is chosen when the engine starts and nothing re-checks it, so
+  an address that moves under a running engine can leave the ranks waiting on each other (issue #196; the
+  reporter's cure was a static address and one subnet per PCIe function).
 - **Key-based ssh** from the first Spark (the head, which runs `./start.sh` and the API) to the second (the worker):
   `ssh-copy-id user@<worker>` (after `ssh-keygen -t ed25519` if you have no key); check with
   `ssh -o BatchMode=yes user@<worker> true`.
 - Docker with the NVIDIA container runtime, your user in the `docker` group, and `rsync`, on both Sparks.
+  On each Spark, also keep the NVIDIA CDI spec generated (`sudo systemctl enable --now nvidia-cdi-refresh.path
+  nvidia-cdi-refresh.service`, then recreate the containers; `nvidia-ctk cdi list` shows `nvidia.com/gpu=all`):
+  without it, a host `systemctl daemon-reload` can remove the GPU from a running container, and the next kernel
+  load fails with `operation not permitted` (issue #150). `prepare.sh` warns when it cannot see the device.
 - **Disk, on each Spark:** ~205 GB: ~176 GB (164 GiB) for the checkpoint and ~2.3 GB for DFlash2 under
   `~/.cache/huggingface`, ~25 GB for the image under Docker's root. `prepare.sh` asks for what the download still
   needs (files already in the cache, from an earlier revision say, do not count; 180 GB, `MIN_FREE_GB`, when it cannot
@@ -184,7 +200,7 @@ If `start.sh` stops at a check:
 
 ## Images and video
 
-GLM's own vision tower runs on the head (rank 0: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). Send images and
+GLM's own vision tower runs on the head (rank 0: 1.05 GiB of bf16 weights and 1.41 GiB of workspace). Send images and
 videos as OpenAI-style content parts in a user message:
 
 ```bash
@@ -208,7 +224,7 @@ pictures are the same.
 | --- | --- | --- |
 | Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
 | Per request | up to 50 (`TENSORFOLD_GLM_MAX_IMAGES`), 10 MB each, 64 MB in all | up to 4 (`TENSORFOLD_GLM_MAX_VIDEOS`), 64 MB each, 96 MB in all, up to an hour of footage each |
-| Tokens | at most 2,048 a picture (`TENSORFOLD_GLM_IMAGE_TOKENS`; a 1080p picture takes 2,040); a request's pictures share 16,384 (`TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`), so past 8 each gets an equal share (327 with 50) | 2 frames a second, at most 128 frames spread over the whole clip (`TENSORFOLD_GLM_VIDEO_FRAMES`), at most 16,384 tokens a clip (`TENSORFOLD_GLM_VIDEO_TOKENS`); a request's clips share 32,768 (`TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS`), so 3 or 4 clips get 10,922 or 8,192 each |
+| Tokens | at most 2,048 a picture (`TENSORFOLD_GLM_IMAGE_TOKENS`; a 1080p picture takes 2,040); every picture of a chat keeps that cap however many it has (a request's pictures share `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`, here 50 x 2,048 = 102,400), so a new picture never resizes the earlier ones and the chat still resumes from its kept prompt state | 2 frames a second, at most 128 frames spread over the whole clip (`TENSORFOLD_GLM_VIDEO_FRAMES`), at most 16,384 tokens a clip (`TENSORFOLD_GLM_VIDEO_TOKENS`); a request's clips share 32,768 (`TENSORFOLD_GLM_REQUEST_VIDEO_TOKENS`), so 3 or 4 clips get 10,922 or 8,192 each |
 
 A request body can be up to 96 MiB, so data URLs carry about 70 MB of pictures and clips in all.
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs.
@@ -461,6 +477,15 @@ access to public gated repositories). The first start downloads the Ablit checkp
 published one in the cache) and, with `WORKER_WEIGHTS=copy`, copies it to the worker. `ABLIT=0` goes back to the
 published checkpoint, which stays in the cache.
 
+The Ablit weights keep the stock DFlash2 drafter. The edit changes `o_proj` in layers 15-46, and three of the drafter's
+five taps (layers 24, 33, 42) read downstream of it, so it accepts a little less than on the published checkpoint
+(a controlled run on agent turns: 3.38 -> 3.06 tokens a round, decode 62.4 -> 60.3 tok/s over 73 requests). A drafter
+whose `fc` layer was refitted by someone else for an abliterated GLM-5.3-Flash
+([`gorbatjovy/GLM-5.3-Flash-DFlash2-ablit-fc`](https://huggingface.co/gorbatjovy/GLM-5.3-Flash-DFlash2-ablit-fc),
+`DFLASH2_ID`) was measured twice on the exact Ablit weights (issue #83, 77 requests by troshab and 12 languages at
+fixed draft lengths by gulldan): it is right more often but drafts shorter chains, tokens a round are equal or lower,
+and decode speed is flat, so it is not recommended here.
+
 ## 3 Sparks (experimental)
 
 `./start-tp3.sh` runs the same recipe as tensor parallel over three Sparks (`TP=3` with `./start.sh`'s options;
@@ -615,7 +640,8 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SERVED_NAME` / `PORT` / `HOST` | `GLM-5.3-Flash-EXL3` / `8888` / `0.0.0.0` | the model id in `/v1/models` and replies; where the API listens |
 | `TENSORFOLD_GLM_IMAGE_TOKENS` / `_VIDEO_TOKENS` / `_VIDEO_FRAMES` | `2048` / `16384` / `128` | a picture's and a clip's token caps, and a clip's frames |
 | `TENSORFOLD_GLM_MAX_IMAGES` / `_MAX_VIDEOS` | `50` / `4` | pictures and clips a request |
-| `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `16384` / `32768` | tokens a request's pictures and clips share (each still within its own cap) |
+| `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS` / `_REQUEST_VIDEO_TOKENS` | `102400` / `32768` | tokens a request's pictures and clips share (each still within its own cap). Pictures: `scripts/config.sh` sets `MAX_IMAGES` x `IMAGE_TOKENS` (at most 262,144; TensorFold's own default is 16,384), so a picture's cap does not depend on how many pictures the chat has. With 16,384, the 9th picture and every one after it shrank all the earlier ones, and the chat's kept prompt state then matched only up to its first picture: an agent session at ~420k tokens waited 150-167 s after each screenshot; `tools/picture_turns.py` on two Sparks, a 48k-token chat, pictures 9 to 11: 16.4-16.6k tokens read and 13.0-13.3 s a turn, now 2.1k and 2.5-2.8 s. 50 full-size pictures are then a 102k-token prompt, not 16k. `16384`: the shared budget, as before |
+| `TENSORFOLD_VISION_WORKSPACE_MIB` | `1440` | what rank 0 sets aside for the tower's encode and a request's feature rows (8 KiB a row, kept through its prefill). TensorFold's 768 MiB plus the rows the picture budget adds past 16,384, so a cold request of 50 full-size pictures fits (rank 0's startup estimate 88.09 -> 88.74 GiB, the pool 2,582,528 -> 2,537,472 tokens on two Sparks at `PARALLEL=4`). Set it to size it yourself (`768` if your requests never carry many pictures) |
 | `TENSORFOLD_GLM_PICTURE_CACHE` / `_PICTURE_CACHE_MB` / `_PICTURE_CANVASES` | `1` / `384` / `8` | the vision frontend reads a request's pictures once, not on every turn of the chat (patch `0079`): what reading each source cost is kept by the source's bytes (host memory only, LRU under `_MB`, that many fitted canvases); `0`: the path before the patch, bit for bit (by ThomasWadeZ, #63) |
 | `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
@@ -646,12 +672,18 @@ The checkpoint's own sampling defaults apply (temperature 1.0, top_p 0.95). Per 
   `"chat_template_kwargs": {"enable_thinking": false}`) answers without thinking. `chat_template_kwargs.thinking`
   (`true` / `false`, or `{"type": "enabled"}` / `{"type": "disabled"}`, as DeepSeek-V4 clients such as pi send it) is
   read as `enable_thinking` when that is absent; other values leave the server's default.
+- A `/no_think` (or `/think`) suffix in the prompt text does not switch thinking off: this template does not
+  read it, so the request keeps the server's default. With thinking on, a client that sends it gets `content: null`,
+  the whole budget in `reasoning_content` and `finish_reason: "length"`. Use `"chat_template_kwargs":
+  {"enable_thinking": false}`, `{"thinking": {"type": "disabled"}}` or `reasoning_effort: "none"` instead.
 - Earlier turns' reasoning stays in the prompt (as in zai-org's current template), so an agent's previous tool loop
   is resumed from the cache at a new user message; `"chat_template_kwargs": {"clear_thinking": true}` or
   `TF_GLM_CLEAR_THINKING=1` drops it, as the checkpoint's template does.
 - The reasoning comes back in `reasoning_content`, the answer in `content`. A request without `max_tokens` gets
   32,768 tokens for both (`MAX_TOKENS`; cut to what the window has left, never refused). An empty `content` means the model
-  thought until `max_tokens`: give more, or use `reasoning_effort: "low"`.
+  thought until `max_tokens`: give more, or use `reasoning_effort: "low"`. A client should not accept that reply as
+  an answer: `content: null` with `reasoning_content` filled and `finish_reason: "length"` is a retry condition
+  (more `max_tokens`, or thinking off).
 
 ### API notes
 
@@ -797,6 +829,8 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/picture_turns.py [pictures] [size]` | a chat of ~`size` tokens (default 40000) gets one new 1920x1080 picture a turn (default 12), with a text turn after each; exit 1 when a turn re-reads more than the new picture, which is what a picture cap that moves with the picture count does from the 9th picture on |
+| `tools/picture_budget_check.py <checkout>` | the picture budget's checks, run in the image (`docker run ... --entrypoint python3`, see the file; CPU): `scripts/config.sh` and `start.sh` send every rank a budget under which a picture's cap is the same for 1 to `MAX_IMAGES` pictures, the environment's values win, and the workspace covers the budget's rows |
 
 ## Repository layout
 
