@@ -388,6 +388,8 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # tokens (2026-10-08); its lowest free memory under a 1M-token prompt is not measured yet. Each rank holds a quarter of
 # the weights instead of a third, so it leaves more memory free.
 case "$TP" in 3|4) _pool=32 ;; *) _pool=12.5 ;; esac
+# Whether KV_POOL_GIB was set: a prompt cache with the default pool gets no budget (scripts/port.sh: port_pool_check)
+PORT_POOL_EXPLICIT=0; [[ -z "${KV_POOL_GIB:-}" ]] || PORT_POOL_EXPLICIT=1
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 # The display reservation in the pool (patch 0072, PARALLEL above 1): the GB10 firmware keeps ~2 GiB for a screen that
@@ -486,19 +488,11 @@ prepared_state() {
 # (1M window, PARALLEL=8, DISPLAY_KV_MIB=1792, PROMPT_CACHE_GIB=16): KV_POOL_GIB=4 gives a 0.1 GiB budget (one state);
 # KV_POOL_GIB=0.5 gives the pool 1,435,648 tokens and the cache 3.7 GiB (27 states), and the same 50k / 100k prompt
 # again answers in 0.18 / 0.26 s instead of 27 / 55 s. ENGINE=python keeps states in the pool.
+# Set above 0 while KV_POOL_GIB is not, start.sh warns that the default pool leaves it nothing (scripts/port.sh:
+# port_pool_check; on the port's pair KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8 gave 6.2 GiB, 5.1 with spill v2 on).
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
 
-# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
-# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
-# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
-# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
-# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
-SPILL_GIB="${SPILL_GIB:-0}"
-SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
-SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
-SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
-SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
-SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
-if [[ "$SPILL_GIB" != 0 ]]; then
-  STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
-fi
+# The spill tier (patch 0088-glm-spill-tier, off by default: SPILL_GIB, SPILL_DIR, SPILL_HIGHWATER, SPILL_MIN_TOKENS,
+# SPILL_MIN_FREE_GIB, SPILL_FLUSH_S; README: Spill tier) and the rest of Robert's GLM features ported to the Zig engine
+# (spill v2, KV sharding; all off by default): their settings, checks and mapping to the ranks are scripts/port.sh's.
+source "$_cfg_root/scripts/port.sh"

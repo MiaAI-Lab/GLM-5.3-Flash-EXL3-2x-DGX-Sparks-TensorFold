@@ -389,6 +389,17 @@ than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that 
 under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and credits: `NOTICE`,
 `CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to TensorFold itself.
 
+The measurements above are the Python engine's. With `ENGINE=zig` (the default) the tier writes the prompt cache's kept
+states, so it also needs `PROMPT_CACHE_GIB` above 0 and DFlash2 drafts: `./start.sh` refuses `SPILL_GIB` without them,
+and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)). Its files
+are root's, not yours: the ranks run as root and the Zig tier keeps them readable by root only, so removing them takes
+`sudo`. Robert's spill v2 (`SPILL_V2=1`, `zig/patches/0018`-`0023`, off by default) writes every kept state when it is
+kept, in 2,048-token blocks a conversation's turns share, reads it back beside decoding and survives a crash; it also
+runs with KV sharding (`KV_SHARD=1`). Both need the prompt cache's room: at the default `KV_POOL_GIB` its budget is 0,
+so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with:
+a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on, whose pinned staging comes first; `./start.sh` warns when
+`PROMPT_CACHE_GIB` is set without `KV_POOL_GIB`).
+
 ## Worker weights over NFS
 
 By default the worker keeps its own copy of the checkpoint and DFlash2 (~166 GiB, copied over the link by
@@ -984,7 +995,8 @@ start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a swit
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
-              banner.sh (start.sh's banner)
+              banner.sh (start.sh's banner), port.sh (Robert's spill / KV-shard settings), port-patches.sh
+              (zig/patches/0017 and later from the engine's port commits)
 patches/      patches baked into the image
 tests/        CPU tests (cpu/, scripts/test-cpu.sh) and GPU tests (gpu/, scripts/test-gpu.sh) of patches 0098-0109
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a

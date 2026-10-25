@@ -47,6 +47,13 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
   `tensorfold-native` serving CUDA families through one registry, which the Zig engine here runs on.
+- **The recipe side of Robert Wojciechowski's GLM port to the Zig engine** (`scripts/port.sh`, `scripts/port_test.sh`,
+  `docs/glm-port/recipe.md`): the settings of the spill tier, spill v2 and KV sharding (`zig/patches/0017`-`0023`) mapped
+  to the ranks, their checks and the `tf.recipe.port` label, by
+  **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)**, from his port of the same
+  features to the DeepSeek-V4.1-Flash recipe. `PROMPT_CACHE_GIB`, which it maps and warns about, is
+  **[ezoushen](https://github.com/ezoushen)**'s setting
+  ([pull request #187](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/187)).
 - **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE
   all-gather of the Zig engine implements the RoCEnante protocol of b12x by local-inference-lab, as `0006-cuda-roce-allgather`
   does for the Python engine (below).
@@ -213,8 +220,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   scheduler's cancelled fills are our code.
 - `zig/patches/0014-zig-chat-id`, `zig/patches/0014-zig-parked-pages`, `zig/patches/0014-zig-prepare-memory`
   (`ENGINE=zig`: a shared prompt cut no longer joins two conversations; the startup budgets count the pages parked on the
-  per-CPU free lists; a long prompt's preparation waits for memory in arrival order): by Robert Wojciechowski
-  ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull requests
+  per-CPU free lists; a long prompt's preparation waits for memory in arrival order): by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull requests
   [#213](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/213),
   [#212](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/212) and
   [#211](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/211), applied as contributed.
@@ -223,6 +230,16 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   a time): by [ezoushen](https://github.com/ezoushen),
   [pull request #186](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/186), applied as
   contributed. They fix the zero and the copy that `0072` (above) needs on the Zig engine.
+- `zig/patches/0017-zig-core-chat-continued`, `0018-zig-core-spill-store`, `0019-zig-core-cache-tier`,
+  `0020-zig-glm-kv-shard-host`, `0021-zig-glm-spill-blocks`, `0022-zig-glm-kv-shard`, `0023-zig-glm-spill-kv-shard`
+  (`ENGINE=zig`: continued chats, spill v2 and KV sharding, the GLM-5.3-Flash patches `0111`, `0088`/`0110` and `0118` ported
+  to the Zig engine): authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), pull request
+  [#214](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/214), from his engine branch
+  [`wojo/TensorFold` `glm-zig/series`](https://github.com/wojo/TensorFold/tree/glm-zig/series). The block store's design
+  (`0018`, `0019`, `0021`, `0023`) is that of [BadAd84](https://github.com/BadAd84), [pull request #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118)
+  (the design only; the code is Robert Wojciechowski's). MiaAI-Lab rebased the series onto `0015` and `0016` and changed the spill store's tests
+  to run on ext4 (see `0018`'s header).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
