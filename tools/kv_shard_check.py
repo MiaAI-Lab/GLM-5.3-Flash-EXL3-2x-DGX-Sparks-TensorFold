@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks for patch 0118 (KV sharding, TF_GLM_KV_SHARD: tensorfold/families/glm5_next/cuda/shard.py and its pool and
+"""Checks for patch 0129 (KV sharding, TF_GLM_KV_SHARD: tensorfold/families/glm5_next/cuda/shard.py and its pool and
 placement hooks in pool.py / multi.py), CPU only, run inside the image that scripts/prepare.sh built (no GPU, no model,
 no server):
 

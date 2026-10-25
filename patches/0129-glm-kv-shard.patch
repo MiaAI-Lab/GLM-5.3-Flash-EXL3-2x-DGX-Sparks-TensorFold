@@ -5,10 +5,12 @@
 # attend locally (taken back when needed). Same bits as unsharded. Spill tier and display reservation supported.
 # A cache hit whose part has no room is carried to another part (its latents sent by the owner) when that saves a
 # recompute, an eviction or a pause (TF_GLM_KV_SHARD_CARRY, on), never to even out the parts.
-# Builds on 0110 (spill tier) and 0111. By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+# Builds on 0128 (the spill tier's blocks) and 0119 (chat-continued). By Robert Wojciechowski (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
+index fd866fa..ab22614 100644
 --- tensorfold/cuda/spill_blocks.py
 +++ tensorfold/cuda/spill_blocks.py
-@@ -12,7 +12,8 @@
+@@ -12,7 +12,8 @@ snapshot fields: recurrences, windows, a head row; ``spill.encode``). On disk:
    it, names the blocks its earlier turns wrote and writes only its new ones. States of the same ids computed apart
    (another prompt chunking: other bits) never share a block by name; a block whose bytes equal one already on disk is
    linked to it instead of written again (content dedup: two streams that prefilled the same system prompt at once
@@ -18,7 +20,7 @@
  - a point a state: ``points/<key>.ids`` (its ids; with pictures its keyed ids and its tokens), ``points/<key>.st``
    (its small state, safetensors), then ``points/<key>.json`` naming its blocks with a CRC-32 of each, written LAST, so
    a point with its json is complete. Every file goes to a temporary name, is fsynced and renamed; the folders are
-@@ -162,6 +163,18 @@
+@@ -199,6 +200,18 @@ def fork(lineage: str, name: str, at: int) -> str:
      return f"{lineage}|{name}@{int(at)}"
  
  
@@ -37,7 +39,7 @@
  def _segments(lineage: str) -> tuple[bytes, list[tuple[int, bytes]]]:
      head, *rest = (lineage or "").split("|")
      forks = []
-@@ -760,7 +773,7 @@
+@@ -832,7 +845,7 @@ class BlockStore:
          items, layer = _sp.encode(obj, skip=skip)
          items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
          small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
@@ -46,11 +48,10 @@
          need = size + small_n + 8 * n * (2 if tokens is not None else 1)
          pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
                     [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
-@@ -798,6 +811,24 @@
-         self.pending.append(job)
+@@ -872,6 +885,24 @@ class BlockStore:
          self.stats["keep_s"] += time.perf_counter() - t0
          return "queued"
-+
+ 
 +    def _present(self, base: int) -> list:
 +        """The planes holding the rows of the extent at ``base`` on this rank: every plane, but one sharded over the
 +        ranks (``shard``: TF_GLM_KV_SHARD's latent planes) only on the rank whose half the extent is in."""
@@ -68,10 +69,11 @@
 +            v = p.view(base, b * p.div)
 +            return None if v is None else v[a:b]
 +        return p.tensor[base // p.div + a:base // p.div + b]
- 
++
      def _parts(self, where, s: int, e: int) -> list[torch.Tensor]:
          """Tokens [s, e) as each plane's rows, where the extent is NOW (it may have moved)."""
-@@ -806,8 +837,9 @@
+ 
+@@ -879,8 +910,9 @@ class BlockStore:
          out = []
          for p in self.planes:
              a, b = _rows(p, s, e)
@@ -83,7 +85,7 @@
          return out
  
      def pump(self, limit: int | None = PUMP_BLOCKS) -> None:
-@@ -1415,7 +1447,7 @@
+@@ -1504,7 +1536,7 @@ class BlockStore:
              b = self._slot(lj)
              if b is None:
                  return
@@ -92,7 +94,7 @@
              fut = self._readers.submit(self._read_block, h, pt.crcs[i], self.read_slots[b], nb)
              with lj.cond:
                  lj.queued[i] = (b, nb, fut, s, e, h)
-@@ -1525,7 +1557,9 @@
+@@ -1614,7 +1646,9 @@ class BlockStore:
          at = 0
          for p in self.planes:
              a, z = _rows(p, s, e)
@@ -103,9 +105,11 @@
              k = dst.numel() * dst.element_size()
              v = dst.reshape(-1).view(torch.uint8)
              if p.spanned:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 84bcf63..a263996 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -599,6 +599,14 @@
+@@ -599,6 +599,14 @@ class GlmEngine:
          if kv != "bf16" and not LATENT:
              raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
          self.kv = kv
@@ -120,7 +124,7 @@
          # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
          self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
          if not self.mtp_on:
-@@ -703,7 +711,8 @@
+@@ -703,7 +711,8 @@ class GlmEngine:
          self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
          from .multi import PRELAUNCH                          # TF_GLM_DRAFT_PRELAUNCH: every rank alike
  
@@ -130,7 +134,7 @@
          rows = self._gather_ints(mine + [spare >> 20])
          odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
          if odd:
-@@ -713,7 +722,7 @@
+@@ -713,7 +722,7 @@ class GlmEngine:
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
                                 "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
@@ -139,7 +143,7 @@
                                 f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                 "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                 "every rank the same flags")
-@@ -792,6 +801,34 @@
+@@ -792,6 +801,34 @@ class GlmEngine:
              print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
                    (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
                    ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
@@ -174,9 +178,11 @@
          self.drafter = None
          self.drafter_dir = drafter
          if drafter is not None:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index bbae712..e86b556 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -12,7 +12,7 @@
+@@ -12,7 +12,7 @@ from tensorfold.cuda import experts as grouped
  from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
  from tensorfold.cuda.kernels import prefill_attention, qmm as shared
  
@@ -185,7 +191,7 @@
  from .attention import AttnScratch, attention, kv_write
  from .weights import LayerW, Weights
  
-@@ -202,23 +202,28 @@
+@@ -202,23 +202,28 @@ class Caches:
          self.kv = kv
          planes: list[Plane] = []
          spanned: list[torch.Tensor] = []
@@ -219,7 +225,7 @@
              return add((HL, c.qk_dim)), add((HL, c.v_dim))
  
          self.kc, self.vc = [], []
-@@ -246,6 +251,9 @@
+@@ -246,6 +251,9 @@ class Caches:
                                      for _ in range(2)) for _ in range(n_idx)]
          self.arena = Arena(rows, planes)
          self.rows = rows
@@ -229,7 +235,7 @@
  
      def index_tensors(self, i: int) -> tuple:
          """Indexed layer i's (keys, gates, pooled keys) over every stream: the rings (or planes) and the pool plane."""
-@@ -267,7 +275,12 @@
+@@ -267,7 +275,12 @@ class Caches:
          """Point ``st``'s caches at tokens [base, base + size) of the pool."""
  
          view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
@@ -243,7 +249,7 @@
          st.vc = [view(i) for i in self.vc]
          if self.mtp is not None:
              st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
-@@ -593,8 +606,9 @@
+@@ -593,8 +606,9 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
  
  def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
                R: int, nch: int | None, index=None, host_pos: int | None = None,
@@ -255,7 +261,7 @@
  
      c = w.cfg
      a = layer.dsa
-@@ -602,7 +616,8 @@
+@@ -602,7 +616,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
          dsa_front(layer, w, b, lo, hi)
      HL = a.heads
      if a.absorb is not None:
@@ -265,7 +271,7 @@
      if sparse_np is not None:
          raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
      mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
-@@ -660,15 +675,111 @@
+@@ -660,15 +675,111 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
  
  
  def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -277,8 +283,8 @@
 -    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
 +    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer, twin=twin, root=root)
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
-+
-+
+ 
+ 
 +def _sharded_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, rs, qa, ol, scale, all_sparse,
 +                  sparse_rows, root: int = -1) -> None:
 +    """``dsa_rows``' attention with the latent cache sharded (TF_GLM_KV_SHARD): the owner of the stream (``lc`` its
@@ -354,8 +360,8 @@
 +    if sparse_rows:
 +        with prof.timed("dsa: sparse attention"):
 +            _shard_sparse(qa, att, tok, counts, ol, scale, b.prefill)
- 
- 
++
++
 +def _shard_sparse(qa, att, tok, counts, ol, scale, prefill: bool) -> None:
 +    """The sharded rows' sparse attention with the unsharded path's kernel choice, so both give the same bits: a prompt
 +    chunk through ``sparse_prompt`` where the base has it (tp4: TF_GLM_MSA, else sparse_onepass), else sparse_onepass
@@ -380,7 +386,7 @@
      """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
      stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
      indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
-@@ -679,8 +790,10 @@
+@@ -679,8 +790,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
      HL = a.heads
      s = b.lat_s
      rs = slice(lo, lo + R)
@@ -393,7 +399,7 @@
      # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
      all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
      sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
-@@ -696,6 +809,14 @@
+@@ -696,6 +809,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
      l2pf.site(layer, "o")
      ol = s.ol[rs]
      scale = c.qk_dim ** -0.5
@@ -408,7 +414,7 @@
      if not all_sparse:
          # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
          # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
-@@ -717,6 +838,13 @@
+@@ -717,6 +838,13 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
          return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
  
  
@@ -422,7 +428,7 @@
  def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
                   select: bool = True) -> torch.Tensor | None:
      """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
-@@ -736,8 +864,9 @@
+@@ -736,8 +864,9 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
      HL = a.heads
      mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
      s = b.lat_s
@@ -434,7 +440,7 @@
      tokens = counts = None
      if index is not None:
          ik, ig, pk = index
-@@ -754,7 +883,10 @@
+@@ -754,7 +883,10 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
          qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
      l2pf.site(layer.index, "o")
      with prof.timed("dsa: attention"):
@@ -446,7 +452,7 @@
      with prof.timed("dsa: expand"):
          o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
      return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
-@@ -840,7 +972,9 @@
+@@ -840,7 +972,9 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
      di = st.dsa_index[layer.index]
      with prof.timed("dsa (total)"):
          return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
@@ -457,9 +463,11 @@
  
  
  def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 3148fa9..fce8f40 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -25,7 +25,7 @@
+@@ -25,7 +25,7 @@ are balanced within the budget without adding rounds; GPU layer cost, finalizati
  learned separately so extra slices cannot inflate every layer cost.
  
  Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
@@ -468,7 +476,7 @@
  in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
  sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
  ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
-@@ -51,16 +51,16 @@
+@@ -51,16 +51,16 @@ from tensorfold.cuda.scheduler import Scheduler
  from tensorfold.server.errors import CapacityError  # TFCAP-0075
  from tensorfold.cuda.streams import Stream, next_fill
  
@@ -488,7 +496,7 @@
  # TF_GLM_SPILL_LOAD_MS (default 40): the most a step of the reads in flight copies between two rounds (rank 0's time)
  LOAD_MS_DEFAULT = 40.0
  
-@@ -223,6 +223,62 @@
+@@ -223,6 +223,62 @@ def kept_bytes_cap() -> int:
  KEPT_BYTES_CAP = kept_bytes_cap()
  
  
@@ -551,7 +559,7 @@
  def known_key(c):
      """A kept state's key as an int64 array, converted once: every admission scans all of ``kept`` for the prefix a
      new prompt shares, and rebuilding the array each time cost O(kept states x their tokens) a request."""
-@@ -498,6 +554,10 @@
+@@ -498,6 +554,10 @@ class Lane:
      images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
      chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
      lineage: str = ""                  # the computation its rows belong to (the spill tier's block names)
@@ -562,7 +570,7 @@
      decoding: bool = False
      paused: bool = False
      t0: float = 0.0
-@@ -541,7 +601,9 @@
+@@ -541,7 +601,9 @@ class MultiDecoder:
          if self.window < streams:
              raise ValueError(f"a verify window of {self.window} rows cannot hold {streams} streams' pending tokens")
          self.rows_max = e.rows                           # a stream's window (decode.MAX_ROWS)
@@ -573,7 +581,7 @@
          self.arena = e.caches.arena
          self.grid = engine.grid
          self.fill_rows = fill_rows(e.prefill_rows, self.grid)
-@@ -581,7 +643,7 @@
+@@ -581,7 +643,7 @@ class MultiDecoder:
                  verify = SerialVerify(e, taps=self.drafts is not None)
          self.verify = verify
          # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
@@ -582,7 +590,7 @@
          self.profiles = None
          if self.tune.profile and self.rank == 0:
              self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
-@@ -605,6 +667,11 @@
+@@ -605,6 +667,11 @@ class MultiDecoder:
          self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
          self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
          self.load_turn = 0                               # which read in flight ``step_loads`` serves first
@@ -594,7 +602,7 @@
          self.boot = os.urandom(6).hex()                  # this process's lineages (a fresh prefill's) are its own
          self.prefix_waits = 0                            # requests that waited for a prefix another one prefilled
          self.prefix_wait_tokens = 0                      # the prompt tokens they did not prefill again
-@@ -635,12 +702,36 @@
+@@ -635,12 +702,36 @@ class MultiDecoder:
      def live(self) -> int:
          return len(self.lanes)
  
@@ -631,7 +639,7 @@
                  "kept_prompts": len(self.kept),
                  # streams that continued their conversation without resuming from its own turn state (a rewind before
                  # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
-@@ -831,6 +922,8 @@
+@@ -831,6 +922,8 @@ class MultiDecoder:
              if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0]
                                      or not 0 <= p[1] < p[2]):
                  raise RuntimeError("invalid MFILLPART payload")
@@ -640,7 +648,7 @@
              ops.append((op, p))
              i += 2 + n
          return ops
-@@ -841,13 +934,29 @@
+@@ -841,13 +934,29 @@ class MultiDecoder:
  
      def fits(self, s: Stream) -> bool:
          """Whether ``s`` can be placed now (else it waits, in order, for streams to finish): the free rows and the
@@ -673,7 +681,7 @@
  
      def admit(self, s: Stream) -> None:
          """Rank 0: place a request (slot, extent; resumed from the longest kept prefix of its prompt when it drafts)
-@@ -895,36 +1004,7 @@
+@@ -895,36 +1004,7 @@ class MultiDecoder:
          if s.vision is not None:              # encoded before anything is sent: a failure stops here
              feed = self._encode(s.vision, encoded_from)
          need = self._need(len(prompt))
@@ -711,7 +719,7 @@
          if s.vision is not None and hit is None and encoded_from:
              feed = None                       # (its rows freed before the tower runs again)
              feed = self._encode(s.vision, 0)  # the kept state was given up: every picture, from the prompt's start
-@@ -945,13 +1025,265 @@
+@@ -945,13 +1025,265 @@ class MultiDecoder:
          payload += [len(packed), *packed, len(positions), *positions, int(s.vision is not None),
                      *pack_keys(vrows, vkeys, vpos)]
          self._emit(ADMIT, payload)
@@ -725,7 +733,7 @@
              self.broken = exc
              raise
          self.lanes[sid].key = key
-+
+ 
 +    carry_kind = None                     # rank 0: which rule chose the carry ``_place_hit`` just decided (counted at the ADMIT)
 +
 +    def _place_hit(self, hit, need: int, key) -> tuple[int, int, Any]:
@@ -812,7 +820,7 @@
 +                raise NoRoom(f"no room for a {need}-token extent in the {pool.rows}-token pool now")
 +            copy = int(hit is not None)
 +        return base, copy, hit
- 
++
 +    def _fits_unevicted(self, hit, need: int, others: list) -> bool:
 +        """Rank 0, read only: whether the hit's part places the request without evicting anything, by the paths the old
 +        code takes: with other conversations' longer states in the hit's extent (the shared-rows copy), a single stretch
@@ -977,7 +985,7 @@
      def _encode(self, prepared, cut: int):
          """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
          it), as a VisionFeed; None when the kept state already holds them all."""
-@@ -1025,7 +1357,11 @@
+@@ -1025,7 +1357,11 @@ class MultiDecoder:
              self._rewrites(x, cut)
          else:
              x = self.pool.add(a["base"], a["size"])
@@ -990,7 +998,7 @@
                  self.arena.copy(hit.extent.base, x.base, cut)
          x.owner = a["sid"]
          st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
-@@ -1058,6 +1394,25 @@
+@@ -1060,6 +1396,25 @@ class MultiDecoder:
  
          own = f"{self.boot}-{a['sid']}"
          lane.lineage = fork(hit.lineage, own, cut) if getattr(hit, "lineage", "") else own
@@ -1013,10 +1021,10 @@
 +            else:
 +                for t in twins:
 +                    self.pool.remove(t)
-         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
-             lane.key = a["keyed"]
          self.next_sid = max(self.next_sid, a["sid"] + 1)
-@@ -1083,7 +1438,7 @@
+         self.next_order += 1
+         s.sid, s.cached = a["sid"], cut
+@@ -1083,7 +1438,7 @@ class MultiDecoder:
                      raise RuntimeError(f"the kept prompt {a['kid']} is the whole prompt of stream {a['sid']} but "
                                         f"kept no head row")
                  lane.head = hit.head.clone()
@@ -1025,7 +1033,7 @@
          # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
          if a["draft"]:
              lane.point = grid_point(len(prompt), cut, self.grid)
-@@ -1140,6 +1495,17 @@
+@@ -1140,6 +1495,17 @@ class MultiDecoder:
      def _touch(self, c) -> None:
          self.kept = [k for k in self.kept if k is not c] + [c]
  
@@ -1043,7 +1051,7 @@
      def _keep(self, lane: Lane, n: int, head=None, own: bool = False) -> None:
          """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent;
          ``head``: at the prompt's end, the logits row its first token is sampled from (kept for a replay);
-@@ -1320,12 +1686,14 @@
+@@ -1321,12 +1687,14 @@ class MultiDecoder:
          drafter = getattr(self.g, "drafter", None)
          model = os.path.basename(str(getattr(self.g, "model_dir", "")).rstrip("/"))
          # what the stored bits depend on: build and runtime, drafter, KV and dense formats, TP layout, plane shapes,
@@ -1060,7 +1068,7 @@
          self.loads: dict = {}                  # load id -> a stored prompt being read into a new extent
          self.next_lid = 0
          self.load_budget = float(os.environ.get("TF_GLM_SPILL_LOAD_MS") or LOAD_MS_DEFAULT) / 1000.0
-@@ -1354,9 +1722,9 @@
+@@ -1360,9 +1728,9 @@ class MultiDecoder:
              self._release_rows(x, 0)
              return remove(x)
  
@@ -1073,7 +1081,7 @@
  
          def g_resize(x, size):
              self._release_rows(x, size)
-@@ -1407,6 +1775,18 @@
+@@ -1413,6 +1781,18 @@ class MultiDecoder:
              return "no_draft_window"
          return None
  
@@ -1092,7 +1100,7 @@
      def _persist(self, c) -> None:
          """Both ranks, as ``c`` is kept: its state to this rank's disk (``BlockStore.persist``; a failure only leaves it
          off disk)."""
-@@ -1416,9 +1796,10 @@
+@@ -1422,9 +1802,10 @@ class MultiDecoder:
              self.disk.unwritten(why)
              return
          try:
@@ -1105,7 +1113,7 @@
          except Exception as exc:                 # noqa: BLE001  (a spill never fails the engine)
              print(f"[tensorfold] spill rank {self.rank}: not written: {exc!r}", flush=True)
              self.disk.unwritten("failed")
-@@ -1473,7 +1854,13 @@
+@@ -1479,7 +1860,13 @@ class MultiDecoder:
              self.disk.stats["has_refused"] += 1          # a rank lacks it (lost, damaged, evicted there)
              return None
          size = align_up(pt.n)
@@ -1120,7 +1128,7 @@
          if base is None:
              self._sync()
              return None
-@@ -1645,9 +2032,13 @@
+@@ -1653,9 +2040,13 @@ class MultiDecoder:
                f"{time.perf_counter() - t:.1f}s{'' if ok else ' (not finished)'}", flush=True)
  
      # -- room --------------------------------------------------------------------------------------------------------------
@@ -1136,7 +1144,7 @@
              used = max([used] + [j.point.n for j in self.disk.pending if j.where is x and j.next < len(j.new)])
          if getattr(x, "loading", None) is not None:      # a stored prompt being read into it (``_start_load``)
              used = max(used, x.loading.n)
-@@ -1661,63 +2052,231 @@
+@@ -1669,6 +2060,8 @@ class MultiDecoder:
          """Both ranks: relocate extent x (its used rows copied) to [base, base + size). A stored prompt being read into
          it goes on: its next blocks land at the new base, after the rows' copy (``BlockStore.moving``)."""
  
@@ -1145,11 +1153,10 @@
          used = self._used(x)
          h = getattr(x, "loading", None)
          with self.disk.moving(h.lj) if h is not None and h.lj is not None else contextlib.nullcontext():
-             old = self.pool.move(x, base, size)
-             self.arena.copy(old, base, used)
-+        if x.owner is not None:
-+            self.lanes[x.owner].st.bind(x.base, x.size)
-+
+@@ -1677,55 +2070,221 @@ class MultiDecoder:
+         if x.owner is not None:
+             self.lanes[x.owner].st.bind(x.base, x.size)
+ 
 +    def _carry(self, src: int, dst: int, n: int, kind: str) -> None:
 +        """Both ranks: tokens [src, src + n) of an extent in one part into [dst, dst + n) in another (``Arena.carry``:
 +        the two owners send and receive, every rank copies what it holds whole), counted for /health and, from
@@ -1202,9 +1209,9 @@
 +            raise RuntimeError(f"rank {self.rank}: XMOVE of extent {x.eid} carries {used} rows of {size}")
 +        old = self.pool.move(x, base, size, cross=True)
 +        self._carry(old, base, used, "live")
-         if x.owner is not None:
-             self.lanes[x.owner].st.bind(x.base, x.size)
- 
++        if x.owner is not None:
++            self.lanes[x.owner].st.bind(x.base, x.size)
++
 +    def _untwin(self, lane: Lane) -> None:
 +        """Both ranks: the lane's twin rows back to the pool; its prompt fills on as sharded (the owner holds every row
 +        the twin did)."""
@@ -1256,18 +1263,13 @@
 -        return [c for c in self.kept if c.extent.owner is None and id(c.extent) not in keep]
 +        return [c for c in self.kept if c.extent.owner is None and id(c.extent) not in keep
 +                and (half is None or not self.pool.half or self.pool.half_of(c.extent) == half)]
- 
--    def _compact(self, grow=None) -> None:
--        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
--        ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
--        follows ``grow`` (each extent moves once at most)."""
++
 +    def _eviction_cost(self, need: int, protect, half: int):
 +        """Rank 0, with halves: evicting the least recently used kept prompts of ``half`` until it has ``need`` free
 +        rows, the place in the kept order (the recency) of the newest one that takes: -1 when none is needed, None
 +        when even all of them leave too little. An extent's rows come free as ``_settle`` frees them, in its segment
 +        (the rows between pinned twins: compaction gathers no further)."""
- 
--        at = 0
++
 +        segs, free = self.pool.segments(half), self.pool.segment_free(half)
 +        if max(free, default=0) >= need:
 +            return -1
@@ -1286,7 +1288,8 @@
 +            if max(free) >= need:
 +                return i
 +        return None
-+
+ 
+-    def _compact(self, grow=None) -> None:
 +    def _cheaper_half(self, need: int, protect) -> int | None:
 +        """Rank 0, with halves: the half where making ``need`` rows evicts only older kept prompts (the newest one it
 +        takes less recently used), so a placement evicts as little, and as old, as one pool would."""
@@ -1295,8 +1298,11 @@
 +        return min(costs)[1] if costs else None
 +
 +    def _compact(self, grow=None, half: int | None = None) -> None:
-+        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
-+        ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
+         """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
+         ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
+-        follows ``grow`` (each extent moves once at most)."""
+-
+-        at = 0
 +        follows ``grow`` (each extent moves once at most). With halves (TF_GLM_KV_SHARD): within ``half`` (grow's),
 +        around the pinned twins (a filling prompt's borrowed rows): they stay where they are, and what slides stays
 +        on its side of each, so a segment's free rows are what gathers."""
@@ -1352,9 +1358,10 @@
          ``protect``'s extents) only while the free rows fall short of ``need``, then compacting if they are not
          together: moving rows costs far less than prefilling an evicted conversation again. None if even evicting
 -        every other kept prompt leaves too little."""
-+        every other kept prompt leaves too little (with halves: in any part, in which case none is evicted)."""
- 
+-
 -        base = self.pool.place(need)
++        every other kept prompt leaves too little (with halves: in any part, in which case none is evicted)."""
++
 +        base = self.pool.place(need, half=half)
 +        if base is None and self.pool.half and self._revoke_twins(half):
 +            base = self.pool.place(need, half=half)
@@ -1384,7 +1391,7 @@
          return base
  
      def _grow(self, x, size: int, protect=()) -> bool:
-@@ -1733,18 +2292,109 @@
+@@ -1741,19 +2300,110 @@ class MultiDecoder:
                  self._emit(GROW, [x.eid, size])
                  self._resize(x, size)
                  return True
@@ -1406,7 +1413,7 @@
              if not victims:
                  return False
              self._evict(victims[0])
-+
+ 
 +    def _legal(self, lane: Lane, part: int) -> bool:
 +        """Rank 0: whether live stream ``lane`` (in ``part``) may move now: nothing pins its rows (``_pins``) and it has
 +        not moved for ``RELOCATE_HOLD`` rounds."""
@@ -1494,10 +1501,11 @@
 +            self._refused(why)
 +        lane.xwhy = why
 +        return False
- 
++
      # -- iterations ---------------------------------------------------------------------------------------------------------
      @torch.no_grad()
-@@ -1828,8 +2478,14 @@
+     def round(self) -> list[Stream]:
+@@ -1836,8 +2486,14 @@ class MultiDecoder:
              return [lane.s] if lane.s.done else []
          lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
          t_begin = time.perf_counter()
@@ -1513,7 +1521,7 @@
          active = [l for l in lanes if not l.paused]
          if not active:
              done = []
-@@ -2066,6 +2722,8 @@
+@@ -2074,6 +2730,8 @@ class MultiDecoder:
  
          from .copy_drafts import CopyDrafts
  
@@ -1522,7 +1530,7 @@
          s = lane.s
          prompt = s.prompt
          lane.decoding = True
-@@ -2355,6 +3013,8 @@
+@@ -2363,6 +3021,8 @@ class MultiDecoder:
              for retired in pending.retired - {sid}:
                  self._finish(retired)
          lane = self.lanes.pop(sid)
@@ -1531,7 +1539,7 @@
          x = lane.extent
          x.owner = None
          self._settle(x)
-@@ -2461,8 +3121,16 @@
+@@ -2471,8 +3131,16 @@ class MultiDecoder:
                  self._do_flush(p)
              elif op == MOVE:
                  self._move(self.pool.get(p[0]), p[1], p[2])
@@ -1548,9 +1556,11 @@
              elif op == FILL:
                  lane = self.lanes[p[0]]
                  if p[1] != self._stop_bound(lane, p[1]):
+diff --git tensorfold/families/glm5_next/cuda/multi_prefill.py tensorfold/families/glm5_next/cuda/multi_prefill.py
+index 474753d..be1112e 100644
 --- tensorfold/families/glm5_next/cuda/multi_prefill.py
 +++ tensorfold/families/glm5_next/cuda/multi_prefill.py
-@@ -113,7 +113,7 @@
+@@ -113,7 +113,7 @@ class PieceMixer:
      def __call__(self, layer, done: tuple[int, int] | None = None):
          from . import prof
          from .forward import chunks_for, dsa_front, dsa_rows, kda_front, kda_rows, out_proj, undone
@@ -1559,7 +1569,7 @@
  
          w, b, R = self.w, self.b, self.R
          if layer.kind == "kda":
-@@ -136,7 +136,9 @@
+@@ -136,7 +136,9 @@ class PieceMixer:
                  st = p.st
                  di = st.dsa_index[layer.index]
                  dsa_rows(a, w, st.kc[di], st.pos_dev, b, p.rows, chunks_for(st, p.rows),
@@ -1570,9 +1580,11 @@
              o = b.vn[:R].view(R, a.heads * c.v_dim)
              return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
  
+diff --git tensorfold/families/glm5_next/cuda/pool.py tensorfold/families/glm5_next/cuda/pool.py
+index 2f39307..7f04340 100644
 --- tensorfold/families/glm5_next/cuda/pool.py
 +++ tensorfold/families/glm5_next/cuda/pool.py
-@@ -33,13 +33,20 @@
+@@ -33,13 +33,20 @@ class Plane:
      past the last token's. ``spanned``: in the display reservation's span (``display_kv``), whose two registrations
      a memcpy may not cross, so its rows move by a kernel."""
  
@@ -1594,7 +1606,7 @@
          return self.tensor[base // self.div:(base + size) // self.div + self.pad]
  
  
-@@ -50,7 +57,12 @@
+@@ -50,7 +57,12 @@ class Arena:
          self.rows = int(rows)
          self.planes = planes
          for p in planes:
@@ -1608,7 +1620,7 @@
              if p.tensor.shape[0] != want:
                  raise ValueError(f"a plane of {p.tensor.shape[0]} rows over {self.rows} tokens (div {p.div}, pad "
                                   f"{p.pad}): want {want}")
-@@ -77,44 +89,112 @@
+@@ -77,44 +89,112 @@ class Arena:
          if min(src, dst) < 0 or max(src, dst) + n > self.rows:
              raise ValueError(f"a copy of {n} tokens from {src} to {dst} reaches outside the arena's {self.rows}")
          for p in self.planes:
@@ -1637,18 +1649,15 @@
 +        on the span itself) and a rank that owns neither (TP3 and up) has nothing to do for them. A collective of the
 +        two owners: every rank calls it with the same arguments in the same order (rank 0 flushes the op that names
 +        it first, so the others are in it when it sends); the source's rows stay."""
- 
--def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
--    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
++
 +        if n <= 0:
 +            return
 +        if min(src, dst) < 0 or max(src, dst) + n > self.rows:
 +            raise ValueError(f"a carry of {n} tokens from {src} to {dst} reaches outside the arena's {self.rows}")
 +        from . import shard
  
--    def put(dst, src):
--        if spanned:                        # the same bytes through an elementwise kernel
--            import torch
+-def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
+-    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
 +        so, do = shard.owner(src), shard.owner(dst)
 +        if so == do:                         # one part: no rows to send
 +            return self.copy(src, dst, n)
@@ -1667,12 +1676,15 @@
 +            elif shard.RANK == do:
 +                shard.recv_rows(nc, so, _byte_rows(p, shard.local(dst), n), p.spanned)
  
--            torch.bitwise_or(src.view(torch.uint8), 0, out=dst.view(torch.uint8))
--        else:
--            dst.copy_(src)
+-    def put(dst, src):
+-        if spanned:                        # the same bytes through an elementwise kernel
+-            import torch
 +    def sharded_bytes(self, n: int) -> int:
 +        """Bytes ``carry`` of ``n`` tokens sends between the two owners (the sharded planes' rows)."""
  
+-            torch.bitwise_or(src.view(torch.uint8), 0, out=dst.view(torch.uint8))
+-        else:
+-            dst.copy_(src)
 +        return sum(n * p.tensor[0].numel() * p.tensor.element_size() for p in self.planes if p.shard)
 +
 +
@@ -1701,7 +1713,7 @@
 +
 +def _move(t, a: int, b: int, m: int, spanned: bool = False) -> None:
 +    """t[b:b + m] = t[a:a + m] (rows), safe when they overlap; ``spanned``: by a kernel, not a memcpy."""
-+
+ 
      gap = abs(a - b)
      if gap >= m:
 -        put(t[b:b + m], t[a:a + m])
@@ -1732,7 +1744,7 @@
  
      @property
      def end(self) -> int:
-@@ -128,10 +208,16 @@
+@@ -128,10 +208,16 @@ class Pool:
      """Extents over ``rows`` pool rows, host side only. Placement is lowest base first; every call is deterministic
      in the calls before it, so two ranks making the same calls hold the same extents."""
  
@@ -1750,7 +1762,7 @@
          self.extents: list[Extent] = []           # by base
          self.next_id = 0
  
-@@ -149,24 +235,108 @@
+@@ -149,24 +235,108 @@ class Pool:
              at = max(at, x.end)
          if at < self.rows:
              out.append((at, self.rows - at))
@@ -1772,7 +1784,7 @@
 +                    base = stop
 +            out = cut
 +        return out
- 
++
 +    def half_of(self, x) -> int:
 +        """The half extent (or pool row) ``x`` lies in (0 without halves)."""
 +        base = x if isinstance(x, int) else x.base
@@ -1791,7 +1803,7 @@
 +        """The lowest base with ``size`` free rows (``ignore``'s rows free), or None. With halves: in ``half``, or
 +        else in the half with fewer live streams first (each row's owner computes its decode attention, so the ranks'
 +        shares of that stay even), then the one with more free rows."""
-+
+ 
          size = align_up(size, self.align)
 -        for base, n in self.gaps(ignore):
 -            if n >= size:
@@ -1870,7 +1882,7 @@
          return nxt - x.end
  
      def get(self, eid: int) -> Extent:
-@@ -176,15 +346,18 @@
+@@ -176,15 +346,18 @@ class Pool:
          raise KeyError(f"no extent {eid}")
  
      # -- changes -------------------------------------------------------------------------------------------------
@@ -1892,7 +1904,7 @@
          self.next_id += 1
          self.extents.append(x)
          self.extents.sort(key=lambda y: y.base)
-@@ -204,15 +377,21 @@
+@@ -204,15 +377,21 @@ class Pool:
              raise ValueError("an extent keeps at least one aligned block")
          x.size = size
  
@@ -1916,9 +1928,11 @@
          old = x.base
          x.base, x.size = base, size
          self.extents.sort(key=lambda y: y.base)
+diff --git tensorfold/families/glm5_next/cuda/segments.py tensorfold/families/glm5_next/cuda/segments.py
+index b8361aa..afea97e 100644
 --- tensorfold/families/glm5_next/cuda/segments.py
 +++ tensorfold/families/glm5_next/cuda/segments.py
-@@ -55,7 +55,7 @@
+@@ -55,7 +55,7 @@ class SegRows:
          self.rows, self.max_segs = rows, max_segs
          self.ring = ring
          self.ring_rows = ring if ring is not None else self.NO_RING
@@ -1927,7 +1941,7 @@
          pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
          self.host = torch.zeros((n,), dtype=torch.int32, pin_memory=pin)
          self.dev = torch.zeros((n,), dtype=torch.int32, device=device)
-@@ -63,6 +63,13 @@
+@@ -63,6 +63,13 @@ class SegRows:
          o = 5 * rows
          self.seg_start, self.seg_rows, self.seg_pbase, self.seg_pools = (
              self.dev[o + i * max_segs:o + (i + 1) * max_segs] for i in range(4))
@@ -1941,7 +1955,7 @@
          self.staged = torch.cuda.Event() if pin else None
          self.R = 0
          self.segments: list[tuple[int, int, int]] = []
-@@ -78,7 +85,13 @@
+@@ -78,7 +85,13 @@ class SegRows:
          if R > self.rows:
              raise ValueError(f"a window of {R} rows, the tables hold {self.rows}")
          rows, S = self.rows, self.max_segs
@@ -1956,7 +1970,7 @@
          r = 0
          for s, seg in enumerate(segments):
              base, pos, n = seg[:3]
-@@ -99,6 +112,12 @@
+@@ -99,6 +112,12 @@ class SegRows:
                  t[2 * rows + r + i] = s
                  t[3 * rows + r + i] = int(sparse_from is not None and q >= sparse_from)
                  t[4 * rows + r + i] = ibase
@@ -1969,6 +1983,9 @@
              last = pos + n - 1
              o = 5 * rows
              t[o + s] = r
+diff --git tensorfold/families/glm5_next/cuda/shard.py tensorfold/families/glm5_next/cuda/shard.py
+new file mode 100644
+index 0000000..9b7dcf0
 --- /dev/null
 +++ tensorfold/families/glm5_next/cuda/shard.py
 @@ -0,0 +1,644 @@

@@ -5,7 +5,7 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
-- **KV sharding** (patch `0118-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
+- **KV sharding** (patch `0129-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
   Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): each
   conversation's MLA latent cache is stored once, on the Spark that owns it,
   instead of on every Spark (tensor parallelism splits the heads, but every head reads the whole latent). The owner
@@ -18,7 +18,8 @@ Every change to this recipe, newest first. Each release names the image it serve
   or evicts kept conversations while another part has room: its rows are carried there (`TF_GLM_KV_SHARD_CARRY`,
   on; only when it saves a recompute, an eviction or a pause, never to even out the parts). The same shard code serves
   the tp4 branch (own-row front, microbatching, a carry relayed over a switchless ring's neighbour links); two Sparks
-  and four (tp4, on a ring) tested, three untested. Builds on `0110` and `0111`. CPU checks: `tools/kv_shard_check.py`, `tools/kv_shard_mutants.sh`.
+  and four (tp4, on a ring) tested, three untested. The staging buffers a prompt's history fetch keeps (`shard._grown`) are outside the start-up
+  estimate. Builds on `0128` and `0119` (renumbered from `0118`, which #216 uses). CPU checks: `tools/kv_shard_check.py`, `tools/kv_shard_mutants.sh`.
 
 - **A rewound conversation keeps its id** (patch `0119-glm-chat-continued`, by
   Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): patch
