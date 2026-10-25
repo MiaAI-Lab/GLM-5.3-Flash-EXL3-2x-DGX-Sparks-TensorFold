@@ -5,7 +5,7 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
-- **A rewound conversation keeps its id** (patch `0111-glm-chat-continued`, by
+- **A rewound conversation keeps its id** (patch `0119-glm-chat-continued`, by
   Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): patch
   `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
   client rewinding before the kept turns (issue #104, @danielbanu), a state read back from the spill tier, or dropped
@@ -16,7 +16,9 @@ Every change to this recipe, newest first. Each release names the image it serve
   while six chats fill the cache: before, its states went under 3 ids; after, 1, holding 2 states as asked; replies
   the same drafted and with `draft:false`. New counters `chats_continued`, `chats_continued_prefill_tokens` (`/health`,
   `/metrics`) and a rank-0 log line for one prefilling 4096 tokens or more, with where the prompt left the kept state
-  and what it resumed from. CPU check: `tools/chat_continued_check.py` (fails on the unpatched engine).
+  and what it resumed from. Two sessions with the same opening message and the same first reply (temperature 0)
+  cannot be told apart by this match and share an id. CPU check: `tools/chat_continued_check.py` (fails on the
+  unpatched engine; also runs `_admitted` itself and the `chat_roots` pruning).
 - **`prepare.sh` warns when a node's NVIDIA CDI device cannot be confirmed** (by
   [SvangenStudios](https://github.com/SvangenStudios), [pull request #207](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/207),
   issue #150): without the host's CDI spec, a `systemctl daemon-reload` can remove the GPU from a running container's
