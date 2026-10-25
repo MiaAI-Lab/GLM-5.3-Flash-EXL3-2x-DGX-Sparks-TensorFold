@@ -63,7 +63,7 @@ run follower-copies $MU "                self._carry(hit.extent.base, x.base, cu
 # the transport: the rows, byte for byte, between the two owners only
 run carry-cut-minus-1 $PO "shard.send_rows(nc, do, _byte_rows(p, shard.local(src), n), p.spanned)" "shard.send_rows(nc, do, _byte_rows(p, shard.local(src), n - 1), p.spanned)" \
     $PO "shard.recv_rows(nc, so, _byte_rows(p, shard.local(dst), n), p.spanned)" "shard.recv_rows(nc, so, _byte_rows(p, shard.local(dst), n - 1), p.spanned)"
-run skip-replicated-copy $PO "                _move(p.tensor, a, b, min(-(-n // p.div), p.tensor.shape[0] - max(a, b)), p.spanned)\n            elif shard.RANK == so:" "                pass\n            elif shard.RANK == so:"
+run skip-replicated-copy $PO "                _move(p.tensor, a, b, min(-(-n // p.div), p.tensor.shape[0] - max(a, b)), p.spanned)\n            elif relay:" "                pass\n            elif relay:"
 run bystander-receives $PO "            elif shard.RANK == do:\n                shard.recv_rows" "            else:\n                shard.recv_rows"
 run span-send-by-memcpy $SH "        put_rows(buf[:k], rows[i:i + k], spanned)" "        put_rows(buf[:k], rows[i:i + k], False)"
 run span-recv-by-memcpy $SH "        put_rows(rows[i:i + k], buf[:k], spanned)" "        put_rows(rows[i:i + k], buf[:k], False)"
@@ -110,7 +110,7 @@ run ms-own-side-only $MU "        if self.w.world > 2:\n            ms = max(" "
 run ms-gathered-at-two-ranks $MU "        if self.w.world > 2:\n            ms = max(" "        if self.w.world > 1:\n            ms = max("
 # TP3 warm-up
 run warm-not-called $EN "            shard.warm(self.comm, w.device)         # (TP3 and up: the pairs' send/recv connections now, not at a carry)\n" ""
-run warm-at-two-ranks $SH "    if WORLD < 3:\n        return\n    nc = " "    if WORLD < 2:\n        return\n    nc = "
+run warm-at-two-ranks $SH "    if WORLD < 3 or not carry_on() or relayed(nc):" "    if WORLD < 2 or not carry_on() or relayed(nc):"
 run warm-pairs-reversed $SH "        for b in range(a + 1, WORLD):" "        for b in range(WORLD - 1, a, -1):"
 run warm-both-send-first $SH "            elif RANK == b:\n                _recv(nc, got, a, stream)\n                _send(nc, out, a, stream)" "            elif RANK == b:\n                _send(nc, out, a, stream)\n                _recv(nc, got, a, stream)"
 run import-per-piece $SH "    w = rows.view(torch.int32)\n    nc._check(nc.lib.ncclSend(" "    from tensorfold.cuda.comm import _DTYPES\n\n    w = rows.view(torch.int32)\n    nc._check(nc.lib.ncclSend("
