@@ -2,7 +2,7 @@
 # Maintainers: write zig/patches/*.patch and zig/aot/glm-aot-sm121.tar.xz from the Zig GLM port's branch, then check that
 # the patches, applied in filename order with git apply to a fresh TensorFold TF_REF tree, give exactly the branch's files
 # (minus the notes, capture tools and kernel set listed below).
-#   tools/make-zig-patches.sh <Zig port checkout> [branch, default r107-int] [base ref, default v1.0.7]
+#   tools/make-zig-patches.sh [--force] <Zig port checkout> [branch, default r107-int] [base ref, default v1.0.7]
 # The port is TensorFold's Zig engine (tensorfold-native, ashhart/TensorFold) plus the Flash Next Zig CUDA base and the
 # GLM engine on top. Each file lands in exactly one patch, by path:
 #   0001 shared runtime   every file the port modifies (lane host, native/cuda, server, build)
@@ -13,9 +13,19 @@
 # Not shipped: notes-glm/, tools/ (capture and reference harnesses), the port's HANDOFF/REPORT files, and the captured
 # Triton kernel set zig/tests/cuda/glm_p1/aot, which goes out as zig/aot/glm-aot-sm121.tar.xz (cubins captured on a GB10
 # from the Python engine; it cannot be rebuilt without a GPU and the reference engine).
+# It writes 0001-0005 only and removes every zig/patches/*.patch first, so it refuses while any patch after 0005 is there
+# (0006-0016, the three 0014 base fixes among them, are hand-written patches; 0017 and later are scripts/port-patches.sh's
+# export of the engine's port commits): --force deletes them too.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
-repo=$(readlink -f "${1:?usage: tools/make-zig-patches.sh <Zig port checkout> [branch] [base ref]}")
+force=0
+if [[ "${1:-}" == --force ]]; then force=1; shift; fi
+later=$(cd zig/patches && LC_ALL=C ls -1 -- *.patch 2>/dev/null | awk -F- '$1 ~ /^[0-9]+$/ && $1 + 0 > 5' | tr '\n' ' ') || true
+if [[ -n "$later" ]] && (( ! force )); then
+  echo "zig/patches holds patches after 0005: ${later% }. This tool writes 0001-0005 only and removes every *.patch first, so it would delete them (0006-0016, the three 0014 base fixes among them, are hand-written patches; 0017 and later are scripts/port-patches.sh's export). Move them aside and put them back after (rebased on the new 0001-0005), or pass --force to delete them; nothing was changed" >&2
+  exit 1
+fi
+repo=$(readlink -f "${1:?usage: tools/make-zig-patches.sh [--force] <Zig port checkout> [branch] [base ref]}")
 branch=${2:-r107-int}
 base=${3:-v1.0.7}
 out=$PWD/zig

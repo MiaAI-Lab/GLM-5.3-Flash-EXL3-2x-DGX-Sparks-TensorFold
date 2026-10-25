@@ -389,6 +389,17 @@ than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that 
 under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and credits: `NOTICE`,
 `CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to TensorFold itself.
 
+The measurements above are the Python engine's. With `ENGINE=zig` (the default) the tier writes the prompt cache's kept
+states, so it also needs `PROMPT_CACHE_GIB` above 0 and DFlash2 drafts: `./start.sh` refuses `SPILL_GIB` without them,
+and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)). Its files
+are root's, not yours: the ranks run as root and the Zig tier keeps them readable by root only, so removing them takes
+`sudo`. Robert's spill v2 (`SPILL_V2=1`, `zig/patches/0018`-`0023`, off by default) writes every kept state when it is
+kept, in 2,048-token blocks a conversation's turns share, reads it back beside decoding and survives a crash; it also
+runs with KV sharding (`KV_SHARD=1`). Both need the prompt cache's room: at the default `KV_POOL_GIB` its budget is 0,
+so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with:
+a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on, whose pinned staging comes first; `./start.sh` warns when
+`PROMPT_CACHE_GIB` is set without `KV_POOL_GIB`).
+
 ## Worker weights over NFS
 
 By default the worker keeps its own copy of the checkpoint and DFlash2 (~166 GiB, copied over the link by
@@ -973,6 +984,10 @@ with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) ([Performance](#perform
 | `tools/test_queued_cancellation.py --source-root DIR` | patch 0073's checks on the CPU, against TensorFold's source with the patches applied (no GPU, no server): requests that wait while every slot is busy and whose client leaves are dropped at once, in queue order; `--expect-stock` before 0073 shows the old wait |
 | `tools/end_of_turn.py [label] [max_cut]` | 8 short French coding prompts, thinking off: counts the replies that run to `max_tokens` (48 requests) and measures P(end of turn) right after each reply's closing code fence; exit 1 above `max_cut` cut replies (default 4) |
 | `tools/prompt_reuse.py [size]` | a ~33k-token conversation takes three more turns, each after a request of another conversation with the same system prompt (an agent and its sub-agents); exit 1 when a turn resumes less than 90% of its prompt. Needs `PARALLEL` above 1 |
+| `tools/exact.py record --out A.json` / `compare A.json B.json` | `ENGINE=zig`: greedy replies of one image against another by token hash (cold sizes to 100k, resumes, eight streams against the same eight alone, three interleaved conversations); record the second with `--like A.json`. Cases past the window (`CONTEXT`) are left out |
+| `tools/spill_check.py`, `tools/resume_bench.py` | `ENGINE=zig`, for Robert's spill v2 port (`zig/patches/0018`-`0023`): restores from disk proven by the tier's counters and equal to a baseline (eviction, damaged files, a cancel, two at once, a restart, `kill -9`, the free-disk floor); cold / memory / disk time to first token. Prompts capped to `CONTEXT`. `spill_check.py`'s `--sudo`, `--rank0-shell` / `--rank1-shell`, `--resolve-cmd` and `--kill-cmd` are operator-only (off unless given): they run file operations as root, commands on a worker, and command lines through the local shell (`--kill-cmd` kills the ranks), so pass them only on a machine you operate, never values from anyone else. Its file operations refuse a path outside the spill root and never follow a symlink |
+| `tools/prefix_fanout.py` | `ENGINE=zig` with `PROMPT_CACHE_GIB` above 0: a shared system prompt fanned out at 1, 2, 4 and 8 streams; `--expect-one-fill` checks the prefix is computed once at every level (the Zig engine fills one prompt at a time, which is why the Python fork's prefix wait is not ported) |
+| `tools/selftest.py` | the four tools above against `tools/fake_server.py`, on any machine (no GPU, no server): each must pass on a correct fake and fail on one with the fault it exists to catch |
 
 ## Repository layout
 
@@ -984,12 +999,14 @@ start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a swit
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
-              banner.sh (start.sh's banner)
+              banner.sh (start.sh's banner), port.sh (Robert's spill / KV-shard settings), port-patches.sh
+              (zig/patches/0017 and later from the engine's port commits)
 patches/      patches baked into the image
 tests/        CPU tests (cpu/, scripts/test-cpu.sh) and GPU tests (gpu/, scripts/test-gpu.sh) of patches 0098-0109
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a
-              full pool), patches 0072's, 0073's and 0074's checks, and make-patches.sh (patches/ from a development
-              tree with a commit a patch)
+              full pool; exact, spill, resume and fan-out checks with selftest.py and a fake server), patches 0072's,
+              0073's and 0074's checks, make-patches.sh (patches/ from a development tree with a commit a patch) and
+              make-zig-patches.sh (zig/patches/0001-0005)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
