@@ -4,11 +4,12 @@
 # pinned ring between rounds, so it survives an eviction, a restart and a crash. Room goes by conversation: old turns,
 # abandoned forks, whole conversations, shared prefixes last; an optional per-conversation quota; the free-disk
 # floor. Reads beside decoding, after every rank says it holds the state (HAS): reader threads read and check blocks
-# into pinned slots, the engine copies them between rounds (TF_GLM_SPILL_LOAD_MS; LOADPART takes rank 1 as far). Rows
-# copied to host memory before they go have their own cap (TF_GLM_SPILL_RELEASE_MIB); one engine a folder and rank
-# (a flock: a second runs without the tier, the one-stream store's too); temporary files O_EXCL | O_NOFOLLOW. A
-# request whose prefix another one is still prefilling can wait for that state (TF_GLM_PREFIX_WAIT=1, off by
-# default). New tensorfold/cuda/spill_blocks.py (no model code).
+# into pinned slots, the engine copies them between rounds (TF_GLM_SPILL_LOAD_MS; LOADPART takes rank 1 as far). What
+# waits for the writer in host memory (rows freed before their write, a keep's small state and the block its end
+# cuts) has its own cap, checked before the copy (TF_GLM_SPILL_RELEASE_MIB); one engine a folder and rank (a flock: a
+# second runs without the tier, the one-stream store's too); temporary files O_EXCL | O_NOFOLLOW. A request whose
+# prefix another one is still prefilling can wait for that state (TF_GLM_PREFIX_WAIT=1, off by default). New
+# tensorfold/cuda/spill_blocks.py (no model code).
 # Block layout, lineage, write-at-keep ring, release and fsync order: PR #118 by @BadAd84; eviction by conversation
 # for issue #122, reported by @xiepengqi; the rest by Robert Wojciechowski (GitHub @wojo, X @rwojo). Builds on
 # 0088-glm-spill-tier. Apache-2.0.
@@ -97,10 +98,10 @@ index 40ed4e6..a1c471e 100644
              raise RuntimeError(f"--snapshot-dir {cfg.root}: rank(s) {bad} cannot use it"
 diff --git tensorfold/cuda/spill_blocks.py tensorfold/cuda/spill_blocks.py
 new file mode 100644
-index 0000000..fd866fa
+index 0000000..5170f0a
 --- /dev/null
 +++ tensorfold/cuda/spill_blocks.py
-@@ -0,0 +1,1804 @@
+@@ -0,0 +1,1827 @@
 +"""The spill tier's block store for a shared pool of cache rows (``tensorfold serve --spill-gib`` with several streams):
 +every kept prompt state is written to this rank's disk when it is kept, so it survives an eviction, a restart and a
 +crash, and a later request that extends the same tokens reads it back instead of prefilling them.
@@ -137,9 +138,10 @@ index 0000000..fd866fa
 +
 +One engine a folder and rank: the store holds ``spill.hold``'s lock on ``<root>/.lock-rank<rank>`` while it runs; a
 +second engine there (any build) gets ``spill.Busy`` before it reads, prunes or writes anything, and runs without the
-+tier. Temporary files are opened O_EXCL | O_NOFOLLOW (``_open_new``). Rows ``release`` copies to pageable host memory
-+(and the block a keep cuts) count against ``release_cap`` (TF_GLM_SPILL_RELEASE_MIB): on a unified-memory GPU that
-+memory is the pool's and the reserve's, so past it a state whose rows go before they are written is not stored.
++tier. Temporary files are opened O_EXCL | O_NOFOLLOW (``_open_new``). Rows ``release`` copies to pageable host memory,
++and a keep's own copies (its small state and the block its end cuts), count against ``release_cap``
++(TF_GLM_SPILL_RELEASE_MIB) before they are made: on a unified-memory GPU that memory is the pool's and the reserve's,
++so past it a state is not stored.
 +
 +Room. The tier holds at most ``--spill-gib`` a rank and never leaves less than ``--spill-min-free-gib`` free on its
 +file system. When either needs room, points go in this order (blocks go once no point names them):
@@ -242,11 +244,11 @@ index 0000000..fd866fa
 +
 +
 +def release_cap() -> int:
-+    """TF_GLM_SPILL_RELEASE_MIB: the most bytes of rows copied to pageable host memory that wait for the writer
-+    (``release``, and the block a kept state's end cuts). On a unified-memory GPU that memory is the pool's and the
-+    reserve's, so by default an eighth of ``capacity.reserve_bytes`` (``TENSORFOLD_MEMORY_RESERVE_GIB``, else a tenth of
-+    the memory, at least 4 GiB). 0: ``release`` copies nothing (a state whose rows go before they are written is not
-+    stored)."""
++    """TF_GLM_SPILL_RELEASE_MIB: the most bytes copied to pageable host memory that wait for the writer (``release``'s
++    rows, and a kept state's small state and the block its end cuts). On a unified-memory GPU that memory is the pool's
++    and the reserve's, so by default an eighth of ``capacity.reserve_bytes`` (``TENSORFOLD_MEMORY_RESERVE_GIB``, else a
++    tenth of the memory, at least 4 GiB). 0: nothing is copied, so no state is stored (every keep copies its small
++    state)."""
 +
 +    raw = str(os.environ.get("TF_GLM_SPILL_RELEASE_MIB", "") or "").strip()
 +    if raw:
@@ -536,6 +538,7 @@ index 0000000..fd866fa
 +    def __init__(self, point: Point, new: list, small: tuple, size: int, where, ids_bytes: bytes) -> None:
 +        self.point, self.new, self.size, self.where = point, new, size, where
 +        self.small = small                                  # (items, layer): its tensors on the host
++        self.small_host = 0                                 # their bytes, in the store's host_bytes until written
 +        self.ids_bytes = ids_bytes
 +        self.cut: list[str] = []                           # its tail block, copied to the host at keep (``persist``)
 +        self.next = 0
@@ -897,8 +900,9 @@ index 0000000..fd866fa
 +        at its extent's rows [base, base + n): its small state (``obj``'s fields, ``spill.encode``) and the block its
 +        end cuts copied to the host now, its other blocks this disk lacks left in the pool and queued (``pump`` stages
 +        them, the writer writes them). Ids stored or on their way already are not written again; kept again as a
-+        shared prefix, their point becomes one (its json rewritten on the writer). Returns what happened ("queued",
-+        "stored", "no_space", "backlog")."""
++        shared prefix, their point becomes one (its json rewritten on the writer). The two host copies count in
++        ``host_bytes`` against ``release_cap`` before they are made; past it the state is not stored. Returns what
++        happened ("queued", "stored", "no_space", "backlog", "release_cap")."""
 +
 +        t0 = time.perf_counter()
 +        ids = np.asarray(ids, dtype=np.int64)
@@ -933,10 +937,19 @@ index 0000000..fd866fa
 +        with self.lock:
 +            new = [(s, e, h) for s, e, h in hashes if h not in self.have and h not in self.inflight]
 +        items, layer = _sp.encode(obj, skip=skip)
-+        items = [(k, _host(t)) for k, t in items]          # (serialized on the writer thread)
-+        small_n = sum(t.numel() * t.element_size() for _, t in items) + 4096
++        small_host = sum(t.numel() * t.element_size() for _, t in items)   # (copied to the host below, if it fits)
++        small_n = small_host + 4096
 +        size = sum(_span_bytes(self.planes, s, e) for s, e, _ in new)
 +        need = size + small_n + 8 * n * (2 if tokens is not None else 1)
++        # the block the state's end cuts (a tail): its last pooled-key row is still filling, and the stream goes on
++        # writing it in place, so its rows are copied to the host at the keep (at most one block). That copy and the
++        # small state's count against the release cap before either is made, and before any room is made for them
++        tail = [(s, e, h) for s, e, h in new[-1:] if e - s < self.block]
++        host = small_host + sum(_span_bytes(self.planes, s, e) for s, e, _ in tail)
++        with self.lock:
++            if self.host_bytes + host > self.release_cap:  # (host memory past TF_GLM_SPILL_RELEASE_MIB): not stored
++                self.stats["release_dropped"] += 1
++                return "release_cap"
 +        pt = Point(key, n, ids, None if tokens is None else np.asarray(tokens, dtype=np.int64), lineage,
 +                   [h for _, _, h in hashes], [], [], 0, small_n, bool(shared), bool(head), time.time(), None,
 +                   fields)
@@ -953,20 +966,30 @@ index 0000000..fd866fa
 +            if short > 0 or self.stored() + self.backlog + need > self.cap:
 +                self.stats["no_space"] += 1
 +                return "no_space"
-+        # the block the state's end cuts (a tail): its last pooled-key row is still filling, and the stream goes on
-+        # writing it in place, so its rows are copied to the host now, as they are at the keep (at most one block)
-+        cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in new[-1:] if e - s < self.block]
 +        with self.lock:
 +            if self.backlog + size > BACKLOG:
 +                self.stats["backlog_skipped"] += 1
 +                return "backlog"
++            if self.host_bytes + host > self.release_cap:  # (again, as it is taken)
++                self.stats["release_dropped"] += 1
++                return "release_cap"
 +            self.backlog += size
-+            self.host_bytes += sum(t.numel() * t.element_size() for _, t in cut)   # (at most a block a state)
++            self.host_bytes += host
++        try:
++            items = [(k, _host(t)) for k, t in items]      # (serialized on the writer thread)
++            cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in tail]
++        except BaseException:
++            with self.lock:
++                self.backlog -= size
++                self.host_bytes -= host
++            raise
++        with self.lock:
 +            self.inflight.add(key)
 +            self.inflight.update(h for _, _, h in new)
 +            ids_bytes = ids.tobytes() + (b"" if tokens is None else np.asarray(tokens, dtype=np.int64).tobytes())
 +            job = Job(pt, new[:len(new) - len(cut)], (items, layer), size, extent, ids_bytes)
 +            job.cut = [h for h, _ in cut]
++            job.small_host = small_host
 +            self.waiting[key] = job
 +            self._ref(pt.blocks, 1)
 +        for h, data in cut:                                 # (written before the blocks the pumps stage)
@@ -1278,6 +1301,7 @@ index 0000000..fd866fa
 +        finally:
 +            job.small = None
 +            with self.lock:
++                self.host_bytes -= job.small_host
 +                self.backlog -= job.size
 +                self.inflight.discard(pt.key)
 +                self.inflight.difference_update([h for _, _, h in job.new] + job.cut)
@@ -1952,7 +1976,7 @@ index 4fab28d..84bcf63 100644
      def _spill_rows(self, snap) -> None:
          """Materialize: a snapshot without saved rows gets views of the live caches it owns (``_saved_views``)."""
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 46df2bd..ef76005 100644
+index e6de0c9..916bf51 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
 @@ -34,6 +34,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
@@ -2785,7 +2809,7 @@ index 46df2bd..ef76005 100644
              prestage = getattr(self.decoder, "prestage", None)
              if prestage is not None and id(stream) not in self.staged:
                  self.staged.add(id(stream))
-@@ -2803,7 +2851,7 @@ class GlmScheduler(Scheduler):
+@@ -2805,7 +2853,7 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()

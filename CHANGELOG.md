@@ -5,6 +5,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The spill tier's host-memory cap counts a keep's own copies before it makes them** (patches `0128-glm-spill-blocks`
+  and `0129-glm-kv-shard`, by Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
+  [@rwojo](https://x.com/rwojo) on X); found in the maintainer's review of #124): a kept state copies its small state and
+  the block its end cuts to host memory at the keep, for the writer. The block was counted in `host_bytes` but never
+  checked against `SPILL_RELEASE_MIB`, and the small state was neither counted nor checked, so with
+  `SPILL_RELEASE_MIB=0` twelve small keeps behind a stalled writer still held their blocks and small states. Both are
+  now counted and checked before the copy (and before room is made for the state); past the cap the state is not
+  stored and `/health` `spill.release_dropped` counts it. With KV sharding a rank now counts the rows it holds: `release`
+  counted every plane while the writer gave back only the rank's own, so on the rank without an extent's latent rows
+  `host_mb` grew after every move across parts until the cap refused every write. CPU checks:
+  `tools/spill_blocks_check.py` (8 new, the release cases count the small states), `tools/kv_shard_check.py` (3 new),
+  four new mutants in `tools/spill_blocks_mutants.sh` (two updated), two in `tools/kv_shard_mutants.sh`.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round

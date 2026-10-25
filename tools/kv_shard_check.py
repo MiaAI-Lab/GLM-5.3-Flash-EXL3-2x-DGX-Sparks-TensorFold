@@ -1719,6 +1719,7 @@ import ctypes
 import math
 import os
 import tempfile
+import threading
 
 SH = 4 * 2048                    # a part: 4 pool blocks (rows)
 
@@ -2115,6 +2116,8 @@ def spill_pending_move():
         sp_drain(decs)
         check("10 spill xmove: the writes still waiting when the extent changed part were released to the host first (both ranks)",
               all(w > 0 for w in waiting) and all(d.disk.stats["released_blocks"] > 0 for d in decs))
+        check("10 spill xmove: the host copies are let go once written, on both ranks (release counts the rows a rank holds)",
+              all(d.disk.host_bytes == 0 for d in decs))
         check("10 spill xmove: the extent is in part 1 now and the point records the part its rows were written from (0)",
               all(d.pool.half_of(cs[r].extent) == 1 for r, d in enumerate(decs))
               and all(d.disk.index[S.point_key(ids)].fields.get("half") == 0 for d in decs)
@@ -2132,6 +2135,40 @@ def spill_pending_move():
         shard.RANK = 0
         shard.setup(0, 2, 4096 * 512)
 section("10 spill xmove", spill_pending_move)
+
+
+def spill_host_bytes():
+    # a sharded keep with a cut block: each rank counts against TF_GLM_SPILL_RELEASE_MIB the host copies it makes (the
+    # owner its latent rows and pooled keys, the other rank its pooled keys only), and lets the same bytes go once written
+    n = SB + 6
+    ids = [int(v) for v in np.random.default_rng(9).integers(1, 150000, n)]
+    nc = SimNccl()
+    saved = shard._stream
+    shard._stream = lambda: 0
+    try:
+        ars = [sp_arena(True), sp_arena(True)]
+        decs = [sp_dec(ars[r], r, True, nc) for r in range(2)]
+        gates = []
+        for d in decs:                                  # (the writer held: the copies wait in host memory)
+            g, orig = threading.Event(), d.disk._write_block
+            d.disk._write_block = lambda *a, g=g, orig=orig: (g.wait(30), orig(*a))[1]
+            gates.append(g)
+        sp_fill(ars, 0, 0, n, 31)
+        sp_keep(decs, 0, ids, "boot-5")
+        tail = [S._span_bytes([p for p in ars[r].planes if not p.shard or shard.owner(0) == r], SB, n) for r in (0, 1)]
+        held = [d.disk.host_bytes - d.disk.waiting[S.point_key(ids)].small_host for d in decs]
+        check("10 spill host bytes: a sharded keep's cut block counts the rows each rank copies (the owner more)",
+              held == tail and tail[0] > tail[1] > 0)
+        for g in gates:
+            g.set()
+        sp_drain(decs)
+        check("10 spill host bytes: ... and every byte counted is let go once written, on both ranks",
+              all(d.disk.host_bytes == 0 for d in decs) and all(S.point_key(ids) in d.disk.index for d in decs))
+    finally:
+        shard._stream = saved
+        shard.RANK = 0
+        shard.setup(0, 2, 4096 * 512)
+section("10 spill host bytes", spill_host_bytes)
 
 
 # -- review fixes: the time of a carry, TP3 warm-up, the lone setting, counting at the ADMIT -----------------------------------

@@ -445,9 +445,10 @@ prepared_state() {
 # at /spill; files owned by your user). SPILL_QUOTA: the share of SPILL_GIB one conversation may hold before its own
 # old turns and forks go first (0: none). SPILL_TURNS: the newest states kept on a conversation's path; older turns
 # go as each one is written (each keeps a ~91 MB small part; 2 for heavy agent loops or a small disk, 8+ for chats with
-# deep edits, 0: every turn kept until room is needed). SPILL_RELEASE_MIB: the most MiB of rows copied to host memory
-# while they wait to be written (rows freed or overwritten before their write: on a GB10 that memory is the pool's and
-# the reserve's); unset, an eighth of MEMORY_RESERVE_GIB (1.8 GiB at 14.5); a state past it is not stored. One engine a
+# deep edits, 0: every turn kept until room is needed). SPILL_RELEASE_MIB: the most MiB copied to host memory while it
+# waits to be written (rows freed or overwritten before their write, and each kept state's small part and cut block:
+# on a GB10 that memory is the pool's and the reserve's); unset, an eighth of MEMORY_RESERVE_GIB (1.8 GiB at 14.5); a
+# state past it is not stored (0: none is). One engine a
 # SPILL_DIR on each Spark: a second one finds it locked and runs without the tier.
 # SPILL_HIGHWATER: no longer used (states are written when kept). A clean stop writes what still waits within
 # SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
