@@ -230,6 +230,22 @@ A request body can be up to 96 MiB, so data URLs carry about 70 MB of pictures a
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs.
 `VISION=0` serves text only and leaves the tower's ~1.8 GiB on rank 0 to the cache.
 
+
+### Optional uncapped image count
+
+For long image-bearing conversations, set these in `scripts/local.sh`:
+
+```sh
+export TENSORFOLD_GLM_MAX_IMAGES=0
+export TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS=0
+```
+
+The first setting disables the image-count limit. The second disables the shared image-token budget, so adding images no longer reduces each image's token allowance. Both are independent opt-ins: the defaults remain 50 images and a shared 16,384-token budget. The per-image token cap (2,048 by default) still applies.
+
+Uncapped count does not mean unlimited resource use. The GLM default-count resource budgets remain: 10 MiB encoded per image, 64 MiB encoded per request, 400 MiPixels aggregate, and a 100-second aggregate image-loading deadline. Per-image dimensions/pixels, URL restrictions and the model's context admission checks still apply. Cached images also count toward aggregate pixels. Video settings are unchanged. More images can require more prefill time, memory and context; requests can still be refused by those remaining limits.
+
+See [the validation record](docs/UNCAPPED_IMAGES.md) for the tested workload and its limitations. CPU regression checks: `python3 tools/test_uncapped_images.py --source-root /path/to/patched/source` (numpy and Pillow; no model or GPU needed).
+
 ## What `start.sh` and `scripts/prepare.sh` do
 
 **`./start.sh`** works in five steps, each shown as it runs:
