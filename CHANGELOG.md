@@ -5,6 +5,15 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A request's `cache_salt` isolates its kept prompt states** (patch `0130-glm-cache-salt`, by
+  [BadAd84](https://github.com/BadAd84)): vLLM's `cache_salt` field was ignored, so a request resumed any kept state
+  of its token ids. Benchmarks that salt their cold samples (RigMark sends a fresh salt per cold / replay prefill pair
+  and fails a run whose cold sample reports cached tokens) failed on a server that still held an earlier run's
+  states. A salted request now resumes only states kept under its own salt, and neither reads nor writes the spill
+  store; a malformed salt (not a non-empty string of at most 256 characters) is refused before the stream opens, a
+  `/v1/responses` request's salt reaches the chat completion that runs it, and `/v1/messages` - whose protocol has no
+  salt - refuses it instead of running the request silently unsalted. Unsalted requests and every reply are
+  unchanged. CPU check: `tools/cache_salt_check.py`.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round

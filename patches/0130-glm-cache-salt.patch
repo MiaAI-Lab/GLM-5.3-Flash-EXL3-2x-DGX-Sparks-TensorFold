@@ -1,0 +1,408 @@
+# A request's cache_salt (vLLM's field) isolates its kept prompt states (number 0130; was 0117, renumbered after main
+# took 0109-0129; rebased over 0120-glm-fork-point-shared, which moved the _keep lines this patch edits).
+#
+# vLLM's OpenAI server takes `cache_salt` on chat and completion requests: a request resumes only cached prefixes
+# written under the same salt. Benchmarks rely on it - RigMark (github.com/alexellis/rigmark, protocol 1.2+) sends a
+# fresh random salt with every cold / immediate-replay prefill pair, so reusing a comparison ID cannot warm the next
+# sweep's cold sample, and fails the run when a cold sample reports cached tokens. TensorFold ignored the field and
+# keyed kept states by token ids alone, so a second run of one comparison ID on a server that still held the first
+# run's states (the same process, or the --spill-gib store across restarts) read the cold prompts as hits.
+#
+# 1. app.py: `cache_salt` must be a non-empty string of at most 256 characters when present (vLLM's rule plus a
+#    bound, so a kept state carries a salt of a bounded size), refused before a stream opens (`_check_fields`);
+#    the salt reaches the engine through `engine.request.cache_salt`, beside policy / stop_eos.
+# 2. A kept state carries the salt of the request that kept it (`snap.salt`; rank 1 holds "" for a salted one: it
+#    only needs to know there is one). `_resume` (parallel and serial) matches only states of the request's own salt;
+#    None is unsalted, exactly as before. Shared-prefix points come only from its own salt's kept prompts. A state
+#    kept with the same ids replaces an older one only when both are salted or neither is (`_keep`, `_remember`):
+#    neither resumes the other, so a salted request no longer drops an unsalted conversation's state, nor the other
+#    way round (two salts of the same ids still replace each other: rank 1 knows only that a state is salted).
+# 3. A salted request reads nothing from the spill store (`prestage`, `find`) and a salted state is never written to
+#    it (`_unspillable` / `_unwritable` "salted"): the store keys entries by token ids, which cannot tell salts apart.
+# 4. The salted flag goes to rank 1 as the ADMIT's last value (parallel) or the serial header's last value, so both
+#    ranks decide spill writes and replacements alike, and rank 1's serial resume takes the state as salted as rank 0's.
+# 5. The translated routes (round 2): a /v1/responses request's `cache_salt` passes to the chat completion that runs
+#    it (`responses_translate.PASSED`) instead of being dropped, and /v1/messages - whose protocol has no such field -
+#    refuses it (`anthropic_translate.translate`) rather than running the request silently unsalted.
+# Unsalted requests are unchanged; replies are unchanged (a salt only turns a resume into a fresh prefill of the same
+# ids). CPU check: tools/cache_salt_check.py.
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+@@ -13,6 +13,21 @@
+ from tensorfold.families.glm5_next.prompts import agent_history, effort_tail_enabled, effort_to_tail, thinking_off
+ 
+ 
++def cache_salt(body: Any) -> str | None:
++    """A request's ``cache_salt`` (vLLM's field; 0130): None when absent or null, else the non-empty string of at
++    most 256 characters it must be (anything else is refused before a stream opens, so a kept state carries a salt
++    of a bounded size). A salted request resumes only kept prompt states written by requests with the same salt, and
++    its own states never go to the spill tier (--spill-gib), whose entries are keyed by token ids alone: so a fresh
++    salt is a fresh prefill, as on vLLM. No salt: as before."""
++
++    salt = body.get("cache_salt") if isinstance(body, dict) else None
++    if salt is not None and (not isinstance(salt, str) or not salt):
++        raise RequestError("cache_salt must be a non-empty string")
++    if salt is not None and len(salt) > 256:
++        raise RequestError("cache_salt must be a non-empty string of at most 256 characters")
++    return salt
++
++
+ class ThinkingOffTemplate:
+     """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+     (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
+@@ -84,6 +99,13 @@
+         kept = getattr(self.template, "kept", None)
+         return kept.restore(messages) if kept is not None else messages
+ 
++    def _check_fields(self, body: Any) -> str | None:
++        try:                        # patch 0130: a malformed cache_salt is refused before a stream's headers go out
++            cache_salt(body)
++        except RequestError as exc:
++            return str(exc)
++        return super()._check_fields(body)
++
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+ 
+@@ -112,6 +134,7 @@
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
++        self.engine.request.cache_salt = cache_salt(body)      # patch 0130: which kept states it may resume
+         result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+         kept = getattr(self.template, "kept", None)
+         if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+@@ -1076,15 +1076,17 @@
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+-    def _resume(self, prompt: list[int], code: list[int]):
++    def _resume(self, prompt: list[int], code: list[int], salt: str | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
+-        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``)."""
++        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``); only one
++        a request with the same ``cache_salt`` kept (patch 0130; None: unsalted)."""
+ 
+         _, mtp, dflash = self._drafters(code)
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
+             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
++            fits = fits and getattr(snap, "salt", None) == salt
+             short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
+             if fits and short and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+@@ -1147,6 +1149,8 @@
+         n = len(snap.ids)
+         if getattr(snap, "images", False):          # one stream resumes no state with pictures, from memory either
+             return "images"
++        if getattr(snap, "salt", None) is not None:  # patch 0130: salted; the store keys by ids, which can't tell
++            return "salted"
+         if snap.rows is None and self.live[:n] != list(snap.ids):
+             return "no_rows"
+         if self.grid and n % self.grid:
+@@ -1273,7 +1277,10 @@
+               f"{time.perf_counter() - t:.1f}s{'' if ok else ' (not finished)'}", flush=True)
+ 
+     def _remember(self, snap) -> None:
+-        for c in [c for c in self.cache if c.ids == snap.ids and c is not snap]:
++        # a kept state of the same ids gives way to it, unless only one of the two is salted (patch 0130: neither
++        # resumes the other)
++        for c in [c for c in self.cache if c.ids == snap.ids and c is not snap
++                  and (getattr(c, "salt", None) is None) == (getattr(snap, "salt", None) is None)]:
+             self._drop(c)
+         self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
+         dropped = False
+@@ -1362,8 +1369,9 @@
+ 
+         return getattr(self, "drafter", None) if self.shared else None
+ 
+-    def _shared(self, prompt: list[int], hit) -> list[int]:
+-        """Rank 0: the shared-prefix points a drafted text request keeps (``shared_points``), sent to rank 1."""
++    def _shared(self, prompt: list[int], hit, salt: str | None = None) -> list[int]:
++        """Rank 0: the shared-prefix points a drafted text request keeps (``shared_points``), sent to rank 1; from the
++        kept prompts of its own ``cache_salt`` only (patch 0130)."""
+ 
+         if not self.shared:
+             return []
+@@ -1372,6 +1380,8 @@
+         cut = len(hit.ids) if hit is not None else 0
+         known = []
+         for c in self.cache:                  # a kept prompt's ids as an array, made once (ids never change)
++            if getattr(c, "salt", None) != salt:
++                continue
+             if getattr(c, "ids_array", None) is None:
+                 c.ids_array = np.asarray(c.ids, dtype=np.int64)
+             known.append(c.ids_array)
+@@ -1384,18 +1394,21 @@
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=()) -> dict[str, Any]:
+-        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
++             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=(),
++             salt: str | None = None) -> dict[str, Any]:
++        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at; ``salt``: the
++        request's ``cache_salt`` its kept states carry (patch 0130; rank 0's own, "" on rank 1 for a salted one)."""
+ 
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
++            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared,
++                                  salt)
+         finally:
+             self.e.constraint = self.e.window = self.e.vote = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+-                  feed=None, shared=()) -> dict[str, Any]:
++                  feed=None, shared=(), salt: str | None = None) -> dict[str, Any]:
+         from .decode import (DepthPolicy, StopVote, dflash_decode, mtp_decode, prefill, serial_decode, take_snapshot,
+                              whole)
+         from .drafter_choice import DrafterChoice, auto_decode
+@@ -1449,6 +1462,7 @@
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+         for snap in kept:
+             snap.images = feed is not None
++            snap.salt = salt                  # patch 0130: resumed only under the same cache_salt, never spilled
+             self._remember(snap)
+         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
+@@ -1525,12 +1539,13 @@
+             spec = getattr(self.request, "policy", None) or self.policy
+         code = self._effective(encode_policy(spec))
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
++        salt = getattr(self.request, "cache_salt", None)      # 0130 (``app.GlmApp``): the kept states it may resume
+         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
+             if vision is not None and self.vision is None:
+                 raise ValueError("image inputs require starting this server with --vision")
+             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
+-                                          background=background, glm={"code": code, "spec": spec})
++                                          background=background, glm={"code": code, "spec": spec, "salt": salt})
+             stats.update(policy=spec, drafts=draft)
+             return stats
+         positions: list[int] = []
+@@ -1551,9 +1566,10 @@
+                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
+             feed = VisionFeed(self, positions, rows)
+             feed.encode_s = time.perf_counter() - t
+-        hit = self._resume(list(prompt), code) if draft and feed is None else None
++        hit = self._resume(list(prompt), code, salt) if draft and feed is None else None
+         disk = None                                    # --spill-gib: a longer stored prefix on disk (every rank reads)
+-        if self.spill is not None and draft and feed is None:    # one whose stored fields fit the request's drafters
++        # one whose stored fields fit the request's drafters; never for a salted request (0130: keyed by ids alone)
++        if self.spill is not None and draft and feed is None and salt is None:
+             disk = self.spill.find(list(prompt), grid=self.grid, usable=lambda e: self._fit(
+                 e.n, e.fields.get("drafter_end", -1), e.fields.get("mtp_len", -1), code))
+             if disk is not None and hit is not None and len(hit.ids) >= disk.n:
+@@ -1562,7 +1578,7 @@
+             import types
+ 
+             hit = types.SimpleNamespace(ids=list(prompt[:disk.n]))
+-        shared = self._shared(list(prompt), hit) if draft and feed is None else []
++        shared = self._shared(list(prompt), hit, salt) if draft and feed is None else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         cached = -disk.n if disk is not None else len(hit.ids) if hit is not None else 0
+         header = [max_tokens, int(stop_eos), int(draft), cached,
+@@ -1570,7 +1586,7 @@
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+                   int(constraint is not None), len(positions),
+-                  *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code
++                  *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code + [int(salt is not None)]   # patch 0130: last
+         from tensorfold.engine.grammar import pack
+ 
+         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
+@@ -1585,7 +1601,7 @@
+         if self.spill is not None:                     # pending copies of the live caches end before they change
+             self._spill_wait()
+         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+-                          shared)
++                          shared, salt)
+         stats.update(policy=spec, drafts=draft)
+         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+             self.comm.check()
+@@ -1613,7 +1629,8 @@
+         if max_tokens == 0 and self.spill is not None:     # rank 0's clean shutdown: the spill tier's flush
+             self._do_flush(self._share(None), self.spill.cfg.flush_s)
+             return
+-        shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
++        # the header's last value: rank 0's request is salted (patch 0130), its states kept with salt "" here
++        shared, code, salted = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:-1], bool(rest[-1])
+         prompt = self._share(None)
+         packed = self._share(None) if shaped else []
+         constraint = None
+@@ -1630,13 +1647,15 @@
+         if cached < 0:                              # rank 0 resumes from a prefix stored on disk: read ours too
+             hit = self._spill_load(list(prompt[:-cached]), code)
+         elif cached:
+-            hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
++            # patch 0130: the state as salted as rank 0's hit (the same ids may be kept salted and not)
++            hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids
++                        and (getattr(c, "salt", None) is not None) == salted), None)
+             if hit is None:
+                 raise RuntimeError(f"rank {self.rank} has no snapshot of the {cached} tokens rank 0 resumes from")
+         if self.spill is not None:
+             self._spill_wait()
+         self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                  constraint, feed, shared)
++                  constraint, feed, shared, "" if salted else None)
+         if hasattr(self.comm, "check"):
+             self.comm.check()
+ 
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+@@ -573,6 +573,7 @@
+     head: Any = None                   # a replay's first-token logits row (its kept prompt's, ``decode.whole``)
+     key: list[int] | None = None       # rank 0: the prompt's ids with its pictures' keys in their rows (kept states)
+     images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
++    salt: str | None = None            # 0130: the request's cache_salt its kept states carry (rank 1: "" if salted)
+     chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
+     lineage: str = ""                  # the computation its rows belong to (the spill tier's block names)
+     twin: Any = None                   # TF_GLM_KV_SHARD: the extents its filling prompt borrows in the other parts
+@@ -1013,6 +1014,7 @@
+         if self._need(len(prompt)) > self.pool.rows:
+             raise ValueError(f"a prompt of {len(prompt)} tokens does not fit the {self.pool.rows}-token pool")
+         info = getattr(s, "glm", None) or {}
++        salt = info.get("salt")               # patch 0130: the request's cache_salt (None: unsalted)
+         draft = bool(s.draft) and not g.serial_only
+         code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None and draft,
+                           self.dflash_code) if draft else [0, 0, 0, 0]
+@@ -1037,7 +1039,7 @@
+         slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
+         if slot is None:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+-        hit = self._resume(key) if draft and key is not None else None
++        hit = self._resume(key, salt) if draft and key is not None else None
+         encoded_from = len(hit.ids) if hit is not None else 0
+         if s.vision is not None:              # encoded before anything is sent: a failure stops here
+             feed = self._encode(s.vision, encoded_from)
+@@ -1050,7 +1052,7 @@
+         cut = len(hit.ids) if hit is not None else 0
+         shared: list[int] = []
+         if draft and key is not None and g.shared:
+-            known = [known_key(c) for c in self.kept if c.key is not None]
++            known = [known_key(c) for c in self.kept if c.key is not None and getattr(c, "salt", None) == salt]
+             shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
+                                    g.opener)
+         sid = self.next_sid
+@@ -1061,7 +1063,7 @@
+ 
+         packed = pack(s.constraint)
+         payload += [len(packed), *packed, len(positions), *positions, int(s.vision is not None),
+-                    *pack_keys(vrows, vkeys, vpos)]
++                    *pack_keys(vrows, vkeys, vpos), int(salt is not None)]       # patch 0130: salted, last
+         self._emit(ADMIT, payload)
+         if copy == 2 and self.carry_kind:         # (counted once the ADMIT is queued: a placement that failed earlier is not)
+             self.carry[self.carry_kind] += 1
+@@ -1368,11 +1370,11 @@
+         n = p[i]
+         positions = p[i + 1:i + 1 + n]
+         images = bool(p[i + 1 + n])
+-        vrows, vkeys, vpos, _ = unpack_keys(p, i + 2 + n)
++        vrows, vkeys, vpos, end = unpack_keys(p, i + 2 + n)
+         keyed = keyed_ids(prompt, vpos, vrows, vkeys) if vrows else None
+         return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
+                     draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed,
+-                    positions=positions, images=images, keyed=keyed)
++                    positions=positions, images=images, keyed=keyed, salted=bool(p[end]))
+ 
+     def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
+         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
+@@ -1443,6 +1445,8 @@
+                     constraint=constraint, images=a["images"], chat=chat)
+         if a.get("keyed") is not None:              # rank 1 too: its kept states are stored and matched by them
+             lane.key = a["keyed"]
++        if a["salted"]:                             # patch 0130: rank 0's own salt; rank 1 knows only that it has one
++            lane.salt = (getattr(s, "glm", None) or {}).get("salt") or ""
+         # the computation its rows belong to: its kept state's up to the resume point (rows copied or taken over are
+         # those bits), its own from there; a new one for a fresh prefill
+         from tensorfold.cuda.spill_blocks import fork
+@@ -1532,14 +1536,15 @@
+                 return c
+         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
+ 
+-    def _resume(self, key: list[int]):
++    def _resume(self, key: list[int], salt: str | None = None):
+         """The longest kept strict prefix of ``key`` (a prompt's keyed ids, ``Lane.key``), or the whole prompt when it
+-        kept its head's logits row (a replay of an earlier prompt), whose DFlash2 window came along."""
++        kept its head's logits row (a replay of an earlier prompt), whose DFlash2 window came along; only one a request
++        with the same ``cache_salt`` kept (patch 0130; None: unsalted)."""
+         best = None
+         for c in self.kept:
+             n = len(c.ids)
+             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
+-            fits = fits and not (self.grid and n % self.grid)
++            fits = fits and not (self.grid and n % self.grid) and getattr(c, "salt", None) == salt
+             short = n < len(key) or (n == len(key) and c.head is not None)
+             if fits and short and c.key is not None and key[:n] == c.key and (best is None or n > len(best.ids)):
+                 best = c
+@@ -1580,6 +1585,7 @@
+         # rank 0's key: a text prompt's is its ids (shared, not a second list); rank 1 keeps none
+         snap.key = None if lane.key is None else snap.ids if not lane.images else lane.key[:n]
+         snap.images = lane.images
++        snap.salt = lane.salt            # resumed only under the same cache_salt, never written to the spill tier
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+@@ -1588,10 +1594,12 @@
+         # how the prompt that wrote it goes on from here (both ranks): a prompt resuming here that goes on otherwise
+         # forked from it (``_admitted``)
+         snap.after = tuple((lane.key if lane.images and lane.key is not None else lane.s.prompt)[n:n + FORK_SPAN])
+-        # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key). The new
+-        # state takes the dropped one's place: a shared prefix stays one, and one two prompts wrote going on differently
+-        # (two conversations that prefilled one system block at the same time) becomes one
+-        for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
++        # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key) or only
++        # one of the two is salted (patch 0130: neither resumes the other; salted or not is all rank 1 knows of a salt).
++        # The new state takes the dropped one's place: a shared prefix stays one, and one two prompts wrote going on
++        # differently (two conversations that prefilled one system block at the same time) becomes one
++        for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)
++                  and (getattr(c, "salt", None) is None) == (snap.salt is None)]:
+             if getattr(c, "shared", False) or forks(getattr(c, "after", None) or (), snap.after):
+                 snap.shared, snap.own = True, False
+             self._drop(c, spill=False)
+@@ -1830,6 +1838,8 @@
+ 
+         if c.images and c.key is None:
+             return "images"                     # pictures without content keys: nothing tells them apart
++        if getattr(c, "salt", None) is not None:
++            return "salted"                     # patch 0130: the store keys by ids, which cannot tell salts apart
+         n = len(c.ids)
+         if not self.disk.wants(n):
+             return "short"
+@@ -1890,8 +1900,8 @@
+         """Rank 0, before a request is admitted: a read of the stored prompt its prompt extends, or None (nothing to
+         read, or no room). The scheduler admits the request once ``load_ready``, after ``complete_load``."""
+ 
+-        if self.disk is None or not s.draft:
+-            return None
++        if self.disk is None or not s.draft or (getattr(s, "glm", None) or {}).get("salt") is not None:
++            return None                          # (a salted request reads no store: patch 0130)
+         self._check()
+         prompt = [int(t) for t in s.prompt]
+         if s.vision is not None:                 # pictures: matched by content (keyed ids), or not at all
+diff --git tensorfold/server/responses_translate.py tensorfold/server/responses_translate.py
+@@ -13,9 +13,10 @@
+ if TYPE_CHECKING:
+     from tensorfold.server.responses import Store
+ 
+-# fields a chat completion reads as they are: OpenAI's and this server's own (top_k, min_p, seed, draft, ...)
++# fields a chat completion reads as they are: OpenAI's and this server's own (top_k, min_p, seed, draft, ...);
++# cache_salt (0130) so a Responses request's salt reaches the engine instead of being dropped here
+ PASSED = ("model", "temperature", "top_p", "top_k", "min_p", "seed", "stream", "parallel_tool_calls", "stop", "draft",
+-          "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs")
++          "thinking_budget", "ignore_eos", "priority", "return_token_ids", "chat_template_kwargs", "cache_salt")
+ REFUSED = {"background": "background responses are not supported: send the request and wait for it",
+            "conversation": "conversations are not supported: send previous_response_id or the items",
+            "prompt": "prompt templates are not supported: send input and instructions",
+diff --git tensorfold/server/anthropic_translate.py tensorfold/server/anthropic_translate.py
+@@ -141,6 +141,8 @@
+     for field in ("container", "mcp_servers", "service_tier"):
+         if body.get(field) not in (None, [], "auto"):
+             raise RequestError(f"{field} is not supported by this server")
++    if body.get("cache_salt") is not None:   # 0130: the Messages protocol has no salt; dropping it silently would run
++        raise RequestError("cache_salt is not supported on this route; send it on /v1/chat/completions")  # unsalted
+     tools = body.get("tools", [])
+     if not isinstance(tools, list):
+         raise RequestError("tools must be an array")
