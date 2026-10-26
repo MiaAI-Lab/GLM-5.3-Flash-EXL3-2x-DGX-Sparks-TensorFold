@@ -1,4 +1,4 @@
-# port-patches.sh: glm/parity-r6 @ 1571e7dfdd29 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 8d1796cc3ab1..3022ee57d656); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/nucleus-race @ 3155e0ea134a over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 8d1796cc3ab1..3022ee57d656); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 for GLM: kept-state packing, the rank protocol, the compatibility fingerprint and the GLM tier behind TF_GLM_SPILL_V2=1 (port of GLM 0110)
 
 The GLM family's half of spill v2, on the core store and the prompt cache's
