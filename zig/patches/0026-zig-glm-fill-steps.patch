@@ -1,4 +1,4 @@
-# port-patches.sh: glm/pub-r5-on-186 @ 1305bda37155 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 863b5f903e44..2cb4f1d2ccf8); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/parity-r6 @ 1571e7dfdd29 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 863b5f903e44..2cb4f1d2ccf8); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: prompts fill a 2048-row chunk a step between decode rounds behind TF_GLM_FILL=1 (concurrent fills, step A)
 
 A prompt pass ran whole on the lane thread, so every decoding stream waited

@@ -352,6 +352,15 @@ case_ "scripts/config.sh: the reserve grows past 4 requests except on the Zig en
   got=$(env -u MEMORY_RESERVE_GIB -u TENSORFOLD_MEMORY_RESERVE_GIB -u TF_GLM_MULTI_WINDOW ENGINE=zig PARALLEL=8 TP=3 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
   awk -v g="$got" "BEGIN { exit !(g > 14.5) }" || { echo "zig at TP=3: the reserve should still grow (got $got)"; exit 1; }'
 
+case_ "scripts/config.sh: MULTI_PREFILL is 1 on the Python engine, 0 on the Zig engine unless set" 0 '' '
+  for e in zig python; do
+    got=$(env -u MULTI_PREFILL -u TF_GLM_MULTI_PREFILL ENGINE=$e TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$TF_GLM_MULTI_PREFILL")
+    want=1; [[ $e == zig ]] && want=0
+    expect "$e $got" "$e $want"
+  done
+  got=$(env -u TF_GLM_MULTI_PREFILL ENGINE=zig MULTI_PREFILL=1 TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$TF_GLM_MULTI_PREFILL")
+  expect "$got" 1'
+
 # ---- spill and KV sharding together
 case_ "refuse: KV_SHARD=1 with spill v1 (both explicit)" 0 'ZIG_HAS="kvshard spillshard" KV_SHARD=1 SPILL_GIB=8' '
   expect_die "the v1 spill tier does not know the owner parts.*Turn one off" port_validate 8 8'

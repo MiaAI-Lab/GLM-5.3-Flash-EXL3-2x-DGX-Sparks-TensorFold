@@ -1,4 +1,4 @@
-# port-patches.sh: glm/pub-r5-on-186 @ 1305bda37155 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 2cb4f1d2ccf8..f4bdb3247840); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/parity-r6 @ 1571e7dfdd29 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 2cb4f1d2ccf8..f4bdb3247840); regenerate with scripts/port-patches.sh, do not edit
 core + server + glm_cuda lanes: a prompt with pictures is kept and resumed under its content key; a pass attaches its pictures once, every mark's segment injects them, a resumed pass runs the tower only for the pictures past its cut (TF_GLM_IMAGE_CACHE, TF_GLM_IMAGE_MARK_SNAP)
 
 A prompt with pictures or clips held the image placeholder (154854) at every

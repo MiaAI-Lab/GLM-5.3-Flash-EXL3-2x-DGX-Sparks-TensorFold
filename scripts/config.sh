@@ -336,7 +336,9 @@ export TENSORFOLD_NUCLEUS_UNION="${NUCLEUS_UNION:-${TENSORFOLD_NUCLEUS_UNION:-1}
 # for every waiting prompt, attention per prompt on its own state, so each gets the bits it gets alone. sparkDash, prose at
 # 4 at once: 103.4 -> 108.8 tok/s, time to first token 590 -> 340 ms; structured at 3 / 4 at once: 175.2 -> 196.3 and
 # 196.3 -> 227.9 tok/s; one request unchanged. Exact. MULTI_PREFILL=0 turns it off.
-MULTI_PREFILL="${MULTI_PREFILL:-1}"
+# ENGINE=zig: 0 by default. Its TF_GLM_MULTI_PREFILL (zig/patches/0033, with FILL=1) lets up to two waiting prompts
+# fill a chunk each a step, in separate forwards: a short prompt no longer waits for a long one, with no batching gain.
+MULTI_PREFILL="${MULTI_PREFILL:-$([[ "$ENGINE" == zig ]] && echo 0 || echo 1)}"
 export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
 # Smooth streaming (patch 0061): with drafts a round accepts ~3 tokens at once, so a streamed reply arrives in bursts
 # (every ~50 ms alone, ~100 ms with 4 streams), and pauses while another request's prompt fills. 1 (default): tokens
