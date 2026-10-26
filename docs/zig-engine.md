@@ -56,7 +56,7 @@ would change what is served.
 | `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `TF_GLM_MULTI_WINDOW`, `TF_GLM_MULTI_LONE` | TODO: prompts fill one at a time; the verify window is fixed (64 rows shared, 16 a stream) |
 | `STREAM_SMOOTH`, `STREAM_SMOOTH_MS` | TODO |
 | `MAX_QUEUED` | TODO (no 429 admission yet) |
-| `NUCLEUS_UNION` | not needed (the Zig sampler has its own) |
+| `NUCLEUS_UNION` | read (`zig/patches/0024`): `TENSORFOLD_NUCLEUS_UNION=1`, the recipe default, merges the ranks' candidates for a top_p draw; every rank must agree |
 | `TF_ROCE_WAIT_S`, `TF_ROCE_IB_TIMEOUT`, `TF_ROCE_RING` | TODO |
 | `TF_GLM_EXL3_LOADS`, `TF_GLM_EXL3_DEC_ORDER` | TODO (its kernels are its own) |
 | `TF_GLM_CLEAR_THINKING`, `TF_GLM_EFFORT_TAIL` | TODO (earlier turns keep their reasoning, as with the Python defaults) |
