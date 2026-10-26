@@ -145,10 +145,9 @@ VISION_URLS="${VISION_URLS:-0}"
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
 # Four Sparks: 8 as three (not measured there yet).
 if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" != 2 ]]; then _par=8; else _par=4; fi
-# ENGINE=zig: at TP=2 4, beside the default 1,048,576-token window (ZIG_CONTEXT_1M below; at 8 streams that window's
-# per-stream buffers leave the prompt cache no memory); 8 with ZIG_CONTEXT_1M=0 (131,072) and at TP=3/4.
+# ENGINE=zig: 8, beside the default 1,048,576-token window at TP=2 (ZIG_CONTEXT_1M below) as at 131,072.
 ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-1}"
-if [[ "$ENGINE" == zig && "$DRAFTER" == dflash2 ]]; then _par=8; [[ "$ZIG_CONTEXT_1M" == 1 && "${TP:-2}" == 2 ]] && _par=4; fi
+[[ "$ENGINE" != zig || "$DRAFTER" != dflash2 ]] || _par=8
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
@@ -163,10 +162,9 @@ export TF_GLM_KV="$KV"
 DENSE="${DENSE:-q4}"
 if [[ "$KV" != bf16 ]]; then _ctx=1048576; elif [[ "$DRAFTER" != dflash2 ]]; then _ctx=524288
 elif [[ "$VISION" == 1 && "$DENSE" != q4 ]]; then _ctx=163840; else _ctx=196608; fi
-# ENGINE=zig: 1,048,576 at TP=2 with 4 streams (ZIG_CONTEXT_1M=1, the default), as the Python engine: served on the pair
-# with prompts to 1,039,999 tokens, each answer equal to the Python engine's (docs/zig-engine.md "1M context").
-# ZIG_CONTEXT_1M=0: 131,072 with 8 streams, the earlier default. TP=3/4: 131,072. Past 262,144 tokens start.sh sets
-# TF_TP_TIMEOUT_S=1500.
+# ENGINE=zig: 1,048,576 at TP=2 with 8 streams (ZIG_CONTEXT_1M=1, the default): served on the pair with prompts to
+# 1,039,999 tokens, each answer equal to the Python engine's (docs/zig-engine.md "1M context"). ZIG_CONTEXT_1M=0:
+# 131,072, the earlier default. TP=3/4: 131,072. Past 262,144 tokens start.sh sets TF_TP_TIMEOUT_S=1500.
 if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi
 CONTEXT="${CONTEXT:-$_ctx}"
 DFLASH2_ID="${DFLASH2_ID:-incoai/GLM-5.3-Flash-DFlash2}"
