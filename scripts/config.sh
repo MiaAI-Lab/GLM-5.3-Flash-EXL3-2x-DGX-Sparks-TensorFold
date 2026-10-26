@@ -388,9 +388,12 @@ export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
 # Past 4 requests, or a verify window past 32 rows, the server takes more than its estimate counts (measured on two
 # Sparks, rank 0's lowest free memory: PARALLEL=4 10.8 GiB, PARALLEL=8 7.0, PARALLEL=8 with a 64-row window 5.8): the
 # reserve grows by that much (~0.95 GiB a request past 4, ~0.04 GiB a row past 32), so the lowest free memory stays
-# where PARALLEL=4 has it; the pool shrinks instead.
+# where PARALLEL=4 has it; the pool shrinks instead. ENGINE=zig: no growth. The Zig engine makes its streams' buffers
+# before it reads MemAvailable, so they are already counted: at 1,048,576 x 8 with 14.5, the pair's lowest free memory
+# under eight 120k-token prompts at once was 15 GiB on rank 0 and 18 on rank 1 (2026-10-26).
 _extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; if (p > 4) e += 0.95 * (p - 4);
   if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
+[[ "$ENGINE" != zig ]] || _extra=0
 MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every

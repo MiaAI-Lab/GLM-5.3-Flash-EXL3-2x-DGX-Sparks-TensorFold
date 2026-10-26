@@ -342,6 +342,13 @@ case_ "scripts/config.sh: ENGINE=zig defaults to 1,048,576 x 4 at TP=2, 131072 x
   done; done; done
   ! grep -q "no prompts past ~32k tokens" "$here/config.sh" || { echo "the stale 32k comment is back"; exit 1; }'
 
+case_ "scripts/config.sh: the reserve grows past 4 requests on the Python engine only" 0 '' '
+  for e in zig python; do for p in 4 8; do
+    got=$(ENGINE=$e PARALLEL=$p TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
+    want=14.5; [[ $e == python && $p == 8 ]] && want=19.6  # 0.95 x 4 requests + 0.04 x 32 rows (its window is 64 at 8)
+    expect "$e $p $got" "$e $p $want"
+  done; done'
+
 # ---- spill and KV sharding together
 case_ "refuse: KV_SHARD=1 with spill v1 (both explicit)" 0 'ZIG_HAS="kvshard spillshard" KV_SHARD=1 SPILL_GIB=8' '
   expect_die "the v1 spill tier does not know the owner parts.*Turn one off" port_validate 8 8'
