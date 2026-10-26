@@ -314,26 +314,31 @@ case_ "long context: past 262,144 tokens TF_TP_TIMEOUT_S=1500 unless set; not at
   ( unset TF_TP_TIMEOUT_S; TP=3; port_long_context 1048576 8 >/dev/null; expect "$TF_TP_TIMEOUT_S" 1500 ) || exit 1'
 case_ "long context: the GPU-checked window is silent, one the coverage test checked warns what is unverified, one past it can miss" 0 "$LC_PRE" '
   expect_out "!WARN" port_long_context 131072 8
+  expect_out "!WARN" port_long_context 1048576 4
   expect_out "WARN: ENGINE=zig: CONTEXT=1048576 PARALLEL=8: the kernel set holds every Triton variant.*no GPU run has served it yet.*Unverified: a long prompt.s memory on each Spark, TF_TP_TIMEOUT_S=1500" port_long_context 1048576 8
   expect_out "no GPU run has served it yet" port_long_context 131072 4
   expect_out "no GPU run has served it yet" port_long_context 200000 8
   expect_out "outside what the kernel set.s coverage test checked (contexts up to 1048576" port_long_context 2097152 8
   expect_out "outside what the kernel set.s coverage test checked" port_long_context 131072 2'
 case_ "long context: a coverage record of another kernel set, or none, leaves every window unchecked; TP=3 keeps the arena warning" 0 "$LC_PRE; tmp=$tmp" '
-  printf "aot=%064d\ncontexts=1048576\nparallel=8\ngpu=131072\ngpu_parallel=8\n" 0 > "$tmp/cov-other.txt"
+  printf "aot=%064d\ncontexts=1048576\nparallel=8\ngpu=131072:8\n" 0 > "$tmp/cov-other.txt"
   ( PORT_COVERAGE=$tmp/cov-other.txt; expect_out "is for set 000000000000, this one is 29ad991945a3.*unchecked" port_long_context 131072 8 ) || exit 1
   ( PORT_COVERAGE=$tmp/none.txt; expect_out "no coverage record for this kernel set.*unchecked" port_long_context 131072 8 ) || exit 1
   ( TP=3; expect_out "keyed on the 8-stream, 131072-token arena" port_long_context 1048576 8; expect_out "!WARN" port_long_context 131072 8 ) || exit 1
   grep -q "^aot=$(cut -c1-64 "$root/zig/aot/glm-aot-sm121.tar.xz.sha256")$" "$root/zig/aot/glm-aot-coverage.txt" || { echo "the coverage record is not for zig/aot/glm-aot-sm121.tar.xz"; exit 1; }'
-LC_DEFAULT='ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-0}"'
+LC_DEFAULT='ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-1}"'
+LC_PAR='if [[ "$ENGINE" == zig && "$DRAFTER" == dflash2 ]]; then _par=8; [[ "$ZIG_CONTEXT_1M" == 1 && "${TP:-2}" == 2 ]] && _par=4; fi'
 LC_CTX='if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi'
-case_ "scripts/config.sh: ENGINE=zig defaults to 131072, ZIG_CONTEXT_1M=1 to 1,048,576 at TP=2 only" 0 '' '
-  grep -qxF -- "$LC_DEFAULT" "$here/config.sh" || { echo "no ZIG_CONTEXT_1M default of 0"; exit 1; }
+case_ "scripts/config.sh: ENGINE=zig defaults to 1,048,576 x 4 at TP=2, 131072 x 8 with ZIG_CONTEXT_1M=0 or at TP=3" 0 '' '
+  grep -qxF -- "$LC_DEFAULT" "$here/config.sh" || { echo "no ZIG_CONTEXT_1M default of 1"; exit 1; }
+  grep -qxF -- "$LC_PAR" "$here/config.sh" || { echo "the ENGINE=zig PARALLEL default moved"; exit 1; }
   grep -qxF -- "$LC_CTX" "$here/config.sh" || { echo "the ENGINE=zig CONTEXT default moved"; exit 1; }
+  DRAFTER=dflash2
   for ENGINE in zig python; do for TP in 2 3; do for ZIG_CONTEXT_1M in 0 1; do
-    _ctx=python; eval "$LC_CTX"; want=python
-    [[ "$ENGINE" == zig ]] && want=131072; [[ "$ENGINE" == zig && "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && want=1048576
-    expect "$ENGINE $TP $ZIG_CONTEXT_1M $_ctx" "$ENGINE $TP $ZIG_CONTEXT_1M $want"
+    _ctx=python; _par=python; eval "$LC_CTX"; eval "$LC_PAR"; want=python; wpar=python
+    [[ "$ENGINE" == zig ]] && { want=131072; wpar=8; }
+    [[ "$ENGINE" == zig && "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && { want=1048576; wpar=4; }
+    expect "$ENGINE $TP $ZIG_CONTEXT_1M $_ctx $_par" "$ENGINE $TP $ZIG_CONTEXT_1M $want $wpar"
   done; done; done
   ! grep -q "no prompts past ~32k tokens" "$here/config.sh" || { echo "the stale 32k comment is back"; exit 1; }'
 

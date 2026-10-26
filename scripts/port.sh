@@ -599,7 +599,7 @@ port_nfs_path() { [[ "${NFS_PATH:-/}" == / ]] || echo "$NFS_PATH"; }
 # ---- long contexts on the Zig engine: TF_TP_TIMEOUT_S and what the kernel set is known to cover
 # zig/aot/glm-aot-coverage.txt records the engine's offline host test (cuda_aot_coverage_test: every Triton lookup the
 # engine makes at TP=2, for the contexts, stream counts and KV pools it names, against the captured set) and the
-# contexts a GPU run has served at TP=2 (gpu=). key=value lines; aot= is the sha256 of the set it checked.
+# windows a GPU run has served at TP=2 (gpu=, CONTEXT:PARALLEL pairs). key=value lines; aot= is the sha256 of the set.
 PORT_COVERAGE="${PORT_COVERAGE:-${_cfg_root:-.}/zig/aot/glm-aot-coverage.txt}"
 port_coverage() {
   [[ -f "$PORT_COVERAGE" ]] || return 0
@@ -626,13 +626,13 @@ port_long_context() {
     warn "ENGINE=zig: no coverage record for this kernel set (zig/aot/glm-aot-coverage.txt$( [[ -z "$set_sha" ]] || echo " is for set ${set_sha:0:12}, this one is ${aot_sha:0:12}")): CONTEXT=$ctx PARALLEL=$par is unchecked and can fail with MissingTritonVariant"
     return 0
   fi
-  for c in $(port_coverage gpu); do [[ "$c" == "$ctx" ]] && gpu=1; done
+  for c in $(port_coverage gpu); do [[ "$c" == "$ctx:$par" ]] && gpu=1; done
   for c in $(port_coverage parallel); do [[ "$c" == "$par" ]] && streams=1; done
   top=0; for c in $(port_coverage contexts); do (( c > top )) && top=$c; done
   [[ "$ctx" =~ ^[0-9]+$ ]] && (( ctx >= 1 && ctx <= top )) && known=1
   if (( ! known || ! streams )); then
     warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par is outside what the kernel set's coverage test checked (contexts up to $top, PARALLEL $(port_coverage parallel), KV pools of $(port_coverage pools) rows: zig/aot/glm-aot-coverage.txt): it can fail with MissingTritonVariant"
-  elif (( ! gpu )) || [[ "$par" != "$(port_coverage gpu_parallel)" ]]; then
-    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par: the kernel set holds every Triton variant this window looks up (checked offline: zig/aot/glm-aot-coverage.txt, for KV pools of $(port_coverage pools) rows), but no GPU run has served it yet (GPU-checked: CONTEXT $(port_coverage gpu) at PARALLEL $(port_coverage gpu_parallel)). Unverified: a long prompt's memory on each Spark, TF_TP_TIMEOUT_S=${TF_TP_TIMEOUT_S:-300}, and the replies"
+  elif (( ! gpu )); then
+    warn "ENGINE=zig: CONTEXT=$ctx PARALLEL=$par: the kernel set holds every Triton variant this window looks up (checked offline: zig/aot/glm-aot-coverage.txt, for KV pools of $(port_coverage pools) rows), but no GPU run has served it yet (GPU-checked CONTEXT:PARALLEL: $(port_coverage gpu)). Unverified: a long prompt's memory on each Spark, TF_TP_TIMEOUT_S=${TF_TP_TIMEOUT_S:-300}, and the replies"
   fi
 }

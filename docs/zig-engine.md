@@ -38,7 +38,7 @@ would change what is served.
 | `TP`, `WORKER`, `WORKER2/3`, `FABRIC_PEER*`, `MASTER_PORT`, `MASTER_ADDR`, `SOCKET_IFNAME` | `--tp`, `--rank`, `--master`, `--master-port`; NCCL variables as the Python engine's. TP=2, TP=3 on a triangle with `SPLIT=0 COMM=nccl` and TP=4 on a ring of four with `SPLIT=0 COMM=nccl` (both experimental, see below; TP=3 also takes `COMM=roce`). TP=4 on a switch is untested and refused; the RoCE ring relay is not ported (start refuses `COMM=roce` at TP=4) |
 | `MODEL_ID`, `MODEL_REVISION`, `ABLIT`, `DFLASH2_ID`, `DFLASH2_REVISION`, `HF_CACHE`, `WORKER_WEIGHTS*`, `NFS_*` | unchanged: the snapshots are mounted at `/root/.cache/huggingface` and passed as `MODEL` and `--drafter` (`ABLIT=1` has the same architecture; not tried yet) |
 | `SERVED_NAME`, `HOST`, `PORT` | `--name`, `--host`, `--port` |
-| `CONTEXT`, `PARALLEL`, `ZIG_CONTEXT_1M` | `--context`, `--parallel`. Defaults 131072 and 8 under `ENGINE=zig`, the window GPU runs have served. At TP=2 the kernel set holds every Triton variant for windows up to 1,048,576 at PARALLEL 4 or 8 (checked offline: "1M context" below); `ZIG_CONTEXT_1M=1` makes 1,048,576 the default at TP=2 (gated until the GPU sweep passes), and past 262,144 tokens `TF_TP_TIMEOUT_S` defaults to 1500. `./start.sh` warns at any window no GPU run has served, naming what is unverified, and at one past the coverage test (`scripts/port.sh`: `port_long_context`) |
+| `CONTEXT`, `PARALLEL`, `ZIG_CONTEXT_1M` | `--context`, `--parallel`. At TP=2 the defaults are 1,048,576 and 4, the Python engine's (`ZIG_CONTEXT_1M=1`, the default): served on the pair, every reply equal to the Python engine's ("1M context" below). `ZIG_CONTEXT_1M=0`: 131072 and 8, the earlier default. TP=3/4: 131072 and 8. Past 262,144 tokens `TF_TP_TIMEOUT_S` defaults to 1500. `./start.sh` warns at a window no GPU run has served, naming what is unverified, and at one past the coverage test (`scripts/port.sh`: `port_long_context`) |
 | `MAX_TOKENS`, `THINKING` | `--max-tokens`, `--thinking` / `--no-thinking` |
 | `DRAFTER`, `TF_GLM_MTP`, `TF_GLM_DRAFT_QUANT` | `dflash2` -> `--drafter DIR`. `mtp` -> no `--drafter`; the container gets `DRAFTER=mtp` (PARALLEL=1), which the Zig engine reads from its environment. The MTP head is in `zig/patches`; `ZIG_HAS` defaults to `mtp displaykv` |
 | `KV`, `DENSE` | fixed at `fp8` and `q4`; other values refused (TODO) |
@@ -111,7 +111,7 @@ concurrent requests, tools/vision and 20 benchmark requests passed at 128K
 context with DFlash2. This does not qualify arbitrary MTP configurations,
 1M context, or every other missing-capture path. No speedup is claimed.
 
-## 1M context (TP=2, gated: `ZIG_CONTEXT_1M=1`)
+## 1M context (TP=2, the default)
 
 **Kernels.** The engine's host test `cuda_aot_coverage_test.zig` (engine branch `glm/ctx-1m`) runs the engine's own
 launch code on a driver that only hands out addresses and looks every Triton launch up in this kernel set as the
@@ -124,20 +124,35 @@ does lack the selection of a prompt block under 64 rows (`_select_split` with in
 `_select_rows` BLOCK=4096 VIS=0; `_scores` R=1), which a chunk whose row count is not a multiple of 64 would reach:
 the engine never makes one at TP=2 (`TF_GLM_PROMPT_MICROBATCH` halves would, and are off at TP=2).
 
-**Not verified yet (the GPU sweep, `g5`):** the 1M prompt on the pair (time, `TF_TP_TIMEOUT_S`), each Spark's memory
-at the long contexts, eight long prompts at once, and the replies. Until it passes, 131072 stays the default.
+**Served on the pair (2026-10-26).** Two GB10s at TP=2, the default 1,048,576 x 4 with `KV_SHARD=1 KV_POOL_GIB=4
+PROMPT_CACHE_GIB=8 SPILL_V2=1 SPILL_GIB=16 VISION=1 FILL=1`, against the Python engine (the published `v0.6.0-789e8f3bdfa2`
+image at its defaults, 1,048,576 x 4). The same prompts: prose with a code buried at 37% of it and a question for it,
+greedy, thinking off.
 
-**Memory** (estimates from the pair's measurements at 131072, to be checked by the sweep):
+| Prompt tokens | Zig: first token | Python: first token | Reply |
+| ---: | ---: | ---: | --- |
+| 33,298 | 17.3 s | 16.6 s | the same text and token digest; both find the code |
+| 131,062 | 71.2 s | 65.8 s | the same |
+| 262,122 | 155.7 s | 139.1 s | the same |
+| 524,230 | 359.6 s | 297.6 s | the same |
+| 1,039,999 | 894.2 s | 671.0 s | the same |
+
+The lowest MemAvailable during these prompts: Zig 16 GiB on rank 0 and 20 GiB on rank 1, Python 8 and 10 GiB. The pool
+holds 3,133,440 tokens (two parts of 1,566,720; the Python engine's at its defaults: 2,582,528) and the prompt cache
+3.2 GiB. A long prompt's first token comes later on the Zig engine, by more the longer the prompt (+4% at 33k, +33% at
+1M): not yet explained. With `PARALLEL=8` at this window the streams' own buffers leave the prompt cache nothing
+(`prompt cache: off (budget 0)`), and `SPILL_V2=1` refuses that: 8 streams go with `ZIG_CONTEXT_1M=0`.
+
+**Memory** (from the pair's measurements):
 - A token costs a rank 6,204 bytes in the pool and in a kept prompt state (the latent rows, 11 x 528, and the pooled
   keys, 11 x 36). **One 1M kept state is ~6.1 GiB a Spark** (6.06 GiB plus ~0.1 GiB of fixed recurrent state); with
   `KV_SHARD=1` the home Spark holds the 6.06 GiB and the other only the pooled keys (~0.4 GiB).
 - The pool starts from one whole window: at `CONTEXT=1048576` it is 1,050,624 rows (6.07 GiB a Spark) plus
   `KV_POOL_GIB` worth of rows (`KV_POOL_GIB=4`: ~1.74M rows), ~5.3 GiB a Spark more than at 131072. That memory comes
   out of the prompt cache's budget, which is what is left above `MEMORY_RESERVE_GIB` once the pool is up.
-- So start 1M with `PROMPT_CACHE_GIB=0` (the default). With the prompt cache, the 6.2 GiB budget measured at 131072
-  (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8`) would fall to ~0.9 GiB, and `KV_POOL_GIB=0` (the pool one window) leaves ~4.9 GiB:
-  kept states of up to ~800k tokens, not a whole 1M one. `PROMPT_CACHE_GIB` should be at least the largest state to
-  keep (~6.2 GiB for 1M) and fit what the pool leaves.
+- At 1,048,576 x 4 with `KV_POOL_GIB=4 PROMPT_CACHE_GIB=8 KV_SHARD=1` the prompt cache gets 3.2 GiB: kept states of up to
+  ~500k tokens, not a whole 1M one (~6.2 GiB). `PROMPT_CACHE_GIB` should be at least the largest state to keep and fit
+  what the pool leaves.
 - `KV_SHARD=1`: a conversation lives in one part, so **a part must hold the whole window, 1,050,624 rows** (a sharded
   pool of at least 2,101,248); with less the engine caps requests and logs "a request holds at most N tokens". The
   sharded pool is ~1.83x the unsharded one in the same memory (`KV_POOL_GIB=4` at 1M: ~3.2M rows, parts of ~1.6M).
