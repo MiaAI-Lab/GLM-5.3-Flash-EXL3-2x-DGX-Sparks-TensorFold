@@ -1,4 +1,4 @@
-# port-patches.sh: glm/sampling-r7 @ 6cc5c62a69ae over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 95526fcaa650..863b5f903e44); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 95526fcaa650..863b5f903e44); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: MTP drafts with the prompt cache (one stream): the head absorbs one row behind the target and kept states carry its section; TF_GLM_MTP_DIGEST
 
 The MTP head is one per engine and kept states had no MTP section, so

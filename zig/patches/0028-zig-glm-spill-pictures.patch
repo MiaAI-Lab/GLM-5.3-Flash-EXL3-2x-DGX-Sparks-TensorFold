@@ -1,4 +1,4 @@
-# port-patches.sh: glm/sampling-r7 @ 6cc5c62a69ae over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f4bdb3247840..7ffb37f42b63); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f4bdb3247840..7ffb37f42b63); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: spill v2 for prompts with pictures: points with pictures before their cut written as format v3 on every rank, found only for the same pictures in the same places, with KV sharding too (port of the DeepSeek port's spill-pictures)
 
 The GLM tier kept every point as text (pointKey(keyed, block, no media))
