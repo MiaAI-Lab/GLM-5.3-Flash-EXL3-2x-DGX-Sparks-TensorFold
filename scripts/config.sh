@@ -134,8 +134,9 @@ export TF_GLM_MTP="${TF_GLM_MTP:-auto}"
 # Image and video input (rank 0 runs GLM's vision tower: 1.05 GiB of bf16 weights and 0.75 GiB of workspace). A picture
 # takes at most TENSORFOLD_GLM_IMAGE_TOKENS tokens (2048), a clip TENSORFOLD_GLM_VIDEO_TOKENS (16384) over at most
 # TENSORFOLD_GLM_VIDEO_FRAMES frames (128, 2 a second). VISION_URLS=1 also accepts public https URLs (default: data URLs).
-# (ENGINE=zig: off by default so the text server keeps the tower's memory; VISION=1 serves pictures and clips)
-VISION="${VISION:-$([[ "$ENGINE" == zig ]] && echo 0 || echo 1)}"
+# ENGINE=zig: on at TP=2 (the native tower on rank 0, its workspace taken at start; with PROMPT_CACHE_GIB above 0 the
+# kept-state budget is ~1.4 GiB smaller, scripts/port.sh port_vision_check), off at TP=3/4 (not run there yet)
+VISION="${VISION:-$([[ "$ENGINE" == zig && "$TP" != 2 ]] && echo 0 || echo 1)}"
 VISION_URLS="${VISION_URLS:-0}"
 # Concurrent requests (patches 0026-0030, 0035, 0040, 0041: one shared pool of per-token caches, one batched verify window
 # a round): 1 to 8 (patch 0069), with DRAFTER=dflash2 only (mtp: 1). Default 4 on two Sparks, 8 on three (v1.5).
@@ -144,7 +145,7 @@ VISION_URLS="${VISION_URLS:-0}"
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
 # Four Sparks: 8 as three (not measured there yet).
 if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" != 2 ]]; then _par=8; else _par=4; fi
-# ENGINE=zig: 8 (the captured decode kernels are keyed on the 8-stream arena: docs/zig-engine.md)
+# ENGINE=zig: 8 (the stream count GPU runs have checked; offline the kernel set covers 4 too: zig/aot/glm-aot-coverage.txt)
 [[ "$ENGINE" != zig || "$DRAFTER" != dflash2 ]] || _par=8
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
@@ -160,8 +161,13 @@ export TF_GLM_KV="$KV"
 DENSE="${DENSE:-q4}"
 if [[ "$KV" != bf16 ]]; then _ctx=1048576; elif [[ "$DRAFTER" != dflash2 ]]; then _ctx=524288
 elif [[ "$VISION" == 1 && "$DENSE" != q4 ]]; then _ctx=163840; else _ctx=196608; fi
-# ENGINE=zig: 131072 for now (the captured kernel set holds that arena's shapes; no prompts past ~32k tokens yet)
-[[ "$ENGINE" != zig ]] || _ctx=131072
+# ENGINE=zig: 131072 by default for now. At TP=2 the captured kernel set holds every Triton variant the engine looks up
+# for windows up to 1,048,576 tokens (PARALLEL 4 or 8, KV pools of 0.8M-4M rows), checked offline by the engine's host
+# test (zig/aot/glm-aot-coverage.txt), but only 131072 has been served on the GPU so far. ZIG_CONTEXT_1M=1 makes
+# 1,048,576 the default at TP=2 until the GPU sweep (g5) passes; start.sh warns at a window no GPU run has served, and
+# sets TF_TP_TIMEOUT_S=1500 past 262,144 tokens. Memory at 1M: docs/zig-engine.md "1M context".
+ZIG_CONTEXT_1M="${ZIG_CONTEXT_1M:-0}"
+if [[ "$ENGINE" == zig ]]; then _ctx=131072; [[ "$ZIG_CONTEXT_1M" == 1 && "$TP" == 2 ]] && _ctx=1048576; fi
 CONTEXT="${CONTEXT:-$_ctx}"
 DFLASH2_ID="${DFLASH2_ID:-incoai/GLM-5.3-Flash-DFlash2}"
 _rev=""; [[ "$DFLASH2_ID" == incoai/GLM-5.3-Flash-DFlash2 ]] && _rev=bf582e4eacc1810f76656d1811693ff6c6737d2a
@@ -349,6 +355,11 @@ export TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH" TF_GLM_STREAM_SMOOTH_MS="$STREAM_SM
 FILL_BUDGET_MS="${FILL_BUDGET_MS:-200}"
 FILL_DRAFTS="${FILL_DRAFTS:-1}"
 export TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS" TF_GLM_FILL_DRAFTS="$FILL_DRAFTS"
+# ENGINE=zig: sliced prompt fills (zig/patches/0026, ZIG_HAS fill). FILL=1: a prompt fills a 2048-row chunk a step
+# between decode rounds (TF_GLM_FILL=1 on both ranks), so a long prompt no longer stalls the other streams for its whole
+# pass (an 18.7 s decoder gap behind a 38k-token cold prefill, measured with whole passes); refused with DRAFTER=mtp.
+# 0 (default): whole passes, as before. Not run on the pair yet. Checked and mapped by scripts/port.sh.
+FILL="${FILL:-${TF_GLM_FILL:-0}}"
 # L2 prefetch in decode windows (patch 0046, adapted from jayleaton/glm53-tensorfold-spark's patch 0460): a side stream
 # brings the weights the next kernels read into L2 during each layer's all-gathers. 1 (default): one request's prose
 # 48.36 -> 49.46 tok/s, code 59.54 -> 61.08 (two boots each). Same bits. 0: off.
@@ -388,6 +399,8 @@ export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # tokens (2026-10-08); its lowest free memory under a 1M-token prompt is not measured yet. Each rank holds a quarter of
 # the weights instead of a third, so it leaves more memory free.
 case "$TP" in 3|4) _pool=32 ;; *) _pool=12.5 ;; esac
+# Whether KV_POOL_GIB was set: a prompt cache with the default pool gets no budget (scripts/port.sh: port_pool_check)
+PORT_POOL_EXPLICIT=0; [[ -z "${KV_POOL_GIB:-}" ]] || PORT_POOL_EXPLICIT=1
 KV_POOL_GIB="${KV_POOL_GIB:-$_pool}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 # The display reservation in the pool (patch 0072, PARALLEL above 1): the GB10 firmware keeps ~2 GiB for a screen that
@@ -486,19 +499,11 @@ prepared_state() {
 # (1M window, PARALLEL=8, DISPLAY_KV_MIB=1792, PROMPT_CACHE_GIB=16): KV_POOL_GIB=4 gives a 0.1 GiB budget (one state);
 # KV_POOL_GIB=0.5 gives the pool 1,435,648 tokens and the cache 3.7 GiB (27 states), and the same 50k / 100k prompt
 # again answers in 0.18 / 0.26 s instead of 27 / 55 s. ENGINE=python keeps states in the pool.
+# Set above 0 while KV_POOL_GIB is not, start.sh warns that the default pool leaves it nothing (scripts/port.sh:
+# port_pool_check; on the port's pair KV_POOL_GIB=4 with PROMPT_CACHE_GIB=8 gave 6.2 GiB, 5.1 with spill v2 on).
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-0}"
 
-# Spill tier (patch 0088-glm-spill-tier, off by default): kept prompt states go to local disk on each Spark and come
-# back instead of a new prefill, also after a clean restart. SPILL_GIB: the cap per Spark (0: off). SPILL_DIR: the same
-# absolute path on every Spark (mounted at /spill; files owned by your user). SPILL_HIGHWATER: past this fraction of
-# the KV pool, the kept prompts eviction would take next are written in the background (1.0: only when evicted).
-# A clean stop writes what is kept within SPILL_FLUSH_S seconds; STOP_TIMEOUT gives it the time. README: Spill tier.
-SPILL_GIB="${SPILL_GIB:-0}"
-SPILL_DIR="${SPILL_DIR:-$HOME/.cache/tensorfold-spill}"
-SPILL_HIGHWATER="${SPILL_HIGHWATER:-0.70}"
-SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"
-SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"
-SPILL_FLUSH_S="${SPILL_FLUSH_S:-60}"
-if [[ "$SPILL_GIB" != 0 ]]; then
-  STOP_TIMEOUT="${STOP_TIMEOUT:-$(( ${SPILL_FLUSH_S%.*} + 30 ))}"
-fi
+# The spill tier (patch 0088-glm-spill-tier, off by default: SPILL_GIB, SPILL_DIR, SPILL_HIGHWATER, SPILL_MIN_TOKENS,
+# SPILL_MIN_FREE_GIB, SPILL_FLUSH_S; README: Spill tier) and the rest of Robert's GLM features ported to the Zig engine
+# (spill v2, KV sharding; all off by default): their settings, checks and mapping to the ranks are scripts/port.sh's.
+source "$_cfg_root/scripts/port.sh"
