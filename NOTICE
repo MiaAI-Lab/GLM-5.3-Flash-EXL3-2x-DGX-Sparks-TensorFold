@@ -101,7 +101,7 @@ glm53-tensorfold-spark
   (https://github.com/ashhart/TensorFold/pull/218, Apache-2.0), applied to v0.6.0 unchanged:
   tensorfold/server/cancellation.py's client-gone check asks poll() instead of select().
   patches/0088-glm-spill-tier.patch (tensorfold/cuda/spill.py and its hooks in the GLM engine and multi.py) is authored
-  by Robert Wojciechowski (GitHub @wojo, X @rwojo). Its multi-rank design (an NVMe tier for kept prompt states,
+  by Robert Wojciechowski (GitHub @wojo, https://github.com/wojo; X @rwojo). Its multi-rank design (an NVMe tier for kept prompt states,
   one directory a rank, rank 0 deciding, an agreement on every read, a reconcile at start) is that of patch 0250 of
   that project, authored by Jay Leaton; the code is a new implementation for this recipe's pool and kept prompts.
 
@@ -129,6 +129,9 @@ bertholomus/TensorFold (a TensorFold fork; design only)
   from it; the code is ours.
 
 Contributions to this project (Apache-2.0, through its issues and pull requests)
+  scripts/port.sh and scripts/port_test.sh (ENGINE=zig: the settings of zig/patches/0017 to 0023 mapped to the ranks):
+  by Robert Wojciechowski (GitHub @wojo, X @rwojo), from his port of the same features to the DeepSeek-V4.1-Flash
+  recipe; the PROMPT_CACHE_GIB setting it maps is ezoushen's (pull request #187).
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.
   patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by MiaAI-Lab.
   patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).

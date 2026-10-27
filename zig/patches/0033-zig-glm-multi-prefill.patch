@@ -1,0 +1,416 @@
+# port-patches.sh: glm/parity-r6 @ 1571e7dfdd29 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 0e0518f341f2..1571e7dfdd29); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: several waiting prompts fill a chunk each a step (TF_GLM_MULTI_PREFILL, default off; with TF_GLM_FILL=1)
+
+Up to TF_GLM_MULTI_PREFILL_MOST (2) prompts, the oldest always first, then the fewest rows left: a short prompt behind
+a long one no longer waits for all of it. Separate forwards, the same chunks as alone, so the same replies.
+
+Commits:
+- glm_cuda: several waiting prompts fill a chunk each a step (TF_GLM_MULTI_PREFILL, default off)
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0033-zig-glm-multi-prefill.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda.zig b/zig/src/families/glm_cuda/cuda.zig
+index 7cc7ffae399d6b8bdc59741cd8a1627c90c9ee66..f309031131b8936d469ef04910735b9cb566fba8 100644
+--- a/zig/src/families/glm_cuda/cuda.zig
++++ b/zig/src/families/glm_cuda/cuda.zig
+@@ -61,6 +61,7 @@ test {
+     _ = rounds;
+     _ = backend;
+     _ = mirror;
++    _ = @import("cuda_fill_pick.zig");
+ }
+ 
+ pub const serving = @import("cuda_serving.zig");
+diff --git a/zig/src/families/glm_cuda/cuda_fill_pick.zig b/zig/src/families/glm_cuda/cuda_fill_pick.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..31e1a7a47588267d38c1d562cb705539a318486f
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_fill_pick.zig
+@@ -0,0 +1,87 @@
++//! TF_GLM_MULTI_PREFILL: which filling prompts a sliced fill's step (cuda_lanes prefillStepFn) advances a chunk each.
++//! The oldest always (it never waits behind a newer one), then the fewest rows left, the older on a tie: a short prompt
++//! admitted behind a long one gets its first token without waiting for the whole long prompt. Every rank picks alike
++//! (orders and rows left are the same on every rank).
++const std = @import("std");
++
++/// A filling prompt: its fill's begin order and the rows its pass has left from its segment's start.
++pub const Candidate = struct { order: u64, left: usize };
++
++/// Prompts a step advances at most (TF_GLM_MULTI_PREFILL_MOST); the setting's range.
++pub const default_most: usize = 2;
++pub const most_max: usize = 8;
++
++/// TF_GLM_MULTI_PREFILL (`on`) and TF_GLM_MULTI_PREFILL_MOST (`most`), as set: the prompts a step advances. Unset, blank or
++/// "0": 1 (the oldest alone, as without it); "1": `most` of them, 2 by default, 2 to 8. Anything else is refused.
++pub fn parse(on: ?[]const u8, most: ?[]const u8) !usize {
++    const v = std.mem.trim(u8, on orelse return 1, " ");
++    if (v.len == 0 or std.mem.eql(u8, v, "0")) return 1;
++    if (!std.mem.eql(u8, v, "1")) return error.BadMultiPrefill;
++    const m = std.mem.trim(u8, most orelse return default_most, " ");
++    if (m.len == 0) return default_most;
++    const n = std.fmt.parseInt(usize, m, 10) catch return error.BadMultiPrefill;
++    if (n < 2 or n > most_max) return error.BadMultiPrefill;
++    return n;
++}
++
++/// The setting once the ranks agreed on it: this rank's read error, or 1 without sliced fills (TF_GLM_FILL=1), which it
++/// needs (whole passes have no chunks to share).
++pub fn admit(read: anyerror!usize, sliced: bool) !usize {
++    const n = try read;
++    return if (sliced) n else 1;
++}
++
++/// Up to `most` of `cands` (indices into it) in `out`, by begin order (the chunks run oldest first).
++pub fn pick(cands: []const Candidate, most: usize, out: []usize) []usize {
++    const n = @min(@min(most, cands.len), out.len);
++    if (n == 0) return out[0..0];
++    var oldest: usize = 0;
++    for (cands, 0..) |c, i| if (c.order < cands[oldest].order) {
++        oldest = i;
++    };
++    out[0] = oldest;
++    var k: usize = 1;
++    while (k < n) : (k += 1) {
++        var best: ?usize = null;
++        for (cands, 0..) |c, i| {
++            if (std.mem.indexOfScalar(usize, out[0..k], i) != null) continue;
++            if (best) |b| {
++                const o = cands[b];
++                if (c.left > o.left or (c.left == o.left and c.order > o.order)) continue;
++            }
++            best = i;
++        }
++        out[k] = best.?;
++    }
++    std.mem.sort(usize, out[0..n], cands, byOrder);
++    return out[0..n];
++}
++
++fn byOrder(cands: []const Candidate, a: usize, b: usize) bool {
++    return cands[a].order < cands[b].order;
++}
++
++test "pick: the oldest, then the fewest rows left (the older on a tie), oldest first; never more than asked" {
++    var out: [8]usize = undefined;
++    const c = [_]Candidate{ .{ .order = 4, .left = 900 }, .{ .order = 1, .left = 5000 }, .{ .order = 7, .left = 100 }, .{ .order = 3, .left = 100 } };
++    try std.testing.expectEqualSlices(usize, &.{1}, pick(&c, 1, &out));
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, pick(&c, 2, &out));
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3, 2 }, pick(&c, 3, &out));
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3, 0, 2 }, pick(&c, 8, &out));
++    try std.testing.expectEqual(@as(usize, 0), pick(&.{}, 2, &out).len);
++    try std.testing.expectEqual(@as(usize, 0), pick(&c, 0, &out).len);
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, pick(&c, 8, out[0..2]));
++}
++
++test "TF_GLM_MULTI_PREFILL: off unless 1, then 2 prompts a step or TF_GLM_MULTI_PREFILL_MOST's 2 to 8; anything else refused; nothing without sliced fills" {
++    try std.testing.expectEqual(@as(usize, 1), try parse(null, "4"));
++    for ([_][]const u8{ "", "0", " 0 " }) |v| try std.testing.expectEqual(@as(usize, 1), try parse(v, "4"));
++    try std.testing.expectEqual(@as(usize, 2), try parse("1", null));
++    try std.testing.expectEqual(@as(usize, 2), try parse(" 1", " "));
++    try std.testing.expectEqual(@as(usize, 8), try parse("1", "8"));
++    for ([_][]const u8{ "2", "yes", "on" }) |v| try std.testing.expectError(error.BadMultiPrefill, parse(v, null));
++    for ([_][]const u8{ "1", "9", "x", "-2" }) |m| try std.testing.expectError(error.BadMultiPrefill, parse("1", m));
++    try std.testing.expectEqual(@as(usize, 3), try admit(3, true));
++    try std.testing.expectEqual(@as(usize, 1), try admit(3, false));
++    try std.testing.expectError(error.BadMultiPrefill, admit(error.BadMultiPrefill, false));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index 9d9eef83e1f553f55a77dd09bab5209d212f27c2..bd0e0037df672a0699d8223245f252f880e5139d 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -8,6 +8,7 @@ const decode = @import("flashnext").decode;
+ const shard = @import("cuda_shard.zig");
+ const wire = @import("cuda_spill_wire.zig");
+ const keep = @import("cuda_shard_keep.zig");
++const fill_pick = @import("cuda_fill_pick.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -199,6 +200,8 @@ pub fn Lanes(comptime E: type) type {
+         sliced: bool = false,
+         /// fills begun (their order)
+         fills: u64 = 0,
++        /// TF_GLM_MULTI_PREFILL: filling prompts a step advances a chunk each (cuda_fill_pick); 1: the oldest alone
++        fill_most: usize = 1,
+         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
+         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
+         opened: std.ArrayList(*Lane) = .empty,
+@@ -366,7 +369,8 @@ pub fn Lanes(comptime E: type) type {
+             f.final = true;
+         }
+ 
+-        /// One chunk of the oldest filling prompt (one in all: the rounds between steps wait for no more); a segment that
++        /// One chunk of the oldest filling prompt (one in all: the rounds between steps wait for no more; with
++        /// TF_GLM_MULTI_PREFILL one each of up to `fill_most`, fillMany); a segment that
+         /// ends keeps its mark's state as pass() does (the save's outcome agreed, the store told, rank 1 told at once:
+         /// each segment is a pass to the notes) and starts the next; a prompt that is in has its first token. A prompt
+         /// that ran whole at its begin is in now too.
+@@ -389,7 +393,31 @@ pub fn Lanes(comptime E: type) type {
+                 }
+             }
+             const i = oldest orelse return;
+-            const s = streams[i];
++            if (self.fill_most > 1) return self.fillMany(streams, states);
++            return self.fillChunk(streams[i], &states[i]);
++        }
++
++        /// TF_GLM_MULTI_PREFILL: a chunk each of the fills cuda_fill_pick takes (the oldest, then the fewest rows left),
++        /// oldest first, each as fillChunk alone; the prompts that ran whole at their begin are done already. No
++        /// allocation: every rank gets here with the same streams and fails alike (a sequence slot each, 8 at most).
++        fn fillMany(self: *Self, streams: []const *lanes.Stream, states: []be.FillState) !void {
++            var at: [fill_pick.most_max * max_streams]usize = undefined;
++            var cands: [at.len]fill_pick.Candidate = undefined;
++            var out: [at.len]usize = undefined;
++            var n: usize = 0;
++            for (streams, states, 0..) |s, st, i| {
++                if (st != .filling) continue;
++                if (n == at.len) return error.TooManyFills;
++                const f = self.lanes.get(s).?.fill.?;
++                at[n] = i;
++                cands[n] = .{ .order = f.order, .left = s.prompt().len -| f.at };
++                n += 1;
++            }
++            for (fill_pick.pick(cands[0..n], self.fill_most, &out)) |k| try self.fillChunk(streams[at[k]], &states[at[k]]);
++        }
++
++        /// The next chunk of `s`'s fill; `state` becomes `done` once its prompt is in.
++        fn fillChunk(self: *Self, s: *lanes.Stream, state: *be.FillState) !void {
+             const l = self.lanes.get(s).?;
+             const f = &l.fill.?;
+             const fl = f.fl.?;
+@@ -432,7 +460,7 @@ pub fn Lanes(comptime E: type) type {
+             self.gpa.free(f.mask);
+             l.fill = null;
+             self.endPass();
+-            states[i] = .done;
++            state.* = .done;
+         }
+ 
+         fn stopFill(self: *Self, l: *Lane) void {
+@@ -2975,6 +3003,105 @@ test "TF_GLM_FILL: a step advances one chunk in all, the oldest fill's; a later
+     SlicedPair.B.releaseFn(&p.r1, &sb);
+ }
+ 
++/// The chunks rank 0's engine ran on `s`'s sequence so far.
++fn chunksOf(p: *SlicedPair, s: *lanes.Stream) usize {
++    const seq = @intFromPtr(p.r0.lanes.get(s).?.seq);
++    var n: usize = 0;
++    for (p.e0.chunk_log.items) |c| n += @intFromBool(c[0] == seq);
++    return n;
++}
++
++test "TF_GLM_MULTI_PREFILL: two long prompts filling both advance a chunk a step, neither waits for the other's whole prompt; each ends as alone on both ranks" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    p.init(gpa, all_yes, all_yes);
++    defer p.deinit();
++    p.r0.fill_most = 2;
++    p.r1.fill_most = 2;
++    const a = testPrompt(3);
++    const b = testPrompt(5);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    // b keeps a state at 64 on the way (a segment ends inside the shared steps)
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &b, .max_new = 4, .reuse = .{ .marks = &.{64} } });
++    defer sb.deinit(gpa);
++    try p.begin(&sa, &sa);
++    try p.begin(&sb, &sb);
++    var st: [2]be.FillState = undefined;
++    // 150 rows each: 5 chunks; every step one of each, the older's first
++    for (0..5) |i| {
++        try p.step(&.{ &sb, &sa }, &.{ &sb, &sa }, &st);
++        try std.testing.expectEqual(2 * (i + 1), p.e0.chunk_log.items.len);
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sa));
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sb));
++        try std.testing.expectEqual(@intFromPtr(p.r0.lanes.get(&sa).?.seq), p.e0.chunk_log.items[2 * i][0]);
++        const state: be.FillState = if (i == 4) .done else .filling;
++        try std.testing.expectEqualSlices(be.FillState, &.{ state, state }, &st);
++    }
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r0, &sa));
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r1, &sa));
++    try std.testing.expectEqual(MiniEngine.hash(&b), try firstToken(SlicedPair.B, &p.r0, &sb));
++    try std.testing.expectEqual(MiniEngine.hash(&b), try firstToken(SlicedPair.B, &p.r1, &sb));
++    // every row once, the same passes and chunks on both ranks
++    var covered: usize = 0;
++    for (p.e0.chunk_log.items) |c| covered += c[2] - c[1];
++    try std.testing.expectEqual(@as(usize, 300), covered);
++    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 150 }, .{ 0, 64 }, .{ 64, 150 } }, p.e0.trace.items);
++    try std.testing.expectEqualSlices([2]usize, p.e0.trace.items, p.e1.trace.items);
++    try std.testing.expectEqual(p.e0.chunk_log.items.len, p.e1.chunk_log.items.len);
++    try std.testing.expectEqual(@as(usize, 0), p.e0.fills_live + p.e1.fills_live);
++    SlicedPair.B.releaseFn(&p.r0, &sa);
++    SlicedPair.B.releaseFn(&p.r1, &sa);
++    SlicedPair.B.releaseFn(&p.r0, &sb);
++    SlicedPair.B.releaseFn(&p.r1, &sb);
++}
++
++test "TF_GLM_MULTI_PREFILL: past the most a step takes, the oldest fill and the one with the fewest rows left go first; a short prompt's first token comes before the long ones'" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    p.init(gpa, all_yes, all_yes);
++    defer p.deinit();
++    p.r0.fill_most = 2;
++    p.r1.fill_most = 2;
++    const a = testPrompt(3);
++    const b = testPrompt(5);
++    const c = testPrompt(7);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &b, .max_new = 4 });
++    defer sb.deinit(gpa);
++    var sc = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = c[0..70], .max_new = 4 });
++    defer sc.deinit(gpa);
++    try p.begin(&sa, &sa);
++    try p.begin(&sb, &sb);
++    try p.begin(&sc, &sc);
++    var st: [3]be.FillState = undefined;
++    // the newest (70 rows, 3 chunks) beside the oldest; the middle one waits
++    for (0..3) |i| {
++        try p.step(&.{ &sa, &sb, &sc }, &.{ &sa, &sb, &sc }, &st);
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sa));
++        try std.testing.expectEqual(@as(usize, 0), chunksOf(&p, &sb));
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sc));
++    }
++    try std.testing.expectEqualSlices(be.FillState, &.{ .filling, .filling, .done }, &st);
++    try std.testing.expectEqual(MiniEngine.hash(c[0..70]), try firstToken(SlicedPair.B, &p.r0, &sc));
++    try std.testing.expectEqual(MiniEngine.hash(c[0..70]), try firstToken(SlicedPair.B, &p.r1, &sc));
++    // then the two long ones together
++    var two: [2]be.FillState = undefined;
++    for (0..2) |_| try p.step(&.{ &sa, &sb }, &.{ &sa, &sb }, &two);
++    try std.testing.expectEqualSlices(be.FillState, &.{ .done, .filling }, &two);
++    try std.testing.expectEqual(@as(usize, 2), chunksOf(&p, &sb));
++    for (0..3) |_| try p.step(&.{&sb}, &.{&sb}, two[0..1]);
++    try std.testing.expectEqual(be.FillState.done, two[0]);
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r1, &sa));
++    try std.testing.expectEqual(MiniEngine.hash(&b), try firstToken(SlicedPair.B, &p.r1, &sb));
++    try std.testing.expectEqual(p.e0.chunk_log.items.len, p.e1.chunk_log.items.len);
++    for ([_]*lanes.Stream{ &sa, &sb, &sc }) |s| {
++        SlicedPair.B.releaseFn(&p.r0, s);
++        SlicedPair.B.releaseFn(&p.r1, s);
++    }
++}
++
+ test "TF_GLM_FILL: a fill cancelled between its steps frees its fill and sequence on both ranks; its kept marks stay, the next fill runs whole" {
+     const gpa = std.testing.allocator;
+     var p: SlicedPair = undefined;
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index 3835749d32d527f69868e1195ca0a55e432ee167..52740c675957657989d8d40d621d05ad1801dd62 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -9,6 +9,7 @@ const link = @import("cuda_link.zig");
+ const comm = @import("cuda_comm.zig");
+ const mirror = @import("cuda_mirror.zig");
+ const lane_backend = @import("cuda_lanes.zig");
++const fill_pick = @import("cuda_fill_pick.zig");
+ const serving = @import("cuda_serving.zig");
+ const engine = @import("cuda_engine.zig");
+ const cache_plan = @import("cuda_cache_plan.zig");
+@@ -106,6 +107,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     // TF_GLM_FILL: in the settings text (every rank must fill alike: the mirror replays rank 0's slices), refused after
+     // the agreement on every rank alike
+     var sliced = false;
++    // TF_GLM_MULTI_PREFILL: the filling prompts a step advances (in the settings text with TF_GLM_FILL; 1 without it)
++    var fill_most: usize = 1;
+     const own = try gpa.create(Own);
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
+@@ -138,6 +141,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+         spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+         sliced = fillAdmit(fillSetting(), o, choice) catch |e| return kvRefused(e);
++        fill_most = fill_pick.admit(multiSetting(), sliced) catch |e| return kvRefused(e);
+         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
+         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
+         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
+@@ -146,6 +150,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+         spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+         sliced = fillAdmit(fillSetting(), o, choice) catch |e| return kvRefused(e);
++        fill_most = fill_pick.admit(multiSetting(), sliced) catch |e| return kvRefused(e);
+     }
+     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
+     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
+@@ -180,6 +185,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     }
+     try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null, sliced);
+     if (sliced) std.log.info("rank {d}: TF_GLM_FILL=1: prompts fill a 2048-row chunk a step between decode rounds", .{o.rank});
++    own.serving.?.local.fill_most = fill_most;
++    if (fill_most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ o.rank, fill_most });
+     if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
+     const build_key = if (agreement == null) buildKey(gpa, io, dir, kernels, o) catch 0 else 0;
+     var budget: u64 = 0;
+@@ -225,6 +232,11 @@ fn fillSetting() anyerror!bool {
+ 
+ /// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head for every stream: a
+ /// fill's chunks would absorb into it between other streams' drafts).
++/// TF_GLM_MULTI_PREFILL with TF_GLM_MULTI_PREFILL_MOST (cuda_fill_pick.parse): this rank's prompts a step, or its error.
++fn multiSetting() anyerror!usize {
++    return fill_pick.parse(envText("TF_GLM_MULTI_PREFILL"), envText("TF_GLM_MULTI_PREFILL_MOST"));
++}
++
+ fn fillAdmit(read: anyerror!bool, o: Options, choice: choice_mod.Choice) !bool {
+     const on = try read;
+     if (on and o.drafts and choice == .mtp) return error.FillWithMtp;
+@@ -242,6 +254,7 @@ pub fn refusal(err: anyerror) ?[]const u8 {
+     return shard.why(err) orelse identity.why(err) orelse switch (err) {
+         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+         error.BadFill => "TF_GLM_FILL: 1 (prompts fill a chunk a step between decode rounds) or 0 (whole passes), nothing else",
++        error.BadMultiPrefill => "TF_GLM_MULTI_PREFILL: 1 (waiting prompts fill a chunk each a step, TF_GLM_MULTI_PREFILL_MOST of them, 2 to 8) or 0, nothing else",
+         error.FillWithMtp => "TF_GLM_FILL=1 does not run with MTP drafts (one MTP head serves every stream); DFlash2 drafts or none",
+         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
+         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: spill v2 does not store the MTP head's state yet (MTP drafts keep prompt states in memory only; DFlash2 drafts or none)",
+@@ -682,8 +695,11 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
+     const v2_words: []const u8 = if (v2) |env| (if (env != null) try spillWords(&v2_buf, o) else "") else |_| " spill_v2=unreadable";
+     // TF_GLM_FILL: on, or a rank that cannot read it (nothing when off: the text as before)
+     const fill_words: []const u8 = if (fillSetting()) |on| (if (on) " fill=1" else "") else |_| " fill=unreadable";
+-    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}{s}", .{
+-        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words, fill_words,
++    // TF_GLM_MULTI_PREFILL: its prompts a step with sliced fills on, or a rank that cannot read it (nothing otherwise)
++    var multi_buf: [32]u8 = undefined;
++    const multi_words: []const u8 = if (multiSetting()) |n| (if (n > 1 and fill_words.len > 0) try std.fmt.bufPrint(&multi_buf, " multi_prefill={d}", .{n}) else "") else |_| " multi_prefill=unreadable";
++    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}{s}{s}", .{
++        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words, fill_words, multi_words,
+     });
+ }
+ 
+@@ -859,6 +875,39 @@ test "TF_GLM_FILL: the settings text carries it only when on (after spill v2's w
+     try std.testing.expect(refusal(error.FillWithMtp) != null);
+ }
+ 
++test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are on (the text as before otherwise), a rank that cannot read it a word no rank sends; refused in words" {
++    const gpa = std.testing.allocator;
++    const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2 };
++    defer _ = TestEnv.unsetenv("TF_GLM_FILL");
++    defer _ = TestEnv.unsetenv("TF_GLM_MULTI_PREFILL");
++    defer _ = TestEnv.unsetenv("TF_GLM_MULTI_PREFILL_MOST");
++    _ = TestEnv.unsetenv("TF_GLM_FILL");
++    _ = TestEnv.unsetenv("TF_GLM_MULTI_PREFILL");
++    _ = TestEnv.unsetenv("TF_GLM_MULTI_PREFILL_MOST");
++    const before = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(before);
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "1", 1);
++    try std.testing.expectEqual(@as(usize, 2), try multiSetting());
++    const no_fill = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(no_fill);
++    try std.testing.expectEqualStrings(before, no_fill); // the recipe's default MULTI_PREFILL=1 with FILL=0: as before
++    _ = TestEnv.setenv("TF_GLM_FILL", "1", 1);
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL_MOST", "3", 1);
++    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(on);
++    try std.testing.expect(std.mem.endsWith(u8, on, " fill=1 multi_prefill=3"));
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "0", 1);
++    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(off);
++    try std.testing.expect(std.mem.endsWith(u8, off, " fill=1"));
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "2", 1);
++    try std.testing.expectError(error.BadMultiPrefill, multiSetting());
++    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(bad);
++    try std.testing.expect(std.mem.endsWith(u8, bad, " multi_prefill=unreadable"));
++    try std.testing.expect(refusal(error.BadMultiPrefill) != null);
++}
++
+ const TestEnv = struct {
+     extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+     extern "c" fn unsetenv(name: [*:0]const u8) c_int;

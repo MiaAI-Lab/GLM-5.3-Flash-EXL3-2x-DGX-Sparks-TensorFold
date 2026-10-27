@@ -1,0 +1,2480 @@
+# port-patches.sh: glm/parity-r6 @ 1571e7dfdd29 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 069c49ffd2dc..1ea862b590e4); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: spill v2 with KV sharding: each rank keeps and restores its own view of a kept state under its home part (port of GLM 0118's spill blocks)
+
+With KV sharding a kept state's latent rows are only on the rank that owned
+its stream (its home part); every other section is on both ranks. Spill v2 of
+such states, so TF_GLM_SPILL_V2=1 and TF_GLM_KV_SHARD=1 run together (the
+refusal of the pair goes).
+
+- cuda_spill_state: an owner-sharded layout: the home part's owner stores a
+  token's latent and pooled rows (6,204 bytes), the other rank the pooled
+  rows alone (396), so a pair stores a point's blocks in 6,600 bytes a token
+  instead of 12,408; the lineage is salted with the home part (a carried
+  conversation names new blocks, never another part's), the point records
+  its home, the namespace and the fingerprint say owner_sharded.
+- cuda_spill_tier: rank 0 keeps its view with the salted lineage and the
+  keep note carries it; rank 1 checks its own state's home against the note
+  before it writes its view. A restore reads the point's part from rank 0's
+  store and sends it in has (a rank answers present only for that part, else
+  every rank forgets the point); each rank's destination is its own view
+  with the home recorded, and the resume then places it as any kept state
+  (in its part, moved home, carried, or from 0). A restore whose resume
+  could only start from 0 (its home part full, no carry) does not start
+  (KvShardHomeFull, asked before the cache makes room and before any read):
+  its prompt prefills at once, also beside other restores in flight.
+- Points per part (points_part0, points_part1) in every rank's tier counters
+  on /health and /metrics.
+
+Switches: TF_GLM_SPILL_V2=1 (with --spill-gib and --snapshot-dir) together
+with TF_GLM_KV_SHARD=1; each alone is unchanged except two zero counters a
+rank under spill v2 alone and two more index lookups a restore (the stats
+answer carries 36 counters instead of 34; one build on both ranks). Each
+rank's store limits count its own bytes, so when points lean to one part that
+part's owner reaches its cap first.
+
+Tests (host): the owner-sharded layout, lineage, home and fingerprint
+(cuda_spill_state, cuda_spill_identity), the store's per-part sizes, and the
+tier over the two-rank host rig with both on (keep, restore into the home, has
+naming the part, a rank missing or of the other part, restart, the
+KvShardHomeFull refusal), each failing without its change.
+
+Measured on the pair: not run yet (round 3; the next GPU session). Round 2's
+image refused the pair at start on both ranks with the intended message (g2),
+which this patch removes.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); spill v2's block store
+design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync
+order): BadAd84 (https://github.com/BadAd84),
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; GLM patches 0110
+and 0118, MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#124 and #152.
+Apply from the checkout root with: git apply 0023-zig-glm-spill-kv-shard.patch
+
+diff --git a/zig/src/core/lane_host_tier_test.zig b/zig/src/core/lane_host_tier_test.zig
+index 71ae408c7f1d43cf509ab77064bce059d13ef5df..fd9415c8ea669b0310b744026e8bbf7b1f8e4bbf 100644
+--- a/zig/src/core/lane_host_tier_test.zig
++++ b/zig/src/core/lane_host_tier_test.zig
+@@ -974,6 +974,50 @@ test "a restore refused for its destination's memory (GLM's SpillReserve) waits
+     try std.testing.expectEqual(@as(u64, 2), r.tier.refused); // once more, when the first ended
+ }
+ 
++test "a restore refused because its home part has no room (GLM's KvShardHomeFull) beside one in flight is admitted on memory at once, not deferred" {
++    var a: Box = .{};
++    defer a.deinit();
++    var b: Box = .{};
++    defer b.deinit();
++    const r = try Rig.create(.{ .load_ms = 5, .defer_ms = 10_000 });
++    defer r.destroy();
++    r.tier.gate.store(false, .release); // the first restore stays in flight until the end
++    _ = try r.point(&t2, 8);
++    const e = r.host.engine();
++    const areq: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
++    try e.submit(1, &areq, a.sink());
++    try r.until(struct {
++        fn ok(s: api.CacheStats) bool {
++            return s.restore_waits == 1;
++        }
++    }.ok);
++    // the second point is on disk but its resume could only start from 0 (its home part full, no carry): its own
++    // placement, which no restore in flight holds, so its prompt prefills now rather than waiting for the first restore
++    r.tier.refuse = 1 << 20;
++    r.tier.refuse_err = error.KvShardHomeFull;
++    const other = [_]u32{ 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6 };
++    _ = try r.point(&other, 8);
++    const breq: Request = .{ .prompt = &other, .max_tokens = 6, .history_len = 14 };
++    try e.submit(2, &breq, b.sink());
++    for (0..5000) |_| {
++        if (b.finished() != null) break;
++        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
++    }
++    try std.testing.expectEqual(@as(?Reason, Reason.length), b.finished()); // with the first restore still in flight
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    try b.exact(&other);
++    try std.testing.expect(a.finished() == null);
++    const s = r.stats();
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred);
++    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred_expired);
++    try std.testing.expectEqual(@as(u64, 1), r.tier.refused); // asked once, never again
++    r.tier.gate.store(true, .release);
++    try std.testing.expectEqual(Reason.length, a.wait());
++    try std.testing.expectEqual(@as(?u32, 8), a.cached);
++    try a.exact(&t2);
++    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_begun);
++}
++
+ // -- prompt passes while requests are parked (whole passes service nothing) -----------------------------------------
+ 
+ /// Records, at each watched pass's first chunk (on the engine thread), how many restores the store had adopted.
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index f4395d00b053330724d1c632d0ac5cb95a528506..5efa1254314bb108157698cd9635b12aeb5e6257 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -320,8 +320,10 @@ pub const TierCounts = struct {
+     quota_trims: u64 = 0,
+     recovered_points: u64 = 0, // published points found at start
+     dropped_temporaries: u64 = 0, // incomplete records removed at start
++    points_part0: u64 = 0, // gauge: KV sharding (an owner-sharded store): published points whose home is part 0
++    points_part1: u64 = 0, // gauge: ... part 1
+ 
+-    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
++    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending", "points_part0", "points_part1" };
+ 
+     /// Each field's /metrics help (a missing one fails the build).
+     pub const help = .{
+@@ -359,6 +361,8 @@ pub const TierCounts = struct {
+         .quota_trims = "Writes that trimmed their conversation to its quota.",
+         .recovered_points = "Published points found at start.",
+         .dropped_temporaries = "Incomplete records removed at start.",
++        .points_part0 = "Published points whose home is KV part 0 (an owner-sharded disk tier; 0 when replicated).",
++        .points_part1 = "Published points whose home is KV part 1 (an owner-sharded disk tier; 0 when replicated).",
+     };
+ };
+ 
+@@ -369,12 +373,15 @@ pub const TierCounts = struct {
+ pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
+ 
+ /// Refusals that name the point itself, never deferred (Store.deferrable): the store's NoTier and BadPoint; a family
+-/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank; core/spill's Missing; the fake
+-/// tier's PointMissing. No wait cures them (the tier forgets a point it learned is gone), with one exception:
+-/// SpillNotOnEveryRank is also GLM's answer while a rank's own write of the point is still queued (`incomplete`, kept
+-/// on every rank), which a later ask would find published. It stays here: rank 0 cannot see that write publish without
+-/// asking every rank `has` again, a gather each time, and the case needs a lookup to choose the point (its memory state
+-/// already evicted) while another rank is still writing it.
++/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank, KvShardHomeFull; core/spill's
++/// Missing; the fake tier's PointMissing. No wait for the restores in flight cures them (the tier forgets a point it
++/// learned is gone), with one exception: SpillNotOnEveryRank is also GLM's answer while a rank's own write of the
++/// point is still queued (`incomplete`, kept on every rank), which a later ask would find published. It stays here:
++/// rank 0 cannot see that write publish without asking every rank `has` again, a gather each time, and the case needs
++/// a lookup to choose the point (its memory state already evicted) while another rank is still writing it.
++/// KvShardHomeFull (GLM, owner-sharded KV: the point's home part has no room for its resume and no carry can take it)
++/// names the point's placement, which no restore holds (a restore's end frees no pool rows; a stream's may), so the
++/// prompt prefills at once, in a part with room, instead of waiting beside the restores in flight.
+ pub const point_errors = [_]anyerror{
+     error.NoTier,
+     error.BadPoint,
+@@ -383,6 +390,7 @@ pub const point_errors = [_]anyerror{
+     error.SpillNotOnEveryRank,
+     error.Missing,
+     error.PointMissing,
++    error.KvShardHomeFull,
+ };
+ 
+ /// The ranks a tier reports counters for (TP ranks; more are not reported).
+diff --git a/zig/src/core/spill/store.zig b/zig/src/core/spill/store.zig
+index fca7028b74e78326486acdbee9db91b48ca3f988..b6ed6613daa1f600e6b22590fdf8cfa25ae1b71d 100644
+--- a/zig/src/core/spill/store.zig
++++ b/zig/src/core/spill/store.zig
+@@ -250,6 +250,9 @@ pub const Counters = struct {
+     staging_bytes: u64 = 0,
+     staging_peak_bytes: u64 = 0,
+     disk_free_bytes: u64 = 0,
++    /// owner_sharded: the points of this rank's own part (Limits.own_part); the others are the other parts' (0 on a
++    /// replicated store)
++    own_part_points: u64 = 0,
+ };
+ 
+ const BlockInfo = struct { crc: u32, sha: Digest, ino: u64, bytes: u64 };
+@@ -2836,6 +2839,10 @@ pub const Store = struct {
+         x.staging_bytes = s.slots.heldBytes();
+         x.staging_peak_bytes = s.slots.peakBytes();
+         x.disk_free_bytes = s.disk_free;
++        if (s.cfg.limits.foreign_block_bytes != 0) {
++            var it = s.points.valueIterator();
++            while (it.next()) |p| x.own_part_points += @intFromBool(p.*.lineage.part == s.cfg.limits.own_part);
++        }
+         return x;
+     }
+ 
+diff --git a/zig/src/core/spill/store_test.zig b/zig/src/core/spill/store_test.zig
+index fc57fda0d81d146b1ca58b1e2e4094a9a90462e9..e8459bd99d7817ce6771620c789fc714238d2668 100644
+--- a/zig/src/core/spill/store_test.zig
++++ b/zig/src/core/spill/store_test.zig
+@@ -1651,6 +1651,7 @@ fn checkOwnerParts(gpa: Allocator) !void {
+     try h.reopen();
+     try ensure(h.s.presence(own) and h.s.presence(other), @src());
+     try ensure(h.s.partOf(own).?.part == 0 and h.s.partOf(other).?.part == 1 and h.s.partOf(@splat(9)) == null, @src());
++    try ensure(h.s.counts().points == 2 and h.s.counts().own_part_points == 1, @src()); // (one of this rank's part)
+     const hit = h.s.lookup(.{ .keyed = other_ids, .max_at = max_tokens }) orelse return CheckFailed;
+     try ensure(hit.part == 1 and std.mem.eql(u8, &hit.key, &other), @src());
+     // a rank owning part 1 with these files: the sizes are not its own, both points damaged
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 9ecbf6dcc046fdbcd9a651a2e99a3f314e31f948..bbb9f63ce3fe7a2d831bcb7ddc42a326e2f65048 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -395,6 +395,8 @@ pub const Engine = struct {
+         // spill v2 (Options.spill_v2): its pinned staging (the write ring, the read-ahead slots, the small states') taken
+         // before the pool is sized, so the pool and the kept-state budget are what it leaves and it never takes pool rows
+         // mid-run. Sized for the largest index ring the caches can end with (the final ring is set below).
++        // TF_GLM_KV_SHARD plans the same slots: a slot holds a rank's largest block, its own part's (the other part's
++        // are smaller).
+         e.tier_staging = null;
+         e.tier_events = &.{};
+         if (o.spill_v2) |sv| {
+@@ -862,9 +864,11 @@ pub const Engine = struct {
+         return e.sectionsFor(at).total;
+     }
+ 
+-    /// Spill v2's layout of this engine's kept states (cuda_spill_state): its geometry, index ring and drafter.
++    /// Spill v2's layout of this engine's kept states (cuda_spill_state): its geometry, index ring and drafter;
++    /// owner_sharded under TF_GLM_KV_SHARD (a state's latent rows on its home part's owner only).
+     pub fn spillLayout(e: *const Engine) !spill_state.Layout {
+-        return spill_state.Layout.init(e.g, e.caches.ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
++        const l = try spill_state.Layout.init(e.g, e.caches.ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
++        return if (e.shard != null) l.sharded() else l;
+     }
+ 
+     // -- spill v2's device side (cuda_spill_tier): copies on the engine's stream, one event a staging slot ----------
+@@ -877,7 +881,7 @@ pub const Engine = struct {
+     }
+ 
+     pub fn tierKept(_: *const Engine, snap: *const Snap) spill_state.Kept {
+-        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec };
++        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec, .home = snap.home };
+     }
+ 
+     fn tierD2h(ptr: *anyopaque, dst: []u8, src: u64) anyerror!void {
+@@ -937,17 +941,27 @@ pub const Engine = struct {
+     }
+ 
+     /// A restore's destination: a new kept-state buffer for `at` tokens, refused under the keep floor (as a save is).
+-    pub fn tierDest(e: *Engine, at: usize) !*Snap {
+-        const sec = e.sectionsFor(at);
++    /// TF_GLM_KV_SHARD: the state of part `home` as takeSnap leaves it on this rank (its latent rows on the part's owner
++    /// only), its home recorded for the resume's placement (placeResume).
++    pub fn tierDest(e: *Engine, at: usize, home: ?u8) !*Snap {
++        const rows = if (e.shard) |sh| (home orelse return error.KvShardNoHome) == sh.rank else if (home != null) return error.KvShardOff else true;
++        const sec = e.sectionsHeld(at, rows);
+         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
+         const snap = try e.gpa.create(Snap);
+         errdefer e.gpa.destroy(snap);
+         const buf = try cuda.DeviceBuffer.alloc(e.stream.d, sec.total);
+         e.snap_next += 1;
+-        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec };
++        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec, .home = home };
+         return snap;
+     }
+ 
++    /// TF_GLM_KV_SHARD: whether a restore of a state of `at` tokens kept in part `home` is worth its reads now (its
++    /// resume could be placed or carried: cuda_shard_keep.restorable); rank 0 asks before any read. Off: true.
++    pub fn tierResumable(e: *const Engine, at: usize, home: u8) !bool {
++        if (e.shard == null) return true;
++        return shard_keep.restorable(&e.pool, home, at, e.kv_switches.carry);
++    }
++
+     fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {
+         const e: *Engine = @ptrCast(@alignCast(ptr));
+         // a DRM display span is two host registrations, and rows of a latent plane can lie on both sides of the cut
+@@ -1709,7 +1723,12 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
+         try std.testing.expectEqual(@as(usize, 4 * G.extent), s.st.base);
+         e.kv_switches.carry = false;
+         try std.testing.expect(!try e.placeResume(s, &home0));
++        // (so a restore of such a state from disk does not start; part 1's two free extents take 2,048 tokens and the
++        // next one, not 4,096)
++        try std.testing.expect(!try e.tierResumable(4096, 0));
++        try std.testing.expect(!try e.tierResumable(4096, 1) and try e.tierResumable(G.extent, 1));
+         e.kv_switches.carry = true;
++        try std.testing.expect(try e.tierResumable(4096, 0) and !try e.tierResumable(shard_keep.carry_min - 64, 0));
+         try std.testing.expect(!try e.placeResume(s, &.{ .pos = shard_keep.carry_min - 64, .home = 0 }));
+         try std.testing.expectEqual(@as(u64, 1), e.kv_counts.refused_small);
+         try std.testing.expectError(error.KvShardNoHome, e.placeResume(s, &.{ .pos = 4096 }));
+@@ -1724,6 +1743,7 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
+     plain.shard = null;
+     var q: Seq = .{ .slot = 0, .st = undefined, .eid = 0 };
+     try std.testing.expect(try plain.placeResume(&q, &home0));
++    try std.testing.expect(try plain.tierResumable(4096, 0));
+     try std.testing.expect(!try plain.borrowRows(&q));
+     plain.giveRows(&q);
+ }
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index e6ff6dae4b3faf68f35d61e39ba265ac181295e2..de12657ed806b65b7d71a14979f3394ee4e165f8 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -133,14 +133,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+             return e;
+         };
+         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+-        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
++        spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
+         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
+         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
+         try own.watch.?.start();
+     } else {
+         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+-        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
++        spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+     }
+     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
+     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
+@@ -218,7 +218,6 @@ pub fn refusal(err: anyerror) ?[]const u8 {
+         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
+         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: the prompt cache is off with MTP drafts, so spill v2 would keep nothing (DFlash2 drafts or none)",
+-        error.SpillV2WithKvShard => "TF_GLM_SPILL_V2=1 with TF_GLM_KV_SHARD=1: spill v2 of sharded kept states is not in this build yet",
+         error.SpillV2NoPromptCache => "TF_GLM_SPILL_V2=1 needs the prompt cache, and a rank's kept-state budget is 0 (--prompt-cache-gib; with PROMPT_CACHE_GIB a lower KV_POOL_GIB)",
+         error.SpillV2StoreFailed => "TF_GLM_SPILL_V2=1: a rank's spill v2 store did not open (that rank's log says why)",
+         error.StagingTooSmall => "TF_GLM_SPILL_STAGE_MIB: spill v2's write ring holds two blocks at least (25 MiB), TF_GLM_SPILL_READ_BLOCKS one",
+@@ -239,13 +238,12 @@ fn spillV2(o: Options, choice: choice_mod.Choice) anyerror!?identity.Env {
+ 
+ /// Spill v2 once the ranks agreed on it (its switch and knobs are in the settings text, so every rank answers alike):
+ /// this rank's own read error, a world it does not run on yet (the recipe's two ranks; the identity agreement and the
+-/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), KV sharding (round 3), or a staging
+-/// too small for its blocks.
+-fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice, kv: shard.Switches) !?identity.Env {
++/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), or a staging too small for its
++/// blocks. With TF_GLM_KV_SHARD=1 the tier is owner-sharded (Engine.spillLayout).
++fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice) !?identity.Env {
+     const env = (try read) orelse return null;
+     if (o.tp != 2) return error.SpillV2NeedsTwoRanks;
+     if (o.drafts and choice == .mtp) return error.SpillV2WithMtp;
+-    if (kv.on) return error.SpillV2WithKvShard;
+     try spill_tier.check(tierSettings(o, 0));
+     return env;
+ }
+@@ -257,16 +255,16 @@ fn tierSettings(o: Options, budget: u64) spill_tier.Settings {
+ }
+ 
+ /// Spill v2's tier on this rank, once the ranks agreed on their identities and on one kept-state budget: this rank's
+-/// store under its own compat (Agreement.storeCommon) over the staging the engine took before its pool, every rank's
+-/// open agreed (one that failed fails the start on all), rank 0's tier for the prompt cache, the other ranks' on
+-/// their lane backends.
++/// store under its own compat (Agreement.storeCommon, and the layout's owner: TF_GLM_KV_SHARD's owner-sharded store is
++/// another namespace) over the staging the engine took before its pool, every rank's open agreed (one that failed
++/// fails the start on all), rank 0's tier for the prompt cache, the other ranks' on their lane backends.
+ fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identity.Agreement, budget: u64) !void {
+     if (budget == 0) return error.SpillV2NoPromptCache;
+     const e = own.engine.?;
+     e.current();
+     const layout = try e.spillLayout();
+     const s = tierSettings(o, budget);
+-    const compat = format.compatDigest(a.storeCommon(@intCast(o.rank)), .replicated, @intCast(spill_state.block_tokens), layout.block_bytes);
++    const compat = layout.compat(a.storeCommon(@intCast(o.rank)));
+     const opened = SpillLeader.S.open(gpa, io, e, layout, s, o.rank, compat, @intCast(e.context), e.tierStaging(), .{});
+     const ok = if (opened) |_| true else |err| blk: {
+         std.log.err("rank {d}: spill v2's store under {s} did not open ({s})", .{ o.rank, s.dir, @errorName(err) });
+@@ -280,7 +278,7 @@ fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identi
+     }
+     const handed = spill_tier.giveFolders(side.store);
+     const c = side.store.counts();
+-    std.log.info("rank {d}: spill v2 tier: {s}, up to {d:.0} GiB, {d} points ({d} MiB) found; each kept state written at keep from {d} tokens, keeping {d:.0} GiB of disk free{s}", .{ o.rank, s.dir, s.gib, c.points, c.stored_bytes >> 20, s.min_tokens, s.min_free_gib, if (handed) "; its folders given to the spill directory's owner" else "" });
++    std.log.info("rank {d}: spill v2 tier: {s}, up to {d:.0} GiB, {d} points ({d} MiB) found; each kept state written at keep from {d} tokens, keeping {d:.0} GiB of disk free{s}{s}", .{ o.rank, s.dir, s.gib, c.points, c.stored_bytes >> 20, s.min_tokens, s.min_free_gib, if (layout.owner == .owner_sharded) "; owner-sharded (TF_GLM_KV_SHARD: a point's latent rows on its home part's rank only)" else "", if (handed) "; its folders given to the spill directory's owner" else "" });
+     // a following rank outlives a stop signal this long: rank 0's flush has it drain its own writes first
+     e.spill_wait_ns = @as(u64, o.spill_flush_ms) * std.time.ns_per_ms;
+     if (o.rank == 0) {
+@@ -306,6 +304,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
+     const e = own.engine.?;
+     const layout = try e.spillLayout();
+     var fbuf: [256]u8 = undefined;
++    var obuf: [48]u8 = undefined;
+     const r: identity.Rank = .{
+         .dir = dir,
+         .kernels = kernels,
+@@ -316,6 +315,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
+         .rank = o.rank,
+         .ring = e.caches.ring,
+         .layout = layout.digest(),
++        .owner_layout = layout.ownerText(&obuf),
+         .capability = try ctx.capability(),
+         .driver = try ctx.d.version(),
+         .state_format = spill_state.format_version,
+@@ -383,9 +383,9 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
+     }
+     if (!(gib > 0)) return null;
+     if (own.engine.?.shard != null) {
+-        // TF_GLM_KV_SHARD: a kept state's latent rows are on its home part's owner only, and a stored one does not say
+-        // which part that was (spill and sharding together: round 3); every rank leaves the tier off alike
+-        if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (a stored state does not record the part its latent rows lie in yet)", .{});
++        // TF_GLM_KV_SHARD: a kept state's latent rows are on its home part's owner only, and v1's stored state does not
++        // say which part that was (spill v2's owner-sharded tier does); every rank leaves the tier off alike
++        if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (v1 does not record the part a stored state's latent rows lie in; TF_GLM_SPILL_V2=1 does)", .{});
+         return null;
+     }
+     if (root.len == 0) {
+@@ -798,27 +798,25 @@ test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sh
+     defer gpa.free(bad);
+     try std.testing.expect(std.mem.endsWith(u8, bad, " spill_v2=unreadable"));
+     try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
+-    // after the agreement: off passes; this rank's own error; a world other than two ranks; MTP drafts; KV sharding; a
+-    // staging too small for two blocks; on
+-    const kv: shard.Switches = .{};
+-    try std.testing.expectEqual(@as(?identity.Env, null), try spillAdmit(null, o, .dflash2, kv));
+-    try std.testing.expectError(error.NoModelRevision, spillAdmit(error.NoModelRevision, o, .dflash2, kv));
++    // after the agreement: off passes; this rank's own error; a world other than two ranks; MTP drafts; a staging too
++    // small for two blocks; on (KV sharding or not: Engine.spillLayout makes the tier owner-sharded)
++    try std.testing.expectEqual(@as(?identity.Env, null), try spillAdmit(null, o, .dflash2));
++    try std.testing.expectError(error.NoModelRevision, spillAdmit(error.NoModelRevision, o, .dflash2));
+     for ([_]u32{ 1, 3, 4 }) |tp| {
+         var x = o;
+         x.tp = tp;
+-        try std.testing.expectError(error.SpillV2NeedsTwoRanks, spillAdmit(env, x, .dflash2, kv));
++        try std.testing.expectError(error.SpillV2NeedsTwoRanks, spillAdmit(env, x, .dflash2));
+     }
+     var mtp = o;
+     mtp.drafts = true;
+-    try std.testing.expectError(error.SpillV2WithMtp, spillAdmit(env, mtp, .mtp, kv));
+-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, mtp, .dflash2, kv)).?.engine);
+-    try std.testing.expectError(error.SpillV2WithKvShard, spillAdmit(env, o, .dflash2, .{ .on = true }));
++    try std.testing.expectError(error.SpillV2WithMtp, spillAdmit(env, mtp, .mtp));
++    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, mtp, .dflash2)).?.engine);
+     var small = o;
+     small.spill_stage_mib = 24;
+-    try std.testing.expectError(error.StagingTooSmall, spillAdmit(env, small, .dflash2, kv));
++    try std.testing.expectError(error.StagingTooSmall, spillAdmit(env, small, .dflash2));
+     small.spill_stage_mib = 25;
+-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, small, .dflash2, kv)).?.engine);
+-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, o, .dflash2, kv)).?.engine);
++    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, small, .dflash2)).?.engine);
++    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, o, .dflash2)).?.engine);
+     // the tier's settings from the server's (the guard's limit a quarter of the agreed budget)
+     const ts = tierSettings(.{ .context = 8, .drafts = false, .spill_gib = 64, .spill_dir = "/spill", .spill_quota = 0.25, .spill_turns = 2, .spill_read_blocks = 8, .spill_stage_mib = 128, .spill_min_tokens = 4096, .spill_min_free_gib = 10 }, 8 << 30);
+     try std.testing.expectEqualStrings("/spill", ts.dir);
+@@ -833,12 +831,12 @@ test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sh
+     // with the spill off (no --spill-gib, or no --snapshot-dir) nothing is read: off whatever the environment holds
+     try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false }, .dflash2));
+     try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false, .spill_gib = 64 }, .dflash2));
+-    for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2WithKvShard, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
++    for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
+         try std.testing.expect(std.mem.startsWith(u8, refusal(e).?, "TF_GLM_SPILL_"));
+     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
+ }
+ 
+-test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds: spill v2's own admission refuses the pair, and only with its tier on" {
++test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds, and spill v2 with it (an owner-sharded tier)" {
+     const C = struct {
+         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+@@ -860,6 +858,13 @@ test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds: spill v2's o
+         _ = C.setenv("TF_GLM_SPILL_V2", v.ptr, 1);
+         try std.testing.expect((try kvAdmit(shard.Switches.read(), o, .dflash2)).on);
+     }
++    // with the spill tier on as well, spill v2 is admitted beside it (round 3: no refusal of the pair)
++    const env: identity.Env = .{ .engine = "a1b2c3d", .patches = "sha256:0014", .model_revision = "4f2e9a1" };
++    var spilled = o;
++    spilled.spill_gib = 64;
++    spilled.spill_dir = "/spill";
++    try std.testing.expect((try kvAdmit(shard.Switches.read(), spilled, .dflash2)).on);
++    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, spilled, .dflash2)).?.engine);
+ }
+ 
+ test "serving refuses more than eight lanes before any CUDA call" {
+diff --git a/zig/src/families/glm_cuda/cuda_shard_keep.zig b/zig/src/families/glm_cuda/cuda_shard_keep.zig
+index 2348e3800542d1e11c3b466095a909d13e2893c8..5a1fd7ad9da06b340cb636a990f808ae5e79db04 100644
+--- a/zig/src/families/glm_cuda/cuda_shard_keep.zig
++++ b/zig/src/families/glm_cuda/cuda_shard_keep.zig
+@@ -65,6 +65,18 @@ pub fn resumeIn(pool: *const Pool, eid: u64, home: usize, at: usize, carry_on: b
+     return .carry;
+ }
+ 
++/// Whether a kept state of `at` tokens whose home is part `home`, read from disk now, could be resumed (resumeIn short
++/// of `recompute`): a carry takes it wherever its prompt lands, else the home part must have room for the resume's
++/// extent (at least its rows and the next token's: newSeq places it there, or the resume moves it there). False: a
++/// restore would read it only for a prefill from 0, so none starts (Python's disk restore `_room(.., half=)` and
++/// DeepSeek's `reserve(.., part)` refuse before reading too). Rank 0 alone asks; room that comes back serves a later
++/// request.
++pub fn restorable(pool: *const Pool, home: usize, at: usize, carry_on: bool) !bool {
++    if (home >= pool.parts()) return error.BadPart;
++    if (carry_on and (at >= carry_min or mut(.carry_small))) return true;
++    return (try pool.placeIn(at + 1, null, home)) != null;
++}
++
+ /// This rank's part of a resume's latent rows: the home owner's state holds them, the new extent's owner needs them.
+ /// `copy`: both here (a restore puts them back); `send` / `recv`: a carry; `none`: no latent row here either way.
+ pub const Latent = enum { copy, none, send, recv };
+diff --git a/zig/src/families/glm_cuda/cuda_shard_keep_test.zig b/zig/src/families/glm_cuda/cuda_shard_keep_test.zig
+index f6169d1fcc0c0063f34fc7ae742afa0242dcf7ea..cb552e9df2e4cfe3178db573f2c48ee45d27f4d4 100644
+--- a/zig/src/families/glm_cuda/cuda_shard_keep_test.zig
++++ b/zig/src/families/glm_cuda/cuda_shard_keep_test.zig
+@@ -102,6 +102,25 @@ test "a resume: in its state's part as it is, moved there when it has room, else
+     try std.testing.expectEqual(@as(usize, 0), p.partOf((try p.extent(b)).base));
+ }
+ 
++test "a restore from disk: started when its resume could be placed in the home part or carried, refused when it could only start from 0" {
++    comptime std.debug.assert(keep.carry_min == E);
++    var p = try Pool.initParts(gpa, 8 * E, 2);
++    defer p.deinit();
++    _ = try p.add(0, 3 * E); // part 0: one extent of E rows left
++    // room for the state's rows and the next token's: whatever the carry
++    try std.testing.expect(try keep.restorable(&p, 0, E - 64, false));
++    // E tokens leave the next one no row there: only a carry takes it (from carry_min, E)
++    try std.testing.expect(!try keep.restorable(&p, 0, E, false));
++    try std.testing.expect(try keep.restorable(&p, 0, E, true));
++    // part 0 full (part 1's room does not count): carried from the minimum up, else refused
++    _ = try p.add(3 * E, E);
++    try std.testing.expect(try keep.restorable(&p, 0, 5000, true));
++    try std.testing.expect(!try keep.restorable(&p, 0, 5000, false));
++    try std.testing.expect(!try keep.restorable(&p, 0, keep.carry_min - 64, true));
++    try std.testing.expect(try keep.restorable(&p, 1, keep.carry_min - 64, false));
++    try std.testing.expectError(error.BadPart, keep.restorable(&p, 2, 5000, true));
++}
++
+ /// Each rank's part for every (home, part): one copier when they agree, else one sender (the home's owner) and one
+ /// receiver (the extent's), the rank between them none.
+ fn roles() anyerror!bool {
+diff --git a/zig/src/families/glm_cuda/cuda_spill_identity.zig b/zig/src/families/glm_cuda/cuda_spill_identity.zig
+index 4f7a6697e8852f626fdf87858017d9e5dfa219e7..33d121c5130df211690f8ab7a4840c8b458c86fb 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_identity.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_identity.zig
+@@ -47,7 +47,7 @@ pub const Field = enum(u16) {
+     grid = 12, // the kept-state grid (64 tokens) and a block's tokens (2,048)
+     layout = 13, // spill_state.Layout.digest(): the buffer, block and sections a point holds
+     tp_split = 14, // the TP world, every rank's share (heads, widths, vocab) and the index ring's rows
+-    owner_layout = 15, // replicated (KV sharding's owner-sharded layout, its version and parts: round 3)
++    owner_layout = 15, // spill_state.Layout.ownerText: replicated, or owner_sharded with its home rule's version and parts
+     features = 16, // the switches that change state or protocol (spill v2, its minimum, KV sharding, drafts, streams)
+     template = 17, // rank 0 renders prompts with its chat template; a follower holds its own (or none)
+     rank_split = 18, // this rank and its share
+@@ -482,6 +482,7 @@ pub const Rank = struct {
+     rank: u32,
+     ring: usize, // the index ring's rows (Caches.ring)
+     layout: Digest, // spill_state.Layout.digest()
++    owner_layout: []const u8 = "replicated", // spill_state.Layout.ownerText (TF_GLM_KV_SHARD: owner_sharded;...)
+     capability: u32,
+     driver: i32,
+     state_format: u32, // spill_state.format_version
+@@ -622,7 +623,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, r: Rank) !Fingerprint {
+     b.int(.tp_split, u16, @intCast(r.world));
+     b.part(.tp_split, try splitText(&sbuf, r.world));
+     b.int(.tp_split, u64, r.ring);
+-    b.part(.owner_layout, "replicated");
++    b.part(.owner_layout, r.owner_layout);
+     b.part(.features, r.features);
+     // the template rank 0 renders with (server/hf_text.zig's order)
+     if (exists(io, model, "chat_template.jinja")) try fileOr(&b, .template, io, model, "chat_template.jinja") else if (exists(io, model, "chat_template.json")) try fileOr(&b, .template, io, model, "chat_template.json") else try fileOr(&b, .template, io, model, "tokenizer_config.json");
+@@ -899,6 +900,9 @@ test "two ranks of one install agree on the common digest; the kernel archive's
+     r.layout = @splat(8);
+     try testing.expectEqual(@as(?Field, .layout), named(f0, try build(gpa, io, r)));
+     r = try testRank(root, a, 0);
++    r.owner_layout = "owner_sharded;version=1;parts=2;"; // (TF_GLM_KV_SHARD: a sharded store never meets a replicated one)
++    try testing.expectEqual(@as(?Field, .owner_layout), named(f0, try build(gpa, io, r)));
++    r = try testRank(root, a, 0);
+     r.driver = 13010;
+     try testing.expectEqual(@as(?Field, .gpu), named(f0, try build(gpa, io, r)));
+     r = try testRank(root, a, 0);
+diff --git a/zig/src/families/glm_cuda/cuda_spill_state.zig b/zig/src/families/glm_cuda/cuda_spill_state.zig
+index 957f37da1d16bfcb0b57a29237af8fb64156d51b..666ed97427f45ff1e8047a0cacc34ad9fa75a299 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_state.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_state.zig
+@@ -15,6 +15,15 @@
+ //! or past `at`; _pool_keys writes a pool only once its four tokens are in a window (P 0038), and the selection reads
+ //! the row masked until the resumed prefill writes it whole. A block holds Python's ceil(e/4) = e/4 pooled rows; an
+ //! unpacked state reads zeros there. Arithmetic and copies only: the tests run on host memory (`Copier`).
++//!
++//! TF_GLM_KV_SHARD (`Layout.sharded`, the store's owner_sharded layout; GLM 0118's spill blocks): a kept state's latent
++//! rows are only in the state of its home part's owner (cuda_snapshot Sections.rows, cuda_engine Snap.home); its pooled
++//! keys (pool-wide on both ranks) and sections are in both. So a rank's blocks of a point of its own part hold latent
++//! and pooled rows as above, of the other part's its pooled rows alone (396 B a token, 811,008 B a block). The block
++//! names are salted with the home part (`Layout.lineageOf`: core/spill Lineage.inPart, 0118's `in_part`), so a rank's
++//! blocks of the two parts never share a name, and every manifest records the part (`homeOf` reads it back). The
++//! layout's bytes, the store's namespace (`compat`) and the fingerprint (`ownerText`) say owner_sharded: a sharded store
++//! never reads a replicated point, nor the reverse.
+ const std = @import("std");
+ const core = @import("core");
+ const snapshot = @import("cuda_snapshot.zig");
+@@ -31,6 +40,11 @@ pub const block_tokens: usize = G.extent;
+ pub const grid: usize = 64;
+ /// Pool-plane bytes a token on a rank: 11 layers of a 528-byte latent row and a quarter of a 144-byte pooled row.
+ pub const token_bytes: usize = G.dsa_layers * (G.latent_row + G.pool_row / G.pool);
++/// TF_GLM_KV_SHARD: a token's bytes in a rank's blocks of the other part's point, its pooled rows alone.
++pub const foreign_token_bytes: usize = G.dsa_layers * (G.pool_row / G.pool);
++/// owner_sharded: the home rule's version (part p's latent rows on rank p: cuda_shard Shard.owner), in the layout's
++/// bytes and the fingerprint's owner_layout field.
++pub const owner_version: u32 = 1;
+ 
+ /// DFlash2's rings of a slot: `kv` heads on this rank, `ring` rows (cuda_snapshot.Draft).
+ pub const Drafter = struct {
+@@ -66,7 +80,10 @@ pub const Layout = struct {
+     /// TF_GLM_PREFILL_ROWS).
+     ring: usize,
+     drafter: ?Drafter = null,
+-    /// A whole block's bytes: 12,705,792 (3,102 pages, so a block slot has no padding).
++    /// replicated, or owner_sharded (TF_GLM_KV_SHARD, `sharded`): a point's latent rows on its home part's owner only.
++    owner: format.OwnerLayout = .replicated,
++    /// A whole block's bytes: 12,705,792 (3,102 pages, so a block slot has no padding); owner_sharded, of a point of
++    /// this rank's own part (`blockBytesOf`).
+     block_bytes: usize,
+     small_bytes: usize,
+     n: usize,
+@@ -100,15 +117,60 @@ pub const Layout = struct {
+         return l;
+     }
+ 
+-    /// The kept-state buffer of a state of `at` tokens (cuda_engine sectionsFor): what a restore allocates.
++    /// This layout owner_sharded (TF_GLM_KV_SHARD=1): a rank holds and stores the latent rows of its own part's points
++    /// only (cuda_engine takeSnap keeps them on the home part's owner); its blocks of the other part's points are their
++    /// pooled rows alone. The sections, the small state and the grid are the replicated layout's.
++    pub fn sharded(l: Layout) Layout {
++        var o = l;
++        o.owner = .owner_sharded;
++        return o;
++    }
++
++    /// Whether this rank's buffer and blocks of a kept state whose home part is `home` hold its latent rows: always on a
++    /// replicated layout (its states name no home), on an owner-sharded one when `home` is this rank's part (part p's
++    /// owner is rank p). error.NoHome: an owner-sharded state without its part; error.LayoutMismatch: a home on a
++    /// replicated layout (a sharded engine's state) or a part past the ranks.
++    pub fn owns(l: *const Layout, home: ?u8) !bool {
++        const h = home orelse return if (l.owner == .replicated) true else error.NoHome;
++        if (l.owner == .replicated or h >= l.g.world) return error.LayoutMismatch;
++        return h == l.g.rank;
++    }
++
++    /// The home part of a stored point whose lineage is salted with `part` (core/spill Hit.part, Store.partOf): what a
++    /// restore's new buffer records (Kept.home, cuda_engine Snap.home). Refused as `owns` refuses a home.
++    pub fn homeOf(l: *const Layout, part: ?u32) !?u8 {
++        const p = part orelse return if (l.owner == .replicated) null else error.NoHome;
++        if (l.owner == .replicated or p >= l.g.world) return error.LayoutMismatch;
++        return @intCast(p);
++    }
++
++    /// The lineage a keep of a state whose home is `home` writes under (Keep.lineage): owner_sharded, salted with the
++    /// home part (Lineage.inPart: replaced, never stacked), so a rank's blocks of the same ids in the two parts (its own
++    /// part's latent and pooled rows, the other's pooled rows alone) never share a name and the manifest records the
++    /// part; replicated, `lin` itself (the names it always had). Shares `lin.forks`.
++    pub fn lineageOf(l: *const Layout, lin: format.Lineage, home: ?u8) !format.Lineage {
++        _ = try l.owns(home);
++        return if (home) |h| lin.inPart(h) else lin;
++    }
++
++    /// The kept-state buffer of a state of `at` tokens (cuda_engine sectionsFor): what a restore allocates (the home
++    /// owner's on an owner-sharded layout).
+     pub fn sections(l: *const Layout, at: usize) snapshot.Sections {
+-        return snapshot.sections(l.g, at, l.ring, if (l.drafter) |d| d.bytes() else 0);
++        return l.sectionsOf(at, true);
+     }
+ 
+-    /// error.OffGrid unless `sec` is a state on the grid; error.LayoutMismatch unless it is this layout's buffer.
+-    pub fn check(l: *const Layout, sec: snapshot.Sections) !void {
++    /// `sections`, the latent rows held or not (`owns`; cuda_engine sectionsHeld).
++    pub fn sectionsOf(l: *const Layout, at: usize, own: bool) snapshot.Sections {
++        return snapshot.sectionsOf(l.g, at, l.ring, if (l.drafter) |d| d.bytes() else 0, own);
++    }
++
++    /// error.OffGrid unless `k` is a state on the grid; error.LayoutMismatch unless its buffer is this layout's on this
++    /// rank: every section (replicated), or the latent rows held exactly where this rank owns its home part
++    /// (owner_sharded); error.NoHome as `owns`.
++    pub fn check(l: *const Layout, k: Kept) !void {
++        const sec = k.sec;
+         if (sec.at == 0 or sec.at % grid != 0) return error.OffGrid;
+-        if (!std.meta.eql(sec, l.sections(sec.at))) return error.LayoutMismatch;
++        if (!std.meta.eql(sec, l.sectionsOf(sec.at, try l.owns(k.home)))) return error.LayoutMismatch;
+     }
+ 
+     /// A point's blocks: ceil(at / 2048), the last a tail unless `at` ends a block.
+@@ -123,21 +185,42 @@ pub const Layout = struct {
+         return .{ .first = first, .tokens = @min(block_tokens, at - first) };
+     }
+ 
+-    /// The bytes of a block of `tokens` (a multiple of 4: whole pools).
++    /// The bytes of a block of `tokens` (a multiple of 4: whole pools) on a rank that holds its latent rows.
+     pub fn spanBytes(tokens: usize) usize {
+-        return tokens * token_bytes;
++        return spanBytesOf(tokens, true);
++    }
++
++    /// `spanBytes` on a rank that holds the point's latent rows (`own`) or not (its pooled rows alone).
++    pub fn spanBytesOf(tokens: usize, own: bool) usize {
++        return tokens * if (own) token_bytes else foreign_token_bytes;
++    }
++
++    /// A whole block's bytes on a rank that holds the point's latent rows (`own`; always when replicated) or not:
++    /// 12,705,792 or 811,008 (198 pages).
++    pub fn blockBytesOf(l: *const Layout, own: bool) usize {
++        return if (own) l.block_bytes else spanBytesOf(block_tokens, false);
+     }
+ 
+     /// The tail's bytes of a point at `at` (the store's Keep.tail_bytes; 0 when `at` ends a block).
+-    pub fn tailBytes(_: *const Layout, at: usize) usize {
+-        return spanBytes(at % block_tokens);
++    pub fn tailBytes(l: *const Layout, at: usize) usize {
++        return l.tailBytesOf(at, true);
++    }
++
++    /// `tailBytes` on a rank that holds the point's latent rows (`own`) or not.
++    pub fn tailBytesOf(_: *const Layout, at: usize, own: bool) usize {
++        return spanBytesOf(at % block_tokens, own);
+     }
+ 
+     /// A point's bytes on a rank: its blocks (shared or not) and its sections. error.Overflow for an `at` no context
+     /// holds (a parsed manifest's).
+     pub fn pointBytes(l: *const Layout, at: usize) !usize {
++        return l.pointBytesOf(at, true);
++    }
++
++    /// `pointBytes` on a rank that holds the point's latent rows (`own`) or not.
++    pub fn pointBytesOf(l: *const Layout, at: usize, own: bool) !usize {
+         const whole = (try l.blocks(at)) - @intFromBool(at % block_tokens != 0);
+-        return std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, whole, l.block_bytes), l.tailBytes(at)), l.small_bytes);
++        return std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, whole, l.blockBytesOf(own)), l.tailBytesOf(at, own)), l.small_bytes);
+     }
+ 
+     /// The sections a keep names (Keep.sections), in the buffer's order.
+@@ -145,24 +228,46 @@ pub const Layout = struct {
+         return l.specs_buf[0..l.n];
+     }
+ 
+-    /// The store's bounds for a context of `max_tokens`.
++    /// The store's bounds for a context of `max_tokens` (owner_sharded: a whole block of this rank's own part's points
++    /// is `block_bytes`, of the other part's its pooled rows, core/spill Limits.fullBlockBytes).
+     pub fn limits(l: *const Layout, max_tokens: u32) format.Limits {
+-        return .{ .max_tokens = max_tokens, .block_tokens = @intCast(block_tokens), .block_bytes = l.block_bytes, .max_small_bytes = l.small_bytes };
++        var lim: format.Limits = .{ .max_tokens = max_tokens, .block_tokens = @intCast(block_tokens), .block_bytes = l.block_bytes, .max_small_bytes = l.small_bytes };
++        if (l.owner == .owner_sharded) {
++            lim.foreign_block_bytes = l.blockBytesOf(false);
++            lim.own_part = @intCast(l.g.rank);
++        }
++        return lim;
+     }
+ 
+-    /// The bytes encode() writes.
+-    pub const encoded_bytes = 16 + 4 + 4 + 16 * 4 + 6 * 8 + 4 * 16;
++    /// The store's namespace (format.compatDigest) over the ranks' agreed `common` digest: it carries the owner layout,
++    /// so a sharded store and a replicated one never open one directory (nor read each other's points).
++    pub fn compat(l: *const Layout, common: format.Digest) format.Digest {
++        return format.compatDigest(common, l.owner, @intCast(block_tokens), l.block_bytes);
++    }
+ 
+-    /// The layout's canonical bytes (the digest's input), little-endian: magic, format version, owner layout
+-    /// (replicated: KV sharding's owner-sharded store is round 3's), TP, the block and the grid, the planes' shape
+-    /// (layers, row bytes, pool, index width), the ring, the KDA heads and width, the drafter's heads, rows and
+-    /// layers, the section count, then token, block, small, rec, conv and draft bytes, and every section's name and
+-    /// length (an absent draft as zeros). The same on both ranks.
+-    pub fn encode(l: *const Layout) [encoded_bytes]u8 {
+-        var e: Enc = .{};
++    /// The fingerprint's owner_layout field (cuda_spill_identity Rank.owner_layout): `replicated`, or
++    /// `owner_sharded;version=1;parts=2;` (the home rule's version and the parts, one a rank).
++    pub fn ownerText(l: *const Layout, buf: *[48]u8) []const u8 {
++        if (l.owner == .replicated) return "replicated";
++        return std.fmt.bufPrint(buf, "owner_sharded;version={d};parts={d};", .{ owner_version, l.g.world }) catch unreachable;
++    }
++
++    /// The bytes encode() writes for a replicated layout; an owner-sharded one adds `sharded_bytes`.
++    pub const encoded_bytes = 16 + 4 + 4 + 16 * 4 + 6 * 8 + 4 * 16;
++    pub const sharded_bytes = 8 + 4 + 4;
++    pub const max_encoded = encoded_bytes + sharded_bytes;
++
++    /// The layout's canonical bytes (the digest's input), little-endian: magic, format version, owner layout, TP, the
++    /// block and the grid, the planes' shape (layers, row bytes, pool, index width), the ring, the KDA heads and width,
++    /// the drafter's heads, rows and layers, the section count, then token, block, small, rec, conv and draft bytes,
++    /// and every section's name and length (an absent draft as zeros); owner_sharded then adds the other part's block
++    /// bytes, the home rule's version and the parts, so a replicated layout's bytes are what they always were. The same
++    /// on both ranks.
++    pub fn encode(l: *const Layout, buf: *[max_encoded]u8) []const u8 {
++        var e: Enc = .{ .buf = buf };
+         e.bytes("tf-glm-state\x00\x00\x00\x00");
+         e.int(u32, format_version);
+-        e.int(u32, @backingInt(format.OwnerLayout.replicated));
++        e.int(u32, @backingInt(l.owner));
+         const d: Drafter = l.drafter orelse .{ .kv = 0, .ring = 0 };
+         const dl: usize = if (l.drafter != null) 5 else 0;
+         for ([_]usize{ l.g.world, block_tokens, grid, G.dsa_layers, G.kda_layers, G.latent_row, G.pool_row, G.pool, G.index_dim, l.ring, l.g.lin_heads, G.lin_dim, d.kv, d.ring, dl, l.n }) |v| e.int(u32, @intCast(v));
+@@ -174,18 +279,24 @@ pub const Layout = struct {
+             e.int(u64, if (i < l.n) l.lens[i] else 0);
+         }
+         std.debug.assert(e.at == encoded_bytes);
+-        return e.buf;
++        if (l.owner == .owner_sharded) {
++            e.int(u64, l.blockBytesOf(false));
++            e.int(u32, owner_version);
++            e.int(u32, @intCast(l.g.world));
++        }
++        return buf[0..e.at];
+     }
+ 
+     /// SHA-256 of encode(): the layout's part of the compatibility fingerprint.
+     pub fn digest(l: *const Layout) format.Digest {
++        var buf: [max_encoded]u8 = undefined;
+         var out: format.Digest = undefined;
+-        std.crypto.hash.sha2.Sha256.hash(&l.encode(), &out, .{});
++        std.crypto.hash.sha2.Sha256.hash(l.encode(&buf), &out, .{});
+         return out;
+     }
+ 
+     const Enc = struct {
+-        buf: [encoded_bytes]u8 = undefined,
++        buf: *[max_encoded]u8,
+         at: usize = 0,
+ 
+         fn bytes(e: *Enc, b: []const u8) void {
+@@ -211,8 +322,9 @@ pub const Copier = struct {
+     fill: *const fn (ptr: *anyopaque, dst: u64, byte: u8, n: usize) anyerror!void,
+ };
+ 
+-/// A kept state's device buffer and its sections (cuda_engine Snap: `buf.?.ptr`, `sec`).
+-pub const Kept = struct { buf: u64, sec: snapshot.Sections };
++/// A kept state's device buffer and its sections (cuda_engine Snap: `buf.?.ptr`, `sec`) and, TF_GLM_KV_SHARD, its home
++/// part (`home`: the part its stream lay in, whose owner alone holds its latent rows; null unsharded).
++pub const Kept = struct { buf: u64, sec: snapshot.Sections, home: ?u8 = null };
+ 
+ /// The store's source of a kept state's rows: its Snap id (never reused). A kept state's bytes never change, so one
+ /// generation; what ends them is its free (Guard).
+@@ -220,33 +332,34 @@ pub fn sourceOf(snap_id: u64) spill.Source {
+     return .{ .id = snap_id, .generation = 0 };
+ }
+ 
+-/// Tokens [first, first + tokens) of kept state `k`, layer by layer (its latent rows, then its pooled rows): from the
+-/// buffer into `out`, or from `in` into the buffer. 22 copies; a pooled plane's stride is its own at/4 + 1 rows.
+-fn blockCopies(c: Copier, k: Kept, first: usize, tokens: usize, out: ?[]u8, in: ?[]const u8) !void {
++/// Tokens [first, first + tokens) of kept state `k`, layer by layer (its latent rows when this rank holds them, `own`,
++/// then its pooled rows): from the buffer into `out`, or from `in` into the buffer. 22 copies (11 without the latent
++/// rows); a pooled plane's stride is its own at/4 + 1 rows.
++fn blockCopies(c: Copier, k: Kept, own: bool, first: usize, tokens: usize, out: ?[]u8, in: ?[]const u8) !void {
+     const s = k.sec;
+-    const lat = tokens * G.latent_row;
++    const lat = if (own) tokens * G.latent_row else 0;
+     const pool = tokens / G.pool * G.pool_row;
+     var at: usize = 0;
+     for (0..G.dsa_layers) |i| {
+-        const l = k.buf + s.latent + i * s.latentBytes() + first * G.latent_row;
+         const p = k.buf + s.pooled + i * s.pooledBytes() + first / G.pool * G.pool_row;
+-        if (out) |o| {
+-            try c.d2h(c.ptr, o[at..][0..lat], l);
+-            try c.d2h(c.ptr, o[at + lat ..][0..pool], p);
+-        } else {
+-            try c.h2d(c.ptr, l, in.?[at..][0..lat]);
+-            try c.h2d(c.ptr, p, in.?[at + lat ..][0..pool]);
++        if (own) {
++            const l = k.buf + s.latent + i * s.latentBytes() + first * G.latent_row;
++            if (out) |o| try c.d2h(c.ptr, o[at..][0..lat], l) else try c.h2d(c.ptr, l, in.?[at..][0..lat]);
+         }
++        if (out) |o| try c.d2h(c.ptr, o[at + lat ..][0..pool], p) else try c.h2d(c.ptr, p, in.?[at + lat ..][0..pool]);
+         at += lat + pool;
+     }
+ }
+ 
+-/// Block [first, first + tokens) of a state of `sec` staged in `len` bytes: refused before any copy unless it is one
+-/// of the point's blocks (`span`) and `len` its bytes.
+-fn checkBlock(l: *const Layout, sec: snapshot.Sections, first: usize, tokens: usize, len: usize) !void {
+-    try l.check(sec);
+-    if (first % block_tokens != 0 or first >= sec.at or tokens != @min(block_tokens, sec.at - first)) return error.BadBlock;
+-    if (len != Layout.spanBytes(tokens)) return error.BadStaging;
++/// Block [first, first + tokens) of kept state `k` staged in `len` bytes: refused before any copy unless it is one of
++/// the point's blocks (`span`) and `len` its bytes on this rank. Whether this rank holds its latent rows.
++fn checkBlock(l: *const Layout, k: Kept, first: usize, tokens: usize, len: usize) !bool {
++    try l.check(k);
++    const own = try l.owns(k.home);
++    const at = k.sec.at;
++    if (first % block_tokens != 0 or first >= at or tokens != @min(block_tokens, at - first)) return error.BadBlock;
++    if (len != Layout.spanBytesOf(tokens, own)) return error.BadStaging;
++    return own;
+ }
+ 
+ /// Where each of the layout's sections sits in a small state of `small` bytes the store laid out (`secs`, matched by
+@@ -281,14 +394,14 @@ pub const Packer = struct {
+ 
+     /// Kept state `k`'s tokens [first, first + tokens) (a StageReq's, or the tail's at a keep) into `dst`.
+     pub fn packBlock(p: *const Packer, k: Kept, first: usize, tokens: usize, dst: []u8) !void {
+-        try checkBlock(p.layout, k.sec, first, tokens, dst.len);
+-        try blockCopies(p.c, k, first, tokens, dst, null);
++        const own = try checkBlock(p.layout, k, first, tokens, dst.len);
++        try blockCopies(p.c, k, own, first, tokens, dst, null);
+     }
+ 
+     /// Kept state `k`'s sections into the small state `dst` at the offsets the store gave them (Queued.sections).
+     pub fn packSmall(p: *const Packer, k: Kept, dst: []u8, secs: []const format.Section) !void {
+         const l = p.layout;
+-        try l.check(k.sec);
++        try l.check(k);
+         const off = try offsets(l, secs, dst.len);
+         for (l.order[0..l.n], l.lens[0..l.n], off[0..l.n]) |s, len, o| try p.c.d2h(p.c.ptr, dst[o..][0..len], k.buf + sectionAt(k.sec, s));
+     }
+@@ -310,8 +423,9 @@ pub const Packer = struct {
+     }
+ };
+ 
+-/// A restore into a new kept-state buffer (allocated for `layout.sections(at)`, as cuda_engine spillIn's): the
+-/// blocks in order as the store hands them (readReady), the sections (readSmallView), then `finish`.
++/// A restore into a new kept-state buffer (allocated for `layout.sections(at)`, as cuda_engine spillIn's;
++/// owner_sharded, `layout.sectionsOf(at, owns(home))` with the point's home, `homeOf`): the blocks in order as the
++/// store hands them (readReady), the sections (readSmallView), then `finish`.
+ pub const Unpacker = struct {
+     layout: *const Layout,
+     c: Copier,
+@@ -320,15 +434,15 @@ pub const Unpacker = struct {
+     small: bool = false,
+ 
+     pub fn init(layout: *const Layout, c: Copier, kept: Kept) !Unpacker {
+-        try layout.check(kept.sec);
++        try layout.check(kept);
+         return .{ .layout = layout, .c = c, .kept = kept };
+     }
+ 
+     /// The point's next block (ReadyBlock: `first`, `tokens`, `data`). error.BlockOrder for any other.
+     pub fn block(u: *Unpacker, first: usize, tokens: usize, src: []const u8) !void {
+         if (first != u.next * block_tokens) return error.BlockOrder;
+-        try checkBlock(u.layout, u.kept.sec, first, tokens, src.len);
+-        try blockCopies(u.c, u.kept, first, tokens, null, src);
++        const own = try checkBlock(u.layout, u.kept, first, tokens, src.len);
++        try blockCopies(u.c, u.kept, own, first, tokens, null, src);
+         u.next += 1;
+     }
+ 
+@@ -470,10 +584,13 @@ fn pattern(out: []u8, seed: u64, at: usize) void {
+ 
+ /// One sequence's live state on host memory (cuda_state's views over plain arrays, every recurrence at parity 0).
+ /// `run(seed, from, to)` is a prefill of rows [from, to) by computation `seed`: their latent rows and complete pools,
+-/// stale bytes in the pooled row past them (no pool there yet), and the fixed state as it stands at `to`.
++/// stale bytes in the pooled row past them (no pool there yet), and the fixed state as it stands at `to`. `onRank`:
++/// the same computation's state on another rank (its own heads of the recurrences, conv windows and drafter rings;
++/// the latent rows, pooled keys and index rings as rank 0's).
+ const Live = struct {
+     gpa: std.mem.Allocator,
+     g: G,
++    salt: u64,
+     rec: []u8,
+     conv: []u8,
+     latent: [11][]u8,
+@@ -490,6 +607,7 @@ const Live = struct {
+         var f: Live = undefined;
+         f.gpa = gpa;
+         f.g = try G.init(2, 0);
++        f.salt = 0;
+         f.drafter = drafter;
+         f.rec = try gpa.alloc(u8, 34 * snapshot.recLayerBytes(f.g));
+         f.conv = try gpa.alloc(u8, 34 * snapshot.convLayerBytes(f.g));
+@@ -554,15 +672,21 @@ const Live = struct {
+             pattern(f.keys[i], s ^ t, 0);
+             pattern(f.gates[i], s ^ t ^ 1, 0);
+         }
+-        pattern(f.rec, seed ^ t, 0);
+-        pattern(f.conv, seed ^ t ^ 2, 0);
++        const mine = seed ^ (f.salt *% 0x3c6ef372fe94f82b); // (this rank's heads)
++        pattern(f.rec, mine ^ t, 0);
++        pattern(f.conv, mine ^ t ^ 2, 0);
+         for (0..5) |i| {
+-            pattern(f.kc[i], seed ^ t ^ @as(u64, 3 + i), 0);
+-            pattern(f.vc[i], seed ^ t ^ @as(u64, 9 + i), 0);
++            pattern(f.kc[i], mine ^ t ^ @as(u64, 3 + i), 0);
++            pattern(f.vc[i], mine ^ t ^ @as(u64, 9 + i), 0);
+         }
+         f.st.pos = to;
+     }
+ 
++    fn onRank(f: *Live, rank: usize) !void {
++        f.g = try G.init(2, rank);
++        f.salt = rank;
++    }
++
+     /// The state as it stands, saved into a new buffer by cuda_snapshot (takeSnap's copy).
+     fn keep(f: *Live, l: *const Layout) !TKept {
+         const sec = l.sections(f.st.pos);
+@@ -572,12 +696,29 @@ const Live = struct {
+         return .{ .buf = buf, .k = .{ .buf = @intFromPtr(buf.ptr), .sec = sec } };
+     }
+ 
+-    /// Block [first, first + tokens) straight from the live planes (a replica of the order, not the packer).
+-    fn expectBlock(f: *const Live, gpa: std.mem.Allocator, first: usize, tokens: usize) ![]u8 {
++    /// TF_GLM_KV_SHARD: the state as this rank keeps it when its stream lay in part `home` (takeSnap's sectionsHeld):
++    /// the latent rows only where this rank owns that part, saved through a view that has none elsewhere.
++    fn keepIn(f: *Live, l: *const Layout, home: u8) !TKept {
++        const own = try l.owns(home);
++        const sec = l.sectionsOf(f.st.pos, own);
++        var st = f.st;
++        if (!own) {
++            st.cache.owner = false;
++            st.cache.latent = @splat(state.no_latent);
++        }
++        const buf = try f.gpa.alloc(u8, sec.total);
++        @memset(buf, 0xee);
++        try snapshot.save(HostCopy.snapCopier(), f.g, sec, @intFromPtr(buf.ptr), &st, f.draft());
++        return .{ .buf = buf, .k = .{ .buf = @intFromPtr(buf.ptr), .sec = sec, .home = home } };
++    }
++
++    /// Block [first, first + tokens) straight from the live planes (a replica of the order, not the packer): each
++    /// layer's latent rows (where this rank holds them, `own`), then its pooled rows.
++    fn expectBlock(f: *const Live, gpa: std.mem.Allocator, first: usize, tokens: usize, own: bool) ![]u8 {
+         var out: std.ArrayList(u8) = .empty;
+         errdefer out.deinit(gpa);
+         for (0..11) |i| {
+-            try out.appendSlice(gpa, f.latent[i][first * G.latent_row ..][0 .. tokens * G.latent_row]);
++            if (own) try out.appendSlice(gpa, f.latent[i][first * G.latent_row ..][0 .. tokens * G.latent_row]);
+             try out.appendSlice(gpa, f.pooled[i][first / 4 * G.pool_row ..][0 .. tokens / 4 * G.pool_row]);
+         }
+         return out.toOwnedSlice(gpa);
+@@ -604,14 +745,15 @@ fn storeSections(l: *const Layout, out: []format.Section) []format.Section {
+     return out[0..l.n];
+ }
+ 
+-/// `got` (an unpacked state) holds `want`'s state: its latent rows, pooled rows [0, at/4) of each layer, zeros in
+-/// pooled row at/4 (where `want` holds whatever the pool held there), and every section.
++/// `got` (an unpacked state) holds `want`'s state: its latent rows (where its buffer holds them), pooled rows
++/// [0, at/4) of each layer, zeros in pooled row at/4 (where `want` holds whatever the pool held there), and every
++/// section.
+ fn expectState(l: *const Layout, want: Kept, got: Kept) !void {
+     try testing.expect(std.meta.eql(want.sec, got.sec));
+     const s = want.sec;
+     const a: [*]const u8 = @ptrFromInt(want.buf);
+     const b: [*]const u8 = @ptrFromInt(got.buf);
+-    try testing.expectEqualSlices(u8, a[s.latent..][0 .. G.dsa_layers * s.latentBytes()], b[s.latent..][0 .. G.dsa_layers * s.latentBytes()]);
++    if (s.rows) try testing.expectEqualSlices(u8, a[s.latent..][0 .. G.dsa_layers * s.latentBytes()], b[s.latent..][0 .. G.dsa_layers * s.latentBytes()]);
+     for (0..G.dsa_layers) |i| {
+         const at = s.pooled + i * s.pooledBytes();
+         const rows = s.at / 4 * G.pool_row;
+@@ -642,7 +784,7 @@ test "the TP=2 layout: 6,204 B a token, 12,705,792 B a block, the sections, tail
+     try testing.expectEqual(d.bytes(), l.drafter.?.bytes());
+     // the buffer is cuda_snapshot's: its sections hold exactly these lengths
+     const sec = l.sections(4096 + 64);
+-    try l.check(sec);
++    try l.check(.{ .buf = 0, .sec = sec });
+     for (l.order[0..l.n], l.lens[0..l.n]) |s, len| try testing.expect(sectionAt(sec, s) + len <= sec.total);
+     try testing.expectEqual(sec.total - sec.draft, std.mem.alignForward(usize, l.lens[3], 256));
+     // blocks and tails: every grid point but 1 in 32 ends inside a block
+@@ -659,9 +801,9 @@ test "the TP=2 layout: 6,204 B a token, 12,705,792 B a block, the sections, tail
+     try testing.expectError(error.OffGrid, l.blocks(100));
+     try testing.expectError(error.OffGrid, l.pointBytes(4096 + 4));
+     // a state off the grid, or of another ring or drafter, is not this layout's buffer
+-    try testing.expectError(error.OffGrid, l.check(snapshot.sections(g, 100, 2112, d.bytes())));
+-    try testing.expectError(error.LayoutMismatch, l.check(snapshot.sections(g, 4096, 2176, d.bytes())));
+-    try testing.expectError(error.LayoutMismatch, l.check(snapshot.sections(g, 4096, 2112, 0)));
++    try testing.expectError(error.OffGrid, l.check(.{ .buf = 0, .sec = snapshot.sections(g, 100, 2112, d.bytes()) }));
++    try testing.expectError(error.LayoutMismatch, l.check(.{ .buf = 0, .sec = snapshot.sections(g, 4096, 2176, d.bytes()) }));
++    try testing.expectError(error.LayoutMismatch, l.check(.{ .buf = 0, .sec = snapshot.sections(g, 4096, 2112, 0) }));
+     // the store's bounds, and the small state as it lays the sections out
+     const lim = l.limits(131072);
+     try testing.expectEqual(@as(u64, 12_705_792), lim.block_bytes);
+@@ -674,7 +816,7 @@ test "the TP=2 layout: 6,204 B a token, 12,705,792 B a block, the sections, tail
+     const n = try Layout.init(g, 2112, null);
+     try testing.expectEqual(@as(usize, 3), n.n);
+     try testing.expectEqual(@as(usize, 11_894_784 + 71_303_168 + 2_506_752), n.small_bytes);
+-    try n.check(snapshot.sections(g, 4096, 2112, 0));
++    try n.check(.{ .buf = 0, .sec = snapshot.sections(g, 4096, 2112, 0) });
+ }
+ 
+ test "spill state refuses TP other than 2, and malformed rings and drafters" {
+@@ -690,8 +832,10 @@ test "the layout digest is the same on both ranks and covers the ring, the draft
+     const a = try Layout.init(try G.init(2, 0), 2112, .{ .kv = 4, .ring = 2176 });
+     const b = try Layout.init(try G.init(2, 1), 2112, .{ .kv = 4, .ring = 2176 });
+     try testing.expectEqualSlices(u8, &a.digest(), &b.digest());
+-    const enc = a.encode();
+-    try testing.expect(std.mem.startsWith(u8, &enc, "tf-glm-state"));
++    var buf: [Layout.max_encoded]u8 = undefined;
++    const enc = a.encode(&buf);
++    try testing.expectEqual(Layout.encoded_bytes, enc.len);
++    try testing.expect(std.mem.startsWith(u8, enc, "tf-glm-state"));
+     try testing.expectEqual(format_version, std.mem.readInt(u32, enc[16..20], .little));
+     const others = [_]Layout{
+         try Layout.init(try G.init(2, 0), 2176, .{ .kv = 4, .ring = 2176 }), // a lone stream's TF_GLM_PREFILL_ROWS: another ring
+@@ -726,7 +870,7 @@ test "pack then unpack gives the kept state back, whole blocks, a tail and a one
+             const before = hc.copies;
+             try p.packBlock(kept.k, sp.first, sp.tokens, packed_blocks[k]);
+             try testing.expectEqual(@as(usize, 22), hc.copies - before);
+-            const want = try live.expectBlock(gpa, sp.first, sp.tokens);
++            const want = try live.expectBlock(gpa, sp.first, sp.tokens, true);
+             defer gpa.free(want);
+             try testing.expectEqualSlices(u8, want, packed_blocks[k]);
+         }
+@@ -910,8 +1054,9 @@ test "two turns of a conversation and a fork share their earlier blocks: equal n
+ 
+ // -- the real store over a scratch directory (TF_SPILL_TEST_DIR, else /tmp) -------------------------------------------
+ 
+-/// A store sized for this layout over a fresh directory, the engine's side of it played by the test: keeps fill the
+-/// small state and tail from the kept buffer, `pump` packs every requested block from its source.
++/// A store sized for this layout over a fresh directory (this layout's rank, owner layout and namespace), the engine's
++/// side of it played by the test: keeps fill the small state and tail from the kept buffer, `pump` packs every
++/// requested block from its source.
+ const TStore = struct {
+     gpa: std.mem.Allocator,
+     path: [256]u8 = undefined,
+@@ -939,11 +1084,18 @@ const TStore = struct {
+             t.lists[i] = .{t.bufs[i]};
+             made += 1;
+         }
+-        t.s = try spill.Store.open(gpa, testing.io, .{
++        t.s = try spill.Store.open(gpa, testing.io, t.config());
++        return t;
++    }
++
++    fn config(t: *TStore) spill.store.Config {
++        const l = t.l;
++        return .{
+             .root = t.root,
+             .prefix = "glm-spill-",
+-            .rank = 0,
+-            .compat = format.compatDigest(l.digest(), .replicated, @intCast(block_tokens), l.block_bytes),
++            .rank = @intCast(l.g.rank),
++            .compat = l.compat(l.digest()),
++            .owner_layout = l.owner,
+             .limits = l.limits(8192),
+             .cap_bytes = 4 << 30,
+             .floor_bytes = 0,
+@@ -953,8 +1105,15 @@ const TStore = struct {
+             .readers = 2,
+             .max_reads = 1,
+             .direct = false,
+-        });
+-        return t;
++        };
++    }
++
++    /// The store closed and opened again in the same directory under layout `l` (its staging the same sizes).
++    fn reopen(t: *TStore, l: *const Layout) !void {
++        t.s.close();
++        t.l = l;
++        t.p.layout = l;
++        t.s = try spill.Store.open(t.gpa, testing.io, t.config());
+     }
+ 
+     fn deinit(t: *TStore) void {
+@@ -965,12 +1124,13 @@ const TStore = struct {
+         t.gpa.destroy(t);
+     }
+ 
+-    /// A keep of kept state `k` (source `id`) under `lin`: the sections and tail captured, reported. Its job, or null
+-    /// when the store wrote nothing.
++    /// A keep of kept state `k` (source `id`) under `lin` (salted with its home part when sharded): the sections and tail
++    /// captured, reported. Its job, or null when the store wrote nothing.
+     fn keep(t: *TStore, ids: []const u32, lin: format.Lineage, id: u64, k: Kept, capture: bool) !?spill.JobId {
+         try t.sources.put(t.gpa, id, k);
+         const at = k.sec.at;
+-        const r = t.s.keep(.{ .keyed = ids[0..at], .lineage = lin, .sections = t.l.specs(), .tail_bytes = t.l.tailBytes(at), .source = sourceOf(id) });
++        const own = try t.l.owns(k.home);
++        const r = t.s.keep(.{ .keyed = ids[0..at], .lineage = try t.l.lineageOf(lin, k.home), .sections = t.l.specs(), .tail_bytes = t.l.tailBytesOf(at, own), .source = sourceOf(id) });
+         if (r != .queued) return null;
+         const q = r.queued;
+         try t.p.packSmall(k, q.small, q.sections);
+@@ -1025,15 +1185,22 @@ const TStore = struct {
+         try testing.expect(t.s.drain(10 * std.time.ns_per_s).done);
+     }
+ 
+-    /// Point `ids[0..at]` read back into a new buffer (gpa-owned).
++    /// The home part point `ids[0..at]` records (its lineage's part salt), as a restore reads it.
++    fn homeOf(t: *TStore, ids: []const u32, at: usize) !?u8 {
++        const held = t.s.partOf(format.pointKey(ids[0..at], @intCast(block_tokens), &.{})) orelse return error.TestNoPoint;
++        return t.l.homeOf(held.part);
++    }
++
++    /// Point `ids[0..at]` read back into a new buffer (gpa-owned) for its recorded home.
+     fn restore(t: *TStore, hc: *HostCopy, ids: []const u32, at: usize) ![]u8 {
+         const key = format.pointKey(ids[0..at], @intCast(block_tokens), &.{});
++        const home = try t.homeOf(ids, at);
+         const id = try t.s.beginRead(key);
+-        const sec = t.l.sections(at);
++        const sec = t.l.sectionsOf(at, try t.l.owns(home));
+         const buf = try t.gpa.alloc(u8, sec.total);
+         errdefer t.gpa.free(buf);
+         @memset(buf, 0x33);
+-        var u = try Unpacker.init(t.l, hc.copier(), .{ .buf = @intFromPtr(buf.ptr), .sec = sec });
++        var u = try Unpacker.init(t.l, hc.copier(), .{ .buf = @intFromPtr(buf.ptr), .sec = sec, .home = home });
+         const total = try t.l.blocks(at);
+         while (u.next < total) {
+             try testing.expect(t.s.readAwait(id, @intCast(u.next), 10 * std.time.ns_per_s, .{}));
+@@ -1224,3 +1391,338 @@ test "the release guard holds a released state while its write reads it, and pas
+         try testing.expect(!t.s.pins(sourceOf(sd.id), 0));
+     }
+ }
++
++// -- TF_GLM_KV_SHARD: owner-sharded points ---------------------------------------------------------------------------
++
++const kv_shard = @import("cuda_shard.zig");
++
++test "the owner-sharded layout: the home's owner stores 6,204 B a token, the other rank its pooled rows (396), the home checked, the replicated bytes unchanged" {
++    const d: Drafter = .{ .kv = 4, .ring = 2176 };
++    const rep = [2]Layout{ try Layout.init(try G.init(2, 0), 2112, d), try Layout.init(try G.init(2, 1), 2112, d) };
++    const sh = [2]Layout{ rep[0].sharded(), rep[1].sharded() };
++    // sizes: the other part's point is its pooled rows alone; the difference is what a carry sends (cuda_shard)
++    try testing.expectEqual(@as(usize, 396), foreign_token_bytes);
++    try testing.expectEqual(kv_shard.carryBytes(1), token_bytes - foreign_token_bytes);
++    try testing.expectEqual(@as(usize, 11 * 512 * 144), sh[0].blockBytesOf(false));
++    try testing.expectEqual(@as(usize, 198), sh[0].blockBytesOf(false) / 4096); // (whole pages too)
++    try testing.expectEqual(@as(usize, 0), sh[0].blockBytesOf(false) % 4096);
++    try testing.expectEqual(rep[0].block_bytes, sh[0].blockBytesOf(true));
++    try testing.expectEqual(rep[0].block_bytes, sh[1].block_bytes);
++    try testing.expectEqual(@as(usize, 64 * 396), sh[1].tailBytesOf(64, false));
++    try testing.expectEqual(rep[0].tailBytes(1984), sh[0].tailBytesOf(1984, true));
++    try testing.expectEqual(@as(usize, 2 * 811_008 + 64 * 396 + 107_986_944), try sh[1].pointBytesOf(4096 + 64, false));
++    try testing.expectEqual(try rep[0].pointBytes(4096 + 64), try sh[0].pointBytesOf(4096 + 64, true));
++    // whose rows: part p's on rank p; a sharded state names its home, a replicated one none
++    for (0..2) |r| for ([_]u8{ 0, 1 }) |h| try testing.expectEqual(h == r, try sh[r].owns(h));
++    try testing.expectError(error.NoHome, sh[0].owns(null));
++    try testing.expectError(error.LayoutMismatch, sh[0].owns(2));
++    try testing.expect(try rep[1].owns(null));
++    try testing.expectError(error.LayoutMismatch, rep[0].owns(0));
++    // check: a sharded state's buffer holds the latent rows exactly on its home's owner (the replicated check refused
++    // every other rank's state as LayoutMismatch, and still refuses it on a replicated layout)
++    const at = 4096 + 64;
++    const with = rep[0].sections(at);
++    const without = rep[0].sectionsOf(at, false);
++    try testing.expect(!without.rows and without.total < with.total);
++    try sh[0].check(.{ .buf = 0, .sec = with, .home = 0 });
++    try sh[1].check(.{ .buf = 0, .sec = without, .home = 0 });
++    try sh[0].check(.{ .buf = 0, .sec = without, .home = 1 });
++    try testing.expectError(error.LayoutMismatch, sh[1].check(.{ .buf = 0, .sec = with, .home = 0 }));
++    try testing.expectError(error.LayoutMismatch, sh[0].check(.{ .buf = 0, .sec = without, .home = 0 }));
++    try testing.expectError(error.NoHome, sh[0].check(.{ .buf = 0, .sec = with }));
++    try testing.expectError(error.LayoutMismatch, sh[0].check(.{ .buf = 0, .sec = with, .home = 2 }));
++    try testing.expectError(error.LayoutMismatch, rep[1].check(.{ .buf = 0, .sec = without }));
++    try testing.expectError(error.LayoutMismatch, rep[0].check(.{ .buf = 0, .sec = with, .home = 0 }));
++    try testing.expectError(error.OffGrid, sh[0].check(.{ .buf = 0, .sec = rep[0].sectionsOf(100, true), .home = 0 }));
++    // a stored point's part is its home: none on a replicated store, one of the ranks' on a sharded one
++    try testing.expectEqual(@as(?u8, 1), try sh[0].homeOf(1));
++    try testing.expectError(error.NoHome, sh[0].homeOf(null));
++    try testing.expectError(error.LayoutMismatch, sh[0].homeOf(2));
++    try testing.expectEqual(@as(?u8, null), try rep[0].homeOf(null));
++    try testing.expectError(error.LayoutMismatch, rep[0].homeOf(0));
++    // the store's bounds: a whole block of each rank's own part's points, and of the other part's its pooled rows
++    for (0..2) |r| {
++        const lim = sh[r].limits(131072);
++        try testing.expectEqual(@as(u32, @intCast(r)), lim.own_part);
++        try testing.expectEqual(@as(?u64, 12_705_792), lim.fullBlockBytes(@as(u32, @intCast(r))));
++        try testing.expectEqual(@as(?u64, 811_008), lim.fullBlockBytes(@as(u32, @intCast(1 - r))));
++        try testing.expectEqual(@as(?u64, null), lim.fullBlockBytes(null));
++        try testing.expectEqual(rep[r].limits(131072).max_small_bytes, lim.max_small_bytes);
++    }
++    try testing.expectEqual(@as(u64, 0), rep[0].limits(131072).foreign_block_bytes);
++    // the bytes: the replicated ones as before, the sharded ones the same but the owner layout, then the other part's
++    // block bytes, the home rule's version and the parts; equal on both ranks
++    var b0: [Layout.max_encoded]u8 = undefined;
++    var b1: [Layout.max_encoded]u8 = undefined;
++    const er = rep[0].encode(&b0);
++    const es = sh[0].encode(&b1);
++    try testing.expectEqual(Layout.encoded_bytes, er.len);
++    try testing.expectEqual(Layout.encoded_bytes + Layout.sharded_bytes, es.len);
++    try testing.expectEqualSlices(u8, er[0..20], es[0..20]);
++    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, er[20..24], .little));
++    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, es[20..24], .little));
++    try testing.expectEqualSlices(u8, er[24..], es[24..Layout.encoded_bytes]);
++    try testing.expectEqual(@as(u64, 811_008), std.mem.readInt(u64, es[200..208], .little));
++    try testing.expectEqual(owner_version, std.mem.readInt(u32, es[208..212], .little));
++    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, es[212..216], .little));
++    try testing.expectEqualSlices(u8, &sh[0].digest(), &sh[1].digest());
++    try testing.expect(!std.mem.eql(u8, &sh[0].digest(), &rep[0].digest()));
++    // pinned from round 2 (glm/integration ef6eb5b0): no replicated store's namespace moves
++    try testing.expectEqualStrings("52cce7c3ec62465586c9392188ec3c1eb1350013187eb8c7ee81a3a825b49505", &std.fmt.bytesToHex(rep[0].digest(), .lower));
++    try testing.expectEqualStrings("15a466b1ccaff335027ccb2854cb38f424ee5712591a8924d5267c25591edc5a", &std.fmt.bytesToHex((try Layout.init(try G.init(2, 1), 2112, null)).digest(), .lower));
++    // the store's namespace and the fingerprint's field say which: a sharded store never opens a replicated one's
++    const common: format.Digest = @splat(5);
++    try testing.expectEqualSlices(u8, &format.compatDigest(common, .replicated, 2048, 12_705_792), &rep[0].compat(common));
++    try testing.expectEqualSlices(u8, &format.compatDigest(common, .owner_sharded, 2048, 12_705_792), &sh[0].compat(common));
++    try testing.expectEqualSlices(u8, &sh[0].compat(common), &sh[1].compat(common));
++    try testing.expect(!std.mem.eql(u8, &sh[0].compat(common), &rep[0].compat(common)));
++    var tb: [48]u8 = undefined;
++    try testing.expectEqualStrings("replicated", rep[0].ownerText(&tb));
++    try testing.expectEqualStrings("owner_sharded;version=1;parts=2;", sh[1].ownerText(&tb));
++    // the lineage a keep writes under: salted with the home when sharded (replaced, never stacked), as it was when not
++    var lin = try format.Lineage.fresh(@splat(3), 7).fork(testing.allocator, @splat(4), 2048);
++    defer lin.deinit(testing.allocator);
++    try testing.expect((try rep[0].lineageOf(lin, null)).eql(lin));
++    const in1 = try sh[0].lineageOf(lin, 1);
++    try testing.expectEqual(@as(?u32, 1), in1.part);
++    try testing.expect(in1.forks.ptr == lin.forks.ptr and std.mem.eql(u8, &in1.root, &lin.root));
++    try testing.expectEqual(@as(?u32, 0), (try sh[1].lineageOf(in1, 0)).part);
++    try testing.expectError(error.NoHome, sh[0].lineageOf(lin, null));
++    try testing.expectError(error.LayoutMismatch, rep[0].lineageOf(lin, 0));
++}
++
++test "owner-sharded: both ranks' views of one point, the home's owner packing latent and pooled rows (22 copies a block), the other rank the pooled rows alone (11), each unpacking its own" {
++    const gpa = testing.allocator;
++    var ls: [2]Layout = undefined;
++    for (&ls, 0..) |*l, r| l.* = (try Layout.init(try G.init(2, r), 128, .{ .kv = 2, .ring = 16 })).sharded();
++    var lives = [2]Live{ try Live.init(gpa, 4096 + 256, 128, ls[0].drafter), try Live.init(gpa, 4096 + 256, 128, ls[1].drafter) };
++    var others = [2]Live{ try Live.init(gpa, 4096 + 256, 128, ls[0].drafter), try Live.init(gpa, 4096 + 256, 128, ls[1].drafter) };
++    defer for (&lives, &others) |*f, *o| {
++        f.deinit();
++        o.deinit();
++    };
++    for (0..2) |r| {
++        try lives[r].onRank(r);
++        try others[r].onRank(r);
++    }
++    var hc: HostCopy = .{};
++    for ([_]usize{ 4096 + 192, 4096, 64 }, 0..) |at, seed| for ([_]u8{ 0, 1 }) |home| {
++        var kept: [2]TKept = undefined;
++        for (0..2) |r| {
++            lives[r].run(seed + 1, 0, at);
++            kept[r] = try lives[r].keepIn(&ls[r], home);
++        }
++        defer for (&kept) |*k| k.deinit(gpa);
++        try testing.expect(!std.mem.eql(u8, lives[0].rec, lives[1].rec)); // (each rank's own heads)
++        const nb = try ls[0].blocks(at);
++        for (0..2) |r| {
++            const own = r == home;
++            const l = &ls[r];
++            const p: Packer = .{ .layout = l, .c = hc.copier() };
++            const blocks = try gpa.alloc([]u8, nb);
++            defer gpa.free(blocks);
++            for (blocks, 0..) |*b, k| {
++                const sp = l.span(at, k);
++                b.* = try gpa.alloc(u8, Layout.spanBytesOf(sp.tokens, own));
++                const before = hc.copies;
++                try p.packBlock(kept[r].k, sp.first, sp.tokens, b.*);
++                try testing.expectEqual(@as(usize, if (own) 22 else 11), hc.copies - before);
++                const want = try lives[r].expectBlock(gpa, sp.first, sp.tokens, own);
++                defer gpa.free(want);
++                try testing.expectEqualSlices(u8, want, b.*);
++            }
++            defer for (blocks) |b| gpa.free(b);
++            try testing.expectEqual(if (at % 2048 == 0) l.blockBytesOf(own) else l.tailBytesOf(at, own), blocks[nb - 1].len);
++            var secs: [4]format.Section = undefined;
++            const laid = storeSections(l, &secs);
++            const small = try gpa.alloc(u8, l.small_bytes);
++            defer gpa.free(small);
++            try p.packSmall(kept[r].k, small, laid);
++            // a new buffer of this rank's own (the latent section only on the home's owner), as a restore allocates it
++            const sec = l.sectionsOf(at, own);
++            const nbuf = try gpa.alloc(u8, sec.total);
++            defer gpa.free(nbuf);
++            @memset(nbuf, 0x77);
++            var u = try Unpacker.init(l, hc.copier(), .{ .buf = @intFromPtr(nbuf.ptr), .sec = sec, .home = home });
++            for (blocks, 0..) |b, k| try u.block(l.span(at, k).first, l.span(at, k).tokens, b);
++            try u.smallState(small, laid);
++            try u.finish();
++            try expectState(l, kept[r].k, u.kept);
++            // and cuda_snapshot's restore of it gives this rank's state back: the latent rows only on the owner
++            others[r].run(99, 0, 4096 + 256);
++            const prior = try gpa.dupe(u8, others[r].latent[3]);
++            defer gpa.free(prior);
++            try snapshot.restore(HostCopy.snapCopier(), others[r].g, sec, u.kept.buf, &others[r].st, others[r].draft(), own);
++            for (0..11) |i| {
++                try testing.expectEqualSlices(u8, lives[r].pooled[i][0 .. at / 4 * G.pool_row], others[r].pooled[i][0 .. at / 4 * G.pool_row]);
++                try testing.expectEqualSlices(u8, lives[r].keys[i], others[r].keys[i]);
++                try testing.expectEqualSlices(u8, lives[r].gates[i], others[r].gates[i]);
++            }
++            if (own) {
++                try testing.expectEqualSlices(u8, lives[r].latent[3][0 .. at * G.latent_row], others[r].latent[3][0 .. at * G.latent_row]);
++            } else try testing.expectEqualSlices(u8, prior, others[r].latent[3]);
++            try testing.expectEqualSlices(u8, lives[r].rec, others[r].rec);
++            try testing.expectEqualSlices(u8, lives[r].conv, others[r].conv);
++        }
++        // the other rank's block is the owner's pooled rows, layer by layer (the pooled keys are pool-wide)
++        const sp = ls[0].span(at, 0);
++        const ob = try gpa.alloc(u8, Layout.spanBytesOf(sp.tokens, true));
++        defer gpa.free(ob);
++        const fb = try gpa.alloc(u8, Layout.spanBytesOf(sp.tokens, false));
++        defer gpa.free(fb);
++        const po: Packer = .{ .layout = &ls[home], .c = hc.copier() };
++        const pf: Packer = .{ .layout = &ls[1 - home], .c = hc.copier() };
++        try po.packBlock(kept[home].k, 0, sp.tokens, ob);
++        try pf.packBlock(kept[1 - home].k, 0, sp.tokens, fb);
++        const lat = sp.tokens * G.latent_row;
++        const pool = sp.tokens / 4 * G.pool_row;
++        for (0..11) |i| try testing.expectEqualSlices(u8, ob[i * (lat + pool) + lat ..][0..pool], fb[i * pool ..][0..pool]);
++    };
++    // refused before any copy: the owner's bytes staged on the other rank, a state without its home or with one past
++    // the ranks, the owner's buffer on the other rank, a sharded state on a replicated layout
++    for (&lives) |*f| f.run(7, 0, 2048 + 64);
++    var own0 = try lives[0].keepIn(&ls[0], 0);
++    defer own0.deinit(gpa);
++    var oth1 = try lives[1].keepIn(&ls[1], 0);
++    defer oth1.deinit(gpa);
++    const copies = hc.copies;
++    const big = try gpa.alloc(u8, ls[0].block_bytes);
++    defer gpa.free(big);
++    const small = big[0..811_008];
++    const p1: Packer = .{ .layout = &ls[1], .c = hc.copier() };
++    try testing.expectError(error.BadStaging, p1.packBlock(oth1.k, 0, 2048, big));
++    var x = oth1.k;
++    x.home = null;
++    try testing.expectError(error.NoHome, p1.packBlock(x, 0, 2048, small));
++    x.home = 2;
++    try testing.expectError(error.LayoutMismatch, p1.packBlock(x, 0, 2048, small));
++    try testing.expectError(error.LayoutMismatch, p1.packBlock(own0.k, 0, 2048, big)); // (rank 0's buffer holds the latent rows)
++    const rep = try Layout.init(try G.init(2, 1), 128, .{ .kv = 2, .ring = 16 });
++    const pr: Packer = .{ .layout = &rep, .c = hc.copier() };
++    try testing.expectError(error.LayoutMismatch, pr.packBlock(oth1.k, 0, 2048, small));
++    try testing.expectError(error.LayoutMismatch, Unpacker.init(&rep, hc.copier(), oth1.k));
++    try testing.expectEqual(copies, hc.copies);
++    try p1.packBlock(oth1.k, 0, 2048, small);
++}
++
++test "owner-sharded block names: the same ids in the two parts never share a name, nor with a replicated store's; salting again replaces" {
++    const gpa = testing.allocator;
++    const l = (try Layout.init(try G.init(2, 0), 128, null)).sharded();
++    var prng = std.Random.DefaultPrng.init(11);
++    var ids: [4096 + 192]u32 = undefined;
++    for (&ids) |*x| x.* = prng.random().intRangeLessThan(u32, 0, 154880);
++    var ch: std.ArrayList(format.Digest) = .empty;
++    defer ch.deinit(gpa);
++    try format.chain(gpa, &ids, block_tokens, &ch);
++    const lin = format.Lineage.fresh(@splat(7), 1);
++    var n: [3][3]format.Span = undefined; // unsalted (a replicated store's), part 0, part 1
++    format.blockNames(lin, ch.items, &ids, block_tokens, &n[0]);
++    format.blockNames(try l.lineageOf(lin, 0), ch.items, &ids, block_tokens, &n[1]);
++    format.blockNames(try l.lineageOf(lin, 1), ch.items, &ids, block_tokens, &n[2]);
++    for (0..3) |k| for (0..3) |i| for (i + 1..3) |j| try testing.expect(!std.mem.eql(u8, &n[i][k].name, &n[j][k].name));
++    // a lineage read back from disk (part 0) and kept again in part 1 names part 1's blocks
++    var again: [3]format.Span = undefined;
++    format.blockNames(try l.lineageOf(try l.lineageOf(lin, 0), 1), ch.items, &ids, block_tokens, &again);
++    for (0..3) |k| try testing.expectEqualSlices(u8, &n[2][k].name, &again[k].name);
++}
++
++test "owner-sharded stores on both ranks: blocks sized by the point's home, the home in its manifest, a carried turn's blocks under its new part, each restore this rank's state" {
++    const gpa = testing.allocator;
++    var hc: HostCopy = .{};
++    var ls: [2]Layout = undefined;
++    for (&ls, 0..) |*l, r| l.* = (try Layout.init(try G.init(2, r), 128, null)).sharded();
++    var lives = [2]Live{ try Live.init(gpa, 4608 + 64, 128, null), try Live.init(gpa, 4608 + 64, 128, null) };
++    defer for (&lives) |*f| f.deinit();
++    for (&lives, 0..) |*f, r| try f.onRank(r);
++    const ts = [2]*TStore{ try TStore.init(gpa, &ls[0], &hc, "glm-state-shard0", 3), try TStore.init(gpa, &ls[1], &hc, "glm-state-shard1", 3) };
++    defer for (ts) |t| t.deinit();
++    var prng = std.Random.DefaultPrng.init(5);
++    var ids: [4608]u32 = undefined;
++    for (&ids) |*x| x.* = prng.random().intRangeLessThan(u32, 0, 154880);
++    const l1 = format.Lineage.fresh(@splat(1), 1);
++    var l2 = try l1.fork(gpa, @splat(2), 3072);
++    defer l2.deinit(gpa);
++    // turn 1 at 3,072 kept in part 0 (rank 0's); the conversation then carried to part 1, its turn 2 kept there at 4,608
++    var t1: [2]TKept = undefined;
++    for (&lives, &ls, &t1) |*f, *l, *k| {
++        f.run(1, 0, 3072);
++        k.* = try f.keepIn(l, 0);
++    }
++    defer for (&t1) |*k| k.deinit(gpa);
++    var t2: [2]TKept = undefined;
++    for (&lives, &ls, &t2) |*f, *l, *k| {
++        f.run(1, 3072, 4608);
++        k.* = try f.keepIn(l, 1);
++    }
++    defer for (&t2) |*k| k.deinit(gpa);
++    // turn 1: the owner writes block 0 whole and its tail, the other rank their pooled rows
++    for (ts, t1) |t, k| {
++        _ = (try t.keep(&ids, l1, 1, k.k, true)).?;
++        try t.settle();
++    }
++    try testing.expectEqual(@as(u64, 12_705_792 + 1024 * 6204), ts[0].s.counts().written_bytes);
++    try testing.expectEqual(@as(u64, 811_008 + 1024 * 396), ts[1].s.counts().written_bytes);
++    // turn 2 names none of turn 1's blocks (another part): its block 0 is written again on each rank, at its size there
++    for (ts, t2) |t, k| {
++        _ = (try t.keep(&ids, l2, 2, k.k, true)).?;
++        try t.settle();
++    }
++    try testing.expectEqual(@as(u64, 12_705_792 + 1024 * 6204 + 2 * 811_008 + 512 * 396), ts[0].s.counts().written_bytes);
++    try testing.expectEqual(@as(u64, 811_008 + 1024 * 396 + 2 * 12_705_792 + 512 * 6204), ts[1].s.counts().written_bytes);
++    for (ts) |t| {
++        try testing.expectEqual(@as(u64, 5), t.s.counts().blocks);
++        try testing.expectEqual(@as(u64, 2), t.s.counts().points);
++        try testing.expectEqual(@as(?u8, 0), try t.homeOf(&ids, 3072));
++        try testing.expectEqual(@as(?u8, 1), try t.homeOf(&ids, 4608));
++    }
++    // each rank's read back is the state it kept (the latent rows on the home's owner only)
++    for (ts, ls, t1, t2) |t, l, a, b| for ([_]Kept{ a.k, b.k }) |k| {
++        const buf = try t.restore(&hc, &ids, k.sec.at);
++        defer gpa.free(buf);
++        try expectState(&l, k, .{ .buf = @intFromPtr(buf.ptr), .sec = k.sec, .home = k.home });
++    };
++}
++
++test "a sharded store and a replicated one in one spill directory: neither reads the other's points, and each finds its own again" {
++    const gpa = testing.allocator;
++    var hc: HostCopy = .{};
++    const rep = try Layout.init(try G.init(2, 0), 128, null);
++    const sh = rep.sharded();
++    var t = try TStore.init(gpa, &rep, &hc, "glm-state-namespaces", 3);
++    defer t.deinit();
++    var live = try Live.init(gpa, 2048 + 128, 128, null);
++    defer live.deinit();
++    var prng = std.Random.DefaultPrng.init(6);
++    var ids: [2048 + 64]u32 = undefined;
++    for (&ids) |*x| x.* = prng.random().intRangeLessThan(u32, 0, 154880);
++    const key = format.pointKey(&ids, @intCast(block_tokens), &.{});
++    live.run(1, 0, 2048 + 64);
++    var a = try live.keep(&rep);
++    defer a.deinit(gpa);
++    var b = try live.keepIn(&sh, 0);
++    defer b.deinit(gpa);
++    _ = (try t.keep(&ids, format.Lineage.fresh(@splat(1), 1), 1, a.k, true)).?;
++    try t.settle();
++    // TF_GLM_KV_SHARD turned on: another namespace, where the replicated point is not
++    try t.reopen(&sh);
++    try testing.expectEqual(@as(u64, 0), t.s.counts().points);
++    try testing.expect(!t.s.presence(key) and t.s.partOf(key) == null);
++    _ = (try t.keep(&ids, format.Lineage.fresh(@splat(1), 2), 2, b.k, true)).?;
++    try t.settle();
++    // off again: the replicated point is there (the newest other build is kept), part-less, and restores
++    try t.reopen(&rep);
++    try testing.expectEqual(@as(u64, 1), t.s.counts().points);
++    try testing.expectEqual(@as(?u8, null), try t.homeOf(&ids, 2048 + 64));
++    {
++        const buf = try t.restore(&hc, &ids, 2048 + 64);
++        defer gpa.free(buf);
++        try expectState(&rep, a.k, .{ .buf = @intFromPtr(buf.ptr), .sec = a.k.sec });
++    }
++    // and on again: the sharded point, in part 0
++    try t.reopen(&sh);
++    try testing.expectEqual(@as(u64, 1), t.s.counts().points);
++    try testing.expectEqual(@as(?u8, 0), try t.homeOf(&ids, 2048 + 64));
++    const buf = try t.restore(&hc, &ids, 2048 + 64);
++    defer gpa.free(buf);
++    try expectState(&sh, b.k, .{ .buf = @intFromPtr(buf.ptr), .sec = b.k.sec, .home = 0 });
++}
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier.zig b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+index f737fe1cad26c4d888647d16d0a83f372c168ae0..3cb35382a6cbe4adb83775f090ac1da491316ae0 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+@@ -16,11 +16,19 @@
+ //!     rank, or abort, and every rank forgets the point when any rank's copy was damaged;
+ //!   - a kept state about to be freed while its write still reads it is held (cuda_spill_state.Guard), or its rest is
+ //!     staged at once past the guard's limit.
++//! TF_GLM_KV_SHARD (GLM 0118's spill blocks; an owner-sharded layout, cuda_spill_state `Layout.sharded`): each rank
++//! writes its own view of a kept state (the home part's owner its latent and pooled rows, the other rank the pooled
++//! rows alone) under a lineage salted with the home part, so every manifest records it; `has` names rank 0's part and
++//! a rank whose point of those ids was kept from another part answers `incompatible` (every rank forgets it); a restore
++//! makes each rank's destination its view of that home (Snap.home), and the resume then places it as any kept state
++//! (its home part, moved there, carried, or from 0: cuda_engine placeResume); rank 0 starts no restore whose resume
++//! could only start from 0 (its home part full, no carry).
+ //! Nothing here waits on a disk while the engine runs: the stores' threads do the file I/O, the engine thread only
+ //! enqueues copies on its stream and polls their events. The engine `E` (cuda_engine.Engine; a host-memory one in the
+-//! tests) gives: `tierKept(snap)` (the buffer and its sections), `tierCopier()`, `tierEvents(n)`, `tierRecord(ev)`,
+-//! `tierDone(ev)`, `tierWait(ev)`, `tierDest(at)` (a new kept-state buffer, under the keep floor), `freeSnapshot`,
+-//! `current`.
++//! tests) gives: `tierKept(snap)` (the buffer, its sections and its home), `tierCopier()`, `tierEvents(n)`,
++//! `tierRecord(ev)`, `tierDone(ev)`, `tierWait(ev)`, `tierDest(at, home)` (a new kept-state buffer, under the keep
++//! floor: this rank's view of a state kept in part `home`), `tierResumable(at, home)` (a restore of such a state could
++//! resume), `freeSnapshot`, `current`.
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const core = @import("core");
+@@ -168,6 +176,8 @@ pub const Counts = struct {
+     quota_trims: u64 = 0,
+     recovered_points: u64 = 0,
+     dropped_temporaries: u64 = 0,
++    points_part0: u64 = 0,
++    points_part1: u64 = 0,
+ };
+ 
+ fn monotonicNs() u64 {
+@@ -319,7 +329,8 @@ pub fn Side(comptime E: type) type {
+ 
+         /// Opens this rank's store under `s.dir` (namespace `prefix` + `compat`) over `staging` (pinned, at least
+         /// plan's bytes, 4 KiB aligned; the caller's), its events made by the engine (eventCount). `layout`: the
+-        /// engine's (Engine.spillLayout); `max_tokens`: the longest point (the context).
++        /// engine's (Engine.spillLayout: owner_sharded under TF_GLM_KV_SHARD, its block sizes this rank's);
++        /// `max_tokens`: the longest point (the context).
+         pub fn open(gpa: Allocator, io: std.Io, e: *E, layout: st.Layout, s: Settings, rank: u32, compat: Digest, max_tokens: u32, staging: []align(spill.slots.alignment) u8, hooks: spill.store.Hooks) !*Self {
+             const p = try plan(s, &layout);
+             if (staging.len < p.bytes()) return error.StagingTooSmall;
+@@ -344,6 +355,7 @@ pub fn Side(comptime E: type) type {
+                 .prefix = prefix,
+                 .rank = rank,
+                 .compat = compat,
++                .owner_layout = layout.owner,
+                 .limits = layout.limits(max_tokens),
+                 .cap_bytes = s.capBytes(),
+                 .floor_bytes = s.floorBytes(),
+@@ -409,16 +421,19 @@ pub fn Side(comptime E: type) type {
+         // -- writes ---------------------------------------------------------------------------------------------
+ 
+         /// The write of a kept state: its sections and its tail copied off its buffer now, its whole blocks staged
+-        /// later by `service`. Never waits on the disk.
++        /// later by `service`. Never waits on the disk. Owner-sharded: this rank's view of it (its latent rows only
++        /// where it owns the state's home), under the lineage salted with that home (cuda_spill_state lineageOf).
+         pub fn keepPoint(self: *Self, k: KeepArgs) Kept {
+             const kept = self.e.tierKept(k.snap);
+             const at = kept.sec.at;
+             if (k.keyed.len != at) return .refused;
+-            self.layout.check(kept.sec) catch return .refused;
++            self.layout.check(kept) catch return .refused;
++            const own = self.layout.owns(kept.home) catch return .refused;
++            const lin = self.layout.lineageOf(k.lineage, kept.home) catch return .refused;
+             if (self.writes.contains(k.snap.id)) return .stored;
+             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+-            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytes(at), .source = st.sourceOf(k.snap.id) });
++            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
+             const q = switch (r) {
+                 .queued => |q| q,
+                 .stored => return .stored,
+@@ -655,10 +670,14 @@ pub fn Side(comptime E: type) type {
+             rx.retry = false;
+         }
+ 
+-        /// `rx`'s destination: a new kept state of the point's size (the engine's, under its keep floor).
++        /// `rx`'s destination: a new kept state of the point's size (the engine's, under its keep floor). Owner-sharded:
++        /// this rank's view of a state of the point's home part, as this rank's store recorded it (`has` agreed it with
++        /// rank 0's).
+         pub fn rxDest(self: *Self, rx: *Rx) void {
+             if (rx.why != .none or rx.dest != null) return;
+-            const snap = self.e.tierDest(rx.at) catch return rx.fail(.reserve);
++            const p = self.store.partOf(rx.key) orelse return rx.fail(.missing);
++            const home = self.layout.homeOf(p.part) catch return rx.fail(.unpack);
++            const snap = self.e.tierDest(rx.at, home) catch return rx.fail(.reserve);
+             rx.dest = snap;
+             rx.un = st.Unpacker.init(&self.layout, self.e.tierCopier(), self.e.tierKept(snap)) catch return rx.fail(.reserve);
+         }
+@@ -867,6 +886,12 @@ pub fn Side(comptime E: type) type {
+                 .recovered_points = c.recovered_points,
+                 .dropped_temporaries = c.temps_removed + c.recovered_dropped,
+             };
++            if (self.layout.owner == .owner_sharded) { // (two parts: this rank's own and the other's)
++                const own = self.layout.g.rank;
++                const parts = [2]*u64{ &self.cached.points_part0, &self.cached.points_part1 };
++                parts[own].* = c.own_part_points;
++                parts[1 - own].* = c.points - c.own_part_points;
++            }
+         }
+     };
+ }
+@@ -1036,7 +1061,8 @@ pub fn Leader(comptime E: type) type {
+             if (kp.at != at) return null;
+             var forks: std.ArrayList(format.Fork) = .empty;
+             defer forks.deinit(self.gpa);
+-            const lin = self.toLineage(w.lineage, &forks) catch return null;
++            // (owner-sharded: salted with the state's home, which every rank's keep note then carries)
++            const lin = self.side.layout.lineageOf(self.toLineage(w.lineage, &forks) catch return null, self.side.e.tierKept(kp.snap).home) catch return null;
+             if (lin.forks.len > wire.max_forks) return null; // (a keep note carries no more: no rank holds a point another lacks)
+             const origin: ?format.Origin = if (w.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = w.fork } else null) else null;
+             const keyed = w.key[0..at];
+@@ -1090,13 +1116,16 @@ pub fn Leader(comptime E: type) type {
+ 
+         /// begin's refusals of point `id` itself that no room cures, from this rank's own records with nothing read,
+         /// sent or reserved: UnknownPoint and BadPoint (not a point lookup gave), SpillMissing (gone from this rank's
+-        /// store: forgotten here). The prompt cache asks it before it makes room for the restore
+-        /// (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin asks it again.
++        /// store: forgotten here), and owner-sharded KvShardHomeFull (begin, below). The prompt cache asks it before it
++        /// makes room for the restore (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin
++        /// asks it again.
+         pub fn check(self: *Self, id: u64, at: u32) !void {
+             _ = try self.checked(id, at);
+         }
+ 
+-        fn checked(self: *Self, id: u64, at: u32) !PointRef {
++        const Checked = struct { ref: PointRef, part: ?u32 };
++
++        fn checked(self: *Self, id: u64, at: u32) !Checked {
+             const side = self.side;
+             const ref = self.points.get(id) orelse return error.UnknownPoint;
+             if (at != ref.at) return error.BadPoint;
+@@ -1104,18 +1133,27 @@ pub fn Leader(comptime E: type) type {
+                 _ = self.points.remove(id);
+                 return error.SpillMissing;
+             }
+-            return ref;
++            // owner-sharded: the part it was kept from (its home), which every rank must hold it under
++            const part = (side.store.partOf(ref.key) orelse return error.SpillMissing).part;
++            if (side.layout.homeOf(part) catch null) |home| if (!try side.e.tierResumable(at, home)) return error.KvShardHomeFull;
++            return .{ .ref = ref, .part = part };
+         }
+ 
+         /// A restore of point `id` (found by lookup): `check`'s refusals first, then this rank's reads (TooMany,
+         /// NoSlot: refused for capacity, nothing sent), then `has` on every rank (a rank that lacks the point or holds
+         /// it damaged makes every rank forget it), then the destination, and a `begin` note that has every other rank
+-        /// reserve its own under the same key and start its reads. Its transaction.
++        /// reserve its own under the same key and start its reads. Its transaction. Owner-sharded, before any of it:
++        /// KvShardHomeFull when the resume could only start from 0 (its home part full, no carry: the engine's
++        /// tierResumable), nothing read, sent or forgotten (not a capacity refusal, and one of
++        /// prompt_cache.point_errors: the prompt prefills at once, other restores in flight or not, since their ends
++        /// free no pool rows; a stream's may).
+         pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
+             self.side.e.current();
+             const side = self.side;
+             if (self.jobs.count() >= self.max_restores) return error.TooManyRestores;
+-            const ref = try self.checked(id, at);
++            const c = try self.checked(id, at);
++            const ref = c.ref;
++            const part = c.part;
+             try self.jobs.ensureUnusedCapacity(self.gpa, 1);
+             const txn = self.next_txn;
+             const rx = try side.newRx(txn, ref.key, at);
+@@ -1125,7 +1163,7 @@ pub fn Leader(comptime E: type) type {
+             };
+             const mine = [1]u64{@backingInt(wire.Absence.present)};
+             var all: [wire.max_world]u64 = undefined;
+-            const ranks = self.ask(.{ .has = .{ .point = ref.key, .at = at, .blocks = rx.blocks } }, &mine, &all) catch |e| {
++            const ranks = self.ask(.{ .has = .{ .point = ref.key, .at = at, .blocks = rx.blocks, .part = part } }, &mine, &all) catch |e| {
+                 side.rxEnd(rx, .cancel, false);
+                 return e;
+             };
+@@ -1358,8 +1396,10 @@ pub fn Follower(comptime E: type) type {
+             switch (m.*) {
+                 .keep => |k| {
+                     const kp: *L.Kept = @ptrCast(@alignCast(kept orelse return error.KeepWithoutState));
+-                    // this rank's own ids must name rank 0's point, or a restore could never agree on it
+-                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point)) {
++                    // this rank's own ids must name rank 0's point, and (owner-sharded) its state the home rank 0's lineage
++                    // is salted with, or a restore could never agree on it
++                    const home = side.e.tierKept(kp.snap).home;
++                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point) or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
+                         self.skipped += 1;
+                         return;
+                     }
+@@ -1407,7 +1447,7 @@ pub fn Follower(comptime E: type) type {
+             const side = self.side;
+             _ = side.retire();
+             switch (m.*) {
+-                .has => |h| out[0] = @backingInt(self.absence(h.point)),
++                .has => |h| out[0] = @backingInt(self.absence(h)),
+                 .validate => |v| out[0] = @backingInt(self.validate(v.txn)),
+                 .stats => {
+                     side.refresh();
+@@ -1417,11 +1457,16 @@ pub fn Follower(comptime E: type) type {
+             }
+         }
+ 
+-        /// This rank's store compat is the pair's (the agreement at start): presence is the check. A point whose write
+-        /// this rank still has queued is `incomplete` (published here soon; rank 0 keeps it).
+-        fn absence(self: *Self, point: Digest) wire.Absence {
+-            if (self.side.store.presence(point)) return .present;
+-            if (self.side.writing(point)) return .incomplete;
++        /// This rank's store compat is the pair's (the agreement at start): presence is the check, and (owner-sharded)
++        /// the part: the same ids kept here from the other part are the other view's bytes (rank 0 dedups a keep this
++        /// rank wrote again after losing its copy), `incompatible`. A point whose write this rank still has queued is
++        /// `incomplete` (published here soon; rank 0 keeps it).
++        fn absence(self: *Self, h: wire.Has) wire.Absence {
++            if (self.side.store.presence(h.point)) {
++                const p = self.side.store.partOf(h.point) orelse return .missing;
++                return if (p.part == h.part) .present else .incompatible;
++            }
++            if (self.side.writing(h.point)) return .incomplete;
+             return .missing;
+         }
+ 
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+index 9a8a02bdcbcc6a3e6ddd2ba6db65a679faf05d7a..aa110f72c4e4975f8d71c4cce9c77d1598b2f58e 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+@@ -2,8 +2,12 @@
+ //! cache): an engine whose kept states are real GLM kept-state buffers (cuda_snapshot.sections at TP=2) in host memory,
+ //! their bytes a function of their tokens, so a pass resumed from a restored state draws what a fresh pass draws
+ //! exactly when every byte of the state came back (`first`); and a pair of ranks in one thread, each with its lane
+-//! backend, its own store under TF_SPILL_TEST_DIR and the tier, rank 1 following rank 0's notes and asks. Test code only:
+-//! glm_cuda exports it in test builds alone (cuda.zig's `spill_tier_rig`).
++//! backend, its own store under TF_SPILL_TEST_DIR and the tier, rank 1 following rank 0's notes and asks. Sharded
++//! (`Pair.initWith(.., .{ .sharded = true })`, TF_GLM_KV_SHARD): each rank's layout owner-sharded and its own, its
++//! sequences extents of a two-part pool (cuda_pool) placed as the engine places them, a kept state holding its latent
++//! rows on its home part's owner only, a resume placed in its home part, moved there, carried, or from 0
++//! (cuda_shard_keep).
++//! Test code only: glm_cuda exports it in test builds alone (cuda.zig's `spill_tier_rig`).
+ const std = @import("std");
+ const core = @import("core");
+ const lanes = @import("lanes");
+@@ -13,6 +17,8 @@ const snapshot = @import("cuda_snapshot.zig");
+ const state = @import("cuda_state.zig");
+ const tier = @import("cuda_spill_tier.zig");
+ const wire = @import("cuda_spill_wire.zig");
++const shard_keep = @import("cuda_shard_keep.zig");
++const Pool = @import("cuda_pool.zig").Pool;
+ 
+ const spill = core.spill;
+ const format = spill.format;
+@@ -22,12 +28,13 @@ const testing = std.testing;
+ extern "c" fn memcmp(a: [*]const u8, b: [*]const u8, n: usize) c_int;
+ 
+ /// An engine whose sequence is its tokens and whose kept state is a GLM kept-state buffer filled from them (`fill`).
+-/// Its device is host memory: copies are synchronous, an event stays pending `delay` polls after its record.
++/// Its device is host memory: copies are synchronous, an event stays pending `delay` polls after its record. With a
++/// `pool` (TF_GLM_KV_SHARD's two parts) a sequence holds an extent and a kept state its home (cuda_engine's rules).
+ pub const HostEngine = struct {
+     pub const snap_holds_rows = true;
+-    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty };
++    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
+     pub const Buf = struct { ptr: u64, bytes: []u8 };
+-    pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1) };
++    pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
+     pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+     pub const Window = struct { seq: *Seq, tokens: []const u32 };
+@@ -49,6 +56,11 @@ pub const HostEngine = struct {
+     /// tierDest refuses (a rank at its keep floor)
+     refuse_dest: bool = false,
+     scratch: []u8 = &.{},
++    /// TF_GLM_KV_SHARD's parts (null: off), TF_GLM_KV_SHARD_CARRY, and the resumes placeResume carried or sent to 0
++    pool: ?Pool = null,
++    carry: bool = true,
++    carries: usize = 0,
++    refused_small: usize = 0,
+ 
+     pub fn init(gpa: std.mem.Allocator, layout: st.Layout) HostEngine {
+         return .{ .gpa = gpa, .layout = layout };
+@@ -57,6 +69,7 @@ pub const HostEngine = struct {
+     pub fn deinit(e: *HostEngine) void {
+         e.gpa.free(e.events);
+         e.gpa.free(e.scratch);
++        if (e.pool) |*p| p.deinit();
+     }
+ 
+     pub fn first(tokens: []const u32) u32 {
+@@ -75,25 +88,27 @@ pub const HostEngine = struct {
+         std.mem.writeInt(u64, dst[dst.len - 8 ..][0..8], ~v, .little);
+     }
+ 
+-    /// The state ranges a kept state holds (every layer's latent rows and complete pools, each section): `f` on each.
++    /// The state ranges a kept state holds (every layer's latent rows when it holds them, its complete pools, each
++    /// section): `f` on each.
+     fn ranges(l: *const st.Layout, sec: snapshot.Sections, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, usize) void) void {
+         for (0..G.dsa_layers) |i| {
+-            f(ctx, sec.latent + i * sec.latentBytes(), sec.at * G.latent_row);
++            if (sec.rows) f(ctx, sec.latent + i * sec.latentBytes(), sec.at * G.latent_row);
+             f(ctx, sec.pooled + i * sec.pooledBytes(), sec.at / 4 * G.pool_row);
+         }
+         const at = [_]usize{ sec.rings, sec.rec, sec.conv, sec.draft };
+         for (l.specs(), l.order[0..l.n]) |s, o| f(ctx, at[@backingInt(o)], s.len);
+     }
+ 
+-    /// The state a fresh pass of `tokens` keeps at their end: each latent row from the tokens through it, each complete
+-    /// pool from its four, the sections from all of them; pooled row at/4 and the padding stale bytes (0xee).
++    /// The state a fresh pass of `tokens` keeps at their end: each latent row from the tokens through it (when the
++    /// buffer holds them), each complete pool from its four, the sections from all of them; pooled row at/4 and the
++    /// padding stale bytes (0xee).
+     pub fn fill(l: *const st.Layout, out: []u8, sec: snapshot.Sections, tokens: []const u32) void {
+         @memset(out[0..sec.total], 0xee);
+         var h: u64 = 0x51ed;
+         for (tokens[0..sec.at], 0..) |t, r| {
+             h = mix(h, t);
+             for (0..G.dsa_layers) |i| {
+-                row(out[sec.latent + i * sec.latentBytes() + r * G.latent_row ..][0..G.latent_row], h +% i);
++                if (sec.rows) row(out[sec.latent + i * sec.latentBytes() + r * G.latent_row ..][0..G.latent_row], h +% i);
+                 if (r % 4 == 3) row(out[sec.pooled + i * sec.pooledBytes() + r / 4 * G.pool_row ..][0..G.pool_row], h ^ (@as(u64, i) << 40));
+             }
+         }
+@@ -120,17 +135,25 @@ pub const HostEngine = struct {
+         return snap.buf.?.bytes;
+     }
+ 
+-    fn newSnap(e: *HostEngine, at: usize) !*Snap {
+-        const sec = e.layout.sections(at);
++    /// A kept-state buffer of `at` tokens kept in part `home` (null: unsharded): its latent rows only where this rank
++    /// owns that part (cuda_engine takeSnap / tierDest).
++    fn newSnap(e: *HostEngine, at: usize, home: ?u8) !*Snap {
++        const sec = e.layout.sectionsOf(at, try e.layout.owns(home));
+         const bytes = try e.gpa.alloc(u8, sec.total);
+         errdefer e.gpa.free(bytes);
+         const s = try e.gpa.create(Snap);
+         e.next_id += 1;
+-        s.* = .{ .id = e.next_id, .pos = at, .buf = .{ .ptr = @intFromPtr(bytes.ptr), .bytes = bytes }, .sec = sec };
++        s.* = .{ .id = e.next_id, .pos = at, .buf = .{ .ptr = @intFromPtr(bytes.ptr), .bytes = bytes }, .sec = sec, .home = home };
+         e.snaps += 1;
+         return s;
+     }
+ 
++    /// The part sequence `s`'s extent lies in (null: unsharded).
++    pub fn partOf(e: *HostEngine, s: *const Seq) ?u8 {
++        const p = if (e.pool) |*q| q else return null;
++        return @intCast(p.partOf((p.extent(s.eid.?) catch unreachable).base));
++    }
++
+     /// Whether `snap` holds the state a fresh pass of `tokens` keeps.
+     pub fn exactFor(e: *HostEngine, snap: *const Snap, tokens: []const u32) bool {
+         if (e.scratch.len < snap.sec.total) {
+@@ -147,15 +170,41 @@ pub const HostEngine = struct {
+     pub fn snapBytes(e: *const HostEngine, at: usize) usize {
+         return e.layout.sections(at).total;
+     }
+-    pub fn newSeq(e: *HostEngine, _: usize) !*Seq {
++    pub fn newSeq(e: *HostEngine, rows: usize) !*Seq {
+         const s = try e.gpa.create(Seq);
++        errdefer e.gpa.destroy(s);
+         s.* = .{};
++        if (e.pool) |*p| {
++            s.eid = (try p.alloc(rows)) orelse return error.NoPoolExtent;
++            (try p.get(s.eid.?)).owner = s.eid.?; // (a live stream: the placement evens the parts' streams out)
++        }
+         return s;
+     }
+     pub fn freeSeq(e: *HostEngine, s: *Seq) void {
++        if (e.pool) |*p| p.remove(s.eid.?) catch unreachable;
+         s.tokens.deinit(e.gpa);
+         e.gpa.destroy(s);
+     }
++    /// cuda_engine placeResume: the fresh extent stays in the state's home part, moves there, keeps its part for a
++    /// carry, or the prompt runs from 0.
++    pub fn placeResume(e: *HostEngine, s: *Seq, snap: *const Snap) !bool {
++        const p = if (e.pool) |*q| q else return true;
++        switch (try shard_keep.resumeIn(p, s.eid.?, snap.home orelse return error.KvShardNoHome, snap.pos, e.carry)) {
++            .here => return true,
++            .move => |base| {
++                _ = try p.move(s.eid.?, base, null, true);
++                return true;
++            },
++            .carry => {
++                e.carries += 1;
++                return true;
++            },
++            .recompute => |why| {
++                e.refused_small += @intFromBool(why == .small);
++                return false;
++            },
++        }
++    }
+     pub fn bind(e: *HostEngine, s: *Seq) void {
+         e.bound = s;
+     }
+@@ -184,7 +233,7 @@ pub const HostEngine = struct {
+         try q.tokens.appendSlice(e.gpa, prompt[q.tokens.items.len..]);
+         var kept: ?*Snap = null;
+         if (o.keep_at) |k| {
+-            kept = try e.newSnap(k);
++            kept = try e.newSnap(k, e.partOf(q));
+             fill(&e.layout, bytesOf(kept.?), kept.?.sec, prompt[0..k]);
+         }
+         return .{ .first = if (ok) first(q.tokens.items) else first(q.tokens.items) ^ 1, .kept = kept };
+@@ -200,7 +249,7 @@ pub const HostEngine = struct {
+     // -- the tier's device (cuda_spill_tier) --------------------------------------------------------------------
+ 
+     pub fn tierKept(_: *const HostEngine, snap: *const Snap) st.Kept {
+-        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec };
++        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec, .home = snap.home };
+     }
+     fn d2h(_: *anyopaque, dst: []u8, src: u64) anyerror!void {
+         const s: [*]const u8 = @ptrFromInt(src);
+@@ -236,12 +285,17 @@ pub const HostEngine = struct {
+         if (e.events[ev] > 0) e.waits += 1;
+         e.events[ev] = 0;
+     }
+-    pub fn tierDest(e: *HostEngine, at: usize) !*Snap {
++    pub fn tierDest(e: *HostEngine, at: usize, home: ?u8) !*Snap {
+         if (e.refuse_dest) return error.BelowMemoryReserve;
+-        const s = try e.newSnap(at);
++        const s = try e.newSnap(at, home);
+         @memset(bytesOf(s), 0x33);
+         return s;
+     }
++    /// cuda_engine tierResumable: a restore only where its resume could be placed or carried.
++    pub fn tierResumable(e: *const HostEngine, at: usize, home: u8) !bool {
++        const p = if (e.pool) |*q| q else return true;
++        return shard_keep.restorable(p, home, at, e.carry);
++    }
+ };
+ 
+ pub const Lanes = lane_backend.Lanes(HostEngine);
+@@ -337,10 +391,20 @@ pub fn testLayout() !st.Layout {
+     return st.Layout.init(try G.init(2, 0), 64, null);
+ }
+ 
++/// Rank `rank`'s owner-sharded layout of the same shape (TF_GLM_KV_SHARD).
++pub fn shardedLayout(rank: usize) !st.Layout {
++    return (try st.Layout.init(try G.init(2, rank), 64, null)).sharded();
++}
++
++/// Rows of the sharded rig's pool: two parts of 8,192 (two 2,200-token streams' extents each).
++pub const pool_rows = 8 * 2048;
++
+ /// Two ranks with the tier on each (`lead`, `fol`), their stores in fresh folders.
+ pub const Pair = struct {
+     gpa: std.mem.Allocator,
++    /// rank 0's layout (the replicated tests' on both ranks); `layouts` each rank's own
+     layout: st.Layout,
++    layouts: [2]st.Layout,
+     e: [2]HostEngine,
+     r: [2]Lanes,
+     sink: Sink,
+@@ -360,9 +424,22 @@ pub const Pair = struct {
+         return .{ .dir = "", .gib = 4, .min_free_gib = 0, .min_tokens = 64, .stage_mib = 26, .read_blocks = 2, .smalls = 1, .restores = restores, .readers = 2, .direct = false, .hold_bytes = 1 << 30 };
+     }
+ 
++    pub const Opts = struct {
++        /// TF_GLM_KV_SHARD: owner-sharded layouts (each rank's own), a two-part pool on each engine
++        sharded: bool = false,
++    };
++
+     pub fn init(p: *Pair, gpa: std.mem.Allocator, tag: []const u8, s: tier.Settings) !void {
++        return p.initWith(gpa, tag, s, .{});
++    }
++
++    pub fn initWith(p: *Pair, gpa: std.mem.Allocator, tag: []const u8, s: tier.Settings, o: Opts) !void {
+         const layout = try testLayout();
+-        p.* = .{ .gpa = gpa, .layout = layout, .e = .{ HostEngine.init(gpa, layout), HostEngine.init(gpa, layout) }, .r = undefined, .sink = .{ .gpa = gpa }, .pg = undefined, .settings = s, .compat = format.compatDigest(layout.digest(), .replicated, @intCast(st.block_tokens), layout.block_bytes) };
++        const ls: [2]st.Layout = if (o.sharded) .{ try shardedLayout(0), try shardedLayout(1) } else .{ layout, layout };
++        p.* = .{ .gpa = gpa, .layout = ls[0], .layouts = ls, .e = .{ HostEngine.init(gpa, ls[0]), HostEngine.init(gpa, ls[1]) }, .r = undefined, .sink = .{ .gpa = gpa }, .pg = undefined, .settings = s, .compat = ls[0].compat(ls[0].digest()) };
++        if (o.sharded) for (&p.e) |*e| {
++            e.pool = try Pool.initParts(gpa, pool_rows, 2);
++        };
+         p.r = .{ Lanes.init(gpa, &p.e[0], true, 1 << 20, 8), Lanes.init(gpa, &p.e[1], true, 1 << 20, 8) };
+         p.r[1].follower = true;
+         p.r[0].notes = p.sink.notesOf();
+@@ -386,7 +463,7 @@ pub const Pair = struct {
+         for (0..2) |i| {
+             var s = p.settings;
+             s.dir = p.roots[i];
+-            sides[i] = try Leader.S.open(p.gpa, testing.io, &p.e[i], p.layout, s, @intCast(i), p.compat, 1 << 20, p.staging[i], .{});
++            sides[i] = try Leader.S.open(p.gpa, testing.io, &p.e[i], p.layouts[i], s, @intCast(i), p.compat, 1 << 20, p.staging[i], .{});
+         }
+         p.lead = try Leader.create(p.gpa, sides[0], &p.r[0], p.settings, @splat(7));
+         p.fol = try Follower.create(p.gpa, sides[1], &p.r[1]);
+@@ -469,6 +546,30 @@ pub const Pair = struct {
+         }
+     };
+ 
++    /// Sharded: a live extent of `rows` in part `part` of both ranks' pools (another stream's), so placements go
++    /// elsewhere while it stays. Its id on each rank.
++    pub fn occupy(p: *Pair, part: usize, rows: usize) ![2]u64 {
++        var ids: [2]u64 = undefined;
++        for (&p.e, &ids) |*e, *id| {
++            const pool = &e.pool.?;
++            id.* = try pool.add((try pool.placeIn(rows, null, part)) orelse return error.TestNoRoom, rows);
++            (try pool.get(id.*)).owner = id.*;
++        }
++        return ids;
++    }
++
++    pub fn vacate(p: *Pair, ids: [2]u64) !void {
++        for (&p.e, ids) |*e, id| try e.pool.?.remove(id);
++    }
++
++    /// Rank `rank`'s kept state of rank 0's `saved` (rank 0's own, or rank 1's copy under its key).
++    pub fn snapOn(p: *Pair, rank: usize, saved: *anyopaque) !*HostEngine.Snap {
++        const k0: *Lanes.Kept = @ptrCast(@alignCast(saved));
++        if (rank == 0) return k0.snap;
++        const k1: *Lanes.Kept = @ptrCast(@alignCast(p.r[1].savedFor(k0.key) orelse return error.TestNotOnRank1));
++        return k1.snap;
++    }
++
+     /// Pumps both ranks (rank 1 by rank 0's pump notes) until neither has a write to stage or publish.
+     pub fn settle(p: *Pair) !void {
+         var i: usize = 0;
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
+index eaf83cf09441e946286c4059132303aee0a7730c..3cb70f54627b5b71f6570442a8ca3fcb256ae0ad 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
+@@ -8,6 +8,7 @@ const rig = @import("cuda_spill_tier_rig.zig");
+ const st = @import("cuda_spill_state.zig");
+ const wire = @import("cuda_spill_wire.zig");
+ const lane_backend = @import("cuda_lanes.zig");
++const shard_keep = @import("cuda_shard_keep.zig");
+ 
+ const spill = core.spill;
+ const format = spill.format;
+@@ -79,6 +80,7 @@ test "a kept state written at keep on both ranks, evicted, restored byte for byt
+         try testing.expectEqual(@as(u64, 1), c.writes_committed);
+         try testing.expectEqual(@as(u64, 1), c.reads);
+         try testing.expectEqual(@as(u64, 2), c.blocks);
++        try testing.expectEqual(@as(u64, 0), c.points_part0 + c.points_part1); // (a replicated store has no parts)
+     }
+     try testing.expectEqual(@as(usize, 0), p.pg.fatals);
+ }
+@@ -447,6 +449,12 @@ test "the staging plan: the ring, read-ahead and small states as asked; under tw
+     // with DFlash2's rings the small slot grows by the drafter's 22,282,240 bytes
+     const d = try st.Layout.init(l.g, 64, .{ .kv = 4, .ring = 2176 });
+     try testing.expectEqual(std.mem.alignForward(usize, l.small_bytes + 22_282_240, 4096), (try tier.plan(.{ .dir = "/s", .gib = 1 }, &d)).small_slot);
++    // TF_GLM_KV_SHARD: the same slots on either rank (a slot holds the rank's largest block, its own part's; the other
++    // part's blocks and tails are smaller), so the staging the engine takes before its pool does not change
++    for (0..2) |r| {
++        const sh = try rig.shardedLayout(r);
++        try testing.expectEqual(p, try tier.plan(.{ .dir = "/s", .gib = 1 }, &sh));
++    }
+ }
+ 
+ test "spill v2 off: a two-rank pass with no tier sends only the pass's note, writes nothing and allocates no staging" {
+@@ -490,3 +498,313 @@ test "spill v2 off: a two-rank pass with no tier sends only the pass's note, wri
+     rig.Lanes.releaseFn(&r0, &s0);
+     rig.Lanes.releaseFn(&r1, &s1);
+ }
++
++// -- TF_GLM_KV_SHARD: owner-sharded points (each rank its own view, the home part recorded) ---------------------------
++
++/// A token's and a whole block's bytes on the home part's owner and on the other rank (cuda_spill_state).
++const own_block = 12_705_792;
++const own_token = 6204;
++const other_block = 811_008;
++const other_token = 396;
++
++/// A sharded pair holding `a` kept in part 0 (an empty pool places it there) and `b` kept in part 1 (part 0 taken by
++/// another stream meanwhile), both written on both ranks.
++fn keepBothParts(p: *rig.Pair, a: []const u32, b: []const u32) ![2]*anyopaque {
++    const ka = try p.keepPass(a, at, 1);
++    try p.settle();
++    const other = try p.occupy(0, rig.pool_rows / 2);
++    const kb = try p.keepPass(b, at, 2);
++    try p.settle();
++    try p.vacate(other);
++    return .{ ka.saved, kb.saved };
++}
++
++test "TF_GLM_KV_SHARD: each rank writes its own view of a kept state under its home part, and a restore gives each rank that view back with its home; the resume lands in the home part" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-restore", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    var b2: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 70);
++    const b = rig.idsOf(&b2, 71);
++    const ka = try p.keepPass(a, at, 1);
++    try p.settle();
++    // a's home is part 0: rank 0 wrote its latent and pooled rows (a whole block and a 64-token tail), rank 1 the
++    // pooled rows alone
++    try testing.expectEqual(@as(u64, own_block + 64 * own_token), p.lead0().side.store.counts().written_bytes);
++    try testing.expectEqual(@as(u64, other_block + 64 * other_token), p.fol.?.side.store.counts().written_bytes);
++    try testing.expectEqual(@as(u64, 0), p.fol.?.skipped);
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| { // (rank 0's own part, rank 1's other part)
++        try testing.expectEqual(@as(u64, 1), side.cached.points_part0);
++        try testing.expectEqual(@as(u64, 0), side.cached.points_part1);
++    }
++    const other = try p.occupy(0, rig.pool_rows / 2);
++    const kb = try p.keepPass(b, at, 2);
++    try p.settle();
++    try p.vacate(other);
++    // b's home is part 1: the reverse
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| try testing.expectEqual(@as(u64, own_block + 64 * own_token + other_block + 64 * other_token), side.store.counts().written_bytes);
++    const keys = [2]format.Digest{ pointKey(a[0..at]), pointKey(b[0..at]) };
++    const saved = [2]*anyopaque{ ka.saved, kb.saved };
++    var originals: [2][2][]u8 = undefined; // [point][rank]
++    for (saved, 0..) |sv, i| for (0..2) |r| {
++        const snap = try p.snapOn(r, sv);
++        try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
++        try testing.expectEqual(r == i, snap.sec.rows); // (the latent rows on the home part's owner only)
++        originals[i][r] = try gpa.dupe(u8, HostEngine.bytesOf(snap));
++    };
++    defer for (originals) |o| for (o) |x| gpa.free(x);
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
++        try testing.expectEqual(@as(?u32, 0), side.store.partOf(keys[0]).?.part);
++        try testing.expectEqual(@as(?u32, 1), side.store.partOf(keys[1]).?.part);
++    }
++    // every rank's points by part (the stats ask)
++    p.lead0().stats_at = 0;
++    p.lead0().pump(1);
++    var counts: [4]tier.Counts = undefined;
++    try testing.expectEqual(@as(usize, 2), p.lead0().counts(&counts));
++    for (counts[0..2]) |c| {
++        try testing.expectEqual(@as(u64, 2), c.points);
++        try testing.expectEqual(@as(u64, 1), c.points_part0);
++        try testing.expectEqual(@as(u64, 1), c.points_part1);
++    }
++    try p.evict(ka.saved);
++    try p.evict(kb.saved);
++    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
++    const exact = [2]usize{ p.e[0].exact, p.e[1].exact }; // (a pass resumes its own mark's state too)
++    // each restored: every rank holds its own view of the point's home again, byte for byte the state it kept
++    for ([_][]const u32{ a, b }, 0..) |ids, i| {
++        const r = try p.restore(ids);
++        try testing.expect(r == .ready);
++        for (0..2) |rank| {
++            const snap = try p.snapOn(rank, r.ready.saved);
++            try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
++            try testing.expectEqual(rank == i, snap.sec.rows);
++            try testing.expect(HostEngine.same(&p.layouts[rank], snap.sec, originals[i][rank], HostEngine.bytesOf(snap)));
++        }
++        // the resume: placed in part 0 (an empty pool), where a's home is (here) and from where b moves to its own;
++        // nothing carried, and both ranks draw a fresh pass's token from their own view
++        const firsts = try p.resumeBoth(ids, r.ready.saved, at);
++        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
++        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
++    }
++    for (&p.e, exact) |*e, x| {
++        try testing.expectEqual(x + 2, e.exact);
++        try testing.expectEqual(e.resumed, e.exact);
++        try testing.expectEqual(@as(usize, 0), e.carries);
++    }
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "TF_GLM_KV_SHARD: a restored state whose home part has no room resumes in the other part (carried), from 0 with the carry off" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-carry", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 72);
++    const k = try p.keepPass(a, at, 1);
++    try p.settle();
++    try p.evict(k.saved);
++    // part 0 full: the restore still starts (a carry takes 2,112 tokens: past the minimum), and the resume's extent
++    // stays in part 1 with the home owner's rows carried; both ranks resume exactly from their own views
++    const full = try p.occupy(0, rig.pool_rows / 2);
++    const r = try p.restore(a);
++    try testing.expect(r == .ready);
++    try testing.expectEqual(@as(?u8, 0), (try p.snapOn(0, r.ready.saved)).home);
++    const exact = [2]usize{ p.e[0].exact, p.e[1].exact };
++    const firsts = try p.resumeBoth(a, r.ready.saved, at);
++    try testing.expectEqual(HostEngine.first(a), firsts[0]);
++    try testing.expectEqual(HostEngine.first(a), firsts[1]);
++    for (&p.e, exact) |*e, x| {
++        try testing.expectEqual(@as(usize, 1), e.carries);
++        try testing.expectEqual(x + 1, e.exact);
++        try testing.expectEqual(e.resumed, e.exact);
++    }
++    // the carry off (TF_GLM_KV_SHARD_CARRY=0 on both ranks) with the state in memory: the prompt from 0, nothing resumed
++    for (&p.e) |*e| e.carry = false;
++    const resumed = [2]usize{ p.e[0].resumed, p.e[1].resumed };
++    try testing.expectEqual(HostEngine.first(a), (try p.resumeBoth(a, r.ready.saved, at))[0]);
++    for (&p.e, resumed) |*e, x| {
++        try testing.expectEqual(@as(usize, 1), e.carries);
++        try testing.expectEqual(x, e.resumed);
++    }
++    try p.vacate(full);
++    try testing.expectEqual(p.e[0].pool.?.digest(), p.e[1].pool.?.digest());
++}
++
++test "TF_GLM_KV_SHARD: a point whose home part has no room is not read when its resume could only start from 0 (the carry off, or a state under the minimum), and restores once the part has room" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-homefull", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    var b2: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 73);
++    const s = rig.idsOf(&b2, 74);
++    const small = 1984; // (under cuda_shard_keep.carry_min)
++    comptime std.debug.assert(small < shard_keep.carry_min);
++    const keys = [2]format.Digest{ pointKey(a[0..at]), pointKey(s[0..small]) };
++    const ka = try p.keepPass(a, at, 1);
++    try p.settle(); // (one small slot a rank)
++    const ks = try p.keepPass(s, small, 2);
++    try p.settle();
++    for ([_]*anyopaque{ ka.saved, ks.saved }) |sv| {
++        try testing.expectEqual(@as(?u8, 0), (try p.snapOn(0, sv)).home); // (an empty pool places both in part 0)
++        try p.evict(sv);
++    }
++    const full = try p.occupy(0, rig.pool_rows / 2);
++    // the carry off: a's restore is refused before any read, `has` or reservation on either rank (its point stays on
++    // both); the carry on: s's too, a carry never taking a state under the minimum
++    for (&p.e) |*e| e.carry = false;
++    // (`check`, which the prompt cache asks before it makes room for the restore, refuses it the same way)
++    const pa = p.lead0().lookup(a, 0, @intCast(a.len - 1), &.{}, 0).?;
++    try testing.expectError(error.KvShardHomeFull, p.lead0().check(pa.id, pa.at));
++    try testing.expectError(error.KvShardHomeFull, p.restore(a));
++    for (&p.e) |*e| e.carry = true;
++    try testing.expectError(error.KvShardHomeFull, p.restore(s));
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
++        try testing.expectEqual(@as(u64, 0), side.store.counts().loaded + side.store.counts().load_failed);
++        try testing.expectEqual(@as(usize, 0), side.rxs.count());
++        for (keys) |key| try testing.expect(side.store.presence(key));
++    }
++    try testing.expectEqual(@as(u64, 0), p.lead0().presence_refused);
++    try testing.expectEqual(@as(usize, 0), p.lead0().jobs.count());
++    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
++    // part 0 has room again: both restore with the carry off, each resumed in its home part exactly, nothing carried
++    try p.vacate(full);
++    try p.lead0().check(pa.id, pa.at);
++    for (&p.e) |*e| e.carry = false;
++    const resumed = [2]usize{ p.e[0].resumed, p.e[1].resumed }; // (a pass resumes its own mark's state too)
++    for ([_][]const u32{ a, s }, [_]u32{ at, small }) |ids, n| {
++        const r = try p.restore(ids);
++        try testing.expect(r == .ready);
++        const firsts = try p.resumeBoth(ids, r.ready.saved, n);
++        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
++        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
++    }
++    for (&p.e, resumed) |*e, x| {
++        try testing.expectEqual(x + 2, e.resumed);
++        try testing.expectEqual(e.resumed, e.exact);
++        try testing.expectEqual(@as(usize, 0), e.carries);
++    }
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "TF_GLM_KV_SHARD: a damaged block on the rank that does not own the point's home makes both ranks forget it" {
++    const gpa = testing.allocator;
++    for ([_]rig.Pair.Damage{ .flip, .truncate }, 0..) |how, n| for (0..2) |home| {
++        var p: rig.Pair = undefined;
++        var tb: [32]u8 = undefined;
++        try p.initWith(gpa, try std.fmt.bufPrint(&tb, "shard-damage{d}{d}", .{ n, home }), rig.Pair.settingsFor(1), .{ .sharded = true });
++        defer p.deinit();
++        var buf: [2200]u32 = undefined;
++        const ids = rig.idsOf(&buf, @intCast(80 + 2 * n + home));
++        const other = if (home == 1) try p.occupy(0, rig.pool_rows / 2) else null;
++        const k = try p.keepPass(ids, at, 1);
++        try p.settle();
++        if (other) |o| try p.vacate(o);
++        try testing.expectEqual(@as(?u8, @intCast(home)), (try p.snapOn(0, k.saved)).home);
++        try p.evict(k.saved);
++        try p.damage(1 - home, how); // (its blocks: the pooled rows alone)
++        const r = try p.restore(ids);
++        try testing.expect(r == .failed);
++        try testing.expectEqual(error.SpillDamaged, r.failed);
++        const key = pointKey(ids[0..at]);
++        try testing.expect(!p.lead0().side.store.presence(key));
++        try testing.expect(!p.fol.?.side.store.presence(key));
++        try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
++        try testing.expectEqual(@as(usize, 0), p.lead0().side.rxs.count() + p.fol.?.side.rxs.count());
++        try testing.expect(p.lead0().lookup(ids, 0, @intCast(ids.len - 1), &.{}, 0) == null);
++    };
++}
++
++test "TF_GLM_KV_SHARD: after a restart both ranks recover their points of both parts, and each restores into its home" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-restart", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    var b2: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 90);
++    const b = rig.idsOf(&b2, 91);
++    _ = try keepBothParts(&p, a, b);
++    try p.restart();
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
++        const c = side.store.counts();
++        try testing.expectEqual(@as(u64, 2), c.recovered_points);
++        try testing.expectEqual(@as(u64, 1), side.cached.points_part0);
++        try testing.expectEqual(@as(u64, 1), side.cached.points_part1);
++    }
++    for ([_][]const u32{ a, b }, 0..) |ids, i| {
++        const r = try p.restore(ids);
++        try testing.expect(r == .ready);
++        for (0..2) |rank| {
++            const snap = try p.snapOn(rank, r.ready.saved);
++            try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
++            try testing.expect(p.e[rank].exactFor(snap, ids[0..at]));
++        }
++        const firsts = try p.resumeBoth(ids, r.ready.saved, at);
++        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
++        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
++    }
++}
++
++test "TF_GLM_KV_SHARD: the same ids kept again from the other part by a rank that lost its copy are refused at has, and every rank forgets them" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-reparted", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 92);
++    const key = pointKey(a[0..at]);
++    _ = try p.keepPass(a, at, 1); // (part 0)
++    try p.settle();
++    // rank 1 loses its copy; the conversation comes back with part 0 full and the carry off: rank 0 finds its point but
++    // refuses the restore before `has` (the resume could only start from 0), so no rank forgets it; the turn prefills
++    // in part 1 and is kept again there: rank 0 dedups it (its point keeps part 0), rank 1 writes it under part 1
++    try p.dropAll();
++    p.close();
++    try p.dropManifests(1);
++    try p.open();
++    const full = try p.occupy(0, rig.pool_rows / 2);
++    for (&p.e) |*e| e.carry = false;
++    try testing.expectError(error.KvShardHomeFull, p.restore(a));
++    try testing.expectEqual(@as(u64, 0), p.lead0().presence_refused);
++    _ = try p.keepPass(a, at, 1);
++    try p.settle();
++    try p.vacate(full);
++    for (&p.e) |*e| e.carry = true;
++    try testing.expectEqual(@as(?u32, 0), p.lead0().side.store.partOf(key).?.part);
++    try testing.expectEqual(@as(?u32, 1), p.fol.?.side.store.partOf(key).?.part);
++    try p.dropAll();
++    // `has` names part 0: rank 1's point of these ids is the other view (incompatible), so no rank restores it and
++    // every rank forgets it
++    try testing.expectError(error.SpillNotOnEveryRank, p.restore(a));
++    try testing.expectEqual(@as(u64, 1), p.lead0().presence_refused);
++    try testing.expect(!p.lead0().side.store.presence(key));
++    try testing.expect(!p.fol.?.side.store.presence(key));
++    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "TF_GLM_KV_SHARD: a keep note whose part is not the home of rank 1's own state writes nothing there" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-skip", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var b1: [2200]u32 = undefined;
++    const a = rig.idsOf(&b1, 93);
++    // rank 1's pool alone has part 0 taken: its pass keeps the state in part 1 while rank 0's keeps it in part 0
++    const pool = &p.e[1].pool.?;
++    const x = try pool.add(0, rig.pool_rows / 2);
++    (try pool.get(x)).owner = x;
++    _ = try p.keepPass(a, at, 1);
++    try p.settle();
++    try pool.remove(x);
++    try testing.expectEqual(@as(u64, 1), p.fol.?.skipped);
++    try testing.expect(p.lead0().side.store.presence(pointKey(a[0..at])));
++    try testing.expect(!p.fol.?.side.store.presence(pointKey(a[0..at])));
++    try testing.expectEqual(@as(u64, 0), p.fol.?.side.store.counts().keeps);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_spill_wire.zig b/zig/src/families/glm_cuda/cuda_spill_wire.zig
+index 04d3bc3985ca1f44bf7816eaef5614bdb4038ac5..8ca9e71d152efd97ef87e2d7c5635bda90a26a23 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_wire.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_wire.zig
+@@ -17,7 +17,8 @@
+ //!   cancel    txn u64, why u8 (Failure), forget u8
+ //!   touch, share, forget   point [32]
+ //!   pump, flush            budget_ns u64
+-//!   has       point [32], at u32, blocks u32           (answer: 1 word, an Absence)
++//!   has       point [32], at u32, blocks u32, part u32 when blocks' bit 31 is set   (answer: 1 word, an Absence;
++//!             the part only on an owner-sharded tier, TF_GLM_KV_SHARD: a replicated has is version 1's bytes)
+ //!   validate  txn u64, shared u8                       (answer: 1 word, a Failure; none is ok)
+ //!   stats     nothing                                  (answer: stats_words words, `words` of the tier's counters)
+ //! where `opt X` is a u8 (0 absent, 1 present) and then X.
+@@ -28,7 +29,13 @@ const format = core.spill.format;
+ pub const Digest = [32]u8;
+ 
+ /// Bumped with any change to the messages or their meaning (the fingerprint's `wire` field carries it, so ranks built
+-/// with another protocol refuse to start together).
++/// with another protocol refuse to start together). TF_GLM_KV_SHARD's changes are not a bump: a replicated `has` is
++/// version 1's bytes (an owner-sharded one's part rides behind bit 31, and the fingerprint's `owner_layout` keeps a
++/// sharded rank from ever pairing with a replicated one); the replicated `stats` answer did grow (36 counters, 34
++/// before: points_part0/1), which only ranks of two builds could disagree on, and two builds pair only under forced
++/// identity exports (TF_GLM_ENGINE_ID and TF_GLM_RECIPE_PATCHES are in the fingerprint; the recipe's differ per build).
++/// The version is in every store's namespace too: at 1, spill v2 alone's stays ef6eb5b0's under the same identity
++/// exports (gpu-validation SA1).
+ pub const version: u16 = 1;
+ 
+ pub const Op = enum(u8) {
+@@ -53,7 +60,7 @@ pub const Op = enum(u8) {
+ pub const Absence = enum(u8) {
+     present = 0,
+     missing = 1, // not held (pruned by this rank's cap, floor or turns; a write it cancelled or never made)
+-    incompatible = 2, // held under another layout or compat
++    incompatible = 2, // held under another layout or compat, or (owner_sharded) kept from another part
+     incomplete = 3, // this rank's own write of it is still queued (it will be there shortly)
+     damaged = 4, // its copy failed a check
+     disabled = 5, // this rank runs without the tier
+@@ -100,7 +107,9 @@ pub const Keep = struct {
+ pub const Begin = struct { txn: u64, kept: u64, point: Digest, at: u32, blocks: u32 };
+ pub const Progress = struct { txn: u64, upto: u32 };
+ pub const Cancel = struct { txn: u64, why: Failure, forget: bool };
+-pub const Has = struct { point: Digest, at: u32, blocks: u32 };
++/// `part`: an owner-sharded tier's (TF_GLM_KV_SHARD) home part of rank 0's point (core/spill Store.partOf); null on a
++/// replicated one.
++pub const Has = struct { point: Digest, at: u32, blocks: u32, part: ?u32 = null };
+ pub const Validate = struct { txn: u64, shared: bool };
+ 
+ pub const Msg = union(enum) {
+@@ -140,6 +149,8 @@ pub const max_world = 4;
+ 
+ /// A forks count past this is refused (core/spill format.Limits' default).
+ pub const max_forks = 4096;
++/// `has`: its blocks word's bit 31, set when a part follows (no point has 2^31 blocks).
++const has_part: u32 = 1 << 31;
+ 
+ // -- encoding -----------------------------------------------------------------------------------------------------
+ 
+@@ -205,9 +216,11 @@ pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
+         .touch, .share, .forget => |p| try o.bytes(&p),
+         .pump, .flush => |ns| try o.int(u64, ns),
+         .has => |h| {
++            if (h.blocks & has_part != 0) return error.BadMessage;
+             try o.bytes(&h.point);
+             try o.int(u32, h.at);
+-            try o.int(u32, h.blocks);
++            try o.int(u32, h.blocks | if (h.part != null) has_part else 0);
++            if (h.part) |p| try o.int(u32, p);
+         },
+         .validate => |v| {
+             try o.int(u64, v.txn);
+@@ -275,7 +288,14 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
+         .forget => .{ .forget = try i.fixed(32) },
+         .pump => .{ .pump = try i.int(u64) },
+         .flush => .{ .flush = try i.int(u64) },
+-        .has => .{ .has = .{ .point = try i.fixed(32), .at = try i.end(), .blocks = try i.end() } },
++        .has => blk: {
++            var h: Has = .{ .point = try i.fixed(32), .at = try i.end(), .blocks = try i.int(u32) };
++            const parted = h.blocks & has_part != 0;
++            h.blocks &= ~has_part;
++            if (h.blocks == 0) return error.BadMessage;
++            if (parted) h.part = try i.int(u32);
++            break :blk .{ .has = h };
++        },
+         .validate => .{ .validate = .{ .txn = try i.int(u64), .shared = try i.flag() } },
+         .stats => .stats,
+         _ => return error.UnknownOp,
+@@ -410,6 +430,10 @@ test "every message survives its bytes, a cut or longer one is refused, and only
+     try std.testing.expectEqual(@as(u64, 60_000_000_000), (try roundTrip(a, .{ .flush = 60_000_000_000 })).flush);
+     const has: Msg = .{ .has = .{ .point = @splat(8), .at = 4288, .blocks = 3 } };
+     try std.testing.expectEqual(has.has, (try roundTrip(a, has)).has);
++    // an owner-sharded tier's has names rank 0's part (a cut before it refused like any other)
++    const parted: Msg = .{ .has = .{ .point = @splat(8), .at = 4288, .blocks = 3, .part = 1 } };
++    try std.testing.expectEqual(parted.has, (try roundTrip(a, parted)).has);
++    try std.testing.expectEqual(@as(?u32, 0), (try roundTrip(a, .{ .has = .{ .point = @splat(8), .at = 64, .blocks = 1, .part = 0 } })).has.part);
+     try std.testing.expectEqual(Validate{ .txn = 9, .shared = true }, (try roundTrip(a, .{ .validate = .{ .txn = 9, .shared = true } })).validate);
+     try std.testing.expect((try roundTrip(a, .stats)) == .stats);
+     try std.testing.expectEqual(@as(?usize, 1), has.width());
+@@ -438,6 +462,23 @@ test "the message layout is the documented one, and bad values are refused" {
+     has[0] = @backingInt(Op.has);
+     has[37] = 1; // at 0: no point ends at 0
+     try std.testing.expectError(error.BadMessage, decode(a, &has));
++    // has: a replicated tier's bytes are version 1's; an owner-sharded one sets the blocks word's bit 31, then the part
++    var want: [45]u8 = @splat(0xaa);
++    want[0] = @backingInt(Op.has);
++    want[33..45].* = .{ 64, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
++    list.clearRetainingCapacity();
++    try encode(&list, gpa, .{ .has = .{ .point = @splat(0xaa), .at = 64, .blocks = 1 } });
++    try std.testing.expectEqualSlices(u8, want[0..41], list.items);
++    want[40] = 0x80;
++    list.clearRetainingCapacity();
++    try encode(&list, gpa, .{ .has = .{ .point = @splat(0xaa), .at = 64, .blocks = 1, .part = 1 } });
++    try std.testing.expectEqualSlices(u8, &want, list.items);
++    list.items[40] = 0; // the part's bytes without the bit: one message's worth of trailing bytes
++    try std.testing.expectError(error.TrailingBytes, decode(a, list.items));
++    list.items[40] = 0x80;
++    list.items[37] = 0; // the bit alone: no blocks
++    try std.testing.expectError(error.BadMessage, decode(a, list.items));
++    try std.testing.expectError(error.BadMessage, encode(&list, gpa, .{ .has = .{ .point = @splat(0), .at = 64, .blocks = 1 << 31 } }));
+     // a keep whose forks count is past what its bytes could hold
+     list.clearRetainingCapacity();
+     try encode(&list, gpa, .{ .keep = .{ .kept = 1, .at = 64, .point = @splat(0), .group = 0, .shared = false, .lineage = .{ .root = @splat(2) } } });
