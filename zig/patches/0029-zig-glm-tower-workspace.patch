@@ -1,0 +1,63 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 7ffb37f42b63..4bab856b97f4); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: the vision tower's workspace for its largest pass is taken at start, before the staging and the pool are sized
+
+The tower took its buffers lazily at the first picture (~0.4 GiB for a pass
+of 8,192 patches), outside the startup sizing: the pool and the kept-state
+budget were sized from free memory without it, so a first picture could
+take room they were promised. Now rank 0 ensures the workspace of its
+largest pass right after loading the tower: towerRows, the larger of the
+tower's pass_patches and one picture of the most tokens a picture may have
+(TENSORFOLD_GLM_IMAGE_TOKENS, 2048 by default, four patches a token; the
+frontend's bound is 8000), with the rope tables and the frame upload of
+that size. With the defaults that is the lazy allocation the first
+8,192-patch picture made before, so a pass never grows it; the startup log
+names it. Vision off, or rank 1: unchanged.
+
+Switches: none new. Tests (host): towerRows.
+
+Measured on the pair: not run yet (the startup line, and the pool and
+kept-state budget with vision on against off).
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0029-zig-glm-tower-workspace.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 52010f5148e21dd584107b1afe3b06cadd5f7c54..e7f8776b8abb886cc07c435549aa1be9a91e694f 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -104,6 +104,22 @@ const Attached = struct {
+ 
+ pub const media_width: usize = 4096;
+ 
++/// The patch rows of the vision tower's largest pass: `pass_patches` (frame pairs of one grid go a pass together), or one
++/// picture of the most tokens a picture may have (TENSORFOLD_GLM_IMAGE_TOKENS, 2048 by default: four patches a token),
++/// which the tower runs alone however large. A clip's pass is within `pass_patches`.
++pub fn towerRows(image_tokens: ?[]const u8, pass_patches: usize) usize {
++    const tokens = std.fmt.parseInt(usize, std.mem.trim(u8, image_tokens orelse "", " "), 10) catch 2048;
++    return @max(pass_patches, 4 * @as(usize, @min(tokens, 8000)));
++}
++
++test towerRows {
++    try std.testing.expectEqual(@as(usize, 8192), towerRows(null, 8192)); // the defaults: one pass of 8192 either way
++    try std.testing.expectEqual(@as(usize, 8192), towerRows("1024", 8192));
++    try std.testing.expectEqual(@as(usize, 16000), towerRows("4000", 8192)); // a picture larger than a pass
++    try std.testing.expectEqual(@as(usize, 32000), towerRows("99999", 8192)); // (the frontend's bound: 8000)
++    try std.testing.expectEqual(@as(usize, 8192), towerRows("x", 8192));
++}
++
+ pub const Engine = struct {
+     /// Lane code looks these up on the engine type (E.Window, E.DraftReq, E.ManyPrompt).
+     pub const Window = struct { seq: *Seq, tokens: []const u32 };
+@@ -385,7 +401,11 @@ pub const Engine = struct {
+         errdefer if (e.mtp) |*m| m.deinit();
+         if (o.vision and o.tower and o.rank == 0) {
+             e.tower = try vision_tower.Tower.init(gpa, io, ctx.d, e.stream, dir, .{});
+-            std.log.info("vision tower loaded on rank 0", .{});
++            // its workspace for the largest pass taken now, before the staging and the pool are sized from free memory
++            // (taken lazily, the first picture's ~0.4 GiB would come out of what the pool and kept states were promised)
++            const rows = towerRows(display.env("TENSORFOLD_GLM_IMAGE_TOKENS"), e.tower.?.opts.pass_patches);
++            try e.tower.?.ensure(rows, rows, rows * 1176);
++            std.log.info("vision tower loaded on rank 0, its workspace for {d} patches a pass taken at start (~{d} MiB)", .{ rows, vision_tower.Tower.workspaceBytes(rows) >> 20 });
+         }
+         errdefer if (e.tower) |*t| t.deinit();
+         if (draft_dir) |dd| {

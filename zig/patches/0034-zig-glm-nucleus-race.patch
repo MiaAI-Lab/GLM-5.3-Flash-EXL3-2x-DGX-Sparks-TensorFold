@@ -1,0 +1,380 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1571e7dfdd29..3155e0ea134a); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: a sampled row with no top_p cut and no min_p draws by a GPU race over every token (TF_GLM_NUCLEUS_RACE, default on)
+
+With top_p 1 (what most chat clients send) no first pass of 1024 candidates covers the nucleus, so every sampled row,
+each verified draft row included, sent its whole vocabulary shard: a top-k over ~77k ids a rank, ~1.8 MB a row through
+the gather and a host lexsort and log over ~154k entries. sampling._draw then keeps every token, so its draw is a Gumbel
+max: glm_race_top scores every token on the GPU (the same value and splitmix64 uniform) and keeps each rank's 4 best
+with its best dropped score; the host rescores them exactly and takes the winner only when it beats every dropped score
+by 1e-9, else sends whole shards as before. Host test: 200 draws equal _draw's whole-shard token and share, two ranks;
+a near tie is refused. TF_GLM_NUCLEUS_RACE=0: the previous path.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0034-zig-glm-nucleus-race.patch
+
+diff --git a/zig/kernels/cuda/glm_ops.cu b/zig/kernels/cuda/glm_ops.cu
+index d4d3ad7e701147c4f6143665e48b8ac84c2e911f..47674953ce50c1c7234040a447a0001da6ac0fe8 100644
+--- a/zig/kernels/cuda/glm_ops.cu
++++ b/zig/kernels/cuda/glm_ops.cu
+@@ -86,6 +86,63 @@ extern "C" __global__ void glm_mass_pack(const float* vals,const int64_t* cols,c
+     if(threadIdx.x==0) { out[at+3*count]=sums[r]; out[at+3*count+1]=width; }
+ }
+ 
++// A sampled row with no top_p cut and no min_p is a Gumbel max over every token (sampling._draw with keep = all):
++// score = double(logit) / temp - log(-log(u)), u from splitmix64(seed, position, id) as lanes/sampling.uniform. Each
++// rank keeps its RACE_KEEP best scores and writes them in mass_pack's layout (vals = double(logit) / temp, global ids,
++// fixed-point mass, the row's mass sum) with the largest score it dropped last; the host rescores them exactly and
++// takes the winner only past that bound (cuda_nucleus.raceDraw), else sends whole shards as before.
++#define RACE_KEEP 4
++__device__ __forceinline__ uint64_t glm_mix(uint64_t x) {
++    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; return x ^ (x >> 31);
++}
++__device__ __forceinline__ bool glm_race_before(double s, double v, int64_t id, double s2, double v2, int64_t id2) {
++    return s != s2 ? s > s2 : (v != v2 ? v > v2 : id < id2);
++}
++extern "C" __global__ void glm_race_top(const __nv_bfloat16* logits, const int64_t* mass, const int64_t* sums,
++    const uint64_t* positions, int64_t* out, uint64_t columns, int64_t offset, double temp, uint64_t seed) {
++    __shared__ double ss[256 * RACE_KEEP], sv[256 * RACE_KEEP]; __shared__ int64_t si[256 * RACE_KEEP];
++    const uint64_t r = blockIdx.x, at = r * (3 * RACE_KEEP + 2);
++    const uint64_t key = glm_mix(glm_mix(seed + 0x9E3779B97F4A7C15ull) ^ (positions[r] * 0xD1B54A32D192ED03ull));
++    double s[RACE_KEEP], v[RACE_KEEP]; int64_t id[RACE_KEEP];
++    for (int k = 0; k < RACE_KEEP; ++k) { s[k] = -INFINITY; v[k] = -INFINITY; id[k] = -1; }
++    double lost = -INFINITY;  // the best score this thread dropped
++    for (uint64_t j = threadIdx.x; j < columns; j += 256) {
++        const double x = double(__bfloat162float(logits[r * columns + j])) / temp;
++        const int64_t g = int64_t(j) + offset;
++        const double u = double(glm_mix(key ^ uint64_t(g)) >> 11) * 0x1p-53 + 0x1p-54;
++        const double sc = x - log(-log(u));
++        if (!glm_race_before(sc, x, g, s[RACE_KEEP - 1], v[RACE_KEEP - 1], id[RACE_KEEP - 1])) { lost = fmax(lost, sc); continue; }
++        lost = fmax(lost, s[RACE_KEEP - 1]);
++        int k = RACE_KEEP - 1;
++        while (k > 0 && glm_race_before(sc, x, g, s[k - 1], v[k - 1], id[k - 1])) { s[k] = s[k - 1]; v[k] = v[k - 1]; id[k] = id[k - 1]; --k; }
++        s[k] = sc; v[k] = x; id[k] = g;
++    }
++    for (int k = 0; k < RACE_KEEP; ++k) { ss[threadIdx.x * RACE_KEEP + k] = s[k]; sv[threadIdx.x * RACE_KEEP + k] = v[k]; si[threadIdx.x * RACE_KEEP + k] = id[k]; }
++    __shared__ double lost_all[256]; lost_all[threadIdx.x] = lost;
++    __syncthreads();
++    if (threadIdx.x != 0) return;
++    double bs[RACE_KEEP], bv[RACE_KEEP]; int64_t bi[RACE_KEEP]; double dropped = -INFINITY;
++    for (int k = 0; k < RACE_KEEP; ++k) { bs[k] = -INFINITY; bv[k] = -INFINITY; bi[k] = -1; }
++    for (int t = 0; t < 256; ++t) dropped = fmax(dropped, lost_all[t]);
++    for (int e = 0; e < 256 * RACE_KEEP; ++e) {
++        const double sc = ss[e], x = sv[e]; const int64_t g = si[e];
++        if (g < 0) continue;
++        if (!glm_race_before(sc, x, g, bs[RACE_KEEP - 1], bv[RACE_KEEP - 1], bi[RACE_KEEP - 1])) { dropped = fmax(dropped, sc); continue; }
++        dropped = fmax(dropped, bs[RACE_KEEP - 1]);
++        int k = RACE_KEEP - 1;
++        while (k > 0 && glm_race_before(sc, x, g, bs[k - 1], bv[k - 1], bi[k - 1])) { bs[k] = bs[k - 1]; bv[k] = bv[k - 1]; bi[k] = bi[k - 1]; --k; }
++        bs[k] = sc; bv[k] = x; bi[k] = g;
++    }
++    for (int k = 0; k < RACE_KEEP; ++k) {
++        const bool real = bi[k] >= 0;
++        out[at + k] = __double_as_longlong(real ? bv[k] : -INFINITY);
++        out[at + RACE_KEEP + k] = real ? bi[k] : -1;
++        out[at + 2 * RACE_KEEP + k] = real ? mass[r * columns + uint64_t(bi[k] - offset)] : 0;
++    }
++    out[at + 3 * RACE_KEEP] = sums[r];
++    out[at + 3 * RACE_KEEP + 1] = __double_as_longlong(dropped);
++}
++
+ // Greedy sampling's top-1 as one pass: per row the largest bf16 logit and its column, packed [value | int32 id] for the
+ // gather. It replaces to_f32 + radix top-k(1) + sort + pack and returns what they returned:
+ //  - order = tf_topk_f32 selection_key: a NaN (any payload) ranks above everything, +0 above -0, -inf lowest;
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 8225d9bac688737269216dd2e42ebc61a05c6485..34ea04e913d3625e2e060ab340d53c1c499ec62d 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -414,6 +414,7 @@ pub const Engine = struct {
+             .vocab_offset = @intCast(e.g.vocab_start),
+             .check_greedy = std.c.getenv("TF_GLM_GREEDY_CHECK") != null,
+             .legacy_greedy = std.c.getenv("TF_GLM_GREEDY_TOPK") != null,
++            .race = if (std.c.getenv("TF_GLM_NUCLEUS_RACE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
+         };
+         if (mtp_on) {
+             e.mtp = try mtp_mod.Head.init(gpa, ctx.d, e.g, extent);
+diff --git a/zig/src/families/glm_cuda/cuda_nucleus.zig b/zig/src/families/glm_cuda/cuda_nucleus.zig
+index 289c11dda2a99ec377c7186bf09af794aac2408c..2c6030a22cba504dffc8c385d8fe8e16dc7a48e7 100644
+--- a/zig/src/families/glm_cuda/cuda_nucleus.zig
++++ b/zig/src/families/glm_cuda/cuda_nucleus.zig
+@@ -175,6 +175,51 @@ pub fn drawSharesWithUnion(gpa: Allocator, sh: Shares, positions: []const u64, s
+     return true;
+ }
+ 
++/// glm_race_top's kept scores a rank (RACE_KEEP in glm_ops.cu).
++pub const race_keep: usize = 4;
++/// The host's exact score may differ from the GPU's by a few ulp (each side's log is within 1 ulp): a winner closer
++/// than this to the best dropped score is a near tie, drawn from whole shards instead.
++pub const race_margin: f64 = 1e-9;
++
++/// A draw with no top_p cut and no min_p keeps every token: the race decides it.
++pub fn raceable(s: S.Sampling) bool {
++    return s.temperature > 0 and s.top_k == 0 and !(0.0 < s.top_p and s.top_p < 1.0) and !(s.min_p > 0.0);
++}
++
++/// sampling._draw with keep = all, from each rank's race: `words` [world][rows][3 * race_keep + 2] as glm_race_top
++/// writes them (vals as f64 bits, global ids, mass, the row's mass sum, the best dropped score as f64 bits). Every
++/// candidate is rescored here as _draw scores it; the best wins as there (score, then value descending, then id), but
++/// only past every rank's dropped bound by race_margin. False: some row is a near tie.
++pub fn raceDraw(words: []const i64, world: usize, rows: usize, positions: []const u64, s: S.Sampling, out: []Drawn) bool {
++    const width = 3 * race_keep + 2;
++    for (0..rows) |r| {
++        var total: i128 = 0;
++        var bound = -std.math.inf(f64);
++        var found = false;
++        var best: Entry = undefined;
++        var best_score: f64 = undefined;
++        for (0..world) |k| {
++            const at = (k * rows + r) * width;
++            total += words[at + 3 * race_keep];
++            bound = @max(bound, @as(f64, @bitCast(words[at + 3 * race_keep + 1])));
++            for (0..race_keep) |j| {
++                const id = words[at + race_keep + j];
++                if (id < 0) continue;
++                const x: Entry = .{ .v = @bitCast(words[at + j]), .id = id, .m = words[at + 2 * race_keep + j] };
++                const score = x.v - log(-log(S.uniform(s.seed, positions[r], @bitCast(x.id))));
++                if (!found or score > best_score or (score == best_score and before({}, x, best))) {
++                    best = x;
++                    best_score = score;
++                    found = true;
++                }
++            }
++        }
++        if (!found or !(best_score > bound + race_margin)) return false;
++        out[r] = .{ .token = @intCast(best.id), .share = @as(f64, @floatFromInt(best.m)) / @as(f64, @floatFromInt(total)) };
++    }
++    return true;
++}
++
+ test "need is math.ceil(Fraction(top_p) * total)" {
+     try std.testing.expectEqual(@as(i128, 95), need(0.95, 100)); // 0.95 is just under 95/100: ceil gives 95
+     try std.testing.expectEqual(@as(i128, 1), need(0.5, 1));
+@@ -259,3 +304,102 @@ test "union covers a nucleus that no individual shard covers, strict tie boundar
+     sh.vals = &.{ 3, 2, 2, 0 };
+     try std.testing.expect(!try drawSharesWithUnion(gpa, sh, &.{7}, sampling, &drawn, true));
+ }
++
++/// glm_race_top on the host: one rank's shard `v` (ids offset..offset + v.len) to its race_keep best and dropped bound.
++fn raceRank(v: []const f64, mass: []const i64, offset: i64, seed: u64, position: u64, row: []i64) void {
++    var keep: [race_keep]Entry = @splat(.{ .v = -std.math.inf(f64), .id = -1, .m = 0 });
++    var score: [race_keep]f64 = @splat(-std.math.inf(f64));
++    var dropped = -std.math.inf(f64);
++    var sum: i64 = 0;
++    for (v, mass, 0..) |x, m, j| {
++        sum += m;
++        const e: Entry = .{ .v = x, .id = offset + @as(i64, @intCast(j)), .m = m };
++        const sc = x - log(-log(S.uniform(seed, position, @bitCast(e.id))));
++        var k: usize = race_keep;
++        while (k > 0 and (sc > score[k - 1] or (sc == score[k - 1] and keep[k - 1].id >= 0 and before({}, e, keep[k - 1])) or keep[k - 1].id < 0)) k -= 1;
++        if (k == race_keep) {
++            dropped = @max(dropped, sc);
++            continue;
++        }
++        if (keep[race_keep - 1].id >= 0) dropped = @max(dropped, score[race_keep - 1]);
++        var i: usize = race_keep - 1;
++        while (i > k) : (i -= 1) {
++            keep[i] = keep[i - 1];
++            score[i] = score[i - 1];
++        }
++        keep[k] = e;
++        score[k] = sc;
++    }
++    for (keep, 0..) |e, j| {
++        row[j] = @bitCast(e.v);
++        row[race_keep + j] = e.id;
++        row[2 * race_keep + j] = e.m;
++    }
++    row[3 * race_keep] = sum;
++    row[3 * race_keep + 1] = @bitCast(dropped);
++}
++
++test "the race draws _draw's token and share with no cut, two ranks, and refuses a near tie" {
++    const gpa = std.testing.allocator;
++    const n = 300;
++    var prng = std.Random.DefaultPrng.init(7);
++    const rnd = prng.random();
++    var v: [2 * n]f64 = undefined;
++    var mass: [2 * n]i64 = undefined;
++    for (&v, &mass) |*x, *m| {
++        x.* = rnd.float(f64) * 12.0 - 6.0;
++        m.* = rnd.intRangeAtMost(i64, 1, 1 << 30);
++    }
++    const sampling: S.Sampling = .{ .seed = 1234, .temperature = 0.7, .top_k = 0, .top_p = 1.0 };
++    try std.testing.expect(raceable(sampling));
++    try std.testing.expect(!raceable(.{ .seed = 1, .temperature = 0.7, .top_k = 0, .top_p = 0.95 }));
++    try std.testing.expect(!raceable(.{ .seed = 1, .temperature = 0.7, .top_k = 40, .top_p = 1.0 }));
++    try std.testing.expect(!raceable(.{ .seed = 1, .temperature = 0.7, .top_k = 0, .top_p = 1.0, .min_p = 0.05 }));
++    var ids: [2 * n]i64 = undefined;
++    for (&ids, 0..) |*x, j| x.* = @intCast(j);
++    const sums = [_]i64{ massSum(mass[0..n]), massSum(mass[n..]) };
++    const widths = [_]i64{ n, n };
++    var drawn: usize = 0;
++    for (0..200) |position| {
++        const pos = [_]u64{position};
++        var full: [1]Drawn = undefined;
++        // the whole-shard draw as _draw makes it, each rank sending its whole (sorted) shard
++        var vs: [2 * n]f64 = undefined;
++        var is: [2 * n]i64 = undefined;
++        var ms: [2 * n]i64 = undefined;
++        for (0..2) |k| {
++            var list: [n]Entry = undefined;
++            for (&list, 0..) |*e, j| e.* = .{ .v = v[k * n + j], .id = ids[k * n + j], .m = mass[k * n + j] };
++            std.mem.sort(Entry, &list, {}, before);
++            for (list, 0..) |e, j| {
++                vs[k * n + j] = e.v;
++                is[k * n + j] = e.id;
++                ms[k * n + j] = e.m;
++            }
++        }
++        try std.testing.expect(try drawShares(gpa, .{ .world = 2, .rows = 1, .count = n, .vals = &vs, .ids = &is, .mass = &ms, .sums = &sums, .widths = &widths }, &pos, sampling, &full));
++        var words: [2 * (3 * race_keep + 2)]i64 = undefined;
++        raceRank(v[0..n], mass[0..n], 0, sampling.seed, position, words[0 .. 3 * race_keep + 2]);
++        raceRank(v[n..], mass[n..], n, sampling.seed, position, words[3 * race_keep + 2 ..]);
++        var raced: [1]Drawn = undefined;
++        if (!raceDraw(&words, 2, 1, &pos, sampling, &raced)) continue;
++        drawn += 1;
++        try std.testing.expectEqual(full[0].token, raced[0].token);
++        try std.testing.expectEqual(full[0].share, raced[0].share);
++    }
++    try std.testing.expect(drawn >= 195); // a near tie is rare
++    // a winner within race_margin of a dropped score is refused
++    var words: [3 * race_keep + 2]i64 = undefined;
++    raceRank(v[0..n], mass[0..n], 0, sampling.seed, 3, &words);
++    const best_v: f64 = @bitCast(words[0]);
++    const best = best_v - log(-log(S.uniform(sampling.seed, 3, @bitCast(words[race_keep]))));
++    words[3 * race_keep + 1] = @bitCast(best - race_margin / 2);
++    var out: [1]Drawn = undefined;
++    try std.testing.expect(!raceDraw(&words, 1, 1, &.{3}, sampling, &out));
++}
++
++fn massSum(xs: []const i64) i64 {
++    var t: i64 = 0;
++    for (xs) |x| t += x;
++    return t;
++}
+diff --git a/zig/src/families/glm_cuda/cuda_sampler.zig b/zig/src/families/glm_cuda/cuda_sampler.zig
+index 508134c4fd2cf5328babae633c42cc81a5e5c05f..2605046e8709775d2a1614cbf67dd49f1cb65513 100644
+--- a/zig/src/families/glm_cuda/cuda_sampler.zig
++++ b/zig/src/families/glm_cuda/cuda_sampler.zig
+@@ -132,6 +132,11 @@ pub const Sampler = struct {
+     columns: usize,
+     vocab_offset: i64,
+     union_cover: bool = false,
++    /// TF_GLM_NUCLEUS_RACE (on unless 0): a part with no top_p cut and no min_p draws by a GPU race over every token,
++    /// rescored exactly on the host (cuda_nucleus.raceDraw); a near tie falls back to whole shards, as before.
++    race: bool = true,
++    race_draws: u64 = 0, // rows drawn by the race, and the calls that fell back to whole shards
++    race_fallbacks: u64 = 0,
+     /// TF_GLM_GREEDY_CHECK=1: every greedy pick is recomputed through to_f32 + radix top-k + sort + pack and compared bit for bit.
+     check_greedy: bool = false,
+     /// TF_GLM_GREEDY_TOPK=1: greedy through to_f32 + radix top-k + sort + pack, as before glm_greedy_pick (A/B timing).
+@@ -221,7 +226,9 @@ pub const Sampler = struct {
+             }
+         }
+         const got = try s.gather(&s.xs[0], words * 4);
+-        const count = nu.nucleus;
++        var raced = s.race and nucleus_rows > 0;
++        for (parts, plans) |p, q| raced = raced and (!q.nucleus or nu.raceable(p.sampling.?));
++        const count: usize = if (raced) nu.race_keep else nu.nucleus;
+         const second_bytes = @max(1, nucleus_rows * (3 * count + 2) * 8);
+         var row0: usize = 0;
+         for (parts, plans, 0..) |p, q, i| {
+@@ -257,8 +264,15 @@ pub const Sampler = struct {
+             try (cuda.DeviceBuffer{ .d = s.d, .ptr = w.top, .len = q.rows * 8 }).upload(0, std.mem.sliceAsBytes(tops));
+             const temp = @max(p.sampling.?.temperature, 1e-6);
+             try s.th.base.nucleusMass(p.logits, s.columns, q.rows, s.columns, temp, w.top, w.mass, w.sums);
+-            try s.th.base.toF32(p.logits, w.f32, q.rows * s.columns);
+-            try s.packNucleus(w.*, q.rows, count, s.xs[1].send.?.ptr + row0 * (3 * count + 2) * 8, temp);
++            const dst = s.xs[1].send.?.ptr + row0 * (3 * count + 2) * 8;
++            if (raced) {
++                // the positions go in the ids workspace, which a race does not use
++                try (cuda.DeviceBuffer{ .d = s.d, .ptr = w.ids, .len = q.rows * 8 }).upload(0, std.mem.sliceAsBytes(p.positions));
++                try s.th.raceTop(p.logits, w.mass, w.sums, w.ids, dst, q.rows, s.columns, s.vocab_offset, temp, p.sampling.?.seed);
++            } else {
++                try s.th.base.toF32(p.logits, w.f32, q.rows * s.columns);
++                try s.packNucleus(w.*, q.rows, count, dst, temp);
++            }
+             row0 += q.rows;
+         }
+         if (nucleus_rows == 0) return;
+@@ -266,6 +280,15 @@ pub const Sampler = struct {
+         row0 = 0;
+         for (parts, plans, 0..) |p, q, i| {
+             if (!q.nucleus) continue;
++            if (raced) {
++                if (!try s.drawRace(got2, nucleus_rows, row0, q.rows, p)) {
++                    const w = s.works[i].?;
++                    try s.th.base.toF32(p.logits, w.f32, q.rows * s.columns);
++                    if (!try s.retry(w, q.rows, s.columns, p)) return error.NucleusUncovered;
++                }
++                row0 += q.rows;
++                continue;
++            }
+             var ok = try s.drawNucleus(got2, nucleus_rows, row0, q.rows, count, p);
+             const widest = widestShard(got2, s.world(), nucleus_rows, row0, q.rows, count);
+             const w = s.works[i].?;
+@@ -288,6 +311,28 @@ pub const Sampler = struct {
+         const got = try s.gather(&s.xs[2], bytes);
+         return s.drawNucleus(got, rows, 0, rows, count, p);
+     }
++    /// The race's candidates (glm_race_top's layout, count = race_keep) drawn exactly, or false on a near tie.
++    fn drawRace(s: *Sampler, got: []const f32, all_rows: usize, row0: usize, rows: usize, p: Part) !bool {
++        const width = 3 * nu.race_keep + 2;
++        const words = try s.gpa.alloc(i64, s.world() * rows * width);
++        defer s.gpa.free(words);
++        for (0..s.world()) |rank| for (0..rows) |r| for (0..width) |j| {
++            const at = ((rank * all_rows + row0 + r) * width + j) * 2;
++            words[(rank * rows + r) * width + j] = @bitCast(@as(u64, @as(u32, @bitCast(got[at]))) | (@as(u64, @as(u32, @bitCast(got[at + 1]))) << 32));
++        };
++        const out = try s.gpa.alloc(nu.Drawn, rows);
++        defer s.gpa.free(out);
++        if (s.race_draws < std.math.maxInt(u64)) s.race_draws += rows;
++        if (!nu.raceDraw(words, s.world(), rows, p.positions, p.sampling.?, out)) {
++            s.race_fallbacks += 1;
++            return false;
++        }
++        for (out, p.out, 0..) |x, *token, r| {
++            token.* = @intCast(x.token);
++            if (p.probs) |probs| probs[r] = x.share;
++        }
++        return true;
++    }
+     fn drawNucleus(s: *const Sampler, got: []const f32, all_rows: usize, row0: usize, rows: usize, count: usize, p: Part) !bool {
+         const n = s.world() * rows * count;
+         const vals = try s.gpa.alloc(f64, n);
+diff --git a/zig/src/families/glm_cuda/cuda_torch_ops.zig b/zig/src/families/glm_cuda/cuda_torch_ops.zig
+index f739891b8b0bed4339aa8bbe74a3ec3222ca91f6..ae2079a9d9e98e4aebe7a95b3198882e35bdd833 100644
+--- a/zig/src/families/glm_cuda/cuda_torch_ops.zig
++++ b/zig/src/families/glm_cuda/cuda_torch_ops.zig
+@@ -17,6 +17,7 @@ pub const Ops = struct {
+     int_add: cuda.Function,
+     scaled_max: cuda.Function,
+     mass_pack: cuda.Function,
++    race_top: cuda.Function,
+     greedy_part: cuda.Function,
+     greedy_pick: cuda.Function,
+     l2pf: cuda.Function,
+@@ -26,7 +27,7 @@ pub const Ops = struct {
+         errdefer base.deinit();
+         var m = try cuda.Module.load(ctx.d, cuda.kernels.glm_ops);
+         errdefer m.unload();
+-        return .{ .module = m, .base = base, .sort = try m.function("glm_sort"), .pack = try m.function("glm_pack"), .index_copy = try m.function("glm_index_copy"), .rotary = try m.function("glm_rotary"), .ring = try m.function("glm_ring"), .rank_add = try m.function("glm_rank_add"), .int_add = try m.function("glm_int_add"), .scaled_max = try m.function("glm_scaled_max"), .mass_pack = try m.function("glm_mass_pack"), .greedy_part = try m.function("glm_greedy_part"), .greedy_pick = try m.function("glm_greedy_pick"), .l2pf = try m.function("glm_l2pf"), .media_rows = try m.function("glm_media_rows") };
++        return .{ .module = m, .base = base, .sort = try m.function("glm_sort"), .pack = try m.function("glm_pack"), .index_copy = try m.function("glm_index_copy"), .rotary = try m.function("glm_rotary"), .ring = try m.function("glm_ring"), .rank_add = try m.function("glm_rank_add"), .int_add = try m.function("glm_int_add"), .scaled_max = try m.function("glm_scaled_max"), .mass_pack = try m.function("glm_mass_pack"), .race_top = try m.function("glm_race_top"), .greedy_part = try m.function("glm_greedy_part"), .greedy_pick = try m.function("glm_greedy_pick"), .l2pf = try m.function("glm_l2pf"), .media_rows = try m.function("glm_media_rows") };
+     }
+     pub fn deinit(o: *Ops) void {
+         o.module.unload();
+@@ -131,6 +132,15 @@ pub const Torch = struct {
+         a.add(@as(u32, @intCast(streams)));
+         try t.go(t.ops.media_rows, count, &a);
+     }
++    /// Every row's RACE_KEEP best Gumbel scores (no top_p cut, no min_p) in mass_pack's layout: glm_ops.cu glm_race_top.
++    pub fn raceTop(t: Torch, logits: u64, mass: u64, sums: u64, positions: u64, out: u64, rows: usize, columns: usize, offset: i64, temp: f64, seed: u64) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ logits, mass, sums, positions, out, columns }) |x| a.add(x);
++        a.add(offset);
++        a.add(temp);
++        a.add(seed);
++        try t.go(t.ops.race_top, rows, &a);
++    }
+     pub fn massPack(t: Torch, vals: u64, ids: u64, mass: u64, sums: u64, out: u64, rows: usize, columns: usize, selected: usize, count: usize, offset: i64, temp: f64) !void {
+         var a: cuda.Args = .{};
+         for ([_]u64{ vals, ids, mass, sums, out, columns }) |x| a.add(x);

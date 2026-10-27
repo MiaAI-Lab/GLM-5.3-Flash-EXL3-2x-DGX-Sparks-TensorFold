@@ -1,0 +1,1542 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 2cb4f1d2ccf8..f4bdb3247840); regenerate with scripts/port-patches.sh, do not edit
+core + server + glm_cuda lanes: a prompt with pictures is kept and resumed under its content key; a pass attaches its pictures once, every mark's segment injects them, a resumed pass runs the tower only for the pictures past its cut (TF_GLM_IMAGE_CACHE, TF_GLM_IMAGE_MARK_SNAP)
+
+A prompt with pictures or clips held the image placeholder (154854) at every
+picture row, so its ids alone would let two different pictures share a kept
+state, and such a prompt was never kept: the lane host skipped its lookup,
+marks, keeps and disk probe. Port of the DeepSeek Zig port's picture work
+(its recipe 0006's content keys, which GLM did not have) into GLM's shapes.
+
+- core/prompt_media.zig (new; re-exported by prompt_cache): Media (a span and
+  the full SHA-256, the same bytes as core/spill's format.Media), pictureId
+  (format.pictureId's scheme 1), itemDigest (SHA-256 of `image[3, H, W]` or
+  `video[T, 3, H, W]`, a zero byte, then the canvas bytes: Python's
+  FittedPicture head), keyOf (the keyed prompt and one identity an item; none
+  for features from another tower, a follower's copy, or an item whose rows
+  are not one run), mediaKeys, spansMatch, historyLen, snapMarks, and the two
+  switches' readings.
+- engine_api.Request: cache_key and cache_media beside media; server
+  prompt.zig keyMedia keys the zig vision backend's prompt when the engine has
+  a prompt cache and TF_GLM_IMAGE_CACHE is not "0", its history the prompt
+  before the template's generation prompt (never inside a picture); the python
+  backend (features only) stays unkeyed.
+- lane_host: keyOf/cacheable/tierMedia (cache_media counts only when item i's
+  rows are exactly media i's span); the admission lookup, the marks' keeps,
+  the warm pass, parkOwn's probe and restore and holdPass key by the content
+  key; keepInfo carries the pictures and the model ids; a picture request
+  joins no other conversation (0111 is text only). TF_GLM_IMAGE_MARK_SNAP=1:
+  a mark inside a picture moves back to the grid at its start.
+- prompt_cache: Want.images/media, Write.images/media/raw, KeepInfo's,
+  Store.probeMedia; Entry.images: such a state is never a conversation's
+  continuation and never goes to the v1 disk tier.
+- glm_cuda lanes + engine: pass() attaches the stream's media once
+  (Engine.attachPass) at its resume point, hands them to every segment
+  (marks and the last) with hold_media and detaches them when it ends (also
+  on an error); startPass attaches at its own resume point unless a pass
+  did, before the MTP head enters; attachMedia runs the tower only on the
+  items with a row at or past the cut (Media.neededFrom, Python's rule),
+  their features at their own rows' offsets; media_skipped counts the rest.
+  Under TF_GLM_FILL=1 a picture prompt still runs pass() whole at its begin,
+  so the same holds there. The broadcast to rank 1 and its mirror record are
+  unchanged.
+
+Switches: TF_GLM_IMAGE_CACHE (on; only "0" turns it off: picture prompts
+keep and resume nothing, as before), TF_GLM_IMAGE_MARK_SNAP (off; "1": no
+kept state cuts inside a picture). With the prompt cache off (the engine's
+default) nothing changes for any request; with it on, text requests are
+unchanged and picture requests are now kept and resumed in memory.
+
+Tests (host): prompt_media (key scheme, Python's digest head, keyOf,
+historyLen, snapMarks); prompt_cache_media_test (lookups and keeps carry the
+identities and the model ids, a disk hit resumes, two different pictures at
+the same rows never share a state, unbound or unkeyed media keep nothing,
+0111 skips picture states, the mark snap); Media.neededFrom; a pass over
+pictures attaches once, every segment sees them, a resume at 128 runs the
+tower from the third picture; a picture prompt refused before its sequence;
+the same under TF_GLM_FILL=1 with marks on both ranks.
+
+Measured on the pair: not run yet (a picture conversation resumed in memory
+equal to a cold prefill, two same-size pictures at the same rows missing,
+the tower's determinism for a straddling cut).
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); the DeepSeek Zig
+port's picture work and the Python GLM engine's FittedPicture keys.
+Apply from the checkout root with: git apply 0027-zig-glm-pictures.patch
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index cfd45f405a0bd323b4340657fa27295329c280b2..dc63cfe47376eb381e0b7f1eb40409fe42fa87f4 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -91,8 +91,15 @@ pub const Request = struct {
+     decide: ?u32 = null,
+     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
+     logprobs: ?u8 = null,
+-    /// The prompt's pictures and clips (``Info.media`` engines only); such a prompt is never kept or resumed.
++    /// The prompt's pictures and clips (``Info.media`` engines only); without `cache_key` such a prompt is never kept or
++    /// resumed.
+     media: ?*const Media = null,
++    /// With `media`: the prompt as the prompt cache keys it, one id a token, each picture's positions made from its
++    /// content (prompt_cache.pictureId: two pictures never share a kept state, one picture always does); empty: the
++    /// media are not keyed (TF_GLM_IMAGE_CACHE=0, features from another tower) and the prompt is neither kept nor resumed.
++    cache_key: []const u32 = &.{},
++    /// With `cache_key`: each item's identity (its span and the full SHA-256 its cache ids derive from), in prompt order.
++    cache_media: []const prompt_cache.Media = &.{},
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+@@ -578,7 +585,9 @@ test {
+     _ = @import("lane_host_reuse_test.zig");
+     _ = @import("lane_host_warm_test.zig");
+     _ = @import("lane_host_tier_test.zig");
++    _ = @import("prompt_cache_media_test.zig");
+     _ = @import("prompt_cache.zig");
++    _ = @import("prompt_media.zig");
+     _ = @import("prompt_radix.zig");
+     _ = @import("prompt_imprint.zig");
+     _ = @import("keepalive.zig");
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 4263f7d2709753a275fbb904e51106be4c536b80..35ada2b18b0ddb7d93f798237da616ced375bf32 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -53,6 +53,9 @@ pub const LaneHost = struct {
+     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
+     lone_job: ?*Job = null, // the job that driver holds now
+     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
++    /// TF_GLM_IMAGE_MARK_SNAP=1 (prompt_cache.markSnapOn): a pass over pictures keeps no state whose cut falls inside one
++    /// (prompt_media.snapMarks: back to the grid at its start), so no resume runs the tower again on a picture half kept
++    mark_snap: bool = false,
+     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
+     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+@@ -157,14 +160,16 @@ pub const LaneHost = struct {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+             if (job.host.cache) |store| {
+-                _ = store.keepWith(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
++                _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
+                 status.noteKept(job.host);
+             }
+         }
+ 
+         /// What its keeps record: its conversation, the point its pass resumed and the pass's lineage.
+         fn keepInfo(job: *const Job) pc.KeepInfo {
+-            return .{ .chat = job.join.chat, .parent = job.parent, .fork = job.fork, .lineage = job.lineage };
++            const r = job.request;
++            const pics = r.media != null; // (the tier records each picture's identity and the prompt's model ids)
++            return .{ .chat = job.join.chat, .parent = job.parent, .fork = job.fork, .lineage = job.lineage, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{} };
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -184,10 +189,31 @@ pub const LaneHost = struct {
+                     job.lineage = fresh;
+                 }
+             }
+-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (ok) store.resumed(e, job.request.prompt, true);
++            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (ok) store.resumed(e, keyOf(job.request), true);
+         }
+     };
+ 
++    /// The ids the prompt cache keys a request by: its prompt, or with pictures the prompt with each picture's rows made
++    /// from its content (Request.cache_key).
++    pub fn keyOf(r: *const Request) []const u32 {
++        return if (r.media != null and r.cache_key.len == r.prompt.len) r.cache_key else r.prompt;
++    }
++
++    /// Whether the cache may serve or keep a request: without pictures always; with them only when the server keyed
++    /// them and their identities name exactly the rows the engine fills (`tierMedia`).
++    pub fn cacheable(r: *const Request) bool {
++        return r.media == null or (r.cache_key.len == r.prompt.len and tierMedia(r).len > 0);
++    }
++
++    /// The pictures' identities a request's cache keys and tier records hold: its `cache_media` only when they name
++    /// exactly the spans the engine fills (prompt_media.spansMatch: item i's rows are media i's span), one for one;
++    /// anything else gives none, and the request is then neither kept nor resumed (a hit must not resume pictures
++    /// placed elsewhere than its state recorded them).
++    pub fn tierMedia(r: *const Request) []const pc.Media {
++        const m = r.media orelse return &.{};
++        return if (pc.prompt_media.spansMatch(m, r.cache_media)) r.cache_media else &.{};
++    }
++
+     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
+         var enforced = info_;
+         enforced.loop_guard = true;
+@@ -457,13 +483,15 @@ pub const LaneHost = struct {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        // a prompt with pictures or clips is neither resumed nor kept
+-        if (r.media == null) if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
++        // a prompt with pictures or clips is resumed and kept only by its content key (cacheable)
++        if (cacheable(r)) if (h.cache) |store| if (store.lookupRewind(h.gpa, keyOf(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+-            reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+-            job.join = store.join(r.prompt, l.entry, r.drafts);
++            const resume_at: u32 = if (l.entry) |e| e.at else 0;
++            const marks = if (h.mark_snap and r.media != null) pc.prompt_media.snapMarks(@constCast(l.marks), resume_at, tierMedia(r), store.rules.grid) else l.marks;
++            reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = resume_at, .marks = marks, .hook = .{ .ptr = job, .at = Job.kept } };
++            job.join = store.join(keyOf(r), l.entry, r.drafts and r.media == null);
+             if (l.entry) |e| {
+                 job.parent = e.point;
+                 job.fork = e.at;
+@@ -737,7 +765,9 @@ pub const LaneHost = struct {
+             return h.cancel(job);
+         };
+         h.prefilled(job, began);
+-        if (h.cache) |store| _ = store.keepWith(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.keepInfo());
++        if (cacheable(job.request)) if (h.cache) |store| {
++            _ = store.keepWith(keyOf(job.request), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.keepInfo());
++        };
+         status.noteKept(h);
+         be.release(&job.stream);
+         h.remove(job);
+@@ -1003,9 +1033,10 @@ pub const LaneHost = struct {
+     fn parkOwn(h: *LaneHost, job: *Job) bool {
+         const store = h.cache orelse return false;
+         const r = job.request;
+-        if (job.tried_disk or r.media != null) return false;
++        if (job.tried_disk or !cacheable(r)) return false;
+         const rows = h.spans(r);
+-        const probe = store.probe(r.prompt, r.chunks, rows);
++        const key = keyOf(r);
++        const probe = store.probeMedia(key, r.chunks, rows, r.media != null, tierMedia(r));
+         const p = probe.durable orelse return false;
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         if (h.entryHeld()) return h.holdOff(job, now);
+@@ -1016,7 +1047,7 @@ pub const LaneHost = struct {
+         room catch return false;
+         // (the best memory state stays while the budget holds it beside the restore: refused, the pass resumes it; a
+         // full tier, or a point the tier's check refuses, is refused before any room is made)
+-        const begun = store.restoreBeginOver(p, r.prompt, .{ .have = probe.memory, .again = job.deferred_since != null });
++        const begun = store.restoreBeginOver(p, key, .{ .have = probe.memory, .again = job.deferred_since != null });
+         status.noteKept(h); // (its room may have evicted kept states, begun or not)
+         if (begun) |rs| {
+             h.lock();
+@@ -1027,7 +1058,7 @@ pub const LaneHost = struct {
+             job.waited = true;
+             return true;
+         } else |err| {
+-            const left = store.find(r.prompt, r.chunks, rows); // (the room may have evicted probe.memory: never read it now)
++            const left = store.find(key, r.chunks, rows); // (the room may have evicted probe.memory: never read it now)
+             if (h.deferRestore(job, p, left, err, now)) return true;
+             if (left) |e| {
+                 note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
+@@ -1049,7 +1080,7 @@ pub const LaneHost = struct {
+         const store = h.cache orelse return false;
+         if (job.waited or h.loading.items.len == 0 or h.tier.hold_min == 0 or h.tier.defer_ns <= 0 or !h.wholePasses()) return false;
+         const r = job.request;
+-        const have: u32 = if (r.media != null) 0 else if (store.find(r.prompt, r.chunks, h.spans(r))) |e| e.at else 0;
++        const have: u32 = if (!cacheable(r)) 0 else if (store.find(keyOf(r), r.chunks, h.spans(r))) |e| e.at else 0;
+         if (r.prompt.len -| have < h.tier.hold_min) return false;
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         const first = job.held_since orelse now;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index be004fb67a7a4a3b1f10ad7cbdd2999d28117929..a0b69b537102dda1a0d9b7635c051ac68fad8a2f 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -197,7 +197,7 @@ pub const MediaItem = struct {
+ 
+ /// A prompt's pictures and clips (GLM vision): the prompt rows the tower's features replace (ascending), and either
+ /// the features already encoded (bf16 [rows.len, width]) or the canvases for the engine's own tower. A prompt with
+-/// media is neither kept nor resumed, and prefills alone.
++/// media prefills alone; it is kept and resumed only under its content key (engine_api.Request.cache_key).
+ pub const Media = struct {
+     rows: []const u32,
+     width: u32 = 4096,
+@@ -207,6 +207,19 @@ pub const Media = struct {
+     /// a following rank's copy (two ranks): the feature rows' count only; rows and features arrive by rank 0's broadcast
+     follower_rows: u32 = 0,
+ 
++    /// What a prefill resuming at `cut` needs the tower for: the first item with a row at or past `cut` (every later
++    /// one too: rows ascend) and that item's first feature row. Items wholly before the cut need no tower run: their
++    /// rows are in the restored state and no chunk reads their features.
++    pub fn neededFrom(m: *const Media, cut: usize) struct { item: usize, row: usize } {
++        var row: usize = 0;
++        for (m.items, 0..) |it, i| {
++            const n = it.rows();
++            if (n > 0 and row + n <= m.rows.len and m.rows[row + n - 1] >= cut) return .{ .item = i, .row = row };
++            row += n;
++        }
++        return .{ .item = m.items.len, .row = row };
++    }
++
+     pub fn rowCount(m: *const Media) usize {
+         return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
+     }
+@@ -662,6 +675,21 @@ test "call gate in commit: observe follows committed tokens" {
+     try std.testing.expect(!s.gateWatching());
+ }
+ 
++test "neededFrom: the tower runs from the first item a row past the cut needs" {
++    const px: [3 * 28 * 56]u8 = @splat(1);
++    const items = [_]MediaItem{ .{ .h = 28, .w = 56, .data = &px }, .{ .h = 28, .w = 56, .data = &px }, .{ .h = 28, .w = 56, .data = &px } };
++    const rows = [_]u32{ 10, 11, 20, 21, 30, 31 };
++    const m: Media = .{ .rows = &rows, .items = &items };
++    try std.testing.expectEqual(@as(usize, 0), m.neededFrom(0).item); // a fresh prefill: every item
++    try std.testing.expectEqual(@as(usize, 0), m.neededFrom(11).item); // the first straddles the cut: all of it again
++    const after = m.neededFrom(12); // the first wholly before the cut
++    try std.testing.expect(after.item == 1 and after.row == 2);
++    const last = m.neededFrom(22);
++    try std.testing.expect(last.item == 2 and last.row == 4);
++    const none = m.neededFrom(32); // every picture before the cut: no tower run
++    try std.testing.expect(none.item == 3 and none.row == 6);
++}
++
+ test "media rows and canvases must cover the prompt" {
+     const pix: [3 * 28 * 56]u8 = @splat(0);
+     const item: MediaItem = .{ .h = 28, .w = 56, .data = &pix };
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 5efa1254314bb108157698cd9635b12aeb5e6257..f4b01ff776308e9f14294f88bf30a505318f623d 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -9,6 +9,16 @@ const Allocator = std.mem.Allocator;
+ const imprint = @import("prompt_imprint.zig");
+ const modes = @import("cache_modes.zig");
+ const learned = @import("prompt_learn.zig");
++const media_mod = @import("prompt_media.zig");
++
++// pictures (prompt_media.zig): content keys and their identities
++pub const Media = media_mod.Media;
++pub const picture_ids = media_mod.picture_ids;
++pub const pictureId = media_mod.pictureId;
++pub const mediaKeys = media_mod.mediaKeys;
++pub const imageCacheOn = media_mod.imageCacheOn;
++pub const markSnapOn = media_mod.markSnapOn;
++pub const prompt_media = media_mod;
+ 
+ /// A family's copy of one state.
+ pub const Saved = *anyopaque;
+@@ -176,6 +186,7 @@ pub const Entry = struct {
+     spilled: bool = false, // the family stored it on disk already (an early write)
+     point: ?u64 = null, // its durable point in the tier (written at keep, or restored from)
+     lineage: []Fork = &.{}, // the computation its rows belong to (store-owned; empty without a tier)
++    images: bool = false, // its key holds pictures' ids: never a conversation's continuation (0111), never in v1's disk tier
+ };
+ 
+ pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0, chats_continued: u64 = 0, chats_continued_prefill_tokens: u64 = 0 };
+@@ -246,6 +257,11 @@ pub const Want = struct {
+     /// A planned family's request chunk starts: a point must stand on one (empty: `grid` decides).
+     starts: []const u32 = &.{},
+     lookahead: u32 = 0,
++    /// The prompt holds pictures, and each one's identity (every picture, in prompt order; see `Media`). A point
++    /// holding pictures matches only when every picture before its cut has the same span and canvas digest; a prompt
++    /// whose picture ids `media` does not account for (`mediaKeys`) finds nothing.
++    images: bool = false,
++    media: []const Media = &.{},
+ };
+ 
+ /// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
+@@ -266,6 +282,12 @@ pub const Write = struct {
+     /// The computation its rows belong to (0110's lineage; block names are salted with it), valid during the call:
+     /// set whether or not the resumed state was ever written, so sibling forks name their shared blocks alike.
+     lineage: []const Fork = &.{},
++    /// Its key holds pictures' ids: each picture's identity (every picture of the prompt, in order; the tier records
++    /// those before `at`) and the prompt's model ids (the placeholder at a picture's rows; at least `at` of them), valid
++    /// during the call. A picture before `at` that `media` does not name keeps nothing on disk.
++    images: bool = false,
++    media: []const Media = &.{},
++    raw: []const u32 = &.{},
+ };
+ 
+ /// One step of a state's lineage: computation `name` produced the rows from `at` on (the first step's `at` is 0). A
+@@ -506,6 +528,10 @@ pub const KeepInfo = struct {
+     parent: ?u64 = null, // the point of the state its pass resumed from (null: none, or never written)
+     fork: u32 = 0, // where that pass resumed
+     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
++    /// its key holds pictures' ids: each one's identity and the prompt's model ids (Write's, for the tier)
++    images: bool = false,
++    media: []const Media = &.{},
++    raw: []const u32 = &.{},
+ };
+ 
+ pub const Store = struct {
+@@ -582,7 +608,7 @@ pub const Store = struct {
+     /// conversation does not hold it (multi.py `_superseded`).
+     fn evict(s: *Store, i: usize, to_disk: bool) void {
+         const e = s.entries.items[i];
+-        if (to_disk and s.spills() and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
++        if (to_disk and s.spills() and !e.spilled and !e.images) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+         s.remove(i);
+     }
+ 
+@@ -688,6 +714,12 @@ pub const Store = struct {
+     /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point
+     /// (none for a request that names decoded rows: a point holds prefill arithmetic only).
+     pub fn probe(s: *Store, key: []const u32, starts: []const u32, spans: []const modes.Span) Probe {
++        return s.probeMedia(key, starts, spans, false, &.{});
++    }
++
++    /// `probe` for a prompt with pictures: `images` (it holds some) and each one's identity go to the tier's lookup
++    /// (Want.images, Want.media), so a point is found only for the same pictures in the same places.
++    pub fn probeMedia(s: *Store, key: []const u32, starts: []const u32, spans: []const modes.Span, images: bool, media: []const Media) Probe {
+         const m = s.find(key, starts, spans);
+         const t = s.tier orelse return .{ .memory = m };
+         if (spans.len > 0) return .{ .memory = m };
+@@ -703,6 +735,8 @@ pub const Store = struct {
+             .grid = if (s.rules.planned and !planned_starts) s.rules.grid else 0,
+             .starts = if (planned_starts) starts else &.{},
+             .lookahead = s.rules.lookahead,
++            .images = images,
++            .media = media,
+         };
+         const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
+         if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
+@@ -870,7 +904,9 @@ pub const Store = struct {
+             return s.unadopted(saved);
+         };
+         s.clock += 1;
+-        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .chat = s.newChat(r.key.len), .own = false, .point = r.point.id, .lineage = lin };
++        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .chat = s.newChat(r.key.len), .own = false, .point = r.point.id, .lineage = lin, .images = for (tokens) |id| {
++            if (id >= picture_ids) break true;
++        } else false };
+         s.entries.append(s.gpa, e) catch {
+             e.point = null; // the point stays the tier's; only the memory copy goes
+             s.free(e);
+@@ -1231,7 +1267,7 @@ pub const Store = struct {
+             return s.fail(at, error.OutOfMemory);
+         };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared, .lineage = lin };
++        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared, .lineage = lin, .images = info.images };
+         owns_decoded = false;
+         s.entries.append(s.gpa, e) catch {
+             s.free(e);
+@@ -1240,7 +1276,7 @@ pub const Store = struct {
+         s.held += charged;
+         s.counts.kept += 1;
+         if (s.tier) |t| if (e.decode_spans.len == 0) { // write at keep: the tier stages the state's bytes between rounds
+-            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = s.groupOf(chat), .shared = shared, .parent = info.parent, .fork = info.fork, .lineage = lin });
++            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = s.groupOf(chat), .shared = shared, .parent = info.parent, .fork = info.fork, .lineage = lin, .images = info.images, .media = info.media, .raw = info.raw });
+             if (e.point != null) s.tier_stats.writes_enqueued += 1;
+         };
+         if (shared) learned.learn(s, e, starts);
+@@ -1317,7 +1353,7 @@ pub const Store = struct {
+         const i = s.capVictim(null, true) orelse return;
+         const e = s.entries.items[i];
+         e.spilled = true;
+-        if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
++        if (!s.superseded(e) and !e.images) f(s.family.ptr, e.saved, e.tokens, e.at);
+     }
+ 
+     /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed (v1's disk tier; a
+@@ -1330,7 +1366,7 @@ pub const Store = struct {
+         var n: u32 = 0;
+         while (true) {
+             var best: ?*Entry = null;
+-            for (s.entries.items) |e| if (!e.spilled and !s.superseded(e) and (best == null or e.used > best.?.used)) {
++            for (s.entries.items) |e| if (!e.spilled and !e.images and !s.superseded(e) and (best == null or e.used > best.?.used)) {
+                 best = e;
+             };
+             const e = best orelse break;
+@@ -1465,7 +1501,7 @@ pub const Store = struct {
+     pub fn continuedChat(s: *const Store, prompt: []const u32) ?*Entry {
+         var best: ?*Entry = null;
+         for (s.entries.items) |c| {
+-            if (!ownTurn(c)) continue;
++            if (!ownTurn(c) or c.images) continue; // (a picture state's ids are its pictures': no continuation evidence)
+             const root = s.roots.get(c.chat) orelse continue;
+             const n = @as(usize, root) + chat_match;
+             if (c.tokens.len < n or prompt.len < n or c.tokens[n - 1] != prompt[n - 1] or !std.mem.eql(u32, c.tokens[0..n], prompt[0..n])) continue;
+diff --git a/zig/src/core/prompt_cache_media_test.zig b/zig/src/core/prompt_cache_media_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..383eeb5ab84b08c8c5fc69ac3d1d8a8c332cea17
+--- /dev/null
++++ b/zig/src/core/prompt_cache_media_test.zig
+@@ -0,0 +1,376 @@
++//! Pictures in the prompt cache and its durable tier (the DeepSeek port's prompt_cache_media_test, in GLM's shapes:
++//! Request.media's rows and canvases, cache_key and cache_media): what the store and the lane host hand a tier for a
++//! prompt with pictures (Want.images/media at lookup, Write.media/raw at keep), memory keys that tell two pictures at
++//! the same rows apart, the media guards a request must pass to be kept at all, 0111 and TF_GLM_IMAGE_MARK_SNAP, over
++//! the fake lane backend and the in-memory tier.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const tt = @import("lane_host_tier_test.zig");
++const LaneHost = api.LaneHost;
++const Request = api.Request;
++const Reason = api.Reason;
++const Box = tt.Box;
++const Rig = tt.Rig;
++const gpa = std.testing.allocator;
++const io = std.testing.io;
++
++/// The in-memory tier, recording what the store hands it for pictures (lookups and keeps), everything else its own.
++const Rec = struct {
++    inner: pc.Tier,
++    mutex: std.Io.Mutex = .init,
++    lookups: u32 = 0,
++    picture_lookups: u32 = 0, // with Want.images
++    want_media: [4]pc.Media = undefined,
++    want_n: usize = 0,
++    keeps: u32 = 0,
++    picture_keeps: u32 = 0,
++    kept_media: [4]pc.Media = undefined,
++    kept_n: usize = 0,
++    kept_raw: [64]u32 = undefined,
++    kept_raw_n: usize = 0,
++    kept_key: [64]u32 = undefined,
++    kept_key_n: usize = 0,
++
++    fn tier(r: *Rec) pc.Tier {
++        return .{ .ptr = r, .vtable = &vtable };
++    }
++    const vtable: pc.Tier.VTable = .{ .lookup = lookup, .begin = begin, .poll = poll, .cancel = cancel, .keep = keep, .release = release, .share = share, .touch = touch, .forget = forget, .pump = pump, .busy = busy, .flush = flush, .counts = counts };
++
++    fn of(p: *anyopaque) *Rec {
++        return @ptrCast(@alignCast(p));
++    }
++    fn in(p: *anyopaque) pc.Tier {
++        return of(p).inner;
++    }
++    fn begin(p: *anyopaque, point: *const pc.Point) anyerror!u64 {
++        const t = in(p);
++        return t.vtable.begin(t.ptr, point);
++    }
++    fn poll(p: *anyopaque, job: u64, budget: u64) pc.Poll {
++        const t = in(p);
++        return t.vtable.poll(t.ptr, job, budget);
++    }
++    fn cancel(p: *anyopaque, job: u64) void {
++        const t = in(p);
++        t.vtable.cancel(t.ptr, job);
++    }
++    fn release(p: *anyopaque, point: u64, saved: pc.Saved) void {
++        const t = in(p);
++        t.vtable.release.?(t.ptr, point, saved);
++    }
++    fn share(p: *anyopaque, point: u64) void {
++        const t = in(p);
++        t.vtable.share.?(t.ptr, point);
++    }
++    fn touch(p: *anyopaque, point: u64) void {
++        const t = in(p);
++        t.vtable.touch.?(t.ptr, point);
++    }
++    fn forget(p: *anyopaque, point: u64) void {
++        const t = in(p);
++        t.vtable.forget(t.ptr, point);
++    }
++    fn pump(p: *anyopaque, budget: u64) void {
++        const t = in(p);
++        t.vtable.pump.?(t.ptr, budget);
++    }
++    fn busy(p: *anyopaque) bool {
++        const t = in(p);
++        return t.vtable.busy.?(t.ptr);
++    }
++    fn flush(p: *anyopaque, budget: u64) u64 {
++        const t = in(p);
++        return t.vtable.flush(t.ptr, budget);
++    }
++    fn counts(p: *anyopaque, out: []pc.TierCounts) usize {
++        const t = in(p);
++        return t.vtable.counts(t.ptr, out);
++    }
++    fn lookup(p: *anyopaque, want: *const pc.Want) ?pc.Point {
++        const r = of(p);
++        r.mutex.lockUncancelable(io);
++        r.lookups += 1;
++        if (want.images) r.picture_lookups += 1;
++        r.want_n = @min(want.media.len, r.want_media.len);
++        @memcpy(r.want_media[0..r.want_n], want.media[0..r.want_n]);
++        r.mutex.unlock(io);
++        const t = in(p);
++        return t.vtable.lookup(t.ptr, want);
++    }
++    fn keep(p: *anyopaque, w: *const pc.Write) ?u64 {
++        const r = of(p);
++        r.mutex.lockUncancelable(io);
++        r.keeps += 1;
++        if (w.images) {
++            r.picture_keeps += 1;
++            r.kept_n = @min(w.media.len, r.kept_media.len);
++            @memcpy(r.kept_media[0..r.kept_n], w.media[0..r.kept_n]);
++            r.kept_raw_n = @min(w.raw.len, r.kept_raw.len);
++            @memcpy(r.kept_raw[0..r.kept_raw_n], w.raw[0..r.kept_raw_n]);
++            r.kept_key_n = @min(w.key.len, r.kept_key.len);
++            @memcpy(r.kept_key[0..r.kept_key_n], w.key[0..r.kept_key_n]);
++        }
++        r.mutex.unlock(io);
++        const t = in(p);
++        return t.vtable.keep(t.ptr, w);
++    }
++};
++
++/// A rig whose tier is recorded (`rec` wraps the rig's in-memory tier).
++fn withRec(rec: *Rec, o: Rig.Opts) !*Rig {
++    const r = try Rig.createWith(.{ .load_ms = 5, .flush_ms = 1000 }, o);
++    rec.* = .{ .inner = r.tier.tier() };
++    r.store.setTier(rec.tier(), 0);
++    return r;
++}
++
++/// A picture of 3 rows (28 x 84) whose canvas is `fill`.
++fn canvas(comptime fill: u8) [3 * 28 * 84]u8 {
++    return @splat(fill);
++}
++
++/// A prompt of 14 tokens with one picture at [2, 5) (the placeholder 99 at its rows), keyed by the picture's canvas.
++const Pic = struct {
++    prompt: [14]u32 = .{ 3, 1, 99, 99, 99, 5, 9, 2, 6, 5, 7, 7, 4, 4 },
++    rows: [3]u32 = .{ 2, 3, 4 },
++    items: [1]lanes.MediaItem,
++    media: lanes.Media = undefined,
++    key: []u32 = &.{},
++    ids: []pc.Media = &.{},
++
++    fn init(p: *Pic, px: []const u8) !void {
++        p.items = .{.{ .h = 28, .w = 84, .data = px }};
++        p.media = .{ .rows = &p.rows, .items = &p.items };
++        const k = (try pc.prompt_media.keyOf(gpa, &p.prompt, &p.media)).?;
++        p.key = k.keyed;
++        p.ids = k.media;
++    }
++    fn deinit(p: *Pic) void {
++        gpa.free(p.key);
++        gpa.free(p.ids);
++    }
++    fn request(p: *const Pic, max_tokens: u32) Request {
++        return .{ .prompt = &p.prompt, .media = &p.media, .cache_key = p.key, .cache_media = p.ids, .max_tokens = max_tokens, .history_len = 12 };
++    }
++};
++
++test "a prompt with pictures: its lookups carry the pictures' identities, its keeps their identities and model ids; a disk hit resumes it" {
++    var rec: Rec = undefined;
++    const r = try withRec(&rec, .{});
++    defer r.destroy();
++    const px = canvas(1);
++    var p: Pic = .{ .items = undefined };
++    try p.init(&px);
++    defer p.deinit();
++    // a point of 8 tokens on "disk" under the content key (its state the prompt's own model ids: the fake backend's
++    // state is its history)
++    _ = try r.tier.put(p.key[0..8], 8, std.mem.sliceAsBytes(p.prompt[0..8]), 0, 0, false);
++    var b: Box = .{};
++    defer b.deinit();
++    const req = p.request(4);
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b.cached); // restored, then resumed
++    try b.exact(&p.prompt);
++    rec.mutex.lockUncancelable(io);
++    defer rec.mutex.unlock(io);
++    try std.testing.expect(rec.picture_lookups >= 1);
++    try std.testing.expectEqual(@as(usize, 1), rec.want_n);
++    try std.testing.expect(rec.want_media[0].eql(p.ids[0]));
++    try std.testing.expect(rec.picture_keeps >= 1);
++    try std.testing.expectEqual(@as(usize, 1), rec.kept_n);
++    try std.testing.expect(rec.kept_media[0].eql(p.ids[0]));
++    try std.testing.expectEqualSlices(u32, &p.prompt, rec.kept_raw[0..rec.kept_raw_n]); // the model's ids, not the key
++    try std.testing.expectEqualSlices(u32, p.key[0..rec.kept_key_n], rec.kept_key[0..rec.kept_key_n]); // the content key
++}
++
++test "two different pictures at the same rows never share a kept state; the same picture again resumes it" {
++    var rec: Rec = undefined;
++    const r = try withRec(&rec, .{});
++    defer r.destroy();
++    const pa = canvas(1);
++    const pb = canvas(2);
++    var a: Pic = .{ .items = undefined };
++    try a.init(&pa);
++    defer a.deinit();
++    var b2: Pic = .{ .items = undefined };
++    try b2.init(&pb);
++    defer b2.deinit();
++    try std.testing.expectEqualSlices(u32, &a.prompt, &b2.prompt); // the model's ids are the same placeholders
++    const runs = [_]struct { p: *const Pic, cached: u32 }{ .{ .p = &a, .cached = 0 }, .{ .p = &b2, .cached = 0 }, .{ .p = &a, .cached = 12 } };
++    for (runs, 1..) |run, id| {
++        var box: Box = .{};
++        defer box.deinit();
++        const req = run.p.request(2);
++        try r.host.engine().submit(id, &req, box.sink());
++        try std.testing.expectEqual(Reason.length, box.wait());
++        try std.testing.expectEqual(@as(?u32, run.cached), box.cached);
++        try box.exact(&run.p.prompt);
++    }
++}
++
++test "tierMedia: a request's media count only when they name exactly the rows the engine fills" {
++    const px = canvas(1);
++    var p: Pic = .{ .items = undefined };
++    try p.init(&px);
++    defer p.deinit();
++    const ok = p.request(1);
++    try std.testing.expectEqual(@as(usize, 1), LaneHost.tierMedia(&ok).len);
++    try std.testing.expect(LaneHost.cacheable(&ok));
++    try std.testing.expectEqualSlices(u32, p.key, LaneHost.keyOf(&ok));
++    var moved = p.ids[0];
++    moved.start = 3; // a span elsewhere than the rows
++    var r2 = ok;
++    r2.cache_media = (&moved)[0..1];
++    try std.testing.expectEqual(@as(usize, 0), LaneHost.tierMedia(&r2).len);
++    try std.testing.expect(!LaneHost.cacheable(&r2));
++    var longer = p.ids[0];
++    longer.len = 4; // another length
++    r2.cache_media = (&longer)[0..1];
++    try std.testing.expect(!LaneHost.cacheable(&r2));
++    var unkeyed = ok;
++    unkeyed.cache_key = &.{}; // TF_GLM_IMAGE_CACHE=0, features from another tower
++    try std.testing.expect(!LaneHost.cacheable(&unkeyed));
++    try std.testing.expectEqualSlices(u32, &p.prompt, LaneHost.keyOf(&unkeyed));
++    const text: Request = .{ .prompt = &p.prompt, .max_tokens = 1 };
++    try std.testing.expect(LaneHost.cacheable(&text) and LaneHost.tierMedia(&text).len == 0);
++}
++
++test "a prompt with pictures whose cache_media name other rows: no lookup, nothing kept" {
++    var rec: Rec = undefined;
++    const r = try withRec(&rec, .{});
++    defer r.destroy();
++    const px = canvas(1);
++    var p: Pic = .{ .items = undefined };
++    try p.init(&px);
++    defer p.deinit();
++    _ = try r.tier.put(p.key[0..8], 8, std.mem.sliceAsBytes(p.prompt[0..8]), 0, 0, false);
++    var moved = p.ids[0];
++    moved.start = 1;
++    var req = p.request(4);
++    req.cache_media = (&moved)[0..1];
++    var b: Box = .{};
++    defer b.deinit();
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached); // the point on disk is not resumed
++    rec.mutex.lockUncancelable(io);
++    defer rec.mutex.unlock(io);
++    try std.testing.expectEqual(@as(u32, 0), rec.lookups);
++    try std.testing.expectEqual(@as(u32, 0), rec.keeps);
++    try std.testing.expectEqual(@as(usize, 0), r.store.entries.items.len);
++}
++
++test "a prompt with pictures and no content key (TF_GLM_IMAGE_CACHE=0): the tier is never asked, nothing is kept" {
++    var rec: Rec = undefined;
++    const r = try withRec(&rec, .{});
++    defer r.destroy();
++    const px = canvas(1);
++    var p: Pic = .{ .items = undefined };
++    try p.init(&px);
++    defer p.deinit();
++    var req = p.request(4);
++    req.cache_key = &.{};
++    req.cache_media = &.{};
++    var b: Box = .{};
++    defer b.deinit();
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b.cached);
++    rec.mutex.lockUncancelable(io);
++    defer rec.mutex.unlock(io);
++    try std.testing.expectEqual(@as(u32, 0), rec.lookups);
++    try std.testing.expectEqual(@as(u32, 0), rec.keeps);
++    try std.testing.expectEqual(@as(usize, 0), r.store.entries.items.len);
++}
++
++test "a text prompt's lookups and keeps carry no pictures" {
++    var rec: Rec = undefined;
++    const r = try withRec(&rec, .{});
++    defer r.destroy();
++    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 7, 7, 5, 3 };
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &prompt, .max_tokens = 4, .history_len = 12 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    rec.mutex.lockUncancelable(io);
++    defer rec.mutex.unlock(io);
++    try std.testing.expect(rec.lookups >= 1 and rec.keeps >= 1);
++    try std.testing.expectEqual(@as(u32, 0), rec.picture_lookups);
++    try std.testing.expectEqual(@as(u32, 0), rec.picture_keeps);
++}
++
++test "0111: a kept picture state is never a conversation's continuation" {
++    const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
++    defer r.destroy();
++    const px = canvas(1);
++    var prompt: [40]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast(10 + i % 7);
++    for (2..5) |i| prompt[i] = 99;
++    const rows = [_]u32{ 2, 3, 4 };
++    const items = [_]lanes.MediaItem{.{ .h = 28, .w = 84, .data = &px }};
++    const m: lanes.Media = .{ .rows = &rows, .items = &items };
++    const k = (try pc.prompt_media.keyOf(gpa, &prompt, &m)).?;
++    defer gpa.free(k.keyed);
++    defer gpa.free(k.media);
++    var b: Box = .{};
++    defer b.deinit();
++    const req: Request = .{ .prompt = &prompt, .media = &m, .cache_key = k.keyed, .cache_media = k.media, .max_tokens = 2, .history_len = 38 };
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    var own: ?*pc.Entry = null;
++    for (r.store.entries.items) |e| if (e.at == 38) {
++        own = e;
++    };
++    const e = own orelse return error.NotKept;
++    try std.testing.expect(e.images and e.own and e.chat != 0);
++    // a later prompt repeating the state's ids past its conversation's first prompt and chat_match more: no continuation
++    r.store.roots.put(gpa, e.chat, 1) catch {};
++    var later: [48]u32 = @splat(8);
++    @memcpy(later[0..38], k.keyed[0..38]);
++    try std.testing.expect(r.store.continuedChat(&later) == null);
++    e.images = false; // (the same state as text would be one: the check is the picture flag's)
++    try std.testing.expect(r.store.continuedChat(&later) == e);
++}
++
++test "TF_GLM_IMAGE_MARK_SNAP=1: a mark inside a picture keeps its state at the picture's start instead" {
++    const r = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
++    defer r.destroy();
++    r.host.mark_snap = true;
++    const px = canvas(1);
++    var p: Pic = .{ .items = undefined };
++    try p.init(&px);
++    defer p.deinit();
++    // the picture at [10, 13) holds the history's cut (12)
++    p.prompt = .{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 99, 99, 99, 4 };
++    p.rows = .{ 10, 11, 12 };
++    gpa.free(p.key);
++    gpa.free(p.ids);
++    const k = (try pc.prompt_media.keyOf(gpa, &p.prompt, &p.media)).?;
++    p.key = k.keyed;
++    p.ids = k.media;
++    var b: Box = .{};
++    defer b.deinit();
++    const req = p.request(2);
++    try r.host.engine().submit(1, &req, b.sink());
++    try std.testing.expectEqual(Reason.length, b.wait());
++    var saw_start = false;
++    for (r.store.entries.items) |e| {
++        try std.testing.expect(!(e.at > 10 and e.at < 13)); // no state cut inside the picture
++        saw_start = saw_start or e.at == 10;
++    }
++    try std.testing.expect(saw_start);
++    // off (the default): the history's cut inside the picture is kept as it is
++    const r2 = try Rig.create(.{ .load_ms = 5, .flush_ms = 1000 });
++    defer r2.destroy();
++    var b2: Box = .{};
++    defer b2.deinit();
++    try r2.host.engine().submit(1, &req, b2.sink());
++    try std.testing.expectEqual(Reason.length, b2.wait());
++    var saw_cut = false;
++    for (r2.store.entries.items) |e| saw_cut = saw_cut or e.at == 12;
++    try std.testing.expect(saw_cut);
++}
+diff --git a/zig/src/core/prompt_media.zig b/zig/src/core/prompt_media.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..93c097e8c4e06b3a5c62c70a4583ea4e99364e5d
+--- /dev/null
++++ b/zig/src/core/prompt_media.zig
+@@ -0,0 +1,256 @@
++//! Pictures in the prompt cache (the DeepSeek port's picture keys, recipe 0006's scheme): a prompt with pictures or
++//! clips is keyed by their content, not by the placeholder its rows hold, so two pictures never share a kept state and
++//! one picture always does. Each picture's identity is its span of the prompt and the full SHA-256 of its canvas
++//! (Python's FittedPicture: kind and shape, then the canvas bytes); the per-position cache ids are shortened from it
++//! (`pictureId`), and the durable tier records the whole digest beside them (core/spill format v3).
++const std = @import("std");
++const lanes = @import("lanes");
++const Allocator = std.mem.Allocator;
++
++/// A picture of a prompt as the durable tier names it: its positions [start, start + len) and the full SHA-256 of
++/// its canvas. (extern: the same bytes as core/spill's format.Media, which a tier checks at comptime.)
++pub const Media = extern struct {
++    start: u32,
++    len: u32,
++    digest: [32]u8,
++
++    pub fn eql(a: Media, b: Media) bool {
++        return a.start == b.start and a.len == b.len and std.mem.eql(u8, &a.digest, &b.digest);
++    }
++};
++
++/// Cache ids at or above this are pictures' (`pictureId`); a vocabulary id is always below it.
++pub const picture_ids: u32 = 0x8000_0000;
++
++/// The prompt cache's id for position `j` of a picture whose canvas's SHA-256 is `digest`: above every vocabulary id,
++/// so it never equals a text token, and the same for the same picture at any place in any prompt (core/spill's
++/// format.pictureId, scheme 1).
++pub fn pictureId(digest: *const [32]u8, j: u32) u32 {
++    const seed = std.mem.readInt(u64, digest[0..8], .little);
++    return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
++}
++
++/// TF_GLM_IMAGE_CACHE's one reading (the server's content keys, the disk tier and the rank fingerprint alike): on
++/// unless it is exactly "0".
++pub fn imageCacheOn(v: ?[]const u8) bool {
++    return !std.mem.eql(u8, v orelse return true, "0");
++}
++
++/// TF_GLM_IMAGE_MARK_SNAP's reading: on only for exactly "1". On, a kept state's cut never falls inside a picture
++/// (`snapMarks`): a resume then never runs the tower on a picture whose earlier rows it took from a kept state, so
++/// it stays exact even if the tower's rows for a picture differed between runs. Off (the default): a cut may
++/// straddle a picture, as Python's resume does (the tower encodes it whole, the chunks embed the rows past the cut).
++pub fn markSnapOn(v: ?[]const u8) bool {
++    return std.mem.eql(u8, v orelse return false, "1");
++}
++
++/// One picture's or clip's digest: SHA-256 of its kind and shape as Python's FittedPicture hashes them
++/// (`image[3, H, W]`, `video[T, 3, H, W]`), a zero byte, then its canvas bytes.
++pub fn itemDigest(it: lanes.MediaItem) [32]u8 {
++    var h = std.crypto.hash.sha2.Sha256.init(.{});
++    var buf: [96]u8 = undefined;
++    const head = (if (it.video)
++        std.fmt.bufPrint(&buf, "video[{d}, 3, {d}, {d}]", .{ it.frames, it.h, it.w })
++    else
++        std.fmt.bufPrint(&buf, "image[3, {d}, {d}]", .{ it.h, it.w })) catch unreachable;
++    h.update(head);
++    h.update("\x00");
++    h.update(it.data);
++    return h.finalResult();
++}
++
++/// A prompt's cache key and its pictures' identities (`keyed`: the prompt with each picture's positions made from its
++/// digest; `media`: one per item, in prompt order).
++pub const Keyed = struct { keyed: []u32, media: []Media };
++
++/// The cache key of `prompt` whose pictures and clips are `m` (its canvases: the engine's own tower), in `a`; null when
++/// the media cannot be keyed: features from another tower (no canvases to hash), a follower's copy, or an item whose
++/// rows are not one run of consecutive prompt positions (a picture is one span).
++pub fn keyOf(a: Allocator, prompt: []const u32, m: *const lanes.Media) Allocator.Error!?Keyed {
++    if (m.follower_rows > 0 or m.features.len > 0 or m.items.len == 0) return null;
++    var n: usize = 0;
++    for (m.items) |it| n += it.rows();
++    if (n != m.rows.len) return null;
++    var off: usize = 0;
++    for (m.items) |it| {
++        const rows = m.rows[off..][0..it.rows()];
++        if (rows.len == 0 or rows[rows.len - 1] >= prompt.len) return null;
++        for (rows, 0..) |r, j| if (r != rows[0] + j) return null;
++        off += rows.len;
++    }
++    const media = try a.alloc(Media, m.items.len);
++    errdefer a.free(media);
++    off = 0;
++    for (m.items, media) |it, *slot| {
++        slot.* = .{ .start = m.rows[off], .len = @intCast(it.rows()), .digest = itemDigest(it) };
++        off += it.rows();
++    }
++    const keyed = try a.dupe(u32, prompt);
++    for (media) |md| for (0..md.len) |j| {
++        keyed[md.start + j] = pictureId(&md.digest, @intCast(j));
++    };
++    return .{ .keyed = keyed, .media = media };
++}
++
++/// The history of a prompt with pictures (`ids`, ending in the template's generation prompt `gen`): the prompt before
++/// `gen`, where a later turn resumes; 0 when it does not end so, or the cut would fall inside a picture.
++pub fn historyLen(ids: []const u32, gen: []const u32, media: []const Media) usize {
++    if (gen.len == 0 or gen.len >= ids.len or !std.mem.endsWith(u32, ids, gen)) return 0;
++    const h = ids.len - gen.len;
++    for (media) |md| if (md.start < h and h < @as(usize, md.start) + md.len) return 0;
++    return h;
++}
++
++/// Whether `media` names every picture in `key[0..n]` and nothing else: spans in order, not overlapping, not empty;
++/// each span position below `n` holds `pictureId(digest, offset)`, every other position below `n` a vocabulary id.
++/// Spans may run past `n` (a picture straddling a cut); spans starting at or past `n` are not looked at. The check
++/// that binds the shortened per-position ids to the full digests a point records.
++pub fn mediaKeys(key: []const u32, n: usize, media: []const Media) bool {
++    if (n > key.len) return false;
++    var at: usize = 0; // positions before it are checked
++    var prev_end: u64 = 0;
++    for (media) |m| {
++        if (m.len == 0 or m.start < prev_end) return false;
++        prev_end = @as(u64, m.start) + m.len;
++        if (m.start >= n) continue;
++        for (key[at..m.start]) |id| if (id >= picture_ids) return false;
++        const stop: usize = @intCast(@min(prev_end, n));
++        for (key[m.start..stop], 0..) |id, j| if (id != pictureId(&m.digest, @intCast(j))) return false;
++        at = stop;
++    }
++    for (key[at..n]) |id| if (id >= picture_ids) return false;
++    return true;
++}
++
++/// Whether the engine's media `m` places its items exactly at `media`'s spans, one for one (item i's rows are
++/// [start, start + len) of media i): what binds the key and the tier's identities to the rows the engine fills.
++pub fn spansMatch(m: *const lanes.Media, media: []const Media) bool {
++    if (m.follower_rows > 0 or m.items.len != media.len or media.len == 0) return false;
++    var off: usize = 0;
++    for (m.items, media) |it, md| {
++        const n = it.rows();
++        if (n != md.len or off + n > m.rows.len) return false;
++        for (m.rows[off..][0..n], 0..) |r, j| if (r != md.start + j) return false;
++        off += n;
++    }
++    return off == m.rows.len;
++}
++
++/// The marks of a pass over pictures `media` with TF_GLM_IMAGE_MARK_SNAP on (sorted, in place): a mark inside a
++/// picture (start < mark < start + len) moves back to the last `grid` point at or below the picture's start, and goes
++/// when that is not past `from` (the pass's resume point) or another mark has it already. The marks left, in order.
++pub fn snapMarks(marks: []u32, from: u32, media: []const Media, grid: u32) []u32 {
++    const g = @max(grid, 1);
++    var n: usize = 0;
++    for (marks) |mk| {
++        var at = mk;
++        for (media) |md| if (md.start < at and at < @as(u64, md.start) + md.len) {
++            at = md.start / g * g;
++            break;
++        };
++        if (at <= from or (n > 0 and marks[n - 1] >= at)) continue;
++        marks[n] = at;
++        n += 1;
++    }
++    return marks[0..n];
++}
++
++test imageCacheOn {
++    try std.testing.expect(!imageCacheOn("0"));
++    try std.testing.expect(imageCacheOn(null) and imageCacheOn("1") and imageCacheOn(""));
++    try std.testing.expect(imageCacheOn(" 0") and imageCacheOn("0 ")); // (exact)
++    try std.testing.expect(!markSnapOn(null) and !markSnapOn("0") and !markSnapOn("") and markSnapOn("1"));
++}
++
++test "itemDigest: kind, shape and every canvas byte" {
++    const px: [3 * 28 * 56]u8 = @splat(7);
++    const a = itemDigest(.{ .h = 28, .w = 56, .data = &px });
++    var other = px;
++    other[100] = 8;
++    try std.testing.expect(!std.mem.eql(u8, &a, &itemDigest(.{ .h = 28, .w = 56, .data = &other })));
++    try std.testing.expect(!std.mem.eql(u8, &a, &itemDigest(.{ .h = 56, .w = 28, .data = &px }))); // same bytes, another shape
++    try std.testing.expect(!std.mem.eql(u8, &a, &itemDigest(.{ .video = true, .frames = 2, .h = 28, .w = 28, .data = &px }))); // a clip
++    try std.testing.expect(std.mem.eql(u8, &a, &itemDigest(.{ .h = 28, .w = 56, .data = &px })));
++    // Python's head and canvas bytes: sha256(b"image[3, 28, 56]" + b"\0" + raw)
++    var h = std.crypto.hash.sha2.Sha256.init(.{});
++    h.update("image[3, 28, 56]\x00");
++    h.update(&px);
++    try std.testing.expectEqualSlices(u8, &h.finalResult(), &a);
++}
++
++test "keyOf: picture positions keyed by content, text unchanged; unkeyable media give none" {
++    const gpa = std.testing.allocator;
++    const pa: [3 * 28 * 28]u8 = @splat(1);
++    const pb: [3 * 28 * 56]u8 = @splat(2);
++    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 28, .data = &pa }, .{ .h = 28, .w = 56, .data = &pb } };
++    const prompt = [_]u32{ 5, 9, 99, 6, 99, 99, 7 };
++    const rows = [_]u32{ 2, 4, 5 };
++    const m: lanes.Media = .{ .rows = &rows, .items = &items };
++    const k = (try keyOf(gpa, &prompt, &m)).?;
++    defer gpa.free(k.keyed);
++    defer gpa.free(k.media);
++    try std.testing.expectEqual(@as(usize, 2), k.media.len);
++    try std.testing.expect(k.media[0].start == 2 and k.media[0].len == 1 and k.media[1].start == 4 and k.media[1].len == 2);
++    try std.testing.expectEqualSlices(u8, &itemDigest(items[1]), &k.media[1].digest);
++    try std.testing.expectEqual(pictureId(&k.media[1].digest, 1), k.keyed[5]);
++    try std.testing.expect(k.keyed[0] == 5 and k.keyed[3] == 6 and k.keyed[6] == 7);
++    try std.testing.expect(mediaKeys(k.keyed, k.keyed.len, k.media));
++    try std.testing.expect(spansMatch(&m, k.media));
++    // another canvas at the same positions: other ids
++    const pc2: [3 * 28 * 56]u8 = @splat(3);
++    const items2 = [_]lanes.MediaItem{ items[0], .{ .h = 28, .w = 56, .data = &pc2 } };
++    const k2 = (try keyOf(gpa, &prompt, &.{ .rows = &rows, .items = &items2 })).?;
++    defer gpa.free(k2.keyed);
++    defer gpa.free(k2.media);
++    try std.testing.expect(k2.keyed[2] == k.keyed[2] and k2.keyed[4] != k.keyed[4]);
++    // features from another tower, a follower's copy, rows split inside one picture: no key
++    const feats: [3 * 8]u8 = @splat(0);
++    try std.testing.expect((try keyOf(gpa, &prompt, &.{ .rows = &rows, .width = 4, .features = &feats })) == null);
++    try std.testing.expect((try keyOf(gpa, &prompt, &.{ .rows = &.{}, .follower_rows = 3 })) == null);
++    const split = [_]u32{ 2, 4, 6 };
++    try std.testing.expect((try keyOf(gpa, &prompt, &.{ .rows = &split, .items = &items })) == null);
++    try std.testing.expect(!spansMatch(&.{ .rows = &split, .items = &items }, k.media));
++}
++
++test historyLen {
++    const d: [32]u8 = @splat(1);
++    const m = [_]Media{.{ .start = 2, .len = 3, .digest = d }};
++    try std.testing.expectEqual(@as(usize, 6), historyLen(&.{ 1, 2, 9, 9, 9, 3, 7, 8 }, &.{ 7, 8 }, &m));
++    try std.testing.expectEqual(@as(usize, 0), historyLen(&.{ 1, 2, 9, 9, 9, 3, 7, 8 }, &.{ 6, 8 }, &m)); // another suffix
++    try std.testing.expectEqual(@as(usize, 0), historyLen(&.{ 1, 2, 9, 9, 7, 8 }, &.{ 7, 8 }, &.{.{ .start = 2, .len = 3, .digest = d }})); // inside a picture
++    try std.testing.expectEqual(@as(usize, 0), historyLen(&.{ 7, 8 }, &.{ 7, 8 }, &.{}));
++}
++
++test "mediaKeys: every picture id named by a span and made from its digest, nothing else" {
++    var a: [32]u8 = @splat(1);
++    var b: [32]u8 = @splat(2);
++    a[9] = 4;
++    b[9] = 5;
++    var key = [_]u32{ 1, 2, 0, 0, 0, 3, 0, 0, 0, 0, 4 };
++    for (0..3) |j| key[2 + j] = pictureId(&a, @intCast(j));
++    for (0..4) |j| key[6 + j] = pictureId(&b, @intCast(j));
++    const m = [_]Media{ .{ .start = 2, .len = 3, .digest = a }, .{ .start = 6, .len = 4, .digest = b } };
++    try std.testing.expect(mediaKeys(&key, key.len, &m));
++    try std.testing.expect(mediaKeys(&key, 8, &m)); // a cut inside the second picture
++    try std.testing.expect(mediaKeys(&key, 2, &.{})); // a cut before every picture: text
++    try std.testing.expect(!mediaKeys(&key, key.len, m[0..1])); // the second picture unnamed
++    try std.testing.expect(!mediaKeys(&key, key.len, &.{})); // none named
++    try std.testing.expect(!mediaKeys(&key, key.len, &.{ m[1], m[0] })); // out of order
++    try std.testing.expect(!mediaKeys(&key, key.len, &.{ m[0], .{ .start = 4, .len = 2, .digest = b } })); // overlapping
++    try std.testing.expect(!mediaKeys(&key, key.len, &.{ .{ .start = 2, .len = 3, .digest = b }, m[1] })); // another canvas
++    try std.testing.expect(!mediaKeys(&key, key.len, &.{ .{ .start = 2, .len = 2, .digest = a }, m[1] })); // a short span
++    try std.testing.expect(!mediaKeys(&key, key.len + 1, &m)); // past the key
++    for (0..1000) |j| try std.testing.expect(pictureId(&a, @intCast(j)) >= picture_ids);
++}
++
++test "snapMarks: a cut inside a picture moves back to the grid at its start, or goes" {
++    const d: [32]u8 = @splat(3);
++    const media = [_]Media{ .{ .start = 100, .len = 300, .digest = d }, .{ .start = 600, .len = 50, .digest = d } };
++    var marks = [_]u32{ 64, 192, 256, 448, 640, 704 };
++    // 192 and 256 sit inside the first picture: both move to 64, which a mark has already; 640 inside the second: 576
++    try std.testing.expectEqualSlices(u32, &.{ 64, 448, 576, 704 }, snapMarks(&marks, 0, &media, 64));
++    var again = [_]u32{ 192, 448 };
++    try std.testing.expectEqualSlices(u32, &.{448}, snapMarks(&again, 64, &media, 64)); // 64 is not past the resume point
++    var none = [_]u32{ 64, 448 };
++    try std.testing.expectEqualSlices(u32, &.{ 64, 448 }, snapMarks(&none, 0, &media, 64)); // no mark inside: unchanged
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 544b4ad9db0cf637375ddc658302655c4a646386..c3c2aca5e46f55d1663ac41f843bf69a3de8c90c 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -1156,7 +1156,7 @@ pub const Toy = struct {
+     // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
+ 
+     pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
+     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
+ 
+     /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 700a28b31125dfc4910656f275e225d9fd79832c..52010f5148e21dd584107b1afe3b06cadd5f7c54 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -85,10 +85,11 @@ pub const Seq = struct { slot: usize, st: state.State, alive: bool = false, tag:
+ pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?cuda.DeviceBuffer = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
+ const SpillJob = struct { snap: *Snap, tokens: []u32, at: u32, key: u64 };
+ /// `mask`: structured output's bits for the first token (one row, the grammar's words); empty: unconstrained.
+-/// `media`: picture and clip rows for this prompt.
++/// `media`: picture and clip rows for this prompt (attached at the call's resume point unless a pass attached them
++/// already: attachPass). `hold_media`: the rows stay attached after the call (a pass's mark segments; the pass detaches).
+ /// `live_from`: the bound sequence stands at this position with live rows and no snapshot (a refused save, cuda_lanes
+ /// pass): the prefill goes on from there, restoring nothing. `resume_from` and `live_from` exclude each other.
+-pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
+ pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+ 
+ /// A prompt's feature rows while it prefills: the prompt rows they replace (host copy, ascending) and the device
+@@ -97,6 +98,8 @@ const Attached = struct {
+     host_rows: []u32,
+     rows: cuda.DeviceBuffer,
+     feats: cuda.DeviceBuffer,
++    /// the rows and features are in place (attachMedia ran), not only reserved
++    attached: bool = false,
+ };
+ 
+ pub const media_width: usize = 4096;
+@@ -191,6 +194,8 @@ pub const Engine = struct {
+     /// the prompt in prefill when it has pictures or clips: the tower's rows, on the device (every rank)
+     media: ?Attached = null,
+     vision: bool = false,
++    /// pictures and clips whose tower run a resumed pass skipped (every row of theirs was in the restored state)
++    media_skipped: u64 = 0,
+     /// rank 0 with --vision-backend zig: the vision tower (null: the server brings the features)
+     tower: ?vision_tower.Tower = null,
+     /// TF_GLM_KV_SHARD: this rank's view of the pool's two parts (null: off), the switches and the counters
+@@ -789,10 +794,7 @@ pub const Engine = struct {
+         const s = e.bound orelse return error.NoBoundSequence;
+         if (prompt.len == 0 or prompt.len > e.context) return error.ContextFull;
+         if (o.keep_at) |k| if (k == 0 or k > prompt.len or k % 64 != 0) return error.BadKeepPoint;
+-        if (o.media) |m| {
+-            try e.attachMedia(m, prompt.len);
+-        }
+-        defer e.detachMedia();
++        defer if (!o.hold_media) e.detachMedia();
+         var fl: Fill = undefined;
+         try e.startPass(&fl, s, prompt, sampling, o);
+         defer e.gpa.free(fl.ids);
+@@ -881,6 +883,8 @@ pub const Engine = struct {
+             st.pos = 0;
+             s.tag = 0;
+         }
++        // the pictures' rows from here: the tower encodes only those a row past the resume point needs
++        if (o.media) |m| if (!e.mediaAttached()) try e.attachMedia(m, prompt.len, begin);
+         if (e.mtpHead()) |m| {
+             // from 0 the head starts empty; from a kept or live state it stands one row behind it (cuda_mtp_keep)
+             try mtp_keep.enter(m, s.slot, begin);
+@@ -1194,11 +1198,23 @@ pub const Engine = struct {
+         e.media = .{ .host_rows = host, .rows = rows, .feats = feats };
+     }
+ 
++    /// A prompt pass's pictures attached once for all its segments (cuda_lanes pass: its marks' prefills and the last
++    /// one inject from the same rows, and the pass detaches them at its end): `cut`, where the pass resumes.
++    pub fn attachPass(e: *Engine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
++        if (!e.mediaAttached()) try e.attachMedia(m, prompt_len, cut);
++    }
++
++    pub fn mediaAttached(e: *const Engine) bool {
++        return if (e.media) |a| a.attached else false;
++    }
++
+     /// The prompt's picture rows on every rank: rank 0 has them (host features, or the tower's output) and
+-    /// broadcasts their prompt rows and values; rank 1 receives. Both ranks call it at the same point.
+-    fn attachMedia(e: *Engine, m: *const lanes.Media, prompt_len: usize) !void {
++    /// broadcasts their prompt rows and values; rank 1 receives. Both ranks call it at the same point. A pass resuming
++    /// at `cut` runs the tower only on the items with a row at or past it (Media.neededFrom: the others' rows are in
++    /// the restored state, and no chunk reads their features); their features land at their own rows' offsets.
++    fn attachMedia(e: *Engine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
+         if (e.media == null) try e.reserveMedia(m, prompt_len);
+-        const a = e.media.?;
++        const a = &e.media.?;
+         const n = m.rowCount();
+         if (n != a.host_rows.len) return error.BadMedia;
+         if (e.g.rank == 0) {
+@@ -1208,10 +1224,12 @@ pub const Engine = struct {
+                 try a.feats.uploadAsync(0, m.features, e.stream.handle);
+             } else {
+                 const t = &(e.tower orelse return error.NoVisionTower);
+-                const items = try e.gpa.alloc(vision_tower.Item, m.items.len);
++                const from = m.neededFrom(cut);
++                const items = try e.gpa.alloc(vision_tower.Item, m.items.len - from.item);
+                 defer e.gpa.free(items);
+-                for (m.items, items) |it, *slot| slot.* = .{ .frames = it.frames, .h = it.h, .w = it.w, .pixels = it.data };
+-                try t.encode(items, a.feats.ptr);
++                for (m.items[from.item..], items) |it, *slot| slot.* = .{ .frames = it.frames, .h = it.h, .w = it.w, .pixels = it.data };
++                if (items.len > 0) try t.encode(items, a.feats.ptr + from.row * media_width * 2);
++                e.media_skipped += from.item;
+             }
+         }
+         if (e.g.world > 1) {
+@@ -1221,6 +1239,7 @@ pub const Engine = struct {
+         }
+         try e.stream.synchronize();
+         if (e.g.rank != 0) try a.rows.download(0, std.mem.sliceAsBytes(a.host_rows));
++        a.attached = true;
+         e.pe.inject = .{ .ctx = e, .call = injectMedia };
+     }
+ 
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index 660f2f57e964eadc8ef96eebeb46c5e0a1c0f0e4..c42a03980418fb9b6a139cd7b5a6f524bc7e822e 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -644,6 +644,10 @@ pub fn Lanes(comptime E: type) type {
+             s.cached = @intCast(at);
+             s.reuse_failed = s.reuse.at > 0 and from == null;
+             self.dropTentative();
++            // pictures and clips: attached once for the whole pass at its resume point (the tower runs only for the
++            // items a row past it needs), so every mark's segment injects them too; detached when the pass ends
++            defer if (s.media != null) if (comptime @hasDecl(E, "detachMedia")) e.detachMedia();
++            if (s.media) |m| if (comptime @hasDecl(E, "attachPass")) try e.attachPass(m, ids.len, at);
+             // TF_GLM_KV_SHARD_TWINS: a fresh prompt fills with rows of the other part borrowed, given back once it is in
+             // (a failure on the way ends the pair, and the lane's release gives them back)
+             const lent = if (from == null) try self.borrow(l) else false;
+@@ -657,7 +661,7 @@ pub fn Lanes(comptime E: type) type {
+                     std.log.warn("prompt cache: no state kept at {d} tokens (a rank is at its keep floor)", .{m});
+                     continue;
+                 }
+-                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = if (live == null) cur else null, .live_from = live });
++                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = if (live == null) cur else null, .live_from = live, .media = s.media, .hold_media = true });
+                 // the save's outcome, agreed too: a rank the engine refused after all holds no state, so none keeps it,
+                 // and every rank goes on the same way, from the rows it just ran (no restore, no rows again)
+                 if (!(try self.agreeOn(r.kept != null))) {
+@@ -686,7 +690,7 @@ pub fn Lanes(comptime E: type) type {
+             var bits: ?[]u32 = null;
+             defer if (bits) |m| self.gpa.free(m);
+             const mask: []const u32 = if (comptime masked) try self.firstMask(s, &bits) else &.{};
+-            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media });
++            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media, .hold_media = true });
+             if (lent) self.giveBack(l);
+             self.endPass();
+             return r.first;
+@@ -1675,11 +1679,14 @@ const MiniEngine = struct {
+     pub const snap_holds_rows = true;
+     pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null, lent: bool = false };
+     pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32, home: ?usize = null };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
+     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+     pub const Window = struct { seq: *Seq, tokens: []const u32 };
+     pub const DraftReq = struct { seq: *Seq };
+     const Disk = struct { key: u64, at: u32, tokens: []u32 };
++    /// A prefillWith call as the pictures saw it: its rows, whether media were attached and from which item the
++    /// tower ran (`attachPass`'s cut, Media.neededFrom).
++    pub const MediaCall = struct { begin: usize, end: usize, attached: bool, from_item: usize };
+ 
+     gpa: std.mem.Allocator,
+     bound: ?*Seq = null,
+@@ -1706,6 +1713,29 @@ const MiniEngine = struct {
+     fills_live: usize = 0,
+     lent_chunks: usize = 0, // fill steps whose sequence held borrowed rows
+     media_passes: usize = 0, // prefillWith calls with pictures or clips
++    // pictures (the engine's attachPass / reserveMedia / detachMedia, as it orders them)
++    vision: bool = true, // the engine has a tower (false: reserveMedia refuses with NoVisionTower, as rank 0 without one)
++    media_reserved: bool = false,
++    media_attached: ?usize = null, // the first item the tower ran for, while attached
++    media_attaches: usize = 0,
++    media_calls: std.ArrayList(MediaCall) = .empty,
++
++    pub fn reserveMedia(e: *MiniEngine, m: *const lanes.Media, prompt_len: usize) !void {
++        e.detachMedia();
++        if (!e.vision) return error.NoVisionTower;
++        try m.check(prompt_len);
++        e.media_reserved = true;
++    }
++    pub fn attachPass(e: *MiniEngine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
++        if (e.media_attached != null) return;
++        if (!e.media_reserved) try e.reserveMedia(m, prompt_len);
++        e.media_attached = m.neededFrom(cut).item;
++        e.media_attaches += 1;
++    }
++    pub fn detachMedia(e: *MiniEngine) void {
++        e.media_reserved = false;
++        e.media_attached = null;
++    }
+ 
+     fn hash(tokens: []const u32) u32 {
+         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
+@@ -1800,6 +1830,11 @@ const MiniEngine = struct {
+             e.resumed += 1;
+         } else q.tokens.clearRetainingCapacity(); // the engine's cold reset of a used sequence
+         try e.trace.append(e.gpa, .{ q.tokens.items.len, prompt.len });
++        if (o.media) |m| {
++            if (e.media_attached == null) try e.attachPass(m, prompt.len, q.tokens.items.len);
++            try e.media_calls.append(e.gpa, .{ .begin = q.tokens.items.len, .end = prompt.len, .attached = true, .from_item = e.media_attached.? });
++        } else if (e.media_attached != null) try e.media_calls.append(e.gpa, .{ .begin = q.tokens.items.len, .end = prompt.len, .attached = true, .from_item = e.media_attached.? });
++        defer if (!o.hold_media) e.detachMedia();
+         if (q.lent) {
+             if (!e.pool.?.holding(q.eid.?)) return error.TwinNotHeld;
+             e.lent_fills += 1;
+@@ -1925,6 +1960,7 @@ const MiniEngine = struct {
+         e.disk.deinit(e.gpa);
+         e.trace.deinit(e.gpa);
+         e.chunk_log.deinit(e.gpa);
++        e.media_calls.deinit(e.gpa);
+         if (e.pool) |*p| p.deinit();
+     }
+ };
+@@ -2068,6 +2104,58 @@ test "kept states that hold their rows: a pass keeps at its marks, a later pass
+     try std.testing.expectEqual(@as(usize, 0), e1.seqs);
+ }
+ 
++test "pictures in a pass: attached once at its resume point, every mark's segment injects them, detached when it ends; a resumed pass runs the tower only from the first picture past the cut" {
++    const gpa = std.testing.allocator;
++    const B = Lanes(MiniEngine);
++    var e0: MiniEngine = .{ .gpa = gpa };
++    defer e0.deinit();
++    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
++    const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
++    var prompt: [200]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast(i * 7 % 101);
++    const px: [3 * 28 * 84]u8 = @splat(4);
++    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
++    const rows = [_]u32{ 10, 11, 12, 100, 101, 102, 170, 171, 172 };
++    for (rows) |r| prompt[r] = 99;
++    const media: lanes.Media = .{ .rows = &rows, .items = &items };
++    // 1. a cold pass with marks at 64 and 128: one attach, every segment (the marks' and the last) with the pictures
++    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    try B.prefillFn(&r0, &s1);
++    try std.testing.expectEqual(@as(usize, 1), e0.media_attaches);
++    try std.testing.expectEqual(@as(usize, 3), e0.media_calls.items.len);
++    for (e0.media_calls.items, [_][2]usize{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 200 } }) |c, want| {
++        try std.testing.expect(c.attached and c.from_item == 0); // a fresh pass: the tower runs every picture
++        try std.testing.expectEqual(want, [2]usize{ c.begin, c.end });
++    }
++    try std.testing.expect(e0.media_attached == null and !e0.media_reserved); // detached at the pass's end
++    const k128 = adopter.saved[1];
++    B.releaseFn(&r0, &s1);
++    // 2. a resume at 128: the first two pictures are wholly in the kept state, so the tower runs from the third
++    e0.media_calls.clearRetainingCapacity();
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = k128, .at = 128 } });
++    defer s2.deinit(gpa);
++    try B.prefillFn(&r0, &s2);
++    try std.testing.expectEqual(@as(u32, 128), s2.cached);
++    try std.testing.expectEqual(@as(usize, 1), e0.media_calls.items.len);
++    try std.testing.expectEqual(@as(usize, 2), e0.media_calls.items[0].from_item);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), (try firstToken(B, &r0, &s2)));
++    try std.testing.expect(e0.media_attached == null);
++    B.releaseFn(&r0, &s2);
++    // 3. a picture prompt refused before its sequence (no tower on rank 0) leaves no sequence and nothing attached
++    e0.vision = false;
++    const seqs = e0.seqs;
++    var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &prompt, .max_new = 4, .media = &media });
++    defer s3.deinit(gpa);
++    try std.testing.expectError(error.NoVisionTower, B.prefillFn(&r0, &s3));
++    try std.testing.expectEqual(seqs, e0.seqs);
++    try std.testing.expect(!e0.media_reserved);
++    r0.deinit();
++    try std.testing.expectEqual(@as(usize, 0), e0.snaps);
++    try std.testing.expectEqual(@as(usize, 0), e0.seqs);
++}
++
+ test "TF_GLM_KV_SHARD: rank 0's placements reach rank 1 with the calls; one of its own elsewhere ends the pair, and with the check any other layout does" {
+     const gpa = std.testing.allocator;
+     const Pool = @import("cuda_pool.zig").Pool;
+@@ -2910,7 +2998,10 @@ test "TF_GLM_FILL: a prompt with pictures runs whole at its begin (its rows come
+     const pic = testPrompt(23);
+     var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
+     defer sa.deinit(gpa);
+-    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 } };
++    // one picture of three rows, its canvas as the tower takes it (the engine checks the media before the pass)
++    const px: [3 * 28 * 84]u8 = @splat(4);
++    const items = [_]lanes.MediaItem{.{ .h = 28, .w = 84, .data = &px }};
++    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 }, .items = &items };
+     var sm = try lanes.Stream.init(gpa, .{ .id = "m", .prompt = &pic, .max_new = 4, .media = &media });
+     defer sm.deinit(gpa);
+     try p.begin(&sa, &sa);
+@@ -2933,6 +3024,68 @@ test "TF_GLM_FILL: a prompt with pictures runs whole at its begin (its rows come
+     }
+ }
+ 
++test "TF_GLM_FILL with pictures and marks: the whole pass at the begin attaches them once, every mark's segment injects them, both ranks keep the marks; a resume runs the tower from the first picture past its cut" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    p.init(gpa, all_yes, all_yes);
++    defer p.deinit();
++    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
++    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
++    var prompt: [200]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast(i * 7 % 101);
++    const px: [3 * 28 * 84]u8 = @splat(4);
++    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
++    const rows = [_]u32{ 10, 11, 12, 100, 101, 102, 170, 171, 172 };
++    for (rows) |r| prompt[r] = 99;
++    const media: lanes.Media = .{ .rows = &rows, .items = &items };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    try p.begin(&s1, &s1);
++    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| {
++        try std.testing.expectEqual(@as(usize, 1), e.media_attaches);
++        try std.testing.expectEqual(@as(usize, 3), e.media_calls.items.len);
++        for (e.media_calls.items, [_][2]usize{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 200 } }) |c, want| {
++            try std.testing.expect(c.attached and c.from_item == 0);
++            try std.testing.expectEqual(want, [2]usize{ c.begin, c.end });
++        }
++        try std.testing.expect(e.media_attached == null and !e.media_reserved); // detached at the pass's end
++        try std.testing.expectEqual(@as(usize, 0), e.fills_live + e.chunk_log.items.len); // no fill, no chunk
++    }
++    var st: [1]be.FillState = undefined;
++    try p.step(&.{&s1}, &.{&s1}, &st);
++    try std.testing.expectEqual(be.FillState.done, st[0]);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s1));
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s1));
++    const k0 = try keptAts(gpa, &p.r0);
++    defer gpa.free(k0);
++    const k1 = try keptAts(gpa, &p.r1);
++    defer gpa.free(k1);
++    try std.testing.expectEqualSlices(u32, &.{128}, k0); // (the store dropped 64 at the second mark)
++    try std.testing.expectEqualSlices(u32, k0, k1);
++    const k128 = adopter.saved[1];
++    SlicedPair.B.releaseFn(&p.r0, &s1);
++    SlicedPair.B.releaseFn(&p.r1, &s1);
++    // a resume at 128: whole at its begin too, the tower from the third picture (the first two are in the state)
++    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| e.media_calls.clearRetainingCapacity();
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = k128, .at = 128 } });
++    defer s2.deinit(gpa);
++    var s2b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = p.r1.savedFor(p.r0.keptOf(k128).?.key), .at = 128 } });
++    defer s2b.deinit(gpa);
++    try p.begin(&s2, &s2b);
++    try std.testing.expectEqual(@as(u32, 128), s2.cached);
++    try std.testing.expectEqual(@as(u32, 128), s2b.cached);
++    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| {
++        try std.testing.expectEqual(@as(usize, 1), e.media_calls.items.len);
++        try std.testing.expectEqual(@as(usize, 2), e.media_calls.items[0].from_item);
++        try std.testing.expect(e.media_attached == null);
++    }
++    try p.step(&.{&s2}, &.{&s2b}, &st);
++    try std.testing.expectEqual(be.FillState.done, st[0]);
++    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s2));
++    SlicedPair.B.releaseFn(&p.r0, &s2);
++    SlicedPair.B.releaseFn(&p.r1, &s2b);
++}
++
+ test "TF_GLM_KV_SHARD with TF_GLM_FILL: a fill borrows no rows (its history is fetched), so nothing is lent between its steps; the placements still check" {
+     const gpa = std.testing.allocator;
+     const Pool = @import("cuda_pool.zig").Pool;
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+index aa110f72c4e4975f8d71c4cce9c77d1598b2f58e..370552d4972941e63c077827130550f7271f9ca6 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+@@ -35,7 +35,7 @@ pub const HostEngine = struct {
+     pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
+     pub const Buf = struct { ptr: u64, bytes: []u8 };
+     pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
+     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
+     pub const Window = struct { seq: *Seq, tokens: []const u32 };
+     pub const DraftReq = struct { seq: *Seq };
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 3078e4272408e388487a959b38cff8551b953c83..61d645d9cb26a5a5a81e2a4af9407dd6395647e4 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -230,6 +230,8 @@ const Host = struct {
+         if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
+         h.host.kv_parts = h.kv_parts;
+         h.host.cache = h.store;
++        // GLM vision: TF_GLM_IMAGE_MARK_SNAP=1 keeps no state cut inside a picture (LaneHost.mark_snap)
++        if (info.media) h.host.mark_snap = api.prompt_cache.markSnapOn(getenv("TF_GLM_IMAGE_MARK_SNAP"));
+         if (h.spill) |sp| h.host.configure(sp); // (after the tier is set: it publishes telemetry only over one)
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         if (h.learn != null) h.host.learner = h.learner();
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index a9798fc76e6344cf3eef4e70505e8005380f75ff..2433843c5c9be563491f5278593eb1fa949e416e 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -223,6 +223,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk), // a cut before the conversation's own text: fresh sessions resume their whole harness
+         .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
+         .media = rendered.media,
++        .cache_key = rendered.key,
++        .cache_media = rendered.cache_media,
+         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+     };
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index e619fa33f6c01388cd47b86e8cc134b7d770441b..7ce05a0bba1b68822eb6a1e8b27c7bac088fc0f9 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -11,11 +11,14 @@ const api = @import("engine_api");
+ const vision = @import("vision");
+ const helper_mod = @import("vision_helper.zig");
+ const vision_server = @import("vision_server.zig");
++const Vision = vision_server.Vision;
+ const log = @import("log.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null };
++/// `key` and `cache_media`: with `media`, the prompt cache's ids for the prompt and each item's identity
++/// (prompt_cache.prompt_media.keyOf); empty when the media are not keyed (the prompt is then neither kept nor resumed).
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null, key: []const u32 = &.{}, cache_media: []const api.prompt_cache.Media = &.{} };
+ 
+ /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
+ pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
+@@ -128,7 +131,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+ 
+ /// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, marked, the
+ /// media in order), normalized with their parts, rendered, then the vision backend: the token ids and the media the
+-/// engine takes. Such a prompt is neither kept nor resumed.
++/// engine takes, keyed by their content for the prompt cache when the engine's tower encodes them (`keyMedia`).
+ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+     const v = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+     if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+@@ -195,11 +198,28 @@ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinkin
+             m.check(ids.len) catch return cx.fail(.server, "the picture rows do not fit the prompt", .{});
+             const t1 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
+             log.line("vision: {d} image(s), {d} clip(s): {d} visual tokens of {d} prompt tokens (frontend {d:.3}s)", .{ media.pictures.len, media.clips.len, fin.positions.len, ids.len, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
+-            return .{ .ids = ids, .media = m };
++            return keyMedia(srv, cx, .{ .ids = ids, .media = m }, thinking);
+         },
+     }
+ }
+ 
++/// A prompt with pictures keyed for the prompt cache: each item's canvas hashed (prompt_cache.prompt_media.keyOf), its
++/// positions' cache ids made from the digest, and the history (the prompt before the template's generation prompt)
++/// named so a later turn resumes it. TF_GLM_IMAGE_CACHE=0 (read with prompt_cache.imageCacheOn: exactly "0"), media
++/// that cannot be keyed (features, an item split across runs) or a cache-less engine: unkeyed, as before (nothing kept
++/// or resumed, no history).
++pub fn keyMedia(srv: *Server, cx: *Cx, r: Rendered, thinking: bool) errors.Refused!Rendered {
++    const m = r.media orelse return r;
++    if (!srv.info.prompt_cache or !api.prompt_cache.imageCacheOn(Vision.getenv("TF_GLM_IMAGE_CACHE"))) return r;
++    const k = (try api.prompt_cache.prompt_media.keyOf(cx.a, r.ids, m)) orelse return r;
++    var out = r;
++    out.key = k.keyed;
++    out.cache_media = k.media;
++    var probe: Cx = .{ .a = cx.a }; // a template that refuses the probe leaves the prompt without a history
++    out.history_len = api.prompt_cache.prompt_media.historyLen(r.ids, generationPrompt(srv, &probe, thinking) catch &.{}, k.media);
++    return out;
++}
++
+ fn mediaFailure(cx: *Cx, e: anyerror, diag: *vision.errors.Diag) errors.Refused {
+     return switch (e) {
+         error.OutOfMemory => error.OutOfMemory,

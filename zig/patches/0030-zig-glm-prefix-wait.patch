@@ -1,0 +1,637 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 4bab856b97f4..1305bda37155); regenerate with scripts/port-patches.sh, do not edit
+lane host: a sliced fill waits for the shared cut another fill is computing (TF_GLM_PREFIX_WAIT, wojo's GLM 0110)
+
+With TF_GLM_FILL=1 prompts that arrive together all fill at once, so eight
+requests on one fresh 28k-token system prompt each computed it (prefix_fanout:
+31,488 / 85,440 / 199,360 duplicate tokens at 2 / 4 / 8 concurrent). Whole
+passes never did: each ends before the next request's lookup.
+
+- lane_host: before a request takes a lane (after spill v2's parking), when an
+  admitted fill still has a mark ahead that the request's prompt shares, that
+  its own lookup would resume and that adds at least the shared-prefix minimum
+  past its memory hit, it waits for the furthest such mark on the prefix list
+  (no lane, counted waiting). It goes to the ready list when that fill has
+  stood at the mark, its prompt is in, it left (cancelled, failed, requeued)
+  or TF_GLM_PREFIX_WAIT_MS passed; its ordinary lookup resumes the cut. A
+  request waits only for an admitted fill and only once: no cycle, the oldest
+  fill always runs. Only with sliced fills and a prompt cache; never for
+  pictures. Counters prefix_waits, prefix_wait_tokens, prefix_wait_timeouts.
+- prompt_cache: Store.waitLeast (the recipe's shared_least; 0: no shared cuts,
+  no wait) and Store.wouldServe (a state another pass will keep, judged as
+  find judges a kept one).
+- native/cuda: TF_GLM_PREFIX_WAIT (1 default, 0 off) and TF_GLM_PREFIX_WAIT_MS
+  (60000 default, 0 off), read when the core slices fills over a cache; bad
+  values fail the start with words.
+
+Tests (core/lane_host_prefix_test.zig, fake sliced backend): 4 requests on one
+system prompt compute it once (3 resume at the cut, replies serial), an
+unrelated prompt neither waits nor is waited for; a cancelled leader releases
+its waiter; a cancelled waiter leaves once; the bound expires; whole passes and
+the wait off unchanged; a run under the minimum is not waited for; the setting.
+5 of the 8 failed before the host logic.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); spill v2's block store design (2,048-token blocks, lineage, the write-at-keep ring, release and fsync order): BadAd84 (https://github.com/BadAd84), MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118.
+Apply from the checkout root with: git apply 0030-zig-glm-prefix-wait.patch
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index dc63cfe47376eb381e0b7f1eb40409fe42fa87f4..2226dec41ed475306b30918707989e2bdd4c8736 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -585,6 +585,7 @@ test {
+     _ = @import("lane_host_reuse_test.zig");
+     _ = @import("lane_host_warm_test.zig");
+     _ = @import("lane_host_tier_test.zig");
++    _ = @import("lane_host_prefix_test.zig");
+     _ = @import("prompt_cache_media_test.zig");
+     _ = @import("prompt_cache.zig");
+     _ = @import("prompt_media.zig");
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 35ada2b18b0ddb7d93f798237da616ced375bf32..28c8291feb37dc9574e3d5d46002fd1881b92707 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -77,6 +77,12 @@ pub const LaneHost = struct {
+     /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+     kv_parts: ?lanes.kv_parts.Source = null,
+     kv_tele: ?api.KvParts = null,
++    /// The prefix wait's bound (TF_GLM_PREFIX_WAIT_MS, prefixWaitSetting; 0: off). With prompts filling in slices
++    /// between rounds (GLM's TF_GLM_FILL), a request whose prompt shares a cut another admitted fill is still computing
++    /// waits for that fill to keep it (prefixWait), holding no lane, at most this long; whole passes never wait (each
++    /// ends before the next request is admitted, which then finds its cut kept).
++    prefix_wait_ns: i96 = 0,
++    prefixed: std.ArrayList(PrefixWait) = .empty, // requests waiting for a cut another fill is computing, in arrival order
+ 
+     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
+     /// How often an idle host polls work in flight (restores, staged writes, deferred retries).
+@@ -86,6 +92,11 @@ pub const LaneHost = struct {
+ 
+     /// A request parked on `restore` since `since` (`passes`: passes_ns then).
+     const Load = struct { job: *Job, restore: *pc.Restore, since: i96, passes: u64 };
++    /// A request waiting since `since` for `leader` (an admitted fill, still named by `leader_id`) to keep its cut at `at`.
++    const PrefixWait = struct { job: *Job, leader: *Job, leader_id: Id, at: u32, since: i96 };
++    /// TF_GLM_PREFIX_WAIT_MS unset: the bound (a 28K-token system prompt fills in ~14 s on the pair; a waiter whose fill
++    /// outlasts it computes the prefix itself, which is no worse than not waiting).
++    pub const prefix_wait_default_ms: u32 = 60_000;
+     /// A request waiting to ask again at `retry_at`; `until_end`: also as soon as no restore is left in flight.
+     const Defer = struct { job: *Job, retry_at: i96, until_end: bool = false };
+ 
+@@ -126,8 +137,23 @@ pub const LaneHost = struct {
+         prefills_held_expired: u64 = 0, // of them, admitted at defer_ns while requests were still parked
+         cached_tokens: u64 = 0, // prompt tokens passes resumed (memory or restored)
+         computed_tokens: u64 = 0, // and computed
++        prefix_waits: u64 = 0, // requests that waited for a cut another fill was computing (prefixWait)
++        prefix_wait_tokens: u64 = 0, // the prompt tokens past their own hit those cuts held (not computed again)
++        prefix_wait_timeouts: u64 = 0, // of them, admitted at the bound with the cut still not kept
+     };
+ 
++    /// TF_GLM_PREFIX_WAIT (`on`: unset, blank or 1 on; 0 off) and TF_GLM_PREFIX_WAIT_MS (`ms`: unset or blank the
++    /// default bound, else whole milliseconds; 0 off): the prefix wait's bound in ns, 0 when off. Anything else is
++    /// error.BadPrefixWait.
++    pub fn prefixWaitSetting(on: ?[]const u8, ms: ?[]const u8) error{BadPrefixWait}!i96 {
++        const o = std.mem.trim(u8, on orelse "", " \t");
++        if (std.mem.eql(u8, o, "0")) return 0;
++        if (o.len > 0 and !std.mem.eql(u8, o, "1")) return error.BadPrefixWait;
++        const m = std.mem.trim(u8, ms orelse "", " \t");
++        const n: u32 = if (m.len == 0) prefix_wait_default_ms else if (m[0] < '0' or m[0] > '9') return error.BadPrefixWait else std.fmt.parseInt(u32, m, 10) catch return error.BadPrefixWait;
++        return @as(i96, n) * std.time.ns_per_ms;
++    }
++
+     const Job = struct {
+         host: *LaneHost,
+         id: Id,
+@@ -154,10 +180,13 @@ pub const LaneHost = struct {
+         parent: ?u64 = null, // the durable point its pass resumes from, and where (spill v2's lineage)
+         fork: u32 = 0,
+         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
++        reached: u32 = 0, // the furthest mark its pass has stood at (kept or refused): a prefix waiter's cut is past then
++        prefix_waited: bool = false, // it waited once for another fill's cut (prefixWait): it never waits again
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
++            job.reached = @max(job.reached, at); // (requests waiting for this cut go on: kept or not, it is done)
+             job.reported(); // before a keep can evict the entry the pass restored
+             if (job.host.cache) |store| {
+                 _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
+@@ -268,6 +297,7 @@ pub const LaneHost = struct {
+         h.ready.deinit(h.gpa);
+         h.loading.deinit(h.gpa);
+         h.deferred.deinit(h.gpa);
++        h.prefixed.deinit(h.gpa);
+     }
+ 
+     pub fn engine(h: *LaneHost) Engine {
+@@ -349,7 +379,7 @@ pub const LaneHost = struct {
+ 
+     /// Requests parked or woken (the lock held).
+     pub fn waitingCount(h: *const LaneHost) usize {
+-        return h.ready.items.len + h.loading.items.len + h.deferred.items.len;
++        return h.ready.items.len + h.loading.items.len + h.deferred.items.len + h.prefixed.items.len;
+     }
+ 
+     /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
+@@ -418,6 +448,10 @@ pub const LaneHost = struct {
+                 dropped.append(h.gpa, h.deferred.orderedRemove(i).job) catch {};
+                 break;
+             };
++            for (h.prefixed.items, 0..) |w, i| if (w.job.id == id) {
++                dropped.append(h.gpa, h.prefixed.orderedRemove(i).job) catch {};
++                break;
++            };
+         }
+         h.mutex.unlock(h.io);
+         // a restore no request waits for any more stops (its reads, DMA and reservations go), exactly once
+@@ -474,6 +508,10 @@ pub const LaneHost = struct {
+             if (h.park(job)) return .parked; // waits for a restore, holding no lane
+             h.lock();
+         }
++        if (h.prefixWait(job)) { // waits for the cut another fill is computing, holding no lane
++            h.unlock();
++            return .parked;
++        }
+         h.admitted.append(h.gpa, job) catch {
+             h.unlock();
+             h.finish(job, .failed, "out of memory");
+@@ -852,6 +890,7 @@ pub const LaneHost = struct {
+         job.started = false;
+         job.fill_began = false;
+         job.entry = null; // looked up again at its next admission
++        job.reached = 0;
+         job.join = .{};
+         job.parent = null;
+         job.fork = 0;
+@@ -896,6 +935,7 @@ pub const LaneHost = struct {
+         while (true) {
+             h.takeCancels();
+             if (h.parking()) h.unhold();
++            h.releasePrefix(); // (before the admissions: a waiter whose cut is kept resumes it now)
+             h.admitAll(); // (its prompt passes are timed: nothing is serviced meanwhile, so restore waits leave them out)
+             if (h.parking() and h.entryHeld()) h.held_from = std.Io.Clock.awake.now(h.io).toNanoseconds(); // (no restore begins or progresses: waits leave it out too)
+             h.fillOne();
+@@ -972,10 +1012,85 @@ pub const LaneHost = struct {
+         for (h.ready.items) |job| h.cancels.append(h.gpa, job.id) catch {};
+         for (h.loading.items) |l| h.cancels.append(h.gpa, l.job.id) catch {};
+         for (h.deferred.items) |d| h.cancels.append(h.gpa, d.job.id) catch {};
++        for (h.prefixed.items) |w| h.cancels.append(h.gpa, w.job.id) catch {};
+         h.unlock();
+         h.takeCancels();
+     }
+ 
++    // -- the prefix wait (TF_GLM_PREFIX_WAIT; wojo's GLM 0110 as the Zig lane host has it) ---------------------------
++
++    /// Before `job` takes a lane (the lock held): with prompts filling in slices between rounds, requests that start
++    /// together on a system prompt nobody has kept yet would each compute it, side by side, each at a share of the GPU
++    /// (prefix_fanout: 31K / 85K / 199K duplicate tokens at 2 / 4 / 8 at once on a 28K-token prompt). When an admitted
++    /// fill still has a mark ahead (past the furthest it has stood at) that `job`'s prompt shares, which its own lookup
++    /// would resume (Store.wouldServe) and which adds at least the shared-prefix minimum past what memory holds for it
++    /// now (Store.waitLeast), `job` waits for the furthest such mark on the prefix list (no lane, counted waiting) and
++    /// true; releasePrefix wakes it when that fill has stood there, its prompt is in, it left (cancelled, failed,
++    /// requeued) or the bound passed, to the ready list, where its ordinary lookup resumes the cut. Never deadlocks: a
++    /// request waits only for an admitted fill, which never waits, and only once (`prefix_waited`). Off (false at once)
++    /// with whole passes (each ends before the next admission, which finds its cut kept), without a cache, for
++    /// pictures, and at prefix_wait_ns 0.
++    fn prefixWait(h: *LaneHost, job: *Job) bool {
++        if (h.prefix_wait_ns <= 0 or job.prefix_waited or !h.core.slices()) return false;
++        const store = h.cache orelse return false;
++        const r = job.request;
++        const least = store.waitLeast();
++        if (least == 0 or r.media != null or !cacheable(r)) return false;
++        const key = keyOf(r);
++        const rows = h.spans(r);
++        const have: u32 = if (store.find(key, r.chunks, rows)) |e| e.at else 0;
++        var best: ?PrefixWait = null;
++        for (h.admitted.items) |l| {
++            if (!l.started or l.prefilled != null or l.request.media != null) continue;
++            for (l.stream.reuse.marks) |at| {
++                if (at <= l.reached or at < have +| least or (best != null and at <= best.?.at)) continue;
++                if (!store.wouldServe(key, r.chunks, rows, keyOf(l.request), h.spans(l.request), at)) continue;
++                best = .{ .job = job, .leader = l, .leader_id = l.id, .at = at, .since = 0 };
++            }
++        }
++        var w = best orelse return false;
++        w.since = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        h.prefixed.append(h.gpa, w) catch return false;
++        job.prefix_waited = true;
++        h.host_counts.prefix_waits += 1;
++        h.host_counts.prefix_wait_tokens += w.at - have;
++        info("a request waits for the {d}-token prefix another prompt is filling ({d} ms at most)", .{ w.at, @divTrunc(h.prefix_wait_ns, std.time.ns_per_ms) });
++        return true;
++    }
++
++    /// Requests on the prefix list whose fill has stood at their cut (kept or refused), whose fill's prompt is in, or
++    /// which is no longer admitted (cancelled, failed, requeued), or whose bound passed, go to the ready list in arrival
++    /// order (engine thread, before the admissions).
++    fn releasePrefix(h: *LaneHost) void {
++        if (h.prefixed.items.len == 0) return;
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        var moved = false;
++        var i: usize = 0;
++        while (i < h.prefixed.items.len) {
++            const w = h.prefixed.items[i];
++            const leader = for (h.admitted.items) |j| {
++                if (j == w.leader and j.id == w.leader_id) break j;
++            } else null;
++            const done = if (leader) |l| !l.started or l.prefilled != null or l.reached >= w.at else true;
++            if (!done and now - w.since < h.prefix_wait_ns) {
++                i += 1;
++                continue;
++            }
++            if (!done) {
++                h.host_counts.prefix_wait_timeouts += 1;
++                note("a request waited {d} ms for the {d}-token prefix another prompt is filling; it fills its own now", .{ @divTrunc(now - w.since, std.time.ns_per_ms), w.at });
++            }
++            h.lock();
++            _ = h.prefixed.orderedRemove(i);
++            h.toReady(w.job); // (releases the lock)
++            moved = true;
++        }
++        if (!moved) return;
++        h.lock();
++        h.wake.signal(h.io);
++        h.unlock();
++    }
++
+     // -- parked work (spill v2) -----------------------------------------------------------------------------------
+ 
+     /// Whether admission may park a request: the cache has a durable tier.
+diff --git a/zig/src/core/lane_host_prefix_test.zig b/zig/src/core/lane_host_prefix_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d842c1afdbaaa5ca42537f9b2773909531a6a2e
+--- /dev/null
++++ b/zig/src/core/lane_host_prefix_test.zig
+@@ -0,0 +1,328 @@
++//! LaneHost's prefix wait (TF_GLM_PREFIX_WAIT, wojo's GLM 0110 on the Zig lane host): with prompts filling in slices
++//! between rounds (GLM's TF_GLM_FILL), a request whose prompt shares a cut another fill is still computing waits for
++//! that fill to keep it, then resumes from it, instead of computing the same prefix beside it (the fake backend).
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const LaneHost = api.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++
++const gpa = std.testing.allocator;
++
++/// A lane host over the fake backend (sliced or whole passes) with GLM's kept-state policy: shared cuts of 16 tokens
++/// or more, marks 4 apart. Requests are submitted before `start`, so every one is queued at the first admission.
++const Rig = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    store: pc.Store,
++    host: LaneHost,
++
++    const vt: pc.Snapshots.VTable = .{ .bytes = bytes, .save = save, .restore = restore, .drop = drop };
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++
++    const Opts = struct { sliced: bool = true, slice: usize = 2, wait_ns: i96 = 30 * std.time.ns_per_s, lanes: u32 = 8 };
++
++    fn init(r: *Rig, o: Opts) !void {
++        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        r.target = .{ .gpa = gpa, .slice = o.slice };
++        r.clock = .{};
++        r.core = lanes.Engine.init(gpa, &r.cfg, if (o.sliced) r.target.backendSliced() else r.target.backend(), r.clock.clock());
++        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &vt }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 24);
++        r.store.policy = .{ .recipe = true, .shared_least = 16 };
++        r.host = LaneHost.init(gpa, std.testing.io, &r.core, .{ .lanes = o.lanes });
++        r.host.cache = &r.store;
++        r.host.prefix_wait_ns = o.wait_ns;
++    }
++
++    fn deinit(r: *Rig) void {
++        r.host.stop();
++        r.store.deinit();
++        r.core.deinit();
++        r.target.deinit();
++        r.cfg.deinit(gpa);
++    }
++
++    fn counts(r: *Rig) LaneHost.HostCounts {
++        r.host.mutex.lockUncancelable(std.testing.io);
++        defer r.host.mutex.unlock(std.testing.io);
++        return r.host.host_counts;
++    }
++
++    /// Until a request waits for a prefix (2 s at most: a host that never waits fails here, never hangs).
++    fn waitForWaiter(r: *Rig) !void {
++        for (0..2000) |_| {
++            if (r.counts().prefix_waits > 0) return;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.NothingWaited;
++    }
++
++    fn waiting(r: *Rig) usize {
++        r.host.mutex.lockUncancelable(std.testing.io);
++        defer r.host.mutex.unlock(std.testing.io);
++        return r.host.waitingCount();
++    }
++};
++
++/// One request: its prompt's last two tokens are the generation prompt, its system block `system_len` long.
++const Turn = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++    prompt: std.ArrayList(u32) = .empty,
++    request: Request = undefined,
++    cut: [1]u32 = undefined,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Turn = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .logprobs => {},
++            .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++            .finished => |f| b.done = f.reason,
++        }
++    }
++
++    /// `system` then `tail`, then the generation prompt; the system block's end is the request's shared cut.
++    fn make(b: *Turn, system: []const u32, tail: []const u32) !void {
++        try b.prompt.appendSlice(gpa, system);
++        try b.prompt.appendSlice(gpa, tail);
++        try b.prompt.appendSlice(gpa, &.{ 7, 7 });
++        b.cut = .{@intCast(system.len)};
++        b.request = .{ .prompt = b.prompt.items, .max_tokens = 6, .history_len = @intCast(b.prompt.items.len - 2), .shared_prefixes = &b.cut };
++    }
++
++    fn submit(b: *Turn, e: api.Engine, id: Id) !void {
++        try e.submit(id, &b.request, .{ .ctx = b, .event = event });
++    }
++
++    fn wait(b: *Turn) Reason {
++        while (true) {
++            b.mutex.lockUncancelable(std.testing.io);
++            const d = b.done;
++            b.mutex.unlock(std.testing.io);
++            if (d) |reason| return reason;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++
++    /// Its reply is the fake's own continuation of its prompt (any slip in a resumed state changes it).
++    fn expectSerial(b: *Turn) !void {
++        var history: std.ArrayList(u32) = .empty;
++        defer history.deinit(gpa);
++        try history.appendSlice(gpa, b.prompt.items);
++        for (b.tokens.items) |t| {
++            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++            try history.append(gpa, t);
++        }
++    }
++
++    fn deinit(b: *Turn) void {
++        b.tokens.deinit(gpa);
++        b.prompt.deinit(gpa);
++    }
++};
++
++fn systemOf(n: usize, salt: u32) ![]u32 {
++    const s = try gpa.alloc(u32, n);
++    for (s, 0..) |*x, i| x.* = 20 + @as(u32, @intCast((i * 7 + salt) % 53));
++    return s;
++}
++
++test "sliced fills on one shared system prompt compute it once: the oldest fills, the others wait and resume at its cut" {
++    var r: Rig = undefined;
++    try r.init(.{});
++    defer r.deinit();
++    const sys = try systemOf(40, 0);
++    defer gpa.free(sys);
++    const other = try systemOf(40, 5); // a prompt sharing nothing: it neither waits nor is waited for
++    defer gpa.free(other);
++    var turns: [5]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    for (turns[0..4], 0..) |*t, i| try t.make(sys, &.{ 100 + @as(u32, @intCast(i)), 3, 1, 4, 1, 5 });
++    try turns[4].make(other, &.{ 9, 9, 9, 9, 9, 9 });
++    const e = r.host.engine();
++    for (&turns, 1..) |*t, id| try t.submit(e, id);
++    try r.host.start();
++    for (&turns) |*t| {
++        try std.testing.expectEqual(Reason.length, t.wait());
++        try t.expectSerial();
++    }
++    try std.testing.expectEqual(@as(?u32, 0), turns[0].cached);
++    for (turns[1..4]) |*t| try std.testing.expectEqual(@as(?u32, 40), t.cached); // resumed at the leader's cut
++    try std.testing.expectEqual(@as(?u32, 0), turns[4].cached);
++    const c = r.counts();
++    try std.testing.expectEqual(@as(u64, 3), c.prefix_waits);
++    try std.testing.expectEqual(@as(u64, 3 * 40), c.prefix_wait_tokens);
++    try std.testing.expectEqual(@as(u64, 0), c.prefix_wait_timeouts);
++    // the shared 40 tokens computed once: the leader's whole prompt, the others' tails, the unrelated prompt's whole
++    try std.testing.expectEqual(@as(u64, 48 + 3 * 8 + 48), c.computed_tokens);
++    try std.testing.expectEqual(@as(usize, 0), r.waiting());
++}
++
++test "a waiter of a cancelled fill goes on at once: it prefills the prefix itself, exactly" {
++    var r: Rig = undefined;
++    try r.init(.{ .slice = 1 });
++    defer r.deinit();
++    const sys = try systemOf(20000, 1); // thousands of steps: the cancel lands mid-fill
++    defer gpa.free(sys);
++    var turns: [2]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    try turns[0].make(sys, &.{ 1, 2, 3, 4 });
++    try turns[1].make(sys, &.{ 5, 6, 7, 8 });
++    const e = r.host.engine();
++    try turns[0].submit(e, 1);
++    try turns[1].submit(e, 2);
++    try r.host.start();
++    try r.waitForWaiter();
++    e.cancel(1);
++    try std.testing.expectEqual(Reason.cancelled, turns[0].wait());
++    try std.testing.expectEqual(Reason.length, turns[1].wait());
++    try turns[1].expectSerial();
++    try std.testing.expectEqual(@as(?u32, 0), turns[1].cached); // nothing was kept: it computed the prefix
++    const c = r.counts();
++    try std.testing.expectEqual(@as(u64, 1), c.prefix_waits);
++    try std.testing.expectEqual(@as(u64, 0), c.prefix_wait_timeouts);
++    try std.testing.expectEqual(@as(usize, 0), r.waiting());
++}
++
++test "a cancelled waiter leaves the wait list once; the fill it waited for runs on" {
++    var r: Rig = undefined;
++    try r.init(.{ .slice = 1 });
++    defer r.deinit();
++    const sys = try systemOf(20000, 2);
++    defer gpa.free(sys);
++    var turns: [2]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    try turns[0].make(sys, &.{ 1, 2, 3, 4 });
++    try turns[1].make(sys, &.{ 5, 6, 7, 8 });
++    const e = r.host.engine();
++    try turns[0].submit(e, 1);
++    try turns[1].submit(e, 2);
++    try r.host.start();
++    try r.waitForWaiter();
++    e.cancel(2);
++    try std.testing.expectEqual(Reason.cancelled, turns[1].wait());
++    try std.testing.expectEqual(Reason.length, turns[0].wait());
++    try turns[0].expectSerial();
++    try std.testing.expectEqual(@as(usize, 0), r.waiting());
++}
++
++test "a prefix wait is bounded (TF_GLM_PREFIX_WAIT_MS): past it the waiter prefills beside the fill, exactly" {
++    var r: Rig = undefined;
++    try r.init(.{ .slice = 1, .wait_ns = 1 }); // the bound expires at the first check
++    defer r.deinit();
++    const sys = try systemOf(4000, 3);
++    defer gpa.free(sys);
++    var turns: [2]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    try turns[0].make(sys, &.{ 1, 2, 3, 4 });
++    try turns[1].make(sys, &.{ 5, 6, 7, 8 });
++    const e = r.host.engine();
++    try turns[0].submit(e, 1);
++    try turns[1].submit(e, 2);
++    try r.host.start();
++    for (&turns) |*t| {
++        try std.testing.expectEqual(Reason.length, t.wait());
++        try t.expectSerial();
++    }
++    try std.testing.expectEqual(@as(?u32, 0), turns[1].cached);
++    const c = r.counts();
++    try std.testing.expectEqual(@as(u64, 1), c.prefix_waits);
++    try std.testing.expectEqual(@as(u64, 1), c.prefix_wait_timeouts);
++}
++
++test "whole prompt passes are unchanged: nothing waits (each pass ends before the next is admitted), the cut still serves" {
++    var r: Rig = undefined;
++    try r.init(.{ .sliced = false });
++    defer r.deinit();
++    const sys = try systemOf(40, 0);
++    defer gpa.free(sys);
++    var turns: [4]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    for (&turns, 0..) |*t, i| try t.make(sys, &.{ 100 + @as(u32, @intCast(i)), 3, 1, 4, 1, 5 });
++    const e = r.host.engine();
++    for (&turns, 1..) |*t, id| try t.submit(e, id);
++    try r.host.start();
++    for (&turns) |*t| {
++        try std.testing.expectEqual(Reason.length, t.wait());
++        try t.expectSerial();
++    }
++    for (turns[1..]) |*t| try std.testing.expectEqual(@as(?u32, 40), t.cached);
++    const c = r.counts();
++    try std.testing.expectEqual(@as(u64, 0), c.prefix_waits);
++    try std.testing.expectEqual(@as(u64, 48 + 3 * 8), c.computed_tokens);
++}
++
++test "the prefix wait off (0): sliced fills on one system prompt each compute it, as before" {
++    var r: Rig = undefined;
++    try r.init(.{ .wait_ns = 0 });
++    defer r.deinit();
++    const sys = try systemOf(40, 0);
++    defer gpa.free(sys);
++    var turns: [3]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    for (&turns, 0..) |*t, i| try t.make(sys, &.{ 100 + @as(u32, @intCast(i)), 3, 1, 4, 1, 5 });
++    const e = r.host.engine();
++    for (&turns, 1..) |*t, id| try t.submit(e, id);
++    try r.host.start();
++    for (&turns) |*t| {
++        try std.testing.expectEqual(Reason.length, t.wait());
++        try t.expectSerial();
++        try std.testing.expectEqual(@as(?u32, 0), t.cached);
++    }
++    try std.testing.expectEqual(@as(u64, 0), r.counts().prefix_waits);
++}
++
++test "a shared run under the shared-prefix minimum is not waited for" {
++    var r: Rig = undefined;
++    try r.init(.{});
++    defer r.deinit();
++    const sys = try systemOf(12, 0); // 12 < shared_least 16
++    defer gpa.free(sys);
++    var turns: [2]Turn = @splat(.{});
++    defer for (&turns) |*t| t.deinit();
++    for (&turns, 0..) |*t, i| try t.make(sys, &.{ 100 + @as(u32, @intCast(i)), 3, 1, 4, 1, 5 });
++    const e = r.host.engine();
++    for (&turns, 1..) |*t, id| try t.submit(e, id);
++    try r.host.start();
++    for (&turns) |*t| {
++        try std.testing.expectEqual(Reason.length, t.wait());
++        try t.expectSerial();
++    }
++    try std.testing.expectEqual(@as(u64, 0), r.counts().prefix_waits);
++}
++
++test "TF_GLM_PREFIX_WAIT / TF_GLM_PREFIX_WAIT_MS: on by default for 60 s, a bound in ms, 0 off; anything else refused" {
++    const ms = std.time.ns_per_ms;
++    try std.testing.expectEqual(@as(i96, 60_000 * ms), try LaneHost.prefixWaitSetting(null, null));
++    try std.testing.expectEqual(@as(i96, 60_000 * ms), try LaneHost.prefixWaitSetting("1", " "));
++    try std.testing.expectEqual(@as(i96, 2_500 * ms), try LaneHost.prefixWaitSetting(null, "2500"));
++    try std.testing.expectEqual(@as(i96, 0), try LaneHost.prefixWaitSetting("0", "2500"));
++    try std.testing.expectEqual(@as(i96, 0), try LaneHost.prefixWaitSetting("1", "0"));
++    try std.testing.expectError(error.BadPrefixWait, LaneHost.prefixWaitSetting("yes", null));
++    try std.testing.expectError(error.BadPrefixWait, LaneHost.prefixWaitSetting(null, "-5"));
++    try std.testing.expectError(error.BadPrefixWait, LaneHost.prefixWaitSetting(null, "1s"));
++}
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 35adf0c9c2c5ca515ed0c5044a25cd38bb1710d5..8fd7d1eb6ac83ced333832917cbaf9caba157ffc 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -700,6 +700,23 @@ pub const Store = struct {
+         return best;
+     }
+ 
++    /// The fewest tokens a cut another pass is still computing must add past a request's own hit for the request to
++    /// wait for it (LaneHost's prefix wait): the recipe's shared-prefix rule (`shared_least`; 0, TF_GLM_SHARED_PREFIX=0:
++    /// no shared cuts are kept, so none is waited for), else the marks' own spacing (min_gap).
++    pub fn waitLeast(s: *const Store) u32 {
++        if (s.policy.recipe) return s.policy.shared_least;
++        return @max(s.rules.min_gap, 1);
++    }
++
++    /// Whether a state another pass will keep at `at` of `kept` (its key, with `kept_spans`) would serve `prompt`
++    /// as `find` serves a kept one: eligible here (a row left, its lookahead inside, on this request's chunk starts),
++    /// the same tokens through its lookahead and the same canonical spans through `at`.
++    pub fn wouldServe(s: *const Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, kept: []const u32, kept_spans: []const modes.Span, at: u32) bool {
++        const n = @as(usize, at) + s.rules.lookahead;
++        if (!s.eligible(at, prompt.len, starts) or n > kept.len) return false;
++        return std.mem.eql(u32, prompt[0..n], kept[0..n]) and modes.equal(kept_spans, spans, at);
++    }
++
+     /// Find a kept token prefix with matching canonical spans through its position, leaving at least one row.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*Entry {
+         var best: ?*Entry = null;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 61d645d9cb26a5a5a81e2a4af9407dd6395647e4..d3fd877d29f01e076e3e52863ac65365a461034e 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -232,6 +232,15 @@ const Host = struct {
+         h.host.cache = h.store;
+         // GLM vision: TF_GLM_IMAGE_MARK_SNAP=1 keeps no state cut inside a picture (LaneHost.mark_snap)
+         if (info.media) h.host.mark_snap = api.prompt_cache.markSnapOn(getenv("TF_GLM_IMAGE_MARK_SNAP"));
++        // GLM's TF_GLM_FILL: a request whose prompt shares a cut another fill is still computing waits for it
++        // (TF_GLM_PREFIX_WAIT, TF_GLM_PREFIX_WAIT_MS: LaneHost.prefixWait; rank 0's admission alone, nothing to agree)
++        if (h.core.slices() and h.store != null) {
++            h.host.prefix_wait_ns = api.LaneHost.prefixWaitSetting(getenv("TF_GLM_PREFIX_WAIT"), getenv("TF_GLM_PREFIX_WAIT_MS")) catch |e| {
++                std.log.err("TF_GLM_PREFIX_WAIT: 1 (the default) or 0; TF_GLM_PREFIX_WAIT_MS: whole milliseconds ({d} by default; 0 off)", .{api.LaneHost.prefix_wait_default_ms});
++                return e;
++            };
++            if (h.host.prefix_wait_ns > 0) std.log.info("TF_GLM_FILL: a prompt sharing a cut another prompt is filling waits for it, {d} ms at most (TF_GLM_PREFIX_WAIT)", .{@divTrunc(h.host.prefix_wait_ns, std.time.ns_per_ms)});
++        }
+         if (h.spill) |sp| h.host.configure(sp); // (after the tier is set: it publishes telemetry only over one)
+         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+         if (h.learn != null) h.host.learner = h.learner();

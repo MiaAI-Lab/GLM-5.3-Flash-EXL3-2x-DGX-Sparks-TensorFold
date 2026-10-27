@@ -1,0 +1,1181 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1305bda37155..fe2f060f7929); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: a prompt chunk's DSA indexer in CUDA, pool scores and one-pass top-K pools (TF_GLM_SCORES_CUDA, default on; ported from BadAd84's Python patches 0101/0105)
+
+On a GB10, tf-glm-index-check: scores and pools byte-equal to the Triton set at 1k-262k pools; at 147,456 pools a
+512-row block's scores 9.59 -> 6.61 ms and selection 6.50 -> 1.36 ms. TF_GLM_SCORES_CUDA=0: the Triton path;
+TF_GLM_SELECT_FLOOR=0: CUDA scores with Triton selection.
+
+Commits:
+- glm_cuda: a prompt chunk's DSA indexer in CUDA: pool scores and one-pass top-K pools (TF_GLM_SCORES_CUDA, ported from BadAd84's Python patches 0101/0105)
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0031-zig-glm-prompt-scores-cuda.patch
+
+diff --git a/tools/glm_pools_emulate/cuda_runtime.h b/tools/glm_pools_emulate/cuda_runtime.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf8bade4fef88351e1d9b7b0f2e27dcc7bfb9378
+--- /dev/null
++++ b/tools/glm_pools_emulate/cuda_runtime.h
+@@ -0,0 +1,44 @@
++// Stand-ins for the CUDA names glm_prompt_pools.cu uses, so its kernel runs as host C++ (emulate.cpp): one OS thread
++// per CUDA thread, __syncthreads a real barrier over the block, a warp's shuffles a real exchange between its lanes,
++// shared memory a function static (blocks run one after another).
++#pragma once
++#include <algorithm>
++#include <atomic>
++#include <barrier>
++#include <cstdint>
++#include <cstring>
++#define __global__
++#define __device__
++#define __forceinline__ inline
++#define __restrict__
++#define __launch_bounds__(x)
++#define __shared__ static
++struct dim3 { unsigned x, y, z; };
++struct float4 { float x, y, z, w; };
++inline thread_local dim3 threadIdx, blockIdx;
++namespace emu {
++inline std::barrier<>* block_bar;
++inline std::barrier<>* warp_bar[32];
++inline int xbuf[1024];
++}  // namespace emu
++inline void __syncthreads() { emu::block_bar->arrive_and_wait(); }
++inline int __shfl_up_sync(unsigned, int v, int d) {
++  const int t = (int)threadIdx.x, l = t & 31;
++  std::barrier<>* w = emu::warp_bar[t >> 5];
++  emu::xbuf[t] = v;
++  w->arrive_and_wait();
++  const int r = l >= d ? emu::xbuf[t - d] : v;
++  w->arrive_and_wait();
++  return r;
++}
++inline int atomicAdd(int* p, int v) { return std::atomic_ref<int>(*p).fetch_add(v); }
++inline int atomicMax(int* p, int v) {
++  std::atomic_ref<int> a(*p);
++  int old = a.load();
++  while (old < v && !a.compare_exchange_weak(old, v)) {}
++  return old;
++}
++inline int __float_as_int(float f) { int i; std::memcpy(&i, &f, 4); return i; }
++inline float __fadd_rn(float a, float b) { return a + b; }
++using std::max;
++using std::min;
+diff --git a/tools/glm_pools_emulate/emulate.cpp b/tools/glm_pools_emulate/emulate.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1b052a120ca528c43d12adab0ba473bf7a6edce
+--- /dev/null
++++ b/tools/glm_pools_emulate/emulate.cpp
+@@ -0,0 +1,96 @@
++// glm_prompt_pools.cu (a prompt chunk's top-K pools, BadAd84's 0101 in CUDA) run on the host, every thread of a block
++// at once with real barriers, against a plain top-K (`_select_rows`: best order keys, ties to the lower pool,
++// ascending). Random, tied, all-equal, -inf-tailed, signed-zero, skewed and decoy (fewer than K at the floor) rows,
++// at pool counts around every CAP; each of the three paths must be taken.
++// No nvcc or GPU: clang++ -std=c++20 -I tools/glm_pools_emulate tools/glm_pools_emulate/emulate.cpp -o <out> && <out>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <random>
++#include <thread>
++#include <vector>
++#include "../../zig/kernels/cuda/glm_prompt_pools.cu"
++
++static int tile_cap(int np) { return np <= 12288 ? 1024 : np <= 32768 ? 2048 : 4096; }
++static int tile_target(int np) { return np <= 12288 ? 724 : np <= 32768 ? 1024 : 2048; }
++
++// every block in turn, its 256 threads at once
++static void run(int rows, const float* s, long long* out, int np, int k, int* path) {
++  for (int b = 0; b < rows; b++) {
++    std::barrier<> block(glm_pools::T);
++    std::vector<std::barrier<>*> warps;
++    for (int w = 0; w < glm_pools::WARPS; w++) warps.push_back(new std::barrier<>(32));
++    emu::block_bar = &block;
++    for (int w = 0; w < glm_pools::WARPS; w++) emu::warp_bar[w] = warps[w];
++    std::vector<std::thread> ts;
++    for (int t = 0; t < glm_pools::T; t++)
++      ts.emplace_back([=] {
++        blockIdx = {(unsigned)b, 0, 0};
++        threadIdx = {(unsigned)t, 0, 0};
++        glm_prompt_pools(s, out, np, k, tile_cap(np), tile_target(np), path);
++      });
++    for (auto& t : ts) t.join();
++    for (auto* w : warps) delete w;
++  }
++}
++
++static uint32_t key(float s) { return glm_pools::order_key(s); }
++
++static std::vector<long long> reference(const float* row, int np, int k) {
++  std::vector<int> o(np);
++  for (int i = 0; i < np; i++) o[i] = i;
++  std::stable_sort(o.begin(), o.end(), [&](int a, int b) { return key(row[a]) > key(row[b]); });
++  std::vector<long long> best(o.begin(), o.begin() + k);
++  std::sort(best.begin(), best.end());
++  return best;
++}
++
++enum Kind { normal, ties, equal, tail, zeros, skewed, decoy };
++
++static void fill(std::mt19937_64& g, float* row, int np, Kind kind) {
++  std::normal_distribution<float> nd(0.0f, 3.0f);
++  const int visible = kind == tail ? std::max(512, (int)(g() % (unsigned)np) + 1) : np;
++  for (int i = 0; i < np; i++) {
++    float v = nd(g);
++    if (kind == ties) v = (float)(int)(g() % 9) * 0.5f;
++    if (kind == equal) v = 1.25f;
++    if (kind == zeros) v = g() % 3 == 0 ? 0.0f : g() % 2 ? -0.0f : (float)(g() % 1000) * 1e-3f - 0.6f;
++    if (kind == skewed) v = i % 997 == 0 ? 100.0f + (float)(g() % 5) : -INFINITY;
++    if (kind == decoy) v = (float)(g() % 1000) * 1e-3f;   // the sampled runs high below: the floor overshoots
++    row[i] = i < visible ? v : -INFINITY;
++  }
++  if (kind == decoy && np > 4096)   // _sample_floor's runs: fewer than K pools at or above the floor
++    for (int s = 0; s < glm_pools::NS * 8; s++) {
++      const long long j = (long long)(s / 8) * np / glm_pools::NS / 8 * 8 + s % 8;
++      if (j < np) row[j] = 10.0f + (float)(g() % 100000) * 1e-4f;
++    }
++}
++
++int main() {
++  std::mt19937_64 g(0x101);
++  const int K = 512;
++  int fails = 0, paths[3] = {0, 0, 0};
++  const int nps[] = {512, 1000, 1024, 4096, 4097, 12288, 12289, 20001, 32768, 32769, 40000, 70001};
++  for (int np : nps)
++    for (Kind kind : {normal, ties, equal, tail, zeros, skewed, decoy}) {
++      const int rows = 2;
++      std::vector<float> s((size_t)rows * np + 4);
++      float* base = s.data() + (np % 4 ? 1 : 0);   // an unaligned row now and then: the scalar loads
++      for (int r = 0; r < rows; r++) fill(g, base + (size_t)r * np, np, kind);
++      std::vector<long long> out((size_t)rows * K, -7);
++      std::vector<int> path(rows, -1);
++      run(rows, base, out.data(), np, K, path.data());
++      for (int r = 0; r < rows; r++) {
++        paths[path[r]]++;
++        const auto want = reference(base + (size_t)r * np, np, K);
++        if (!std::equal(want.begin(), want.end(), out.begin() + (size_t)r * K)) {
++          fails++;
++          printf("np %d kind %d row %d (path %d) differs\n", np, (int)kind, r, path[r]);
++        }
++      }
++    }
++  printf("paths: whole row %d, candidates %d, whole row after candidates %d\n", paths[0], paths[1], paths[2]);
++  if (paths[1] == 0 || paths[2] == 0) { fails++; printf("a path was never taken\n"); }
++  printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
++  return fails != 0;
++}
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 202f0f1b40fe3dac454ac7e42fec8edd29b1b527..b25a07e3a135a743c7fd960ceb658c3eb56a01aa 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -74,6 +74,8 @@ const kernels = [_]Kernel{
+     // GLM-5.3-Flash (glm5_next), P5 MLA/DSA: the only CUDA in the attention path (the rest is Triton, replayed from cubins)
+     .{ .name = "glm_msa", .flags = &.{ "-O3", "-lineinfo" } }, // glm5_next/cuda/msa.py, tensorfold_glm_flash_msa_v2 (TF_GLM_MSA=1)
+     .{ .name = "glm_shard", .optional = true, .flags = torch_ops }, // ours: TF_GLM_KV_SHARD's byte movers (GLM 0118 port: cuda_shard_decode.zig, cuda_shard_prompt.zig); without it sharding is refused at start
++    .{ .name = "glm_prompt_scores", .optional = true, .flags = &.{"-O3"} }, // BadAd84's 0105 (prompt_scores.cu, tensorfold_glm_scores_v1): a prompt chunk's pool scores, Triton `_scores`' bits; without it the Triton kernel serves
++    .{ .name = "glm_prompt_pools", .optional = true, .flags = torch_ops }, // BadAd84's 0101 (prompt_pools) in CUDA: a prompt chunk's top-K pools in one pass, `_select_rows`' pools
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -201,6 +203,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     // TF_GLM_KV_SHARD: glm_shard.cu's kernels against their host rules (docs/glm-port/gpu-validation.md)
+     const shard_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_shard_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
+     b.step("glm-shard-check", "Build tf-glm-shard-check: glm_shard.cu's kernels against their host rules (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-shard-check", .root_module = shard_check }), .{}).step);
++    // TF_GLM_SCORES_CUDA: glm_prompt_scores.cu / glm_prompt_pools.cu against the captured Triton kernels
++    const index_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_index_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
++    b.step("glm-index-check", "Build tf-glm-index-check AOT_DIR: the prompt indexer's CUDA kernels against Triton _scores / _select_rows (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-index-check", .root_module = index_check }), .{}).step);
+     // GLM vision tower: the GPU tower against the Python reference's stages (zig/tests/vision/tower)
+     const vision_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_vision_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
+     b.step("glm-vision-check", "Build tf-glm-vision-check: the vision tower stage by stage against the Python tower (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-vision-check", .root_module = vision_check }), .{}).step);
+@@ -277,6 +282,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     shard_emulated.expectExitCode(0);
+     glm_host.dependOn(&shard_emulated.step);
+     step.dependOn(&shard_emulated.step);
++    // TF_GLM_SCORES_CUDA: glm_prompt_pools.cu as host C++, a block's threads at once, against a plain top-K
++    const pools_emulate = b.addExecutable(.{ .name = "glm-pools-emulate", .root_module = b.createModule(.{ .target = host, .optimize = .ReleaseSafe, .link_libcpp = true }) });
++    pools_emulate.root_module.addCSourceFile(.{ .file = b.path("tools/glm_pools_emulate/emulate.cpp"), .flags = &.{ "-std=c++20", "-O1" } });
++    pools_emulate.root_module.addIncludePath(b.path("tools/glm_pools_emulate"));
++    const pools_emulated = b.addRunArtifact(pools_emulate);
++    pools_emulated.expectExitCode(0);
++    glm_host.dependOn(&pools_emulated.step);
++    step.dependOn(&pools_emulated.step);
+     const serve_test = b.step("test-glm-serve", "GLM serving and drafted-versus-serial CPU contracts");
+     serve_test.dependOn(&glm_test.step);
+     const cli_tests = b.createModule(.{
+diff --git a/zig/kernels/cuda/glm_prompt_pools.cu b/zig/kernels/cuda/glm_prompt_pools.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c50baba530ff7b270181782417214aec4f9c1f1
+--- /dev/null
++++ b/zig/kernels/cuda/glm_prompt_pools.cu
+@@ -0,0 +1,229 @@
++// GLM-5.3-Flash DSA indexer, a prompt chunk's top-K pools from one pass over its scores (cuda_prompt_index.zig,
++// cuda_prefill.zig choose / choosePools): ported from BadAd84's Python patch 0101 (sparse.prompt_pools /
++// _select_floor, a Triton kernel there; here CUDA, since the Zig engine's Triton set is captured, not compiled).
++// The contract is `_select_rows`' (VIS off): row r's K best scores by `_order_key`, ties to the lower pool, pools
++// ascending as int64 into OUT[r]. 0101's method: a strided sample of the row sets a floor (the 16-bit key prefix
++// expecting about TARGET pools), one pass compacts the pools at or above it in pool order into shared memory, and
++// `_select_rows`' radix select and write run over those candidates. They are an upper set of the row's order: with
++// between K and CAP of them, the K best of the row and every tie at the K-th best are among them, so the pools are
++// `_select_rows`'. A row whose count misses [K, CAP], or of at most CAP scores, selects over the whole row (4 radix
++// passes and the write, `_select_rows` itself). The floor, CAP and TARGET are speed only. No float arithmetic but
++// `s + 0` (-0 as +0). tools/glm_pools_emulate runs this file as host C++ against a plain top-K.
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace glm_pools {
++
++constexpr int T = 256, WARPS = T / 32, PER = 8, CHUNK = T * PER;   // threads, warps, scores a thread a step
++constexpr int CAP_MAX = 4096, NS = 512;                          // candidates in shared memory, sample runs of 8
++
++struct Smem {
++    uint32_t key[CAP_MAX];   // candidates' order keys, in pool order
++    int idx[CAP_MAX];        // their pools
++    int hist[256];
++    int warp[2][WARPS];      // block_scan's warp totals, two buffers taken in turn
++    int digit, need;         // a radix step's results
++};
++
++// A float32 score as a uint32 whose unsigned order is the scores' order (-0 counted as +0): `_order_key`.
++__device__ __forceinline__ uint32_t order_key(float s) {
++    const int bits = __float_as_int(__fadd_rn(s, 0.0f));
++    return (uint32_t)(bits ^ ((bits >> 31) | (int)0x80000000u));
++}
++
++// Exclusive sum of v over the block's threads in thread order; `total` the block's sum. Every thread calls it.
++__device__ __forceinline__ int block_scan(Smem& sm, int v, int& phase, int& total) {
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, buf = phase & 1;
++    phase++;
++    int x = v;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const int y = __shfl_up_sync(0xffffffffu, x, d);
++        if (lane >= d) x += y;
++    }
++    if (lane == 31) sm.warp[buf][w] = x;
++    __syncthreads();
++    int before = 0;
++    total = 0;
++#pragma unroll
++    for (int i = 0; i < WARPS; ++i) {
++        const int s = sm.warp[buf][i];
++        if (i < w) before += s;
++        total += s;
++    }
++    return before + x - v;
++}
++
++// The row's scores, or the candidates in shared memory: element i's key and pool.
++struct Row {
++    const float* s;
++    int n;
++    __device__ __forceinline__ uint32_t key(int i) const { return order_key(s[i]); }
++    __device__ __forceinline__ int pool(int i) const { return i; }
++    // keys of elements i0 .. i0 + PER - 1 (0 past n), one 32-byte read where aligned
++    __device__ __forceinline__ void keys(int i0, uint32_t (&u)[PER]) const {
++        if (i0 + PER <= n && ((uintptr_t)(s + i0) & 15) == 0) {
++            const float4 a = *reinterpret_cast<const float4*>(s + i0), b = *reinterpret_cast<const float4*>(s + i0 + 4);
++            const float v[PER] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
++#pragma unroll
++            for (int j = 0; j < PER; ++j) u[j] = order_key(v[j]);
++        } else {
++#pragma unroll
++            for (int j = 0; j < PER; ++j) u[j] = i0 + j < n ? order_key(s[i0 + j]) : 0u;
++        }
++    }
++};
++struct Cand {
++    const Smem* sm;
++    int n;
++    __device__ __forceinline__ uint32_t key(int i) const { return sm->key[i]; }
++    __device__ __forceinline__ int pool(int i) const { return sm->idx[i]; }
++    __device__ __forceinline__ void keys(int i0, uint32_t (&u)[PER]) const {
++#pragma unroll
++        for (int j = 0; j < PER; ++j) u[j] = i0 + j < n ? sm->key[i0 + j] : 0u;
++    }
++};
++
++// `_radix_step` from sm.hist: the digit (pass p, 8 bits from the top) of the need-th best among the keys matching
++// prefix on fixed (the largest digit with at least need at or above it, else 0), need less the pools above it.
++__device__ __forceinline__ void radix_step(Smem& sm, int& need, uint32_t& prefix, uint32_t& fixed, int p, int& phase) {
++    const int b = T - 1 - threadIdx.x;                          // thread t holds bin 255 - t
++    const int h = sm.hist[b];
++    int total;
++    const int above = block_scan(sm, h, phase, total);          // pools in bins above b
++    if (above + h >= need) atomicMax(&sm.digit, b);
++    __syncthreads();
++    if (b == sm.digit) sm.need = need - above;
++    __syncthreads();
++    const uint32_t digit = (uint32_t)sm.digit;
++    need = sm.need;
++    prefix |= digit << (24 - 8 * p);
++    fixed |= 0xFFu << (24 - 8 * p);
++}
++
++// A pass's histogram cleared and the digit reset; the caller's previous reads of them done first.
++__device__ __forceinline__ void hist_clear(Smem& sm) {
++    __syncthreads();
++    sm.hist[threadIdx.x] = 0;
++    if (threadIdx.x == 0) sm.digit = 0;
++    __syncthreads();
++}
++
++// `_select_rows` over src's n elements: the K best's pools ascending into out (K of them).
++template <class Src>
++__device__ void select(Smem& sm, const Src& src, int K, long long* __restrict__ out, int& phase) {
++    uint32_t prefix = 0, fixed = 0;
++    int need = K;
++    for (int p = 0; p < 4; ++p) {
++        hist_clear(sm);
++        const int sh = 24 - 8 * p;
++        for (int i = threadIdx.x; i < src.n; i += T) {
++            const uint32_t u = src.key(i);
++            if ((u & fixed) == prefix) atomicAdd(&sm.hist[(u >> sh) & 0xFFu], 1);
++        }
++        __syncthreads();
++        radix_step(sm, need, prefix, fixed, p, phase);
++    }
++    // in pool order: every key above the K-th best's, and the first `need` equal to it; a pool's place is the pools
++    // above before it plus min(ties before it, need)
++    int gt_run = 0, eq_run = 0;
++    for (int c0 = 0; c0 < src.n; c0 += CHUNK) {
++        const int i0 = c0 + (int)threadIdx.x * PER;
++        uint32_t u[PER];
++        src.keys(i0, u);
++        int g = 0, e = 0;
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            const bool ok = i0 + j < src.n;
++            g += ok && u[j] > prefix;
++            e += ok && u[j] == prefix;
++        }
++        int total;
++        const int ex = block_scan(sm, (g << 16) | e, phase, total);
++        int gb = gt_run + (ex >> 16), eb = eq_run + (ex & 0xFFFF);
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            if (i0 + j >= src.n) break;
++            if (u[j] > prefix) {
++                out[gb + min(eb, need)] = (long long)src.pool(i0 + j);
++                gb++;
++            } else if (u[j] == prefix) {
++                if (eb < need) out[gb + eb] = (long long)src.pool(i0 + j);
++                eb++;
++            }
++        }
++        gt_run += total >> 16;
++        eq_run += total & 0xFFFF;
++    }
++}
++
++// `_sample_floor`: the 16-bit key prefix of the sample's rank that scales to TARGET pools (NS runs of 8 scores at
++// even spacing; past NP a sample reads 0, as the Triton load's `other`). Speed only.
++__device__ uint32_t sample_floor(Smem& sm, const float* row, int NP, int TARGET, int& phase) {
++    uint32_t prefix = 0, fixed = 0;
++    int need = max((int)((long long)TARGET * (NS * 8) / NP), 1);
++    for (int p = 0; p < 2; ++p) {
++        hist_clear(sm);
++        const int sh = 24 - 8 * p;
++        for (int s = threadIdx.x; s < NS * 8; s += T) {
++            const long long j = (long long)(s / 8) * NP / NS / 8 * 8 + s % 8;
++            const uint32_t u = order_key(j < NP ? row[j] : 0.0f);
++            if ((u & fixed) == prefix) atomicAdd(&sm.hist[(u >> sh) & 0xFFu], 1);
++        }
++        __syncthreads();
++        radix_step(sm, need, prefix, fixed, p, phase);
++    }
++    return prefix;
++}
++
++}  // namespace glm_pools
++
++// S [R, NP] fp32 scores (contiguous rows), OUT [R, K] int64: row r's K best pools ascending (`_select_rows`, VIS
++// off). CAP (<= 4096) and TARGET from cuda_prompt_index.promptTile (speed only). PATH: null, or int32 [R] set to
++// the path row r took (0 whole row, 1 candidates, 2 whole row after the candidates missed [K, CAP]).
++// Grid (R), 256 threads, static shared memory (~33 KB).
++extern "C" __global__ void __launch_bounds__(glm_pools::T) glm_prompt_pools(const float* __restrict__ S,
++                                                                           long long* __restrict__ OUT, int NP,
++                                                                           int K, int CAP, int TARGET,
++                                                                           int* __restrict__ PATH) {
++    using namespace glm_pools;
++    __shared__ Smem sm;
++    const long long r = blockIdx.x;
++    const float* row = S + r * NP;
++    long long* out = OUT + r * K;
++    int phase = 0;
++    if (NP <= CAP) {
++        select(sm, Row{row, NP}, K, out, phase);
++        if (PATH != nullptr && threadIdx.x == 0) PATH[r] = 0;
++        return;
++    }
++    const uint32_t lo = sample_floor(sm, row, NP, TARGET, phase);
++    const Row src{row, NP};
++    int n = 0;
++    for (int c0 = 0; c0 < NP; c0 += CHUNK) {
++        const int i0 = c0 + (int)threadIdx.x * PER;
++        uint32_t u[PER];
++        src.keys(i0, u);
++        int m = 0;
++#pragma unroll
++        for (int j = 0; j < PER; ++j) m += i0 + j < NP && u[j] >= lo;
++        int total;
++        int at = n + block_scan(sm, m, phase, total);
++#pragma unroll
++        for (int j = 0; j < PER; ++j)
++            if (i0 + j < NP && u[j] >= lo) {
++                if (at < CAP) {
++                    sm.key[at] = u[j];
++                    sm.idx[at] = i0 + j;
++                }
++                at++;
++            }
++        n += total;
++        if (n > CAP) break;                                      // the whole row's then: no need to count on
++    }
++    __syncthreads();                                             // the candidates other threads stored
++    const bool fits = n >= K && n <= CAP;
++    if (fits) select(sm, Cand{&sm, n}, K, out, phase);
++    else select(sm, src, K, out, phase);
++    if (PATH != nullptr && threadIdx.x == 0) PATH[r] = fits ? 1 : 2;
++}
+diff --git a/zig/kernels/cuda/glm_prompt_scores.cu b/zig/kernels/cuda/glm_prompt_scores.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..f94f684e7bbccde1949d31a6226e23340f27071e
+--- /dev/null
++++ b/zig/kernels/cuda/glm_prompt_scores.cu
+@@ -0,0 +1,221 @@
++// GLM-5.3-Flash DSA indexer, a prompt chunk's pool scores (cuda_prompt_index.zig, cuda_prefill.zig scoreTile):
++// ported from BadAd84's Python patch 0105 (glm5_next/cuda/prompt_scores.cu, TF_GLM_SCORES_CUDA). The kernel body is
++// 0105's; only the torch wrapper is gone (raw pointers, the caller's stream, POS int32 as Zig's pos_dev / origins).
++// It computes every score with Triton `_scores`' own instruction sequence (Triton 3.7's PTX on a GB10, the release
++// the AOT set was captured from), so the bits are the Triton kernel's, while a CTA of RB rows converts each FP8 key
++// tile once for all of them (Triton: every row converts and loads it again).
++//
++// The Triton kernel, read from its PTX / GPU IR on a GB10 (Triton 3.7), per 0105:
++//   - the keys' e4m3 codes -> f16x2 (cvt.rn.f16x2.e4m3x2) -> bf16 (exact: every e4m3 value is a bf16 value); keys
++//     past the row's visible pools load as 0 (their scores are -inf whatever the dot);
++//   - dots[32 heads, 64 pools] = mma.sync m16n8k16 bf16 -> fp32, each output one chain over the 8 k16 steps in
++//     ascending order from +0, both operands in the kWidth = 4 dot layout: k = 32 b + 16 u + 4 t + 2 h + e (lane t,
++//     e < 2) is step 2 b + h, mma slot 8 u + 2 t + e (the natural k16 grouping gives other bits: ~13% differ);
++//   - per element (dots * ks[pool]) * scale, then max(., 0);
++//   - the head sum: per pool column a lane (g = lane / 4, t = lane % 4) holds heads g, g + 8, 16 + g, 24 + g, summed
++//     as fma(w24, x24, fma(w16, x16, fma(w0, x0, w8 * x8))) with w_h = float(W[h]) * wscale, then over the lanes of
++//     one t: s += shfl_xor(s, 16), then 8, then 4;
++//   - pools past the row's visible ones -> -inf; a block past all of them -> -inf without dots.
++// Every operation below is that one in that order (explicit _rn intrinsics: no contraction or reassociation).
++// Below sm_89 (no e4m3 cvt) the codes decode in software, exactly (the same bf16 values).
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <math.h>
++#include <stdint.h>
++
++namespace {
++
++constexpr int H = 32, D = 128, BP = 64, KS = D / 16;   // heads, key width, pools a block, k16 steps
++constexpr int CH = D * 2 / 16;                          // 16-byte chunks of a bf16 key row (16)
++constexpr int RB = 8, LB = 16;                          // rows a CTA (one a warp), tiles a CTA (measured on a GB10)
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
++// one e4m3 code -> its bf16 bits, exactly (sign, 4-bit exponent bias 7, 3-bit mantissa; S.1111.111 is NaN)
++__device__ __forceinline__ uint32_t e4m3_bf16(uint32_t c) {
++    const uint32_t s = (c & 0x80u) << 8, e = (c >> 3) & 15u, m = c & 7u;
++    if (e == 15u && m == 7u) return s | 0x7FC0u;
++    if (e == 0u) return s | (__float_as_uint((float)m * 0x1p-9f) >> 16);   // subnormal m * 2^-9 (0 for m = 0)
++    return s | ((e + 120u) << 7) | (m << 4);
++}
++#endif
++
++// two e4m3 codes (low byte first) -> their bf16 values (low first), exactly: e4m3 -> f16 -> f32 -> bf16
++__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t two) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
++    return e4m3_bf16(two & 0xFFu) | (e4m3_bf16((two >> 8) & 0xFFu) << 16);
++#else
++    uint32_t h2, r;
++    const unsigned short v = (unsigned short)two;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(v));
++    asm("{\n .reg .b16 lo, hi;\n .reg .f32 a, b;\n mov.b32 {lo, hi}, %1;\n cvt.f32.f16 a, lo;\n cvt.f32.f16 b, hi;\n"
++        " cvt.rn.bf16x2.f32 %0, b, a;\n}" : "=r"(r) : "r"(h2));
++    return r;
++#endif
++}
++
++// The physical 16-byte chunk of logical chunk c in key row p (ldmatrix's 8 rows on distinct bank groups).
++__device__ __forceinline__ int swz(int p, int c) { return c ^ (p & 7); }
++
++// One 64-pool key tile in two halves, so the next tile's global reads run under this tile's dots: ``fetch`` reads a
++// thread's share (GPT 16-byte k16 groups of pool i) and the pool's fp32 scale into registers; ``put`` converts them
++// to bf16 into tile[p][chunk] in mma slot order (logical chunk 2 s + c: step s's slots 8 c .. 8 c + 7) and the
++// scale into ks[p] (1 where p >= NP: never read).
++struct Fetch {
++    static constexpr int T = RB * 32, TPP = T / BP, GPT = KS / TPP;   // threads a pool, k16 groups a thread
++    uint4 c[GPT];
++    float s;
++};
++
++__device__ __forceinline__ void fetch(const uint8_t* __restrict__ PK, int RS, int NP, int pb, Fetch& f) {
++    const int tid = threadIdx.x, i = tid / Fetch::TPP, part = tid % Fetch::TPP;
++    const int p = pb * BP + i;
++    const bool ok = p < NP;
++    const uint8_t* row = PK + (size_t)(ok ? p : 0) * RS;
++#pragma unroll
++    for (int gg = 0; gg < Fetch::GPT; ++gg)
++        f.c[gg] = ok ? *reinterpret_cast<const uint4*>(row + 16 * (part * Fetch::GPT + gg)) : make_uint4(0, 0, 0, 0);
++    f.s = ok && part == 0 ? *reinterpret_cast<const float*>(row + D) : 1.0f;
++}
++
++__device__ __forceinline__ void put(const Fetch& f, uint4* tile, float* ks) {
++    const int tid = threadIdx.x, i = tid / Fetch::TPP, part = tid % Fetch::TPP;
++#pragma unroll
++    for (int gg = 0; gg < Fetch::GPT; ++gg) {
++        const int j = part * Fetch::GPT + gg;                   // k16 group: k = 16 j .. 16 j + 15
++        const uint32_t in[4] = {f.c[gg].x, f.c[gg].y, f.c[gg].z, f.c[gg].w};
++        uint32_t wv[8];                                          // wv[m]: values (2m, 2m + 1) of the group
++#pragma unroll
++        for (int m = 0; m < 8; ++m) wv[m] = e4m3x2_bf16x2(in[m >> 1] >> (16 * (m & 1)));
++        // group j: 32-block b = j / 2, half u = j % 2; word m = 2 t + h goes to step 2 b + h, slots 8 u + 2 t + e
++        tile[i * CH + swz(i, 4 * (j >> 1) + (j & 1))] = make_uint4(wv[0], wv[2], wv[4], wv[6]);       // h = 0
++        tile[i * CH + swz(i, 4 * (j >> 1) + 2 + (j & 1))] = make_uint4(wv[1], wv[3], wv[5], wv[7]);   // h = 1
++    }
++    if (part == 0) ks[i] = f.s;
++}
++
++}  // namespace
++
++// OUT [R, NP] fp32 = the rows' pool scores, Triton `_scores`' outputs bit for bit: QI [R, 32 * 128] bf16 rows, W bf16
++// head weights (row stride w_stride, unit column stride), PK an FP8 pooled-key cache (rows of 128 e4m3 codes, then
++// the row's fp32 scale; RS bytes apart), POS [1] int32 (row r's position is POS + r), NP a multiple of 64.
++// Grid (cdiv(R, 8), cdiv(NP / 64, 16)), 256 threads (cuda_prompt_index.scoresCfg).
++extern "C" __global__ void __launch_bounds__(RB * 32) glm_prompt_scores(const __nv_bfloat16* __restrict__ QI,
++                                                                        const __nv_bfloat16* __restrict__ W,
++                                                                        int w_stride, const uint8_t* __restrict__ PK,
++                                                                        int RS, float* __restrict__ OUT,
++                                                                        const int* __restrict__ POS, int R, int NP,
++                                                                        float scale, float wscale) {
++    __shared__ __align__(16) uint4 tile[BP * CH];               // 16 KB: one key tile, bf16
++    __shared__ float ks[BP];
++    __shared__ __align__(16) float stage[RB][BP];               // a warp's 64 scores before the row's store
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int r = blockIdx.x * RB + warp;
++    const bool live = r < R;
++    const long long P = *POS;
++    const int npool = live ? (int)((P + r + 1) / 4) : 0;
++    const int rlast = min(R, (int)(blockIdx.x + 1) * RB) - 1;
++    const int nmax = (int)((P + rlast + 1) / 4);                // the CTA's largest visible pool count
++    const int nblk = NP / BP;
++
++    // this warp's row: query fragments of both m16 tiles for the 8 k16 steps (a0 / a1: k = 32 b + 4 t + 2 h, + 1;
++    // a2 / a3: 16 more; step s = 2 b + h), and the 4 head weights a lane sums
++    uint32_t qa[2][KS][4];
++    float wh[4];
++    {
++        const int rr = live ? r : 0;
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++            for (int s = 0; s < KS; ++s) {
++                const __nv_bfloat16* q0 = QI + ((size_t)rr * H + 16 * mt + g) * D;
++                const __nv_bfloat16* q1 = q0 + 8 * D;
++                const int k = 32 * (s >> 1) + 4 * t + 2 * (s & 1);
++                qa[mt][s][0] = *reinterpret_cast<const uint32_t*>(q0 + k);
++                qa[mt][s][1] = *reinterpret_cast<const uint32_t*>(q1 + k);
++                qa[mt][s][2] = *reinterpret_cast<const uint32_t*>(q0 + k + 16);
++                qa[mt][s][3] = *reinterpret_cast<const uint32_t*>(q1 + k + 16);
++            }
++        const int hs[4] = {g, g + 8, 16 + g, 24 + g};
++#pragma unroll
++        for (int x = 0; x < 4; ++x) wh[x] = __fmul_rn(__bfloat162float(W[(size_t)rr * w_stride + hs[x]]), wscale);
++    }
++
++    Fetch f;
++    bool any_next = (int)blockIdx.y * LB < nblk && (int)blockIdx.y * LB * BP < nmax;
++    if (any_next) fetch(PK, RS, NP, blockIdx.y * LB, f);
++    for (int jb = 0; jb < LB; ++jb) {
++        const int pb = blockIdx.y * LB + jb;
++        if (pb >= nblk) break;
++        const int p0 = pb * BP;
++        const bool any = any_next;                               // some row of the CTA sees pools of this block
++        if (any) {
++            __syncthreads();                                     // the previous tile is read
++            put(f, tile, ks);
++            __syncthreads();
++        }
++        any_next = jb + 1 < LB && pb + 1 < nblk && p0 + BP < nmax;
++        if (any_next) fetch(PK, RS, NP, pb + 1, f);             // in flight during this tile's dots
++        if (!live) continue;
++        float* st = stage[warp];
++        if (p0 >= npool) {                                       // the row sees none of them: -inf, no dots
++            st[2 * lane] = -INFINITY;
++            st[2 * lane + 1] = -INFINITY;
++        } else {
++#pragma unroll 2
++            for (int n = 0; n < 8; ++n) {                        // n8 tile: pools p0 + 8 n .. + 7
++                float acc[2][4];
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) acc[mt][c] = 0.0f;
++#pragma unroll
++                for (int j = 0; j < KS; j += 2) {                // steps j, j + 1 from one ldmatrix.x4
++                    uint32_t b[4];
++                    const int pr = 8 * n + (lane & 7), c = 2 * j + (lane >> 3);
++                    ldsm_x4(b, &tile[pr * CH + swz(pr, c)]);
++#pragma unroll
++                    for (int mt = 0; mt < 2; ++mt) {
++                        mma16816(acc[mt], qa[mt][j], b[0], b[1]);
++                        mma16816(acc[mt], qa[mt][j + 1], b[2], b[3]);
++                    }
++                }
++                const int pc = 8 * n + 2 * t;
++                float s[2];
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {                    // pool columns pc, pc + 1
++                    const float k = ks[pc + e];
++                    const float x0 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[0][e], k)), 0.0f);       // head g
++                    const float x8 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[0][2 + e], k)), 0.0f);   // g + 8
++                    const float x16 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[1][e], k)), 0.0f);      // 16 + g
++                    const float x24 = fmaxf(__fmul_rn(scale, __fmul_rn(acc[1][2 + e], k)), 0.0f);  // 24 + g
++                    float v = __fmul_rn(wh[1], x8);
++                    v = __fmaf_rn(wh[0], x0, v);
++                    v = __fmaf_rn(wh[2], x16, v);
++                    v = __fmaf_rn(wh[3], x24, v);
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 16));
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 8));
++                    v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, 4));
++                    s[e] = p0 + pc + e < npool ? v : -INFINITY;
++                }
++                if (g == 0) *reinterpret_cast<float2*>(&st[pc]) = make_float2(s[0], s[1]);
++            }
++        }
++        __syncwarp();
++        *reinterpret_cast<float2*>(OUT + (size_t)r * NP + p0 + 2 * lane) = *reinterpret_cast<const float2*>(&st[2 * lane]);
++        __syncwarp();
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index a912df94c42250c741e264ab76d9e871e47aadb4..f152ef95275142a41940cb97eaba2796cbb0cbd0 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -48,6 +48,8 @@ pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes els
+ pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
+ pub const glm_msa: []const u8 = if (available) &Blob("fatbin_glm_msa").bytes else &.{};
+ pub const glm_shard: []const u8 = if (options.glm_shard) &Blob("fatbin_glm_shard").bytes else &.{};
++pub const glm_prompt_scores: []const u8 = if (options.glm_prompt_scores) &Blob("fatbin_glm_prompt_scores").bytes else &.{};
++pub const glm_prompt_pools: []const u8 = if (options.glm_prompt_pools) &Blob("fatbin_glm_prompt_pools").bytes else &.{};
+ pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
+ pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
+ pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
+diff --git a/zig/src/families/glm_cuda/cuda.zig b/zig/src/families/glm_cuda/cuda.zig
+index a1b451206a1982822046f2c657517182e9dcab23..7cc7ffae399d6b8bdc59741cd8a1627c90c9ee66 100644
+--- a/zig/src/families/glm_cuda/cuda.zig
++++ b/zig/src/families/glm_cuda/cuda.zig
+@@ -12,7 +12,9 @@ pub const segments = @import("cuda_segments.zig");
+ pub const kda = @import("cuda_kda.zig"); // P4: kda.cu / kda_chunk.cu, the segment table, replay, conv shift
+ pub const triton = @import("cuda_triton.zig");
+ pub const kernels = @import("cuda_kernels.zig");
++pub const prompt_index = @import("cuda_prompt_index.zig"); // BadAd84's 0105 / 0101: the prompt indexer in CUDA
+ test {
++    _ = prompt_index;
+     _ = native;
+     _ = geometry;
+     _ = state;
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index e7f8776b8abb886cc07c435549aa1be9a91e694f..d843a7e4c9e7ecc2e830646bd3198ef568828872 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -47,6 +47,7 @@ const shard_mod = @import("cuda_shard.zig");
+ const shard_dec = @import("cuda_shard_decode.zig");
+ const shard_prompt = @import("cuda_shard_prompt.zig");
+ const shard_keep = @import("cuda_shard_keep.zig");
++const prompt_index = @import("cuda_prompt_index.zig");
+ 
+ pub const Options = struct {
+     context: usize,
+@@ -225,6 +226,8 @@ pub const Engine = struct {
+     kv_dec: ?shard_dec.Decode = null,
+     /// TF_GLM_KV_SHARD: the prompt chunks' history fetch, its kernels, buffers and counters (e.pe.shard points here)
+     kv_prompt: ?shard_prompt.Fetch = null,
++    /// TF_GLM_SCORES_CUDA: the prompt indexer's CUDA kernels (e.pe.index points here); null: the Triton ones
++    prompt_idx: ?prompt_index.Kernels = null,
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
+         if (o.world < 1 or o.world > 4) return error.UnsupportedTp;
+@@ -284,6 +287,8 @@ pub const Engine = struct {
+         errdefer if (e.kv_dec) |*k| k.deinit();
+         e.kv_prompt = null;
+         errdefer if (e.kv_prompt) |*k| k.deinit();
++        e.prompt_idx = null;
++        errdefer if (e.prompt_idx) |*k| k.unload();
+         if (o.kv_shard) |sw| try shard_mod.refuse(sw, o.world, @intCast(streams), false);
+         var why: cfgs.Why = .{};
+         e.cfg = try cfgs.Config.read(gpa, io, dir, .{}, &why);
+@@ -383,6 +388,15 @@ pub const Engine = struct {
+             .micro_s = pm,
+         };
+         e.pe.lane = null;
++        // TF_GLM_SCORES_CUDA (BadAd84's 0105 / 0101, default on): the prompt chunks' indexer scores and selects in
++        // CUDA, the Triton kernels' scores and pools; a build without the fatbins logs it and keeps the Triton ones
++        const isw = prompt_index.Switches.read();
++        if (isw.scores) {
++            if (prompt_index.Kernels.load(ctx.d, cuda.kernels.glm_prompt_scores, cuda.kernels.glm_prompt_pools)) |k| {
++                e.prompt_idx = k;
++                e.pe.index = .{ .k = &e.prompt_idx.?, .select = isw.select };
++            } else |err| if (o.rank == 0) std.log.warn("TF_GLM_SCORES_CUDA: the prompt indexer's CUDA kernels are not used ({t}); prompt chunks score and select with the Triton kernels", .{err});
++        }
+         if (hc_split.on and hc_split.overlap != 0 and e.g.world == 2) e.pe.lane = try prefill_split.Lane.init(ctx.d);
+         errdefer if (e.pe.lane) |*l| l.deinit();
+         e.sampler = .{
+@@ -554,6 +568,7 @@ pub const Engine = struct {
+         e.memo.deinit();
+         if (e.kv_dec) |*k| k.deinit();
+         if (e.kv_prompt) |*k| k.deinit();
++        if (e.prompt_idx) |*k| k.unload();
+         e.fwd.s.deinit();
+         e.fwd.b.deinit();
+         e.tables.deinit();
+diff --git a/zig/src/families/glm_cuda/cuda_prefill.zig b/zig/src/families/glm_cuda/cuda_prefill.zig
+index 4362c344884034516b225758c4fef99c092b9712..4a3e8b36957f175e95bd1cf2d1f5c15621fcfa20 100644
+--- a/zig/src/families/glm_cuda/cuda_prefill.zig
++++ b/zig/src/families/glm_cuda/cuda_prefill.zig
+@@ -15,6 +15,7 @@ const grid = @import("cuda_prefill_grid.zig");
+ const split = @import("cuda_prefill_split.zig");
+ const micro = @import("cuda_prompt_micro.zig");
+ const shard_prompt = @import("cuda_shard_prompt.zig");
++const prompt_index = @import("cuda_prompt_index.zig");
+ 
+ fn cdiv(a: usize, b: usize) usize {
+     return (a + b - 1) / b;
+@@ -208,6 +209,8 @@ pub const Engine = struct {
+     /// TF_GLM_KV_SHARD: the history fetch of a stream whose latent rows are on one rank (cuda_shard_prompt.zig); null:
+     /// off, every launch as before.
+     shard: ?*shard_prompt.Fetch = null,
++    /// TF_GLM_SCORES_CUDA (BadAd84's 0105 / 0101): the indexer's CUDA scores and pools; empty: the Triton launches.
++    index: prompt_index.Use = .{},
+ 
+     pub fn putI32(e: Engine, addr: u64, value: i32) !void {
+         try e.tri.s.d.check(e.tri.s.d.api.cuMemsetD32Async(addr, @as(c_uint, @bitCast(value)), 1, e.tri.s.handle), "cuMemsetD32Async");
+@@ -325,6 +328,7 @@ pub const Engine = struct {
+     }
+     /// choose() without the tokens: the block's pools into e.s.pools_i.
+     fn choosePools(e: Engine, n: usize, np: usize, pos: u64) !void {
++        if (e.index.pools(np)) |k| return k.pools(e.tri.s, e.s.scores, e.s.pools_i, n, np, grid.topk_pools, 0);
+         const launch = try grid.selectLaunch(n, np, true);
+         if (launch.kind == .split) {
+             try e.splitCall(n, np, pos, e.s.pools_i, e.s.tokens, e.s.counts, true);
+@@ -647,6 +651,11 @@ pub const Engine = struct {
+         }
+     }
+     fn choose(e: Engine, n: usize, np: usize, pos: u64, prompt_block: bool, tok: u64, cnt: u64) !void {
++        // BadAd84's 0101: a prompt block's pools in one pass over its scores (`_select_rows`' pools)
++        if (prompt_block) if (e.index.pools(np)) |k| {
++            try k.pools(e.tri.s, e.s.scores, e.s.pools_i, n, np, grid.topk_pools, 0);
++            return e.poolTokens(n, pos, tok, cnt);
++        };
+         const launch = try grid.selectLaunch(n, np, prompt_block);
+         if (launch.kind == .split) {
+             if (prompt_block) {
+@@ -661,6 +670,8 @@ pub const Engine = struct {
+     }
+     fn scoreTile(e: Engine, qi: u64, wts: u64, pk: u64, n: usize, np: usize, pos: u64) !void {
+         if (n > e.s.select or np > e.s.pools) return error.ScoresScratch;
++        // BadAd84's 0105: `_scores`' bits with each key tile converted once for 8 rows
++        if (e.index.scores(np)) |k| return k.scores(e.tri.s, qi, wts, 160, pk, 144, e.s.scores, pos, n, np, grid.score_scale, grid.wscale_h32);
+         const gy = cdiv(cdiv(np, 64), grid.score_loop);
+         try e.tri.scores(.{ n, gy, 1 }, qi, wts, 160, pk, pk, e.s.scores, pos, try ci(n), try ci(np), grid.score_scale, grid.wscale_h32, .{ .H = 32, .HP = 32, .D = 128, .BP = 64, .L = grid.score_loop, .RS = 144, .FP8 = 1 });
+     }
+diff --git a/zig/src/families/glm_cuda/cuda_prompt_index.zig b/zig/src/families/glm_cuda/cuda_prompt_index.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..99e5ddc680eab8309d553f738cdd3e69e1c5636f
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_prompt_index.zig
+@@ -0,0 +1,212 @@
++//! A prompt chunk's DSA indexer in CUDA: pool scores (glm_prompt_scores.cu) and one-pass top-K pools
++//! (glm_prompt_pools.cu), ported from BadAd84's Python patches 0105 (TF_GLM_SCORES_CUDA) and 0101 (prompt_pools).
++//! The same scores as Triton `_scores`, bit for bit, and the same pools as `_select_rows`; the Triton launches stay
++//! the fallback (switch off, a build without the fatbins, a pool count off the 64 grid).
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const topk: usize = 512;
++/// glm_prompt_scores: rows a CTA (a warp each), 64-pool tiles a CTA, threads.
++pub const score_rows: usize = 8;
++pub const score_tiles: usize = 16;
++pub const score_pools: usize = 64;
++/// glm_prompt_pools: threads a row, candidates its shared memory holds.
++pub const pool_threads: usize = 256;
++pub const cap_max: usize = 4096;
++
++/// TF_GLM_SCORES_CUDA (default on; "0": Triton `_scores` and selection, today's path) and TF_GLM_SELECT_FLOOR
++/// (default on; "0": Triton selection with the CUDA scores, to bisect a difference).
++pub const Switches = struct {
++    scores: bool = true,
++    select: bool = true,
++
++    pub fn parse(scores_text: ?[]const u8, select_text: ?[]const u8) Switches {
++        const on = !off(scores_text);
++        return .{ .scores = on, .select = on and !off(select_text) };
++    }
++    pub fn read() Switches {
++        return parse(env("TF_GLM_SCORES_CUDA"), env("TF_GLM_SELECT_FLOOR"));
++    }
++    fn off(text: ?[]const u8) bool {
++        return std.mem.eql(u8, std.mem.trim(u8, text orelse return false, " "), "0");
++    }
++    fn env(name: [:0]const u8) ?[]const u8 {
++        return std.mem.sliceTo(std.c.getenv(name) orelse return null, 0);
++    }
++};
++
++pub const Cfg = struct { grid: [3]u32, block: u32 };
++
++/// glm_prompt_scores' launch: rows in CTAs of 8, the pool blocks in runs of 16 (NP a multiple of 64).
++pub fn scoresCfg(rows: usize, np: usize) !Cfg {
++    if (!scoresFit(np) or rows == 0 or rows > std.math.maxInt(i32)) return error.BadScoresLaunch;
++    const blocks = np / score_pools;
++    return .{ .grid = .{ @intCast(cdiv(rows, score_rows)), @intCast(cdiv(blocks, score_tiles)), 1 }, .block = score_rows * 32 };
++}
++pub fn scoresFit(np: usize) bool {
++    return np > 0 and np % score_pools == 0 and np <= std.math.maxInt(i32);
++}
++
++/// 0101's PROMPT_TILES: (most scores a row, CAP, TARGET). Speed only.
++pub const Tile = struct { cap: usize, target: usize };
++pub fn promptTile(np: usize) Tile {
++    if (np <= 12288) return .{ .cap = 1024, .target = 724 };
++    if (np <= 32768) return .{ .cap = 2048, .target = 1024 };
++    return .{ .cap = 4096, .target = 2048 };
++}
++
++/// glm_prompt_pools' launch: one CTA a row.
++pub fn poolsCfg(rows: usize, np: usize, k: usize) !Cfg {
++    if (rows == 0 or rows > std.math.maxInt(i32) or np < k or k == 0 or np > std.math.maxInt(i32)) return error.BadPoolsLaunch;
++    return .{ .grid = .{ @intCast(rows), 1, 1 }, .block = pool_threads };
++}
++
++pub const Kernels = struct {
++    scores_mod: cuda.Module,
++    pools_mod: cuda.Module,
++    scores_fn: cuda.Function,
++    pools_fn: cuda.Function,
++
++    /// cuda.kernels.glm_prompt_scores / glm_prompt_pools (empty when the build has no such fatbin).
++    pub fn load(d: *const cuda.Driver, scores_image: []const u8, pools_image: []const u8) !Kernels {
++        if (scores_image.len == 0 or pools_image.len == 0) return error.NoPromptIndexKernels;
++        var sm = try cuda.Module.load(d, scores_image);
++        errdefer sm.unload();
++        var pm = try cuda.Module.load(d, pools_image);
++        errdefer pm.unload();
++        return .{ .scores_mod = sm, .pools_mod = pm, .scores_fn = try sm.function("glm_prompt_scores"), .pools_fn = try pm.function("glm_prompt_pools") };
++    }
++    pub fn unload(k: *Kernels) void {
++        k.scores_mod.unload();
++        k.pools_mod.unload();
++    }
++    /// out [rows, np] fp32: qi [rows, 32 * 128] bf16, w bf16 head weights (w_stride apart), pk FP8 keys (rs-byte rows,
++    /// the fp32 scale at byte 128), pos int32 [1] (row r at pos + r).
++    pub fn scores(k: *const Kernels, s: cuda.Stream, qi: u64, w: u64, w_stride: usize, pk: u64, rs: usize, out: u64, pos: u64, rows: usize, np: usize, scale: f32, wscale: f32) !void {
++        const c = try scoresCfg(rows, np);
++        if (rs % 16 != 0 or rs < 128 + 4 or pk % 16 != 0) return error.BadScoresLaunch;
++        var a: cuda.Args = .{};
++        for ([_]u64{ qi, w }) |x| a.add(x);
++        a.add(@as(c_int, @intCast(w_stride)));
++        a.add(pk);
++        a.add(@as(c_int, @intCast(rs)));
++        for ([_]u64{ out, pos }) |x| a.add(x);
++        a.add(@as(c_int, @intCast(rows)));
++        a.add(@as(c_int, @intCast(np)));
++        a.add(scale);
++        a.add(wscale);
++        try cuda.launch.launch(k.scores_fn, .{ .grid = .{ .x = c.grid[0], .y = c.grid[1] }, .block = .{ .x = c.block } }, s, &a);
++    }
++    /// out [rows, kk] int64: each row's kk best pools of scores [rows, np] ascending; path: 0 or int32 [rows].
++    pub fn pools(k: *const Kernels, s: cuda.Stream, scores_ptr: u64, out: u64, rows: usize, np: usize, kk: usize, path: u64) !void {
++        const c = try poolsCfg(rows, np, kk);
++        const t = promptTile(np);
++        var a: cuda.Args = .{};
++        for ([_]u64{ scores_ptr, out }) |x| a.add(x);
++        for ([_]usize{ np, kk, t.cap, t.target }) |x| a.add(@as(c_int, @intCast(x)));
++        a.add(path);
++        try cuda.launch.launch(k.pools_fn, .{ .grid = .{ .x = c.grid[0] }, .block = .{ .x = c.block } }, s, &a);
++    }
++};
++
++/// The prompt engine's choice: the kernels when loaded (switch on, fatbins built), and whether they select too.
++pub const Use = struct {
++    k: ?*const Kernels = null,
++    select: bool = false,
++
++    /// glm_prompt_scores for np pools, else null (Triton `_scores`).
++    pub fn scores(u: Use, np: usize) ?*const Kernels {
++        return if (scoresFit(np)) u.k else null;
++    }
++    /// glm_prompt_pools for a prompt block, else null (Triton `_select_rows` / `_select_split`).
++    pub fn pools(u: Use, np: usize) ?*const Kernels {
++        return if (u.select and np >= topk) u.k else null;
++    }
++};
++
++/// `_order_key`: a score as a u32 whose unsigned order is the scores' (-0 as +0).
++pub fn orderKey(s: f32) u32 {
++    const bits: i32 = @bitCast(s + 0.0);
++    return @bitCast(bits ^ ((bits >> 31) | std.math.minInt(i32)));
++}
++
++/// `_select_rows`' pools for one row, on the CPU: the k best keys, ties to the lower pool, ascending.
++pub fn topPoolsRef(gpa: std.mem.Allocator, row: []const f32, out: []i64) !void {
++    if (out.len > row.len) return error.BadPoolsLaunch;
++    const order = try gpa.alloc(u32, row.len);
++    defer gpa.free(order);
++    for (order, 0..) |*o, i| o.* = @intCast(i);
++    const Ctx = struct {
++        row: []const f32,
++        fn better(c: @This(), a: u32, b: u32) bool {
++            const ka = orderKey(c.row[a]);
++            const kb = orderKey(c.row[b]);
++            return ka > kb or (ka == kb and a < b);
++        }
++    };
++    std.mem.sort(u32, order, Ctx{ .row = row }, Ctx.better);
++    const best = order[0..out.len];
++    std.mem.sort(u32, best, {}, std.sort.asc(u32));
++    for (out, best) |*o, i| o.* = i;
++}
++
++fn cdiv(a: usize, b: usize) usize {
++    return (a + b - 1) / b;
++}
++
++test "TF_GLM_SCORES_CUDA defaults on, 0 is the Triton path, TF_GLM_SELECT_FLOOR=0 keeps the CUDA scores" {
++    try std.testing.expectEqual(Switches{ .scores = true, .select = true }, Switches.parse(null, null));
++    try std.testing.expectEqual(Switches{ .scores = true, .select = true }, Switches.parse("1", ""));
++    try std.testing.expectEqual(Switches{ .scores = false, .select = false }, Switches.parse("0", null));
++    try std.testing.expectEqual(Switches{ .scores = false, .select = false }, Switches.parse(" 0 ", "1"));
++    try std.testing.expectEqual(Switches{ .scores = true, .select = false }, Switches.parse(null, "0"));
++}
++
++test "scores launch: 8 rows a CTA, 16 pool blocks a CTA, pool counts on the 64 grid only" {
++    // a 512-row block at 590k: 147,456 pools, 2,304 blocks
++    try std.testing.expectEqual(Cfg{ .grid = .{ 64, 144, 1 }, .block = 256 }, try scoresCfg(512, 147456));
++    try std.testing.expectEqual(Cfg{ .grid = .{ 11, 1, 1 }, .block = 256 }, try scoresCfg(88, 1024));
++    try std.testing.expectEqual(Cfg{ .grid = .{ 1, 2, 1 }, .block = 256 }, try scoresCfg(1, 64 * 17));
++    try std.testing.expectError(error.BadScoresLaunch, scoresCfg(512, 1000));
++    try std.testing.expectError(error.BadScoresLaunch, scoresCfg(0, 1024));
++    try std.testing.expect(!scoresFit(0));
++    try std.testing.expect(scoresFit(262144));
++}
++
++test "pools launch and 0101's tiles" {
++    try std.testing.expectEqual(Cfg{ .grid = .{ 512, 1, 1 }, .block = 256 }, try poolsCfg(512, 147456, topk));
++    try std.testing.expectError(error.BadPoolsLaunch, poolsCfg(512, 511, topk));
++    try std.testing.expectEqual(Tile{ .cap = 1024, .target = 724 }, promptTile(12288));
++    try std.testing.expectEqual(Tile{ .cap = 2048, .target = 1024 }, promptTile(12289));
++    try std.testing.expectEqual(Tile{ .cap = 2048, .target = 1024 }, promptTile(32768));
++    try std.testing.expectEqual(Tile{ .cap = 4096, .target = 2048 }, promptTile(32769));
++    try std.testing.expect(promptTile(1 << 30).cap <= cap_max);
++}
++
++test "the CPU reference: best keys, -0 equal to +0, ties to the lower pool, ascending" {
++    const gpa = std.testing.allocator;
++    const inf = std.math.inf(f32);
++    const row = [_]f32{ 1, -inf, 3, 0.0, -0.0, 3, 2, -inf };
++    var out: [4]i64 = undefined;
++    try topPoolsRef(gpa, &row, &out);
++    try std.testing.expectEqualSlices(i64, &.{ 0, 2, 5, 6 }, &out);
++    var five: [5]i64 = undefined;
++    try topPoolsRef(gpa, &row, &five);
++    try std.testing.expectEqualSlices(i64, &.{ 0, 2, 3, 5, 6 }, &five);
++    var all: [7]i64 = undefined;
++    try topPoolsRef(gpa, &row, &all);
++    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2, 3, 4, 5, 6 }, &all);
++    try std.testing.expectEqual(orderKey(0.0), orderKey(-0.0));
++    try std.testing.expect(orderKey(-1) < orderKey(-0.5) and orderKey(-inf) < orderKey(-1) and orderKey(1) < orderKey(inf));
++}
++
++test "the prompt engine takes the kernels only when loaded: scores on the 64 grid, pools when selecting" {
++    const k: *const Kernels = @ptrFromInt(0x1000);
++    try std.testing.expect((Use{}).scores(1024) == null);
++    try std.testing.expect((Use{ .k = k }).scores(1024) == k);
++    try std.testing.expect((Use{ .k = k }).scores(1000) == null);
++    try std.testing.expect((Use{ .k = k }).pools(1024) == null);
++    try std.testing.expect((Use{ .k = k, .select = true }).pools(1024) == k);
++    try std.testing.expect((Use{ .k = k, .select = true }).pools(511) == null);
++    try std.testing.expect((Use{ .select = true }).pools(1024) == null);
++}
+diff --git a/zig/tests/cuda/glm_index_check.zig b/zig/tests/cuda/glm_index_check.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..595a5df2feb58ae3c80b7a5f58ae42abafd27227
+--- /dev/null
++++ b/zig/tests/cuda/glm_index_check.zig
+@@ -0,0 +1,161 @@
++//! tf-glm-index-check AOT_DIR (GPU): the prompt indexer's CUDA kernels (BadAd84's 0105 / 0101 ported,
++//! cuda_prompt_index.zig) against the captured Triton ones on the same inputs: glm_prompt_scores vs `_scores` byte
++//! for byte, glm_prompt_pools vs `_select_rows` (and a CPU top-K on a few rows), on random FP8 keys and on tied
++//! scores, 512-row blocks at 1k..262k pools (4k..1M tokens). Prints each kernel's time a block.
++const std = @import("std");
++const cuda = @import("cuda");
++const glm = @import("glm_cuda");
++const idx = glm.prompt_index;
++const grid = glm.prefill_grid;
++
++const R = 512;
++const nps = [_]usize{ 1024, 4096, 16384, 65536, 147456, 262144 };
++
++fn bf16(x: f32) u16 {
++    const b: u32 = @bitCast(x);
++    return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
++}
++
++pub fn main(init: std.process.Init) !void {
++    const gpa = init.gpa;
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len != 2) return error.ExpectedAotDirectory;
++    var d = try cuda.Driver.open();
++    defer d.close();
++    var ctx = try cuda.Context.init(&d, 0);
++    defer ctx.deinit();
++    var s = try cuda.Stream.init(&d, true);
++    defer s.deinit();
++    var set = try cuda.aot.Set.load(gpa, init.io, &d, ctx.device, args[1]);
++    defer set.deinit();
++    var memo: glm.triton.Memo = .{ .gpa = gpa };
++    defer memo.deinit();
++    const tri: glm.triton.Tri = .{ .set = &set, .s = s, .memo = &memo };
++    var k = try idx.Kernels.load(&d, cuda.kernels.glm_prompt_scores, cuda.kernels.glm_prompt_pools);
++    defer k.unload();
++
++    const np_max = nps[nps.len - 1];
++    var rng = std.Random.DefaultPrng.init(0x105);
++    const rand = rng.random();
++    // queries [R, 32 * 128] bf16, head weights in columns 128.. of [R, 160] bf16, FP8 keys [np_max, 144]
++    const q = try gpa.alloc(u16, R * 4096);
++    defer gpa.free(q);
++    for (q) |*x| x.* = bf16(rand.floatNorm(f32));
++    const w = try gpa.alloc(u16, R * 160);
++    defer gpa.free(w);
++    for (w) |*x| x.* = bf16(rand.floatNorm(f32));
++    const pk = try gpa.alloc(u8, np_max * 144);
++    defer gpa.free(pk);
++    for (0..np_max) |p| {
++        const row = pk[p * 144 ..][0..144];
++        for (row[0..128]) |*c| {
++            c.* = rand.int(u8);
++            if (c.* & 0x7F == 0x7F) c.* ^= 1; // no e4m3 NaN (S.1111.111)
++        }
++        std.mem.writeInt(u32, row[128..132], @bitCast(0.01 + rand.float(f32) * 0.09), .little);
++        @memset(row[132..], 0);
++    }
++    var dq = try cuda.DeviceBuffer.fromHost(&d, std.mem.sliceAsBytes(q));
++    defer dq.free();
++    var dw = try cuda.DeviceBuffer.fromHost(&d, std.mem.sliceAsBytes(w));
++    defer dw.free();
++    var dk = try cuda.DeviceBuffer.fromHost(&d, pk);
++    defer dk.free();
++    var dpos = try cuda.DeviceBuffer.alloc(&d, 16);
++    defer dpos.free();
++    var sa = try cuda.DeviceBuffer.alloc(&d, R * np_max * 4);
++    defer sa.free();
++    var sb = try cuda.DeviceBuffer.alloc(&d, R * np_max * 4);
++    defer sb.free();
++    var pa = try cuda.DeviceBuffer.alloc(&d, R * idx.topk * 8);
++    defer pa.free();
++    var pb = try cuda.DeviceBuffer.alloc(&d, R * idx.topk * 8);
++    defer pb.free();
++    var path = try cuda.DeviceBuffer.alloc(&d, R * 4);
++    defer path.free();
++    const ha = try gpa.alloc(u8, R * np_max * 4);
++    defer gpa.free(ha);
++    const hb = try gpa.alloc(u8, R * np_max * 4);
++    defer gpa.free(hb);
++    var fails: usize = 0;
++    for (nps) |np| {
++        const pos: i32 = @intCast(np * 4 - R - 100); // the last rows see nearly every pool, the first ~R/4 fewer
++        try dpos.upload(0, std.mem.asBytes(&pos));
++        const gy = (np / 64 + grid.score_loop - 1) / grid.score_loop;
++        const wts = dw.ptr + 128 * 2;
++        for (0..2) |_| try tri.scores(.{ R, gy, 1 }, dq.ptr, wts, 160, dk.ptr, dk.ptr, sa.ptr, dpos.ptr, R, @intCast(np), grid.score_scale, grid.wscale_h32, .{ .H = 32, .HP = 32, .D = 128, .BP = 64, .L = grid.score_loop, .RS = 144, .FP8 = 1 });
++        try k.scores(s, dq.ptr, wts, 160, dk.ptr, 144, sb.ptr, dpos.ptr, R, np, grid.score_scale, grid.wscale_h32);
++        try s.synchronize();
++        const t0 = now(init.io);
++        try tri.scores(.{ R, gy, 1 }, dq.ptr, wts, 160, dk.ptr, dk.ptr, sa.ptr, dpos.ptr, R, @intCast(np), grid.score_scale, grid.wscale_h32, .{ .H = 32, .HP = 32, .D = 128, .BP = 64, .L = grid.score_loop, .RS = 144, .FP8 = 1 });
++        try s.synchronize();
++        const t1 = now(init.io);
++        try k.scores(s, dq.ptr, wts, 160, dk.ptr, 144, sb.ptr, dpos.ptr, R, np, grid.score_scale, grid.wscale_h32);
++        try s.synchronize();
++        const t2 = now(init.io);
++        const bytes = R * np * 4;
++        try sa.download(0, ha[0..bytes]);
++        try sb.download(0, hb[0..bytes]);
++        const diff = differ(f32, ha[0..bytes], hb[0..bytes]);
++        if (diff > 0) fails += 1;
++        std.debug.print("np {d}: scores {d} of {d} differ; Triton {d:.2} ms, CUDA {d:.2} ms\n", .{ np, diff, R * np, ms(t0, t1), ms(t1, t2) });
++        fails += try pools(gpa, init.io, tri, &k, s, sa, ha[0..bytes], pa, pb, path, np, "scores");
++        // tied scores: each a multiple of 1/4 in [0, 4), -inf past a row's visible pools as the scoring writes them
++        const f: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ha[0..bytes]));
++        for (f, 0..) |*x, i| x.* = if (i % np < (@as(usize, @intCast(pos)) + i / np + 1) / 4) @as(f32, @floatFromInt(rand.uintLessThan(u32, 16))) * 0.25 else -std.math.inf(f32);
++        try sa.upload(0, ha[0..bytes]);
++        fails += try pools(gpa, init.io, tri, &k, s, sa, ha[0..bytes], pa, pb, path, np, "ties");
++    }
++    std.debug.print("{s}: {d} failures\n", .{ if (fails == 0) "PASS" else "FAIL", fails });
++    if (fails != 0) std.process.exit(1);
++}
++
++/// Triton `_select_rows` and glm_prompt_pools on the scores in sa (host copy `host`); the first rows also on the CPU.
++fn pools(gpa: std.mem.Allocator, io: std.Io, tri: glm.triton.Tri, k: *const idx.Kernels, s: cuda.Stream, sa: cuda.DeviceBuffer, host: []const u8, pa: cuda.DeviceBuffer, pb: cuda.DeviceBuffer, path: cuda.DeviceBuffer, np: usize, what: []const u8) !usize {
++    try tri.select_rows(.{ R, 1, 1 }, sa.ptr, pa.ptr, @intCast(np), sa.ptr, "*fp32", .{ .K = grid.topk_pools, .BLOCK = 1024, .VIS = 0 });
++    try k.pools(s, sa.ptr, pb.ptr, R, np, idx.topk, path.ptr);
++    try s.synchronize();
++    const t0 = now(io);
++    try tri.select_rows(.{ R, 1, 1 }, sa.ptr, pa.ptr, @intCast(np), sa.ptr, "*fp32", .{ .K = grid.topk_pools, .BLOCK = 1024, .VIS = 0 });
++    try s.synchronize();
++    const t1 = now(io);
++    try k.pools(s, sa.ptr, pb.ptr, R, np, idx.topk, path.ptr);
++    try s.synchronize();
++    const t2 = now(io);
++    const a = try gpa.alloc(i64, R * idx.topk);
++    defer gpa.free(a);
++    const b = try gpa.alloc(i64, R * idx.topk);
++    defer gpa.free(b);
++    try pa.download(0, std.mem.sliceAsBytes(a));
++    try pb.download(0, std.mem.sliceAsBytes(b));
++    var p: [R]i32 = undefined;
++    try path.download(0, std.mem.sliceAsBytes(&p));
++    var taken = [3]usize{ 0, 0, 0 };
++    for (p) |x| taken[@intCast(x)] += 1;
++    var fails: usize = 0;
++    var rows: usize = 0;
++    for (0..R) |r| rows += @intFromBool(!std.mem.eql(i64, a[r * idx.topk ..][0..idx.topk], b[r * idx.topk ..][0..idx.topk]));
++    if (rows > 0) fails += 1;
++    const f: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, host));
++    var want: [idx.topk]i64 = undefined;
++    for ([_]usize{ 0, 1, R / 2, R - 1 }) |r| {
++        try idx.topPoolsRef(gpa, f[r * np ..][0..np], &want);
++        if (!std.mem.eql(i64, &want, b[r * idx.topk ..][0..idx.topk])) fails += 1;
++    }
++    std.debug.print("np {d} {s}: pools of {d} rows differ from Triton; paths row/candidates/fallback {d}/{d}/{d}; Triton {d:.2} ms, CUDA {d:.2} ms\n", .{ np, what, rows, taken[0], taken[1], taken[2], ms(t0, t1), ms(t1, t2) });
++    return fails;
++}
++
++fn differ(comptime T: type, a: []const u8, b: []const u8) usize {
++    const x: []const T = @alignCast(std.mem.bytesAsSlice(T, a));
++    const y: []const T = @alignCast(std.mem.bytesAsSlice(T, b));
++    var n: usize = 0;
++    for (x, y) |p, q| n += @intFromBool(@as(u32, @bitCast(p)) != @as(u32, @bitCast(q)));
++    return n;
++}
++fn now(io: std.Io) std.Io.Timestamp {
++    return std.Io.Timestamp.now(io, .awake);
++}
++fn ms(a: std.Io.Timestamp, b: std.Io.Timestamp) f64 {
++    return @as(f64, @floatFromInt(a.durationTo(b).nanoseconds)) / 1e6;
++}

@@ -1,0 +1,593 @@
+# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits fe2f060f7929..0e0518f341f2); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: decode clusters, draft prelaunch and narrow prompt tiles (TF_GLM_QMM_CLUSTERS, TF_GLM_DRAFT_PRELAUNCH, TF_GLM_PROMPT_TILE; after BadAd84's GLM 0103, 0100, 0102)
+
+Each byte-identical by design and behind its own switch; their speed at TP=2 is measured on the GPU, not assumed.
+
+Commits:
+- glm_cuda: decode K splits sum in a cluster only past 64 rows or from 28 Mi weight values (TF_GLM_QMM_CLUSTERS, port of BadAd84's GLM 0103)
+- glm_cuda: the DFlash2 block pass queues behind the round's tap pass with no wait between (TF_GLM_DRAFT_PRELAUNCH, after BadAd84's GLM 0100)
+- glm_cuda: narrow prompt projections on 64 x 64 tiles (TF_GLM_PROMPT_TILE, port of BadAd84's GLM 0102)
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0032-zig-glm-decode-speed.patch
+
+diff --git a/zig/kernels/cuda/glm_qmm_prefill.cu b/zig/kernels/cuda/glm_qmm_prefill.cu
+index d23a41f572a3909d1b85e98fa50ce3c3acb55647..9d4884081c56822c99fc0ca6ed67c3bf1727e9fc 100644
+--- a/zig/kernels/cuda/glm_qmm_prefill.cu
++++ b/zig/kernels/cuda/glm_qmm_prefill.cu
+@@ -36,8 +36,9 @@ __device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
+     return d;
+ }
+ 
++// A device function (TensorFold's is the __global__ template): patch 0102's 64 x 64 entry points below call it.
+ template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
+-__global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
++__device__ __forceinline__ void prefill_kernel(
+         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
+         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int M, int N, int K, int npad, int ldx,
+         int group) {
+@@ -382,4 +383,16 @@ extern "C" __global__ void  __launch_bounds__(2 * 2 * 32) glm_qmm_prefill_1(
+         }
+ }
+ 
++// Patch 0102 (BadAd84): Python's tile 3, 64 x 64 blocks on four 16 x 64 warps, four stages, for narrow, short-K or
++// few-block prompt projections; the same fp32 chain over K per output as the 128 x 128 tile, so the same bits.
++#define GLM_QMM_PREFILL64(F32)                                                                                         \
++    extern "C" __global__ void __launch_bounds__(1 * 4 * 32) glm_qmm_prefill64_##F32(                                 \
++            const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w,                                      \
++            const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases,                       \
++            void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                              \
++        prefill_kernel<64, 64, 64, 1, 4, 4, F32 != 0>(x, w, scales, biases, out, M, N, K, npad, ldx, group);         \
++    }
++GLM_QMM_PREFILL64(0)
++GLM_QMM_PREFILL64(1)
++
+ } // namespace
+diff --git a/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig b/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
+index cee38f5133799beb68d73ab2a7b5e60768829a97..836cd26f4b4d0802e1af59b295ae490ecdd2b53d 100644
+--- a/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
++++ b/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
+@@ -163,6 +163,8 @@ const Rig = struct {
+         const g = try G.init(2, rank);
+         const entries = try gpa.create(mm.Entries);
+         for (&entries.functions) |*f| f.* = func();
++        entries.clusters = .wide;
++        entries.prompt_tiles = true;
+         const kk = try gpa.create(kda.Kernels);
+         const info = @typeInfo(kda.Kernels).@"struct";
+         inline for (info.field_names, info.field_types) |name, T| if (T == cuda.Function) {
+diff --git a/zig/src/families/glm_cuda/cuda_dflash.zig b/zig/src/families/glm_cuda/cuda_dflash.zig
+index 0e89427771c0e1bb26a001b0d5a7ed6b8406c88d..a69526b496746d2aebeb3b3daa35ed2f59b26caf 100644
+--- a/zig/src/families/glm_cuda/cuda_dflash.zig
++++ b/zig/src/families/glm_cuda/cuda_dflash.zig
+@@ -118,7 +118,7 @@ pub const Multi = struct {
+         try m.padRows(rows, bucket, &pos, &slots);
+         try m.stageRows(pos[0..bucket], slots[0..bucket]);
+         try m.forward.tapsPass(bucket);
+-        try m.forward.check(); // the round's one check (addTaps checks each window's pass; tapsDone would defer it to a proposal that may not come)
++        try m.forward.roundTaps(); // the round's one check: waited for here, or (patch 0100) at the proposal's wait
+         for (items) |it| m.contexts[it.slot].end += it.keep;
+     }
+     fn padRows(m: *Multi, rows: usize, bucket: usize, pos: *[64]i64, slots: *[64]i64) !void {
+@@ -187,7 +187,7 @@ pub const Multi = struct {
+             }
+             n += 1;
+         }
+-        if (n == 0) return;
++        if (n == 0) return m.forward.flush(); // no pass to carry the round's tap check
+         try m.forward.stage(m.forward.ids, std.mem.sliceAsBytes(ids[0 .. n * 8]));
+         try m.stageRows(rowpos[0 .. n * 8], rowslots[0 .. n * 8]);
+         try m.forward.stage(m.forward.bpos, std.mem.sliceAsBytes(bpos[0..n]));
+@@ -232,3 +232,6 @@ pub fn draftMany(m: *Multi, engine: anytype, reqs: anytype) !void {
+     try m.propose(proposals[0..reqs.len]);
+     for (reqs, proposals[0..reqs.len]) |*r, p| r.drafted = p.drafted;
+ }
++test {
++    _ = @import("cuda_dflash_test.zig");
++}
+diff --git a/zig/src/families/glm_cuda/cuda_dflash_forward.zig b/zig/src/families/glm_cuda/cuda_dflash_forward.zig
+index 18bf3a675ba6042dde4b49d76416112d7504c227..6e480bc0eeebfd02bea172f811323dd24f702311 100644
+--- a/zig/src/families/glm_cuda/cuda_dflash_forward.zig
++++ b/zig/src/families/glm_cuda/cuda_dflash_forward.zig
+@@ -81,6 +81,8 @@ pub const Forward = struct {
+     stager: Stager = .{},
+     pin: ?cuda.HostBuffer = null,
+     tap_pending: bool = false,
++    /// TF_GLM_DRAFT_PRELAUNCH (default on; 0 off, patch 0100): a round's tap check rides on the block pass's wait.
++    prelaunch: bool = true,
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, cfg: config.Config, rank: config.Rank, streams: usize, w: weights.Weights, embed: u64, tri: Tri, th: Torch, entries: *const mm.Entries, comm: ?Coll, lt: *const cuda.cublaslt.Library) !Forward {
+         if (streams < 1 or streams > 8 or (rank.world > 1 and comm == null)) return error.BadDraftStreams;
+         if (comm) |c| if (c.world != rank.world or c.rank != rank.rank) return error.BadDraftRank;
+@@ -103,6 +105,7 @@ pub const Forward = struct {
+         f.stager = .{};
+         f.pin = null;
+         f.tap_pending = false;
++        f.prelaunch = prelaunchFrom(if (std.c.getenv("TF_GLM_DRAFT_PRELAUNCH")) |v| std.mem.span(v) else null);
+         errdefer {
+             for (f.owned.items) |*b| b.free();
+             f.owned.deinit(gpa);
+@@ -192,7 +195,7 @@ pub const Forward = struct {
+     fn mat(f: *Forward, x: u64, q: mm.Q4, out: u64, rows: usize, sums: ?u64, f32_out: bool) !void {
+         const xs = sums orelse f.sums;
+         if (sums == null) try f.tri.groupSums(x, xs, rows, q.k);
+-        try mm.matmul(f.entries, f.stream, x, q.k, xs, q, out, f.part, rows, f32_out, false, false, .{});
++        try mm.matmul(f.entries, f.stream, x, q.k, xs, q, out, f.part, rows, f32_out, true, false, .{}); // splits as Entries.clusters says
+     }
+     fn norm(f: *Forward, x: u64, w: u64, out: u64, rows: usize) !void {
+         try f.tri.draftRmsnorm(x, 4096, w, out, f.sums, rows, 4096, f.cfg.eps);
+@@ -330,10 +333,23 @@ pub const Forward = struct {
+     /// synchronized (the next proposal's readback). Without pinned staging this is the blocking `check`.
+     pub fn tapsDone(f: *Forward) !void {
+         if (!f.asyncOk()) return f.check();
++        try f.flush(); // an earlier flag still unread is read before its slot is reused
+         const view: cuda.DeviceBuffer = .{ .d = f.d, .ptr = f.invalid, .len = 4 };
+         try view.downloadAsync(0, f.pinned(pin_tap, 4), f.stream.handle);
+         f.tap_pending = true;
+     }
++    /// After a round's tap pass (patch 0100): with TF_GLM_DRAFT_PRELAUNCH and pinned readback its check is queued
++    /// (tapsDone), so the block pass goes in behind the taps with no wait between; else the blocking check.
++    pub fn roundTaps(f: *Forward) !void {
++        if (!f.prelaunch) return f.check();
++        return f.tapsDone();
++    }
++    /// A queued tap check with no proposal to carry it: wait and read it now.
++    pub fn flush(f: *Forward) !void {
++        if (!f.tap_pending) return;
++        try f.stream.synchronize();
++        try f.settle(false);
++    }
+     /// After block(n): queue the invalid flag, this rank's candidates and the projection for one synchronization.
+     pub fn queueProposal(f: *Forward, n: usize) !void {
+         const copies = [_]struct { ptr: u64, at: usize, bytes: usize }{
+@@ -367,6 +383,11 @@ pub const Forward = struct {
+     }
+ };
+ 
++/// TF_GLM_DRAFT_PRELAUNCH: anything but 0 is on (Python's rule).
++pub fn prelaunchFrom(value: ?[]const u8) bool {
++    const v = value orelse return true;
++    return !std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "0");
++}
+ /// CUDA's installed cublasLt.h: ALGO_CONFIG_SPLITK_NUM=2, REDUCTION_SCHEME=3.
+ /// Pick a fixed nonsplit algorithm; parallel reduction schemes may change proposal bits.
+ fn deterministicSelector(linear: *cuda.cublaslt.Linear) !void {
+diff --git a/zig/src/families/glm_cuda/cuda_dflash_test.zig b/zig/src/families/glm_cuda/cuda_dflash_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e4cca0c0556c025eb4bdb4cc22fec600555a413
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_dflash_test.zig
+@@ -0,0 +1,159 @@
++//! A round's tap pass and the next block pass against a driver that logs each call (patch 0100's ordering).
++const std = @import("std");
++const cuda = @import("cuda");
++const abi = cuda.abi;
++const df = @import("cuda_dflash.zig");
++const Forward = @import("cuda_dflash_forward.zig").Forward;
++const shared = @import("cuda_torch_ops.zig").shared;
++
++const Call = enum { taps, block, kernel, upload, flag_async, read_async, sync, flag_read };
++const Fake = struct {
++    var log: [64]Call = undefined;
++    var n: usize = 0;
++    var syncs_left: usize = 0; // a synchronization past these fails (stops a proposal at its wait)
++    var bad_tap = false; // the first flag copied back reads 1
++    fn add(c: Call) void {
++        log[n] = c;
++        n += 1;
++    }
++    fn ok() callconv(.c) c_int {
++        return 0;
++    }
++    fn graph(g: abi.GraphExec, _: abi.Stream) callconv(.c) c_int {
++        add(if (@intFromPtr(g) == 0x10) .taps else .block);
++        return 0;
++    }
++    fn kernel(_: abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
++        add(.kernel);
++        return 0;
++    }
++    fn upload(_: abi.DevicePtr, _: ?*const anyopaque, _: usize, _: abi.Stream) callconv(.c) c_int {
++        add(.upload);
++        return 0;
++    }
++    fn readAsync(dst: ?*anyopaque, _: abi.DevicePtr, bytes: usize, _: abi.Stream) callconv(.c) c_int {
++        const out: [*]u8 = @ptrCast(dst.?);
++        @memset(out[0..bytes], 0);
++        if (bytes == 4 and bad_tap) {
++            out[0] = 1;
++            bad_tap = false;
++        }
++        add(if (bytes == 4) .flag_async else .read_async);
++        return 0;
++    }
++    fn read(dst: ?*anyopaque, _: abi.DevicePtr, bytes: usize) callconv(.c) c_int {
++        const out: [*]u8 = @ptrCast(dst.?);
++        @memset(out[0..bytes], 0);
++        add(.flag_read);
++        return 0;
++    }
++    fn sync(_: abi.Stream) callconv(.c) c_int {
++        add(.sync);
++        if (syncs_left == 0) return abi.error_not_ready; // an error the driver does not log
++        syncs_left -= 1;
++        return 0;
++    }
++};
++var drv: cuda.Driver = undefined;
++var fns: shared.Functions = undefined;
++var ring: [16 << 10]u8 align(16) = undefined;
++var pinned: [128 << 10]u8 align(16) = undefined;
++
++fn forward(prelaunch: bool) !Forward {
++    var api: abi.Api = undefined;
++    inline for (@typeInfo(abi.Api).@"struct".field_names) |name| @field(api, name) = @ptrCast(&Fake.ok);
++    api.cuGraphLaunch = Fake.graph;
++    api.cuLaunchKernel = Fake.kernel;
++    api.cuMemcpyHtoDAsync_v2 = Fake.upload;
++    api.cuMemcpyDtoHAsync_v2 = Fake.readAsync;
++    api.cuMemcpyDtoH_v2 = Fake.read;
++    api.cuStreamSynchronize = Fake.sync;
++    drv = .{ .lib = undefined, .api = api };
++    const s: cuda.Stream = .{ .d = &drv, .handle = null };
++    fns.strided = .{ .d = &drv, .handle = null };
++    var f: Forward = undefined;
++    f.d = &drv;
++    f.stream = s;
++    f.streams = 2;
++    f.th.base = .{ .f = &fns, .s = s };
++    f.cfg.mask = 7;
++    f.rank = try @import("cuda_dflash_config.zig").Rank.init(1, 0);
++    inline for (.{ "tap_in", "ids", "rowpos", "rowslots", "bpos", "bslots", "invalid", "candidates", "projection" }, 1..) |name, i| @field(f, name) = 0x100000 * i;
++    f.taps = @splat(null);
++    f.taps[0] = .{ .d = &drv, .handle = @ptrFromInt(0x10) };
++    f.blocks = @splat(@as(?cuda.graph.Exec, .{ .d = &drv, .handle = @ptrFromInt(0x20) }));
++    f.stager = .{ .stream = s, .host = .{ .d = &drv, .bytes = &ring }, .event = .{ .d = &drv, .handle = null } };
++    f.pin = .{ .d = &drv, .bytes = &pinned };
++    f.tap_pending = false;
++    f.prelaunch = prelaunch;
++    return f;
++}
++fn multi(f: *Forward) df.Multi {
++    var m: df.Multi = .{ .gpa = std.testing.allocator, .forward = f, .selector = undefined };
++    for (&m.contexts) |*c| c.* = .{ .capacity = 4096, .end = 32 };
++    return m;
++}
++const items = [_]df.Multi.TapItem{ .{ .slot = 0, .row0 = 0, .keep = 4 }, .{ .slot = 1, .row0 = 4, .keep = 4 } };
++/// A round's end on the drafter: its kept rows' tap pass, then both streams' block pass (stopped at its wait).
++fn round(prelaunch: bool, syncs: usize) ![]const Call {
++    var f = try forward(prelaunch);
++    var m = multi(&f);
++    Fake.n = 0;
++    Fake.syncs_left = syncs;
++    try m.commitTaps(&items, 0x900000, 8);
++    var out: [2][7]u32 = undefined;
++    var reqs = [_]df.Request{ .{ .slot = 0, .pending = 5, .count = 7, .out = &out[0] }, .{ .slot = 1, .pending = 6, .count = 7, .out = &out[1] } };
++    try std.testing.expectError(error.NotReady, m.propose(&reqs));
++    return Fake.log[0..Fake.n];
++}
++fn first(log: []const Call, c: Call) usize {
++    return std.mem.indexOfScalar(Call, log, c).?;
++}
++test "TF_GLM_DRAFT_PRELAUNCH: the block pass queues behind the round's tap pass with no wait between (patch 0100)" {
++    const on = try round(true, 0);
++    // the taps' flag rides on the proposal's one synchronization, after the block pass and its readback are queued
++    try std.testing.expect(first(on, .taps) < first(on, .flag_async));
++    try std.testing.expect(first(on, .flag_async) < first(on, .block));
++    try std.testing.expectEqual(@as(usize, 1), std.mem.count(Call, on, &.{.sync}));
++    try std.testing.expectEqual(Call.sync, on[on.len - 1]);
++    try std.testing.expectEqual(@as(usize, 0), std.mem.count(Call, on, &.{.flag_read}));
++    // 0: the round's taps are waited for and checked before the pass is staged, as before
++    const off = try round(false, 1);
++    try std.testing.expect(first(off, .taps) < first(off, .sync));
++    try std.testing.expect(first(off, .flag_read) < first(off, .block));
++    try std.testing.expectEqual(@as(usize, 2), std.mem.count(Call, off, &.{.sync}));
++}
++test "a deferred tap check still fails the round: at the proposal's wait, before another flag overwrites it, or alone" {
++    // a bad index in the round's tap pass surfaces at the block pass's synchronization
++    var f = try forward(true);
++    var m = multi(&f);
++    Fake.n = 0;
++    Fake.syncs_left = 9;
++    Fake.bad_tap = true;
++    try m.commitTaps(&items, 0x900000, 8);
++    var out: [2][7]u32 = undefined;
++    var reqs = [_]df.Request{ .{ .slot = 0, .pending = 5, .count = 7, .out = &out[0] }, .{ .slot = 1, .pending = 6, .count = 7, .out = &out[1] } };
++    try std.testing.expectError(error.BadDraftIndex, m.propose(&reqs));
++    // a second round's taps with no proposal between: the first flag is waited for and read before it is replaced
++    f = try forward(true);
++    m = multi(&f);
++    Fake.n = 0;
++    Fake.bad_tap = true;
++    try m.commitTaps(&items, 0x900000, 8);
++    try std.testing.expectError(error.BadDraftIndex, m.commitTaps(&items, 0x900000, 8));
++    // a proposal with no block pass (nothing to draft) settles the pending check itself
++    f = try forward(true);
++    m = multi(&f);
++    Fake.n = 0;
++    Fake.bad_tap = true;
++    try m.commitTaps(&items, 0x900000, 8);
++    var none = [_]df.Request{.{ .slot = 0, .pending = 5, .count = 0, .out = &out[0] }};
++    try std.testing.expectError(error.BadDraftIndex, m.propose(&none));
++}
++test "TF_GLM_DRAFT_PRELAUNCH: on unless 0" {
++    const from = @import("cuda_dflash_forward.zig").prelaunchFrom;
++    try std.testing.expect(from(null));
++    try std.testing.expect(from("1"));
++    try std.testing.expect(!from("0"));
++    try std.testing.expect(!from(" 0\n"));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index d843a7e4c9e7ecc2e830646bd3198ef568828872..8225d9bac688737269216dd2e42ebc61a05c6485 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -313,6 +313,11 @@ pub const Engine = struct {
+         e.kda_k = try kda.Kernels.load(ctx.d);
+         errdefer e.kda_k.deinit();
+         e.entries = try mm.Entries.load(ctx);
++        // patch 0103: the decode K splits that sum in a cluster (the same bits either way, so ranks need not agree)
++        e.entries.clusters = mm.clustersFromEnv(try ctx.capability());
++        std.log.info("TF_GLM_QMM_CLUSTERS: decode K splits in clusters: {s}", .{@tagName(e.entries.clusters)});
++        // patch 0102: narrow prompt projections on 64 x 64 tiles (the same bits)
++        e.entries.prompt_tiles = mm.promptTilesFromEnv();
+         errdefer e.entries.deinit();
+         e.torch = try ops.Ops.load(ctx);
+         errdefer e.torch.deinit();
+@@ -348,6 +353,7 @@ pub const Engine = struct {
+             .kseg = 0,
+             .comm = o.comm,
+             .kda = kda.install(&e.kda_k),
++            .clusters = true,
+         };
+         // TF_GLM_SIDE=1: the MoE's shared expert on a second stream in decode and verify windows (graphs included); the
+         // same bits, so ranks need not agree. Off unless set, as in Python.
+diff --git a/zig/src/families/glm_cuda/cuda_entries.zig b/zig/src/families/glm_cuda/cuda_entries.zig
+index 6d7a580ba531d75abd268992f7ae47830434e3b5..b9adf718dd580da356a77f1c5af8e3e3b3d3c0c5 100644
+--- a/zig/src/families/glm_cuda/cuda_entries.zig
++++ b/zig/src/families/glm_cuda/cuda_entries.zig
+@@ -5,9 +5,15 @@ const cuda = @import("cuda");
+ pub const Entries = struct {
+     modules: [4]cuda.Module,
+     functions: [variants.len]cuda.Function,
++    /// Which decode K splits sum in a cluster (cuda_matmuls.Clusters; the engine sets it from TF_GLM_QMM_CLUSTERS).
++    clusters: @import("cuda_matmuls.zig").Clusters = .never,
++    /// Prompt projections on 64 x 64 tiles where 128 x 128 would not fill the GPU (patch 0102; TF_GLM_PROMPT_TILE).
++    prompt_tiles: bool = true,
+     pub fn load(ctx: *const cuda.Context) !Entries {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         var e: Entries = undefined;
++        e.clusters = .never;
++        e.prompt_tiles = true;
+         var loaded: usize = 0;
+         errdefer for (e.modules[0..loaded]) |*m| m.unload();
+         for ([_][]const u8{ cuda.kernels.glm_qmm, cuda.kernels.glm_qmm_prefill, cuda.kernels.glm_exl3, cuda.kernels.experts }, 0..) |img, i| {
+@@ -848,6 +854,8 @@ pub const variants = [_]struct { image: usize, symbol: [:0]const u8, shared: u32
+     .{ .image = 0, .symbol = "glm_qmm_reduce_1", .shared = 0 },
+     .{ .image = 1, .symbol = "glm_qmm_prefill_0", .shared = 41984 },
+     .{ .image = 1, .symbol = "glm_qmm_prefill_1", .shared = 41984 },
++    .{ .image = 1, .symbol = "glm_qmm_prefill64_0", .shared = 41984 },
++    .{ .image = 1, .symbol = "glm_qmm_prefill64_1", .shared = 41984 },
+     .{ .image = 2, .symbol = "glm_exl3_rot_0", .shared = 0 },
+     .{ .image = 2, .symbol = "glm_exl3_rot_1", .shared = 0 },
+     .{ .image = 2, .symbol = "glm_exl3_gateup", .shared = 0 },
+diff --git a/zig/src/families/glm_cuda/cuda_forward.zig b/zig/src/families/glm_cuda/cuda_forward.zig
+index 3b3a0aa97cfd4c618fd39da38238faeb2bb756b7..f227eda66ac02954f735801412ce07d41d49be04 100644
+--- a/zig/src/families/glm_cuda/cuda_forward.zig
++++ b/zig/src/families/glm_cuda/cuda_forward.zig
+@@ -152,6 +152,7 @@ pub const Forward = struct {
+     kseg: u64,
+     comm: ?*const Comm = null,
+     kda: kd.Interface = .{},
++    /// The decode matmuls may sum K splits in clusters (Entries.clusters picks which; patch 0103).
+     clusters: bool = false,
+     /// TF_GLM_SIDE=1: the MoE's shared expert on this second stream (decode and verify windows; null is the single stream).
+     side: ?*const side_mod.Side = null,
+diff --git a/zig/src/families/glm_cuda/cuda_matmuls.zig b/zig/src/families/glm_cuda/cuda_matmuls.zig
+index ecb47577ef1bce6bb4ad8441208123a8ab317290..a500f860d74ed0575de2ecdf4c5e9c2ced700483 100644
+--- a/zig/src/families/glm_cuda/cuda_matmuls.zig
++++ b/zig/src/families/glm_cuda/cuda_matmuls.zig
+@@ -39,6 +39,21 @@ pub fn tile(rows: usize, n: usize, k: usize, prompt: bool) Tile {
+     if (rows <= 16) if (decTile(n, k)) |cfg| return .{ .bm = 16, .bn = 128, .wm = 1, .wn = if (cfg == 2) 8 else 4, .stages = if (cfg == 2) 4 else 6 };
+     return .{ .bm = if (rows <= 16) 16 else if (rows <= 32) 32 else 64, .bn = 64, .wm = 1, .wn = 4, .stages = 4 };
+ }
++/// Patch 0102 (BadAd84): a prompt projection runs on 128 x 128 blocks (Python's tile 9) where K >= 1024 and they number
++/// 96 or more, else on 64 x 64 (tile 3; narrow, short-K or few-block shapes). Every output is the same fp32 chain over
++/// K whichever warp computes it: the same bits.
++pub fn promptWide(rows: usize, n: usize, k: usize) bool {
++    return k >= 1024 and (rows + 127) / 128 * ((n + 127) / 128) >= 96;
++}
++pub const narrow_prompt: Tile = .{ .bm = 64, .bn = 64, .wm = 1, .wn = 4, .stages = 4 };
++/// TF_GLM_PROMPT_TILE: on unless 0 (0: 128 x 128 throughout, as before).
++pub fn promptTilesFrom(value: ?[]const u8) bool {
++    const v = value orelse return true;
++    return !std.mem.eql(u8, v, "0");
++}
++pub fn promptTilesFromEnv() bool {
++    return promptTilesFrom(if (std.c.getenv("TF_GLM_PROMPT_TILE")) |v| std.mem.span(v) else null);
++}
+ fn ci(x: usize) c_int {
+     return @intCast(x);
+ }
+@@ -74,8 +89,32 @@ test "TP=3 projection slices need the aligned copy; TP=2 and TP=4 do not" {
+     try std.testing.expectError(error.Invalid, matmul(&e, undefined, 0x1000, 8726, 0, q, 0, 0, 4, false, false, false, .{ .ptr = 0x2000, .bytes = 4 * 128 * 2 - 1 }));
+     try std.testing.expectEqual(@as(usize, 8344), alignedStride(8341));
+ }
++/// Patch 0103 (BadAd84): which reduced K splits meet in a thread-block cluster instead of the partials and
++/// glm_qmm_reduce. Both add the slices in order in fp32 and round once: the same bits. `wide`: windows past 64 rows or
++/// weights of 28 Mi values or more (bandwidth-bound; the latency-bound rest lose 20-60% to the cluster's launch and
++/// syncs on a GB10); `always`: every split (Python before 0103); `never`: none (this engine before 0103).
++pub const Clusters = enum { never, wide, always };
++pub const cluster_rows = 64;
++pub const cluster_values: usize = 28 << 20;
++pub fn useCluster(c: Clusters, sk: usize, rows: usize, n: usize, k: usize) bool {
++    if (sk < 2 or sk > 8) return false;
++    return switch (c) {
++        .never => false,
++        .always => true,
++        .wide => rows > cluster_rows or n * k >= cluster_values,
++    };
++}
++/// TF_GLM_QMM_CLUSTERS: unset the 0103 rule, 1 every split, 0 none; no clusters before sm_90 (`capability` 10 * major).
++pub fn clustersFrom(value: ?[]const u8, capability: u32) Clusters {
++    if (capability < 90) return .never;
++    const v = value orelse return .wide;
++    return if (std.mem.eql(u8, v, "1")) .always else if (std.mem.eql(u8, v, "0")) .never else .wide;
++}
++pub fn clustersFromEnv(capability: u32) Clusters {
++    return clustersFrom(if (std.c.getenv("TF_GLM_QMM_CLUSTERS")) |v| std.mem.span(v) else null, capability);
++}
+ /// The caller supplies group sums (P1) and SK*M*N fp32 scratch when clusters are disabled.
+-/// Clusters are selected by GPU capability, and reduction always adds slices in ascending order.
++/// `clusters`: the caller allows them; `e.clusters` picks the splits. Reduction always adds slices in ascending order.
+ /// Scratch for the aligned copy of an activation block (`alignment` says copy): rows * k bf16, 16-byte aligned.
+ pub const Stage = struct { ptr: u64 = 0, bytes: usize = 0 };
+ pub fn matmul(e: *const Entries, stream: cuda.Stream, x_in: u64, x_stride_in: usize, xs: u64, q: Q4, out: u64, part: u64, rows: usize, f32_out: bool, clusters: bool, prompt: bool, stage: Stage) !void {
+@@ -92,14 +131,15 @@ pub fn matmul(e: *const Entries, stream: cuda.Stream, x_in: u64, x_stride_in: us
+     }
+     const sk = if (prompt) 1 else splitK(q.n, q.k);
+     if (q.k / 64 % sk != 0 or (!clusters and sk > 1 and part == 0)) return error.Invalid;
+-    const t = tile(rows, q.n, q.k, prompt);
++    const narrow = prompt and e.prompt_tiles and !promptWide(rows, q.n, q.k);
++    const t = if (narrow) narrow_prompt else tile(rows, q.n, q.k, prompt);
+     const rt = (rows + t.bm - 1) / t.bm;
+     const npad = (q.n + 127) / 128 * 128;
+     const stride = if (q.scale_stride == 0) npad else q.scale_stride;
+     if (stride < npad or (prompt and stride != npad)) return error.Invalid;
+-    const cluster = clusters and sk > 1;
++    const cluster = clusters and useCluster(e.clusters, sk, rows, q.n, q.k);
+     var name: [80]u8 = undefined;
+-    const sym: [:0]const u8 = if (prompt) try printZ(&name, "glm_qmm_prefill_{d}", .{@intFromBool(f32_out)}) else if (rows <= 16 and decTile(q.n, q.k) != null) try printZ(&name, "glm_qmm_cfg{d}_{d}_{d}", .{ decTile(q.n, q.k).?, @intFromBool(f32_out), @intFromBool(cluster) }) else try printZ(&name, "glm_qmm_{d}_{d}_{d}", .{ t.bm, @intFromBool(f32_out), @intFromBool(cluster) });
++    const sym: [:0]const u8 = if (prompt) try printZ(&name, "glm_qmm_prefill{s}_{d}", .{ if (narrow) "64" else "", @intFromBool(f32_out) }) else if (rows <= 16 and decTile(q.n, q.k) != null) try printZ(&name, "glm_qmm_cfg{d}_{d}_{d}", .{ decTile(q.n, q.k).?, @intFromBool(f32_out), @intFromBool(cluster) }) else try printZ(&name, "glm_qmm_{d}_{d}_{d}", .{ t.bm, @intFromBool(f32_out), @intFromBool(cluster) });
+     var a: cuda.Args = .{};
+     a.add(x);
+     if (!prompt) a.add(xs);
+@@ -145,6 +185,7 @@ test "weight shape alone selects K splits and decode config" {
+     try std.testing.expectEqual(@as(usize, 8), headConfig(65).warps);
+ }
+ test {
++    _ = @import("cuda_matmuls_test.zig");
+     _ = layouts;
+     std.testing.refAllDecls(Entries);
+ }
+diff --git a/zig/src/families/glm_cuda/cuda_matmuls_test.zig b/zig/src/families/glm_cuda/cuda_matmuls_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9c00bf9f51714733845a88f6c638bfe344df366
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_matmuls_test.zig
+@@ -0,0 +1,117 @@
++//! cuda_matmuls.matmul against a driver that records each launch: its kernel, grid, block, shared bytes and cluster.
++const std = @import("std");
++const cuda = @import("cuda");
++const abi = cuda.abi;
++const mm = @import("cuda_matmuls.zig");
++const variants = @import("cuda_entries.zig").variants;
++
++const Launch = struct { symbol: []const u8, grid: [3]u32, block: u32, shared: u32, cluster: u32, group: c_int = 0 };
++const Rec = struct {
++    var log: [4]Launch = undefined;
++    var n: usize = 0;
++    fn ok() callconv(.c) c_int {
++        return 0;
++    }
++    fn note(f: abi.Function, grid: [3]u32, block: u32, shared: u32, cluster: u32) void {
++        log[n] = .{ .symbol = variants[@intFromPtr(f) - 1].symbol, .grid = grid, .block = block, .shared = shared, .cluster = cluster };
++        n += 1;
++    }
++    fn plain(f: abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, shared: c_uint, _: abi.Stream, p: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
++        note(f, .{ gx, gy, gz }, bx, shared, 0);
++        // a prompt launch's last (11th) argument: the rows a group of blocks shares
++        if (std.mem.startsWith(u8, log[n - 1].symbol, "glm_qmm_prefill")) log[n - 1].group = @as(*const c_int, @ptrCast(@alignCast(p.?[10].?))).*;
++        return 0;
++    }
++    fn ex(lc: *const abi.LaunchConfig, f: abi.Function, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
++        var cluster: u32 = 0;
++        for (lc.attrs.?[0..lc.num_attrs]) |a| if (a.id == .cluster_dimension) {
++            cluster = a.value.cluster_dim.z;
++        };
++        note(f, .{ lc.grid_x, lc.grid_y, lc.grid_z }, lc.block_x, lc.shared_bytes, cluster);
++        return 0;
++    }
++};
++var drv: cuda.Driver = undefined;
++fn entries(rule: mm.Clusters) mm.Entries {
++    var api: abi.Api = undefined;
++    inline for (@typeInfo(abi.Api).@"struct".field_names) |name| @field(api, name) = @ptrCast(&Rec.ok);
++    api.cuLaunchKernel = Rec.plain;
++    api.cuLaunchKernelEx = Rec.ex;
++    drv = .{ .lib = undefined, .api = api };
++    var e: mm.Entries = undefined;
++    for (&e.functions, 0..) |*f, i| f.* = .{ .d = &drv, .handle = @ptrFromInt(i + 1) };
++    e.clusters = rule;
++    e.prompt_tiles = true;
++    return e;
++}
++/// The launches of one (rows x k) by (k x n) matmul, decode unless `prompt`.
++fn run(e: *const mm.Entries, rows: usize, n: usize, k: usize, may: bool, prompt: bool) ![]const Launch {
++    Rec.n = 0;
++    const q: mm.Q4 = .{ .w = 0x100000, .s = 0x200000, .b = 0x300000, .n = n, .k = k };
++    try mm.matmul(e, .{ .d = &drv, .handle = null }, 0x400000, k, if (prompt) 0 else 0x500000, q, 0x600000, if (prompt) 0 else 0x700000, rows, false, may, prompt, .{});
++    return Rec.log[0..Rec.n];
++}
++fn expectOne(got: []const Launch, symbol: []const u8, cluster: u32) !void {
++    try std.testing.expectEqual(@as(usize, 1), got.len);
++    try std.testing.expectEqualStrings(symbol, got[0].symbol);
++    try std.testing.expectEqual(cluster, got[0].cluster);
++}
++fn expectReduced(got: []const Launch, symbol: []const u8) !void {
++    try std.testing.expectEqual(@as(usize, 2), got.len);
++    try std.testing.expectEqualStrings(symbol, got[0].symbol);
++    try std.testing.expectEqual(@as(u32, 0), got[0].cluster);
++    try std.testing.expectEqualStrings("glm_qmm_reduce_0", got[1].symbol);
++}
++test "decode matmuls sum K slices in a cluster only past 64 rows or from 28 Mi weight values (patch 0103)" {
++    var e = entries(.wide);
++    // latency-bound: 16 Mi values (TP=2's 4096 x 4096, two slices) through the partials and reduce_kernel
++    try expectReduced(try run(&e, 8, 4096, 4096, true, false), "glm_qmm_cfg2_0_0");
++    try expectReduced(try run(&e, 64, 4096, 4096, true, false), "glm_qmm_64_0_0");
++    // bandwidth-bound: 49 Mi (12576 x 4096, four slices) and 32 Mi (4096 x 8192, eight) keep their clusters
++    try expectOne(try run(&e, 8, 12576, 4096, true, false), "glm_qmm_16_0_1", 4);
++    try expectOne(try run(&e, 1, 4096, 8192, true, false), "glm_qmm_cfg4_0_1", 8);
++    // more rows than a decode window
++    try expectOne(try run(&e, 65, 4096, 4096, true, false), "glm_qmm_64_0_1", 2);
++    // one slice: nothing to reduce
++    try expectOne(try run(&e, 8, 4096, 128, true, false), "glm_qmm_16_0_0", 0);
++    // a caller that may not cluster, or a rule of none (this engine before 0103) or all (Python before it)
++    try expectReduced(try run(&e, 8, 12576, 4096, false, false), "glm_qmm_16_0_0");
++    e = entries(.never);
++    try expectReduced(try run(&e, 8, 12576, 4096, true, false), "glm_qmm_16_0_0");
++    e = entries(.always);
++    try expectOne(try run(&e, 8, 4096, 4096, true, false), "glm_qmm_cfg2_0_1", 2);
++}
++test "TF_GLM_QMM_CLUSTERS: unset the 0103 rule, 1 every split, 0 none; none before sm_90" {
++    try std.testing.expectEqual(mm.Clusters.wide, mm.clustersFrom(null, 121));
++    try std.testing.expectEqual(mm.Clusters.always, mm.clustersFrom("1", 121));
++    try std.testing.expectEqual(mm.Clusters.never, mm.clustersFrom("0", 121));
++    try std.testing.expectEqual(mm.Clusters.wide, mm.clustersFrom("2", 90));
++    try std.testing.expectEqual(mm.Clusters.never, mm.clustersFrom("1", 86));
++    try std.testing.expectEqual(mm.Clusters.never, mm.clustersFrom(null, 80));
++}
++fn expectPrompt(got: []const Launch, symbol: []const u8, blocks: u32, group: c_int) !void {
++    try expectOne(got, symbol, 0);
++    try std.testing.expectEqual(@as([3]u32, .{ blocks, 1, 1 }), got[0].grid);
++    try std.testing.expectEqual(@as(u32, 128), got[0].block);
++    try std.testing.expectEqual(@as(u32, 41984), got[0].shared);
++    try std.testing.expectEqual(group, got[0].group);
++}
++test "prompt projections launch 64 x 64 tiles unless K >= 1024 and 96 or more 128 x 128 blocks (patch 0102)" {
++    var e = entries(.never);
++    // a 2,048-row chunk at 4096 x 4096: 16 x 32 blocks of 128 x 128
++    try expectPrompt(try run(&e, 2048, 4096, 4096, true, true), "glm_qmm_prefill_0", 512, 12);
++    // narrow (512 columns: 64 big blocks), short K (512) and few rows (64: 32 big blocks): 64 x 64
++    try expectPrompt(try run(&e, 2048, 512, 4096, true, true), "glm_qmm_prefill64_0", 32 * 8, 24);
++    try expectPrompt(try run(&e, 2048, 4096, 512, true, true), "glm_qmm_prefill64_0", 32 * 64, 32);
++    try expectPrompt(try run(&e, 64, 4096, 4096, true, true), "glm_qmm_prefill64_0", 64, 1);
++    // exactly 96 blocks with K 1024 stays wide
++    try expectPrompt(try run(&e, 2048, 768, 1024, true, true), "glm_qmm_prefill_0", 96, 16);
++    // TF_GLM_PROMPT_TILE=0: 128 x 128 throughout, as before
++    e.prompt_tiles = false;
++    try expectPrompt(try run(&e, 2048, 512, 4096, true, true), "glm_qmm_prefill_0", 64, 12);
++}
++test "TF_GLM_PROMPT_TILE: on unless 0" {
++    try std.testing.expect(mm.promptTilesFrom(null));
++    try std.testing.expect(mm.promptTilesFrom("1"));
++    try std.testing.expect(!mm.promptTilesFrom("0"));
++}
