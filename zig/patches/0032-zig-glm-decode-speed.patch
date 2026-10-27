@@ -1,4 +1,4 @@
-# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits fe2f060f7929..0e0518f341f2); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits fe2f060f7929..0e0518f341f2); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: decode clusters, draft prelaunch and narrow prompt tiles (TF_GLM_QMM_CLUSTERS, TF_GLM_DRAFT_PRELAUNCH, TF_GLM_PROMPT_TILE; after BadAd84's GLM 0103, 0100, 0102)
 
 Each byte-identical by design and behind its own switch; their speed at TP=2 is measured on the GPU, not assumed.

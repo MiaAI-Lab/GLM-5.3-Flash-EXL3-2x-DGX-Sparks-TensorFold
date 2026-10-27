@@ -352,6 +352,15 @@ case_ "scripts/config.sh: the reserve grows past 4 requests except on the Zig en
   got=$(env -u MEMORY_RESERVE_GIB -u TENSORFOLD_MEMORY_RESERVE_GIB -u TF_GLM_MULTI_WINDOW ENGINE=zig PARALLEL=8 TP=3 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
   awk -v g="$got" "BEGIN { exit !(g > 14.5) }" || { echo "zig at TP=3: the reserve should still grow (got $got)"; exit 1; }'
 
+case_ "start.sh: MULTI_PREFILL takes 2 on the Zig engine only, and only with FILL=1" 0 '' '
+  blk=$(awk "/MULTI_PREFILL=2 \\(one forward/{f=1} f{print} f && /^fi$/{exit}" "'"$root"'/start.sh")
+  [[ -n $blk ]] || { echo "no MULTI_PREFILL block in start.sh"; exit 1; }
+  run() { (die() { echo "DIE $*"; exit 3; }; ENGINE=$1 MULTI_PREFILL=$2 FILL=$3; eval "$blk"; echo ok); }
+  expect "$(run zig 2 1)" ok; expect "$(run zig 1 0)" ok; expect "$(run python 1 0)" ok
+  [[ $(run zig 2 0) == "DIE MULTI_PREFILL=2 needs FILL=1" ]] || { echo "zig 2 without FILL: $(run zig 2 0)"; exit 1; }
+  [[ $(run python 2 1) == DIE* ]] || { echo "python took 2"; exit 1; }
+  [[ $(run zig 3 1) == DIE* ]] || { echo "zig took 3"; exit 1; }'
+
 case_ "scripts/config.sh: MULTI_PREFILL is 1 on the Python engine, 0 on the Zig engine unless set" 0 '' '
   for e in zig python; do
     got=$(env -u MULTI_PREFILL -u TF_GLM_MULTI_PREFILL ENGINE=$e TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$TF_GLM_MULTI_PREFILL")

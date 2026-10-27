@@ -1,4 +1,4 @@
-# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 6cc5c62a69ae..3c8b05d8bbb7); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 6cc5c62a69ae..3c8b05d8bbb7); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: the race's margin is relative past 1, and TF_GLM_NUCLEUS_RACE_CHECK=1 draws every raced row again from whole shards
 
 Review: an absolute 1e-9 rounds back to the bound once |score| passes 2^24 (temperature near its 1e-6 clamp), so the

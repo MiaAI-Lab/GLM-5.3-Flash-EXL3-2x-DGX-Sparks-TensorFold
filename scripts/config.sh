@@ -338,6 +338,8 @@ export TENSORFOLD_NUCLEUS_UNION="${NUCLEUS_UNION:-${TENSORFOLD_NUCLEUS_UNION:-1}
 # 196.3 -> 227.9 tok/s; one request unchanged. Exact. MULTI_PREFILL=0 turns it off.
 # ENGINE=zig: 0 by default. Its TF_GLM_MULTI_PREFILL (zig/patches/0033, with FILL=1) lets up to two waiting prompts
 # fill a chunk each a step, in separate forwards: a short prompt no longer waits for a long one, with no batching gain.
+# MULTI_PREFILL=2 (zig/patches/0038, with FILL=1) runs those chunks in one forward, as the Python engine does; each
+# chunk is the one its prompt runs alone, so replies are the same. Under KV sharding it falls back to two at a time.
 MULTI_PREFILL="${MULTI_PREFILL:-$([[ "$ENGINE" == zig ]] && echo 0 || echo 1)}"
 export TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
 # Smooth streaming (patch 0061): with drafts a round accepts ~3 tokens at once, so a streamed reply arrives in bursts

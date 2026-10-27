@@ -1,4 +1,4 @@
-# port-patches.sh: glm/sampling-r7 @ 3c8b05d8bbb7 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1305bda37155..fe2f060f7929); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1305bda37155..fe2f060f7929); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: a prompt chunk's DSA indexer in CUDA, pool scores and one-pass top-K pools (TF_GLM_SCORES_CUDA, default on; ported from BadAd84's Python patches 0101/0105)
 
 On a GB10, tf-glm-index-check: scores and pools byte-equal to the Triton set at 1k-262k pools; at 147,456 pools a
