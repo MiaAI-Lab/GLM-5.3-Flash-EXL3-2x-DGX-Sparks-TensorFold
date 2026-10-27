@@ -343,12 +343,14 @@ case_ "scripts/config.sh: ENGINE=zig defaults to 1,048,576 x 8 at TP=2, 131072 x
   done; done; done
   ! grep -q "no prompts past ~32k tokens" "$here/config.sh" || { echo "the stale 32k comment is back"; exit 1; }'
 
-case_ "scripts/config.sh: the reserve grows past 4 requests on the Python engine only" 0 '' '
+case_ "scripts/config.sh: the reserve grows past 4 requests except on the Zig engine at TP=2" 0 '' '
   for e in zig python; do for p in 4 8; do
-    got=$(ENGINE=$e PARALLEL=$p TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
+    got=$(env -u MEMORY_RESERVE_GIB -u TENSORFOLD_MEMORY_RESERVE_GIB -u TF_GLM_MULTI_WINDOW ENGINE=$e PARALLEL=$p TP=2 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
     want=14.5; [[ $e == python && $p == 8 ]] && want=19.6  # 0.95 x 4 requests + 0.04 x 32 rows (its window is 64 at 8)
     expect "$e $p $got" "$e $p $want"
-  done; done'
+  done; done
+  got=$(env -u MEMORY_RESERVE_GIB -u TENSORFOLD_MEMORY_RESERVE_GIB -u TF_GLM_MULTI_WINDOW ENGINE=zig PARALLEL=8 TP=3 bash -c "source \"$here/config.sh\" >/dev/null 2>&1; echo \$MEMORY_RESERVE_GIB")
+  awk -v g="$got" "BEGIN { exit !(g > 14.5) }" || { echo "zig at TP=3: the reserve should still grow (got $got)"; exit 1; }'
 
 # ---- spill and KV sharding together
 case_ "refuse: KV_SHARD=1 with spill v1 (both explicit)" 0 'ZIG_HAS="kvshard spillshard" KV_SHARD=1 SPILL_GIB=8' '
