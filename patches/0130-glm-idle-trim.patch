@@ -5,17 +5,22 @@
 # of MemAvailable that stays low after the agents disconnect, and of reserved CUDA memory ~25 GB above what is in use
 # (issues #143, #168, #197). The KV pool, the kept prompts and the weights are not touched (empty_cache frees only blocks no
 # tensor uses), so the next request prefills no more than it would have; it can pay the CUDA allocations the trim freed.
-# Every rank runs its own timer (a daemon thread on the rank's ``idle`` flag): no new message between the ranks. Each trim
+# Every rank runs its own timer. A local lock serializes trim with protocol and work transitions; no new rank messages.
+# Work covers scheduler admission before _flush and worker spill after IDLE. Epochs catch phases between polls. Each trim
 # logs "[tensorfold] rank N idle S s: trimmed X GiB of cached CUDA memory"; /health's idle_trim has the count and the bytes.
 # Same replies: memory only.
+# Based on MiaAI-Lab's Patch 0130; atomic synchronization covers local work, not only the protocol idle bit.
+# Lock order: idle_lock is a leaf; never hold it across queue/doorbell waits, transport or decoder/spill work.
+# Startup calibration finishes before the trim thread starts. CPU tests: tests/test_sync_guard.py.
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 7b6016b..4f69fcb 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -98,6 +98,39 @@ def watchdog_exits(value: str | None = None) -> bool:
+@@ -96,6 +96,39 @@
+     if raw not in ("0", "1"):
+         raise ValueError(f"TF_GLM_MULTI_WATCHDOG_EXIT: 0 or 1, not {raw!r}")
      return raw == "1"
- 
- 
++
++
 +def idle_trim_seconds(value: str | None = None) -> float:
 +    """TF_GLM_IDLE_TRIM_S: seconds a rank may sit idle (no stream, none queued) before it gives the memory it only
 +    caches back to the system (torch's cached blocks, Python garbage, the C heap's free pages); 0 (default): never."""
@@ -47,66 +52,102 @@ index 7b6016b..4f69fcb 100644
 +    except (OSError, AttributeError):
 +        pass
 +    return before, torch.cuda.memory_reserved()
-+
-+
+ 
+ 
  def _watch(seconds: float, what: str) -> None:
-     if seconds > 0:
-         import faulthandler
-@@ -703,6 +736,13 @@ class MultiDecoder:
+@@ -702,7 +735,14 @@
+         self.chat_roots: dict[int, int] = {}             # each conversation's first prompt length (continued_chat)
          self.chats_continued = self.chats_continued_prefill = 0
          self.outbox: list[int] = []
++        self.idle_lock = threading.Lock()  # local only; never held across transport/decoder work
++        self.idle_epoch = 0
++        self.trim_busy = True              # startup/calibration is work, not an idle spell
          self.idle = True
 +        self.idle_trim_s = idle_trim_seconds()           # TF_GLM_IDLE_TRIM_S, read now: a typo fails at start
 +        self.trims = 0                                   # idle spells that ended in a trim, and what they gave back
 +        self.trimmed_bytes = 0
 +        self.trim_stop = threading.Event()
-+        if self.idle_trim_s > 0 and torch.cuda.is_available():
-+            self.device_index = torch.cuda.current_device()
-+            threading.Thread(target=self._trim_idle, name="idle-trim", daemon=True).start()
          self.exit_on_broken = exit_on_broken()
          self.broken: Exception | None = None
          self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
-@@ -746,6 +786,39 @@ class MultiDecoder:
+@@ -710,6 +750,10 @@
+         self.dflash_code = encode_policy(DFLASH_POLICY)
+         if self.fill_budget:
+             self.fill_costs = self._time_prompt_layers()
++        self._trim_work(False)
++        if self.idle_trim_s > 0 and torch.cuda.is_available():
++            self.device_index = torch.cuda.current_device()
++            threading.Thread(target=self._trim_idle, name="idle-trim", daemon=True).start()
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -746,6 +790,65 @@
                  "carry": dict(self.carry, ms_total=round(self.carry["ms_total"], 1), ms_max=round(self.carry["ms_max"], 1),
                                refused=dict(self.carry["refused"]))}
  
-+    def _trim_idle(self) -> None:
-+        """Both ranks, a thread: once ``idle`` has held for TF_GLM_IDLE_TRIM_S, trim the memory this rank only caches
-+        (``trim_memory``), once per idle spell. The prefill scratch of a long prompt stays in torch's cache after its
-+        request ends; on the Spark's one memory pool that is memory nothing else can use. The pool, the kept prompts
-+        and the weights are not touched, so the next request prefills no more than it would have."""
++    def _set_idle(self, value: bool) -> bool:
++        """Protocol idle transition, atomic with this rank's trim. Return the old state."""
++        with self.idle_lock:
++            old = self.idle
++            if old != value:
++                self.idle_epoch += 1
++            self.idle = value
++            return old
 +
++    def _trim_work(self, busy: bool) -> None:
++        """Cover pre-message admission/vision and post-IDLE spill work too.
++
++        Only the scheduler/follow thread changes this flag. Release the local lock
++        BEFORE CUDA work, doorbells, queue waits or collectives; trim never uses transport.
++        """
++        with self.idle_lock:
++            if busy != self.trim_busy:
++                self.idle_epoch += 1
++            self.trim_busy = busy
++
++    def _trim_idle(self) -> None:
++        """All ranks: one local trim per uninterrupted, work-free idle epoch."""
 +        import sys
 +
 +        torch.cuda.set_device(self.device_index)
-+        since: float | None = None
++        since = None
++        epoch = None
 +        done = False
 +        poll = min(5.0, max(0.5, self.idle_trim_s / 4))
 +        while not self.trim_stop.wait(poll):
-+            if not self.idle:
-+                since, done = None, False
++            with self.idle_lock:
++                eligible = self.idle and not self.trim_busy
++                observed = self.idle_epoch
++            if not eligible:
++                since, done, epoch = None, False, None
 +                continue
++            # The clock is deliberately outside the critical section. Revalidate the
++            # epoch under the SAME lock used by EVERY busy/idle transition before trim.
 +            now = time.monotonic()
-+            if since is None:
-+                since = now
-+            if done or now - since < self.idle_trim_s:
-+                continue
-+            done = True
-+            try:
-+                before, after = trim_memory()
-+            except Exception as exc:                  # noqa: BLE001  (a trim that fails is skipped, never fatal)
-+                print(f"[tensorfold] rank {self.rank} idle trim failed: {exc!r}", file=sys.stderr, flush=True)
-+                continue
-+            self.trims += 1
-+            self.trimmed_bytes += max(0, before - after)
-+            print(f"[tensorfold] rank {self.rank} idle {self.idle_trim_s:g} s: trimmed "
-+                  f"{(before - after) / 2**30:.2f} GiB of cached CUDA memory ({before / 2**30:.2f} -> "
-+                  f"{after / 2**30:.2f} GiB reserved)", file=sys.stderr, flush=True)
++            with self.idle_lock:
++                if not self.idle or self.trim_busy or observed != self.idle_epoch:
++                    since, done, epoch = None, False, None
++                    continue
++                if epoch != observed:
++                    since, done, epoch = now, False, observed
++                if done or now - since < self.idle_trim_s:
++                    continue
++                done = True
++                try:
++                    before, after = trim_memory()
++                except Exception as exc:  # failed attempt is once per spell; context releases lock
++                    print(f"[tensorfold] rank {self.rank} idle trim failed: {exc!r}", file=sys.stderr, flush=True)
++                    continue
++                self.trims += 1
++                self.trimmed_bytes += max(0, before - after)
++                print(f"[tensorfold] rank {self.rank} idle {self.idle_trim_s:g} s: trimmed "
++                      f"{(before - after) / 2**30:.2f} GiB of cached CUDA memory ({before / 2**30:.2f} -> "
++                      f"{after / 2**30:.2f} GiB reserved)", file=sys.stderr, flush=True)
 +
      def health(self) -> dict:
          lanes = list(self.lanes.values())
          return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
-@@ -755,6 +828,8 @@ class MultiDecoder:
+@@ -755,6 +858,8 @@
                  "kv_shard_twins": dict(self.twins, held=sum(1 for l in lanes if l.twin is not None)),
                  "kv_shard": self._shard_health() if self.pool.half else None,
                  "kept_prompts": len(self.kept),
@@ -115,3 +156,120 @@ index 7b6016b..4f69fcb 100644
                  # streams that continued their conversation without resuming from its own turn state (a rewind before
                  # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
                  "chats_continued": self.chats_continued,
+@@ -782,6 +887,7 @@
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+ 
+     def _break(self, exc: Exception) -> None:
++        self.trim_stop.set()  # a broken decoder is not eligible for background CUDA work
+         # Every error path latches its first cause before any cleanup that might itself fail or hang.
+         if self.broken is None:
+             self.broken = exc
+@@ -810,9 +916,8 @@
+     def _flush(self) -> None:
+         """Rank 0: this iteration's ops to rank 1, one message (after the doorbell when rank 1 idles)."""
+ 
+-        if self.idle:
++        if self._set_idle(False):
+             self.g._ring()
+-            self.idle = False
+         msg, self.outbox = seal(self.outbox, self.sent), []
+         self.sent = (self.sent + 1) % SEAL_MOD
+         if self.tune.async_msg or (self.fill_budget and (self.partial is not None or self.short_round_due)):
+@@ -2088,7 +2193,7 @@
+             self._emit(IDLE, [])
+         self._flush()
+         if not self.lanes:
+-            self.idle = True
++            self._set_idle(True)
+         self._do_flush([])
+ 
+     def _do_flush(self, kids, budget: float | None = None) -> None:
+@@ -3060,7 +3165,7 @@
+             self.decode_due = self.short_round_due = False
+             self._emit(IDLE, [])
+             self._flush()
+-            self.idle = True
++            self._set_idle(True)
+             if self.disk is not None:          # nothing pumps while idle: every waiting block through the ring now
+                 self.disk.stage_all()
+         _unwatch(self.watchdog)
+@@ -3140,13 +3245,20 @@
+ 
+         while True:
+             if self.idle:
+-                self.g._await_bell()
+-                self.idle = False
+-            _watch(self.watchdog, f"rank {self.rank} message")   # busy: rank 0's next message is due within a round
+-            self.apply(unseal(self.g._share(None), self.received, self.rank))
+-            self.received = (self.received + 1) % SEAL_MOD
+-            self._pump()
+-            _unwatch(self.watchdog)
++                self.g._await_bell()  # CPU store wait, OUTSIDE idle_lock; trimming must remain possible
++            self._trim_work(True)
++            try:
++                self._set_idle(False)
++                _watch(self.watchdog, f"rank {self.rank} message")
++                self.apply(unseal(self.g._share(None), self.received, self.rank))
++                self.received = (self.received + 1) % SEAL_MOD
++                self._pump()
++                _unwatch(self.watchdog)
++            except BaseException:
++                self.trim_stop.set()  # never trim a failed/incomplete message
++                raise
++            finally:
++                self._trim_work(False)
+             if once:
+                 return
+ 
+@@ -3238,7 +3350,7 @@
+             elif op == IDLE:
+                 if self.lanes:
+                     raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
+-                self.idle = True
++                self._set_idle(True)
+                 if self.disk is not None:      # nothing pumps while idle: every waiting block through the ring now
+                     self.disk.stage_all()
+             else:
+@@ -3526,21 +3638,25 @@
+         if reading and not self.decoder.live():
+             time.sleep(0.002)                    # only reads in flight: poll them
+         first = self.waiting.get() if idle else None                # idle: wait for a request
+-        until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
+-        done = self._admit(first, until)
++        self.decoder._trim_work(True)
+         try:
+-            done += self.decoder.round()
+-        except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+-            for s in self.decoder.drop():
+-                self._reply(s, "error", exc)
+-        self._requeue()
+-        try:
+-            self.decoder.finish(done)
+-        except Exception as exc:                 # noqa: BLE001
+-            for s in self.decoder.drop():
+-                self._reply(s, "error", exc)
+-        for s in done:
+-            self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
+-        if self.held is not None and not self.decoder.live():
+-            time.sleep(0)                        # the held request retries next iteration (now alone)
+-        _unwatch(getattr(self.decoder, "watchdog", 0))
++            until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
++            done = self._admit(first, until)
++            try:
++                done += self.decoder.round()
++            except Exception as exc:                 # noqa: BLE001  (the live requests fail)
++                for s in self.decoder.drop():
++                    self._reply(s, "error", exc)
++            self._requeue()
++            try:
++                self.decoder.finish(done)
++            except Exception as exc:                 # noqa: BLE001
++                for s in self.decoder.drop():
++                    self._reply(s, "error", exc)
++            for s in done:
++                self._reply(s, *(("error", s.error) if s.error is not None else ("done", self.decoder.stats(s))))
++            if self.held is not None and not self.decoder.live():
++                time.sleep(0)                        # the held request retries next iteration (now alone)
++            _unwatch(getattr(self.decoder, "watchdog", 0))
++        finally:
++            self.decoder._trim_work(False)
