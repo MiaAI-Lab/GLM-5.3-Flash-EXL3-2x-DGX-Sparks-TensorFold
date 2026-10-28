@@ -1,0 +1,1148 @@
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3c8b05d8bbb7..cf4dde927470); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: several prompts' prefill chunks in one forward (TF_GLM_MULTI_PREFILL=2, with TF_GLM_FILL=1; default 0, as today)
+
+Commits:
+- glm_cuda: TF_GLM_MULTI_PREFILL=2 runs several waiting prompts' next chunks in ONE forward
+- glm_cuda: batched fills: origins slots up to 40, zeroed gap rows, true rows left, capped fallback
+- glm_cuda: the TF_GLM_MULTI_PREFILL=2 startup line says what a step does under TF_GLM_KV_SHARD
+- glm_cuda: the refusal for a bad TF_GLM_MULTI_PREFILL names =2 among the values it takes
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0038-zig-glm-batched-fill.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig b/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
+index 836cd26f4b4d0802e1af59b295ae490ecdd2b53d..d5ef543c71018494671be04b9c5329d5f450c9cc 100644
+--- a/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
++++ b/zig/src/families/glm_cuda/cuda_aot_coverage_test.zig
+@@ -25,6 +25,7 @@ const hc = @import("cuda_hc.zig");
+ const mla = @import("cuda_mla.zig");
+ const tri_mod = @import("cuda_triton.zig");
+ const engine = @import("cuda_engine.zig");
++const many = @import("cuda_prefill_many.zig");
+ const G = @import("cuda_geometry.zig").Geometry;
+ 
+ const gpa = std.testing.allocator;
+@@ -553,6 +554,51 @@ test "every Triton lookup of a TP=2 context, stream count and KV pool is in the
+     try std.testing.expectEqual(@as(usize, 0), gained);
+ }
+ 
++test "a batched prompt chunk (TF_GLM_MULTI_PREFILL=2: pieces of several prompts, one forward) looks up only variants the captured set has" {
++    var set = try loadSet();
++    defer set.deinit();
++    drv = Fake.driver();
++    const c = configs[0];
++    const most = capMax(c);
++    const s = try gpa.create(Sweep);
++    defer gpa.destroy(s);
++    try s.init(set.value.kernels, most);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x49_62);
++    const rnd = prng.random();
++    var missing: usize = 0;
++    var many_pieces: usize = 0;
++    for (0..400) |trial| {
++        // up to eight prompts' next chunks, each the rows a chunk of its own has (chunk_rows), at a grid position
++        var wants: [10]usize = undefined;
++        const k = rnd.intRangeAtMost(usize, 2, wants.len);
++        for (wants[0..k]) |*w| w.* = if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, 63) else rnd.intRangeAtMost(usize, 1, 16) * 64;
++        const lay = many.plan(wants[0..k], grid.chunk_rows);
++        if (lay.n < 2) continue;
++        many_pieces += lay.n;
++        const rank = trial % 2;
++        const e = try s.engineFor(rank, extentOf(c), .{});
++        var parities: [many.max_pieces][34]u1 = @splat(@splat(0));
++        var pieces: [many.max_pieces]pre.Engine.Piece = undefined;
++        for (0..lay.n) |i| {
++            const rows = wants[lay.who[i]];
++            // a piece anywhere on the grid: under the dense limit, past it, deep in the context
++            const pos = if (rnd.boolean()) rnd.uintLessThan(usize, 40) * grid.state_grid else rnd.uintLessThan(usize, (most - rows) / grid.state_grid + 1) * grid.state_grid;
++            const low = std.mem.alignForward(usize, pos + rows, G.extent);
++            const cap = low + rnd.uintLessThan(usize, (most - low) / G.extent + 1) * G.extent;
++            pieces[i] = .{ .lo = lay.lo[i], .rows = rows, .pos = pos, .cache = try s.caches[rank].view(0, cap, 0), .conv = dev(1 << 16), .rec = dev(1 << 16), .pos_dev = dev(64), .parity = &parities[i] };
++        }
++        s.l.run.clearRetainingCapacity();
++        try e.chunkMany(pieces[0..lay.n], lay.total);
++        for (s.l.run.items) |line| if (!s.l.seen.get(line).?) {
++            std.debug.print("a batched chunk of {d} pieces ({d} rows, rank {d}) looks up what the set lacks: {s}\n", .{ lay.n, lay.total, rank, line });
++            missing += 1;
++        };
++    }
++    try std.testing.expect(many_pieces > 800);
++    try std.testing.expectEqual(@as(usize, 0), missing);
++}
++
+ test "a prompt's chunks are the rows and positions the sweep enumerates" {
+     var prng = std.Random.DefaultPrng.init(0x64);
+     const rnd = prng.random();
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 6000ab7ac49baf1dc26945d0632dab72b40548cf..718ac055dd63c727a566f7f998479183f932f339 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -27,6 +27,8 @@ const mirror = @import("cuda_mirror.zig");
+ const ops = @import("cuda_torch_ops.zig");
+ const prefill_mod = @import("cuda_prefill.zig");
+ const prefill_loop = @import("cuda_prefill_loop.zig");
++const many = @import("cuda_prefill_many.zig");
++const fill_pick = @import("cuda_fill_pick.zig");
+ const draft_pkg = @import("cuda_dflash_package.zig");
+ const dflash = @import("cuda_dflash.zig");
+ const dflash_config = @import("cuda_dflash_config.zig");
+@@ -978,23 +980,38 @@ pub const Engine = struct {
+                 e.prompt_tokens = &.{};
+             }
+             _ = try prefill_loop.chunkAt(&e.pe, &st.cur, .{ .tokens = fl.ids[0..r.end], .begin = r.begin, .limit = e.prefill_rows, .head = r.head, .tap_ctx = e, .on_taps = promptTaps }, ch.pos, ch.rows);
+-            if (!fl.cursor.ran(&fl.plan, ch)) return false;
+-            if (fl.plan.keep and ch.run == 0) {
+-                const k = r.end;
+-                st.pos = k;
+-                // the save may be refused (the keep floor, or no device memory): never the prompt, which goes on from its
+-                // live rows (the lanes continue from them, `live_from`; the ranks agreed on this keep from their free
+-                // memory first, cuda_lanes pass, so this is the rare case of memory going in between)
+-                fl.kept = e.takeSnap(s, k) catch |err| switch (err) {
+-                    error.BelowMemoryReserve, error.OutOfDeviceMemory => blk: {
+-                        std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k, @errorName(err) });
+-                        break :blk null;
+-                    },
+-                    else => return err,
+-                };
+-            }
+-            if (fl.cursor.run < fl.plan.n) return false;
++            if (!try e.chunkRan(fl, ch)) return false;
+         }
++        return e.fillEnd(fl);
++    }
++
++    /// Chunk `ch` of the fill ran (its rows are in): the cursor moved on; at the keep point's run's end the state is kept.
++    /// False while the plan has chunks left, true once the pass's rows are all in (fillEnd draws its first token).
++    fn chunkRan(e: *Engine, fl: *Fill, ch: prefill_loop.Chunk) !bool {
++        const s = fl.seq;
++        const st = &s.st;
++        const r = fl.plan.runs[ch.run];
++        if (!fl.cursor.ran(&fl.plan, ch)) return false;
++        if (fl.plan.keep and ch.run == 0) {
++            const k = r.end;
++            st.pos = k;
++            // the save may be refused (the keep floor, or no device memory): never the prompt, which goes on from its
++            // live rows (the lanes continue from them, `live_from`; the ranks agreed on this keep from their free
++            // memory first, cuda_lanes pass, so this is the rare case of memory going in between)
++            fl.kept = e.takeSnap(s, k) catch |err| switch (err) {
++                error.BelowMemoryReserve, error.OutOfDeviceMemory => blk: {
++                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k, @errorName(err) });
++                    break :blk null;
++                },
++                else => return err,
++            };
++        }
++        return fl.cursor.run >= fl.plan.n;
++    }
++
++    /// The pass's rows are all in: done, and unless its keep point was its end the first token drawn from the head's logits.
++    fn fillEnd(e: *Engine, fl: *Fill) !bool {
++        const st = &fl.seq.st;
+         fl.done = true;
+         if (!fl.plan.draws) return true;
+         st.pos = fl.prompt.len;
+@@ -1007,6 +1024,82 @@ pub const Engine = struct {
+         return true;
+     }
+ 
++    /// Where the fill's pass stands: the prompt position its next chunk starts at (the lanes order batched fills by rows left).
++    pub fn fillPos(_: *const Engine, fl: *const Fill) usize {
++        if (fl.done or fl.cursor.run >= fl.plan.n) return fl.prompt.len;
++        return if (fl.cursor.step == 0) fl.plan.runs[fl.cursor.run].begin else fl.cursor.pos;
++    }
++
++    /// TF_GLM_MULTI_PREFILL=2: the next chunks of `fls` (in the order given) in ONE forward where they fit (recipe patches
++    /// 0049 / 0062: cuda_prefill.Engine.chunkMany over cuda_prefill_many's layout: the chunk's rows hold them back to
++    /// back, one that does not fit waits for a later step, `ran` false). Each fill's chunk is the one it would run alone
++    /// (same rows, position, head and keep), so what it computes is its own; its keep and first token follow as alone.
++    /// `done[i]`: fill i's pass is in. One piece, or an engine that cannot share (pictures, the sharded KV, an observer):
++    /// a chunk each of the first fill_pick.fallback_most, in order, as fillStep runs it.
++    pub fn fillStepMany(e: *Engine, fls: []const *Fill, ran: []bool, done: []bool) !void {
++        const cap = 64;
++        if (ran.len != fls.len or done.len != fls.len or fls.len > cap) return error.BadFills;
++        @memset(ran, false);
++        @memset(done, false);
++        switch (fill_pick.batched(fls.len, !e.pe.manyOk())) {
++            .shared => {},
++            .turns => |n| {
++                // a chunk each of the first few: not 8 x a whole chunk between decode rounds
++                for (fls[0..n], ran[0..n], done[0..n]) |fl, *r, *d| {
++                    r.* = true;
++                    d.* = try e.passChunk(fl);
++                }
++                return;
++            },
++        }
++        var chs: [cap]?prefill_loop.Chunk = undefined;
++        var wants: [cap]usize = undefined;
++        for (fls, 0..) |fl, i| {
++            chs[i] = if (fl.done) null else try fl.cursor.next(&fl.plan, e.prefill_rows);
++            wants[i] = if (chs[i]) |c| c.rows else 0;
++        }
++        // a pass with no chunk left (its keep point was its end) has only its ending to do
++        for (fls, 0..) |fl, i| if (chs[i] == null) {
++            ran[i] = true;
++            done[i] = if (fl.done) true else try e.fillEnd(fl);
++        };
++        const lay = many.plan(wants[0..fls.len], e.prefill_rows);
++        if (lay.n < 2) {
++            if (lay.n == 1) {
++                const i = lay.who[0];
++                ran[i] = true;
++                done[i] = try e.passChunk(fls[i]);
++            }
++            return;
++        }
++        const ids = try e.gpa.alloc(i32, lay.total);
++        defer e.gpa.free(ids);
++        @memset(ids, 0);
++        var pieces: [many.max_pieces]prefill_mod.Engine.Piece = undefined;
++        for (0..lay.n) |k| {
++            const fl = fls[lay.who[k]];
++            const ch = chs[lay.who[k]].?;
++            const st = &fl.seq.st;
++            if (ch.pos + ch.rows > st.cache.capacity) return error.BadExtent;
++            @memcpy(ids[lay.lo[k]..][0..ch.rows], fl.ids[ch.pos..][0..ch.rows]);
++            pieces[k] = .{ .lo = lay.lo[k], .rows = ch.rows, .pos = ch.pos, .cache = st.cache, .conv = st.fixed.conv, .rec = st.fixed.rec, .pos_dev = st.fixed.pos_dev, .parity = &st.cur };
++        }
++        try prefill_loop.stageIds(&e.pe, ids);
++        try e.pe.chunkMany(pieces[0..lay.n], lay.total);
++        for (0..lay.n) |k| {
++            const i = lay.who[k];
++            const fl = fls[i];
++            const ch = chs[i].?;
++            const pc = pieces[k];
++            e.bound = fl.seq;
++            if (fl.plan.runs[ch.run].head) try e.pe.headRow(e.pe.b.normed + (pc.lo + pc.rows - 1) * 4096 * 2);
++            if (e.drafter) |p| try e.absorbTaps(p, fl.seq.slot, e.pe.b.taps, e.pe.b.rows, pc.lo, pc.rows);
++            fl.prompt_at += pc.rows;
++            ran[i] = true;
++            done[i] = if (try e.chunkRan(fl, ch)) try e.fillEnd(fl) else false;
++        }
++    }
++
+     // -- kept prompt states (cuda_snapshot.zig) -----------------------------------------------------------------------
+ 
+     /// This engine's state buffer for `at` tokens: rows, rings, recurrent states and (with drafts) DFlash2's rings.
+diff --git a/zig/src/families/glm_cuda/cuda_fill_pick.zig b/zig/src/families/glm_cuda/cuda_fill_pick.zig
+index 31e1a7a47588267d38c1d562cb705539a318486f..cf7ca1c9189224ac5248de3dd74a098dcad19aa1 100644
+--- a/zig/src/families/glm_cuda/cuda_fill_pick.zig
++++ b/zig/src/families/glm_cuda/cuda_fill_pick.zig
+@@ -4,31 +4,89 @@
+ //! (orders and rows left are the same on every rank).
+ const std = @import("std");
+ 
+-/// A filling prompt: its fill's begin order and the rows its pass has left from its segment's start.
+-pub const Candidate = struct { order: u64, left: usize };
++/// A filling prompt: its fill's begin order, the rows its pass has left from its segment's start, and (batched fills)
++/// the steps in a row it was left out of.
++pub const Candidate = struct { order: u64, left: usize, waits: u32 = 0 };
+ 
+ /// Prompts a step advances at most (TF_GLM_MULTI_PREFILL_MOST); the setting's range.
+ pub const default_most: usize = 2;
+ pub const most_max: usize = 8;
+ 
+-/// TF_GLM_MULTI_PREFILL (`on`) and TF_GLM_MULTI_PREFILL_MOST (`most`), as set: the prompts a step advances. Unset, blank or
+-/// "0": 1 (the oldest alone, as without it); "1": `most` of them, 2 by default, 2 to 8. Anything else is refused.
+-pub fn parse(on: ?[]const u8, most: ?[]const u8) !usize {
+-    const v = std.mem.trim(u8, on orelse return 1, " ");
+-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return 1;
+-    if (!std.mem.eql(u8, v, "1")) return error.BadMultiPrefill;
+-    const m = std.mem.trim(u8, most orelse return default_most, " ");
+-    if (m.len == 0) return default_most;
++/// Prompts a batched step holds at most by default (TF_GLM_MULTI_PREFILL=2): the chunk's row budget bounds it too.
++pub const default_batch: usize = 8;
++/// A batched step's prompt left out this many steps in a row goes first (so a long prompt is not starved by short
++/// ones that keep coming: they take the chunk's rows, it does not fit beside them).
++pub const starved: u32 = 4;
++
++/// Prompts a batched step runs a chunk of, one forward each, where the engine cannot share a forward (fillStepMany).
++pub const fallback_most: usize = default_most;
++
++/// What a batched step does: `shared` prompts' chunks in ONE forward, or a chunk each of `turns` prompts in turn.
++pub const Batched = union(enum) { shared: usize, turns: usize };
++
++/// A batched step's choice for up to `most` prompts; `cannot_share`: the engine's prompt chunks cannot share a forward.
++pub fn batched(most: usize, cannot_share: bool) Batched {
++    return if (cannot_share) .{ .turns = @min(most, fallback_most) } else .{ .shared = most };
++}
++
++/// What TF_GLM_MULTI_PREFILL asks: `most` prompts a step (1: the oldest alone), and whether they share ONE forward
++/// (`batch`, TF_GLM_MULTI_PREFILL=2: cuda_prefill_many) or take turns, a chunk each in separate forwards (=1).
++pub const Setting = struct { most: usize = 1, batch: bool = false };
++
++/// TF_GLM_MULTI_PREFILL (`on`) and TF_GLM_MULTI_PREFILL_MOST (`most`), as set. Unset, blank or "0": the oldest alone, as
++/// without it. "1": `most` prompts take turns a step, 2 by default, 2 to 8. "2": up to `most` share one forward, 8 by
++/// default, 2 to 8. Anything else is refused.
++pub fn parse(on: ?[]const u8, most: ?[]const u8) !Setting {
++    const v = std.mem.trim(u8, on orelse return .{}, " ");
++    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .{};
++    const batch = std.mem.eql(u8, v, "2");
++    if (!batch and !std.mem.eql(u8, v, "1")) return error.BadMultiPrefill;
++    const dflt: usize = if (batch) default_batch else default_most;
++    const m = std.mem.trim(u8, most orelse return .{ .most = dflt, .batch = batch }, " ");
++    if (m.len == 0) return .{ .most = dflt, .batch = batch };
+     const n = std.fmt.parseInt(usize, m, 10) catch return error.BadMultiPrefill;
+     if (n < 2 or n > most_max) return error.BadMultiPrefill;
+-    return n;
++    return .{ .most = n, .batch = batch };
+ }
+ 
+-/// The setting once the ranks agreed on it: this rank's read error, or 1 without sliced fills (TF_GLM_FILL=1), which it
++/// The setting once the ranks agreed on it: this rank's read error, or off without sliced fills (TF_GLM_FILL=1), which it
+ /// needs (whole passes have no chunks to share).
+-pub fn admit(read: anyerror!usize, sliced: bool) !usize {
++pub fn admit(read: anyerror!Setting, sliced: bool) !Setting {
+     const n = try read;
+-    return if (sliced) n else 1;
++    return if (sliced) n else .{};
++}
++
++/// The startup line for the setting (`sharded`: TF_GLM_KV_SHARD=1, where =2 takes turns, as `batched` says).
++pub fn logStartup(rank: u32, s: Setting, sharded: bool) void {
++    if (!s.batch) {
++        if (s.most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ rank, s.most });
++        return;
++    }
++    switch (batched(s.most, sharded)) {
++        .shared => |n| std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=2: a step fills the next chunks of up to {d} waiting prompts in ONE forward (fewest rows left first, as many as the chunk's rows hold)", .{ rank, n }),
++        .turns => |n| std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=2 with TF_GLM_KV_SHARD=1: the sharded KV cannot share a forward, so a step fills a chunk of each of up to {d} waiting prompts, one forward each (fewest rows left first)", .{ rank, n }),
++    }
++}
++
++/// A batched step's prompts (indices into `cands`, up to `most`, in `out`) in the order their chunks claim the forward's
++/// rows (Python's `_group`): those left out `starved` steps first (oldest first), then the fewest rows left, the older on a
++/// tie. A short prompt's first token does not wait behind a long one.
++pub fn order(cands: []const Candidate, most: usize, out: []usize) []usize {
++    const k = @min(cands.len, out.len); // (`out` holds every candidate in practice)
++    for (out[0..k], 0..) |*o, i| o.* = i;
++    std.mem.sort(usize, out[0..k], cands, before);
++    return out[0..@min(most, k)];
++}
++
++fn before(cands: []const Candidate, a: usize, b: usize) bool {
++    const x = cands[a];
++    const y = cands[b];
++    const sx = x.waits >= starved;
++    const sy = y.waits >= starved;
++    if (sx != sy) return sx;
++    if (sx) return x.order < y.order;
++    if (x.left != y.left) return x.left < y.left;
++    return x.order < y.order;
+ }
+ 
+ /// Up to `most` of `cands` (indices into it) in `out`, by begin order (the chunks run oldest first).
+@@ -73,15 +131,48 @@ test "pick: the oldest, then the fewest rows left (the older on a tie), oldest f
+     try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, pick(&c, 8, out[0..2]));
+ }
+ 
+-test "TF_GLM_MULTI_PREFILL: off unless 1, then 2 prompts a step or TF_GLM_MULTI_PREFILL_MOST's 2 to 8; anything else refused; nothing without sliced fills" {
+-    try std.testing.expectEqual(@as(usize, 1), try parse(null, "4"));
+-    for ([_][]const u8{ "", "0", " 0 " }) |v| try std.testing.expectEqual(@as(usize, 1), try parse(v, "4"));
+-    try std.testing.expectEqual(@as(usize, 2), try parse("1", null));
+-    try std.testing.expectEqual(@as(usize, 2), try parse(" 1", " "));
+-    try std.testing.expectEqual(@as(usize, 8), try parse("1", "8"));
+-    for ([_][]const u8{ "2", "yes", "on" }) |v| try std.testing.expectError(error.BadMultiPrefill, parse(v, null));
+-    for ([_][]const u8{ "1", "9", "x", "-2" }) |m| try std.testing.expectError(error.BadMultiPrefill, parse("1", m));
+-    try std.testing.expectEqual(@as(usize, 3), try admit(3, true));
+-    try std.testing.expectEqual(@as(usize, 1), try admit(3, false));
++test "TF_GLM_MULTI_PREFILL: off unless 1 (turns, 2 prompts a step) or 2 (one forward, up to 8), TF_GLM_MULTI_PREFILL_MOST's 2 to 8; anything else refused; nothing without sliced fills" {
++    try std.testing.expectEqual(Setting{}, try parse(null, "4"));
++    for ([_][]const u8{ "", "0", " 0 " }) |v| try std.testing.expectEqual(Setting{}, try parse(v, "4"));
++    try std.testing.expectEqual(Setting{ .most = 2 }, try parse("1", null));
++    try std.testing.expectEqual(Setting{ .most = 2 }, try parse(" 1", " "));
++    try std.testing.expectEqual(Setting{ .most = 8 }, try parse("1", "8"));
++    try std.testing.expectEqual(Setting{ .most = 8, .batch = true }, try parse("2", null));
++    try std.testing.expectEqual(Setting{ .most = 8, .batch = true }, try parse(" 2 ", " "));
++    try std.testing.expectEqual(Setting{ .most = 3, .batch = true }, try parse("2", "3"));
++    for ([_][]const u8{ "3", "yes", "on" }) |v| try std.testing.expectError(error.BadMultiPrefill, parse(v, null));
++    for ([_][]const u8{ "1", "9", "x", "-2" }) |m| {
++        try std.testing.expectError(error.BadMultiPrefill, parse("1", m));
++        try std.testing.expectError(error.BadMultiPrefill, parse("2", m));
++    }
++    try std.testing.expectEqual(Setting{ .most = 3, .batch = true }, try admit(.{ .most = 3, .batch = true }, true));
++    try std.testing.expectEqual(Setting{}, try admit(.{ .most = 3, .batch = true }, false));
+     try std.testing.expectError(error.BadMultiPrefill, admit(error.BadMultiPrefill, false));
+ }
++
++test "order: the starved first (oldest first), then the fewest rows left, the older on a tie; up to most" {
++    var out: [8]usize = undefined;
++    const c = [_]Candidate{ .{ .order = 4, .left = 900 }, .{ .order = 1, .left = 5000 }, .{ .order = 7, .left = 100 }, .{ .order = 3, .left = 100 } };
++    try std.testing.expectEqualSlices(usize, &.{ 3, 2, 0, 1 }, order(&c, 8, &out));
++    try std.testing.expectEqualSlices(usize, &.{ 3, 2 }, order(&c, 2, &out));
++    var d = c;
++    d[1].waits = starved;
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3, 2, 0 }, order(&d, 8, &out));
++    d[0].waits = starved + 3;
++    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 3 }, order(&d, 3, &out));
++    d[0].waits = starved - 1;
++    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, order(&d, 2, &out));
++    try std.testing.expectEqual(@as(usize, 0), order(&.{}, 8, &out).len);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, order(&c, 8, out[0..2]));
++}
++
++test "batched: up to most prompts share a forward; where they cannot, a forward each for two, whatever most is" {
++    try std.testing.expectEqual(Batched{ .shared = 8 }, batched(8, false));
++    try std.testing.expectEqual(Batched{ .shared = 3 }, batched(3, false));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(8, true));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(3, true));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(2, true));
++    const asked = try parse("2", null); // TF_GLM_MULTI_PREFILL=2 alone: most is 8, the line still says 2 turns under the shard
++    try std.testing.expectEqual(Batched{ .shared = asked.most }, batched(asked.most, false));
++    try std.testing.expectEqual(Batched{ .turns = fallback_most }, batched(asked.most, true));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index bd0e0037df672a0699d8223245f252f880e5139d..a1a3db448020b1214251832bed8dd441a5376d90 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -153,6 +153,8 @@ pub fn Lanes(comptime E: type) type {
+             mark: usize = 0,
+             /// the begin's order: a step advances the oldest fill
+             order: u64 = 0,
++            /// TF_GLM_MULTI_PREFILL=2: the steps in a row this fill was left out of the shared forward
++            waits: u32 = 0,
+             /// a prompt with pictures or clips ran whole at its begin: in at the next step
+             whole: bool = false,
+             /// structured output's bits for the first token (gpa-owned; the last segment's draw)
+@@ -202,6 +204,8 @@ pub fn Lanes(comptime E: type) type {
+         fills: u64 = 0,
+         /// TF_GLM_MULTI_PREFILL: filling prompts a step advances a chunk each (cuda_fill_pick); 1: the oldest alone
+         fill_most: usize = 1,
++        /// TF_GLM_MULTI_PREFILL=2: those prompts' chunks share ONE forward (E.fillStepMany) instead of taking turns
++        fill_batch: bool = false,
+         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
+         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
+         opened: std.ArrayList(*Lane) = .empty,
+@@ -393,6 +397,9 @@ pub fn Lanes(comptime E: type) type {
+                 }
+             }
+             const i = oldest orelse return;
++            if (comptime @hasDecl(E, "fillStepMany")) {
++                if (self.fill_batch) return self.fillBatch(streams, states);
++            }
+             if (self.fill_most > 1) return self.fillMany(streams, states);
+             return self.fillChunk(streams[i], &states[i]);
+         }
+@@ -416,12 +423,56 @@ pub fn Lanes(comptime E: type) type {
+             for (fill_pick.pick(cands[0..n], self.fill_most, &out)) |k| try self.fillChunk(streams[at[k]], &states[at[k]]);
+         }
+ 
++        /// TF_GLM_MULTI_PREFILL=2: the next chunks of the fills cuda_fill_pick.order takes (those left out too long, then
++        /// the fewest rows left) in ONE forward as far as the engine fits them (E.fillStepMany: pieces that do not fit the
++        /// chunk's rows wait, an engine that cannot share runs them one after another); then, in that order, what each
++        /// chunk leaves to do (fillAfter). Nothing is allocated and the order comes from state every rank holds alike,
++        /// so the ranks make the same calls; a failure fails every filling stream, as a chunk's does.
++        fn fillBatch(self: *Self, streams: []const *lanes.Stream, states: []be.FillState) !void {
++            const cap = fill_pick.most_max * max_streams;
++            var at: [cap]usize = undefined;
++            var cands: [cap]fill_pick.Candidate = undefined;
++            var out: [cap]usize = undefined;
++            var n: usize = 0;
++            for (streams, states, 0..) |s, st, i| {
++                if (st != .filling) continue;
++                if (n == cap) return error.TooManyFills;
++                const f = self.lanes.get(s).?.fill.?;
++                at[n] = i;
++                // rows left: to the prompt's end from where its pass stands (not from its segment's start)
++                cands[n] = .{ .order = f.order, .left = s.prompt().len -| self.e.fillPos(f.fl.?), .waits = f.waits };
++                n += 1;
++            }
++            const picked = fill_pick.order(cands[0..n], self.fill_most, &out);
++            var fls: [cap]FillPtr = undefined;
++            var ran: [cap]bool = undefined;
++            var done: [cap]bool = undefined;
++            for (picked, 0..) |k, j| fls[j] = self.lanes.get(streams[at[k]]).?.fill.?.fl.?;
++            self.e.fillStepMany(fls[0..picked.len], ran[0..picked.len], done[0..picked.len]) catch |err| return self.lost("a prompt's fill", err);
++            // who was left out (all of them, before the rest runs: fillAfter may end a fill)
++            for (cands[0..n], 0..) |_, k| {
++                const f = &self.lanes.get(streams[at[k]]).?.fill.?;
++                f.waits += 1;
++            }
++            for (picked, 0..) |k, j| {
++                const f = &self.lanes.get(streams[at[k]]).?.fill.?;
++                if (ran[j]) f.waits = 0;
++            }
++            for (picked, 0..) |k, j| if (ran[j]) try self.fillAfter(streams[at[k]], &states[at[k]], done[j]);
++        }
++
+         /// The next chunk of `s`'s fill; `state` becomes `done` once its prompt is in.
+         fn fillChunk(self: *Self, s: *lanes.Stream, state: *be.FillState) !void {
++            const l = self.lanes.get(s).?;
++            const done = self.e.fillStep(l.fill.?.fl.?, 1) catch |err| return self.lost("a prompt's fill", err);
++            return self.fillAfter(s, state, done);
++        }
++
++        /// What `s`'s chunk leaves to do once the engine ran it (`done`: its segment's pass is in).
++        fn fillAfter(self: *Self, s: *lanes.Stream, state: *be.FillState, done: bool) !void {
+             const l = self.lanes.get(s).?;
+             const f = &l.fill.?;
+             const fl = f.fl.?;
+-            const done = self.e.fillStep(fl, 1) catch |err| return self.lost("a prompt's fill", err);
+             if (!done) return;
+             if (!f.final) {
+                 const m: u32 = @intCast(fl.prompt.len);
+@@ -1737,6 +1788,8 @@ const MiniEngine = struct {
+     carries: usize = 0, // resumes whose state's rows a carry brought
+     refused_small: usize = 0,
+     chunk: usize = 32, // a sliced fill's rows a step
++    fill_rows: usize = 64, // fillStepMany: the rows one shared forward holds
++    batch_log: std.ArrayList(usize) = .empty, // each shared forward's pieces
+     chunk_log: std.ArrayList([3]usize) = .empty, // every fill step: [sequence, from, to)
+     fills_live: usize = 0,
+     lent_chunks: usize = 0, // fill steps whose sequence held borrowed rows
+@@ -1928,11 +1981,31 @@ const MiniEngine = struct {
+         fl.done = true;
+         return true;
+     }
++    pub fn fillPos(_: *const MiniEngine, fl: *const Fill) usize {
++        return fl.at;
++    }
+     pub fn fillFree(e: *MiniEngine, fl: *Fill) void {
+         if (fl.kept) |k| e.freeSnapshot(k);
+         e.gpa.destroy(fl);
+         e.fills_live -= 1;
+     }
++    /// The engine's fillStepMany as its rows rule has it: the fills in the order given each take their next chunk
++    /// (`chunk` rows at most) while the shared forward's `fill_rows` rows hold it (one that does not fit waits, a later one
++    /// may); a lone piece is an ordinary step. `batch_log` has each shared forward's piece count.
++    pub fn fillStepMany(e: *MiniEngine, fls: []const *Fill, ran: []bool, done: []bool) !void {
++        var at: usize = 0;
++        var n: usize = 0;
++        for (fls, ran) |fl, *r| {
++            const want = @min(e.chunk, fl.prompt.len - fl.at);
++            r.* = n == 0 or at + want <= e.fill_rows;
++            if (r.*) {
++                at += want;
++                n += 1;
++            }
++        }
++        if (n > 1) try e.batch_log.append(e.gpa, n);
++        for (fls, ran, done) |fl, r, *d| d.* = if (r) try e.fillStep(fl, 1) else false;
++    }
+     pub fn commitWindow(_: *MiniEngine, _: usize, _: usize) !void {
+         return error.NotUsed;
+     }
+@@ -1988,6 +2061,7 @@ const MiniEngine = struct {
+         e.disk.deinit(e.gpa);
+         e.trace.deinit(e.gpa);
+         e.chunk_log.deinit(e.gpa);
++        e.batch_log.deinit(e.gpa);
+         e.media_calls.deinit(e.gpa);
+         if (e.pool) |*p| p.deinit();
+     }
+@@ -3003,6 +3077,12 @@ test "TF_GLM_FILL: a step advances one chunk in all, the oldest fill's; a later
+     SlicedPair.B.releaseFn(&p.r1, &sb);
+ }
+ 
++/// Both ranks' engines ran the same chunks in the same order (a chunk's sequence is each engine's own: rows only).
++fn sameChunks(p: *SlicedPair) !void {
++    try std.testing.expectEqual(p.e0.chunk_log.items.len, p.e1.chunk_log.items.len);
++    for (p.e0.chunk_log.items, p.e1.chunk_log.items) |a, b| try std.testing.expectEqualSlices(usize, a[1..], b[1..]);
++}
++
+ /// The chunks rank 0's engine ran on `s`'s sequence so far.
+ fn chunksOf(p: *SlicedPair, s: *lanes.Stream) usize {
+     const seq = @intFromPtr(p.r0.lanes.get(s).?.seq);
+@@ -3102,6 +3182,175 @@ test "TF_GLM_MULTI_PREFILL: past the most a step takes, the oldest fill and the
+     }
+ }
+ 
++/// TF_GLM_MULTI_PREFILL=2 on both ranks of a SlicedPair: `most` prompts a step, the engines' shared forward holding `budget` rows.
++fn batchPair(p: *SlicedPair, gpa: std.mem.Allocator, most: usize, budget: usize) void {
++    p.init(gpa, all_yes, all_yes);
++    for ([_]*Lanes(MiniEngine){ &p.r0, &p.r1 }) |r| {
++        r.fill_most = most;
++        r.fill_batch = true;
++    }
++    p.e0.fill_rows = budget;
++    p.e1.fill_rows = budget;
++}
++
++test "TF_GLM_MULTI_PREFILL=2: the fills that fit the forward's rows share it a step, the fewest rows left first; the one left out goes on beside the others as they finish; every first token as alone on both ranks" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    batchPair(&p, gpa, 8, 64);
++    defer p.deinit();
++    const a = testPrompt(3);
++    const b = testPrompt(5);
++    const c = testPrompt(7);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = b[0..70], .max_new = 4 });
++    defer sb.deinit(gpa);
++    var sc = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = c[0..40], .max_new = 4 });
++    defer sc.deinit(gpa);
++    try p.begin(&sa, &sa);
++    try p.begin(&sb, &sb);
++    try p.begin(&sc, &sc);
++    var st: [3]be.FillState = undefined;
++    // 40, 70 and 150 rows left; 32-row chunks, 64 rows a forward: c and b share (32 + 32), a (32 more) does not fit
++    try p.step(&.{ &sa, &sb, &sc }, &.{ &sa, &sb, &sc }, &st);
++    try std.testing.expectEqualSlices(usize, &.{2}, p.e0.batch_log.items);
++    try std.testing.expectEqual(@as(usize, 0), chunksOf(&p, &sa));
++    try std.testing.expectEqual(@as(usize, 1), chunksOf(&p, &sb));
++    try std.testing.expectEqual(@as(usize, 1), chunksOf(&p, &sc));
++    // c's last 8 rows and b's next 32 (40); a's 32 would make 72
++    try p.step(&.{ &sa, &sb, &sc }, &.{ &sa, &sb, &sc }, &st);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 2 }, p.e0.batch_log.items);
++    try std.testing.expectEqual(@as(usize, 0), chunksOf(&p, &sa));
++    try std.testing.expectEqualSlices(be.FillState, &.{ .filling, .filling, .done }, &st);
++    try std.testing.expectEqual(MiniEngine.hash(c[0..40]), try firstToken(SlicedPair.B, &p.r0, &sc));
++    try std.testing.expectEqual(MiniEngine.hash(c[0..40]), try firstToken(SlicedPair.B, &p.r1, &sc));
++    // b's last 6 rows and a's 32 now fit together
++    var two: [2]be.FillState = undefined;
++    try p.step(&.{ &sa, &sb }, &.{ &sa, &sb }, &two);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 2 }, p.e0.batch_log.items);
++    try std.testing.expectEqual(@as(usize, 1), chunksOf(&p, &sa));
++    try std.testing.expectEqualSlices(be.FillState, &.{ .filling, .done }, &two);
++    try std.testing.expectEqual(MiniEngine.hash(b[0..70]), try firstToken(SlicedPair.B, &p.r1, &sb));
++    // a alone: an ordinary step, no shared forward
++    var one: [1]be.FillState = undefined;
++    for (0..4) |_| try p.step(&.{&sa}, &.{&sa}, &one);
++    try std.testing.expectEqual(be.FillState.done, one[0]);
++    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 2 }, p.e0.batch_log.items);
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r0, &sa));
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r1, &sa));
++    // the same chunks, in the same order, on both ranks
++    try sameChunks(&p);
++    try std.testing.expectEqualSlices(usize, p.e0.batch_log.items, p.e1.batch_log.items);
++    try std.testing.expectEqual(@as(usize, 0), p.e0.fills_live + p.e1.fills_live);
++    for ([_]*lanes.Stream{ &sa, &sb, &sc }) |s| {
++        SlicedPair.B.releaseFn(&p.r0, s);
++        SlicedPair.B.releaseFn(&p.r1, s);
++    }
++}
++
++test "TF_GLM_MULTI_PREFILL=2: two long prompts share every step, a keep mark crossing inside the shared forwards; each ends as alone on both ranks" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    batchPair(&p, gpa, 8, 64);
++    defer p.deinit();
++    const a = testPrompt(3);
++    const b = testPrompt(5);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &b, .max_new = 4, .reuse = .{ .marks = &.{64} } });
++    defer sb.deinit(gpa);
++    try p.begin(&sa, &sa);
++    try p.begin(&sb, &sb);
++    var st: [2]be.FillState = undefined;
++    for (0..5) |i| {
++        try p.step(&.{ &sb, &sa }, &.{ &sb, &sa }, &st);
++        try std.testing.expectEqual(i + 1, p.e0.batch_log.items.len);
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sa));
++        try std.testing.expectEqual(i + 1, chunksOf(&p, &sb));
++        const state: be.FillState = if (i == 4) .done else .filling;
++        try std.testing.expectEqualSlices(be.FillState, &.{ state, state }, &st);
++    }
++    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r1, &sa));
++    try std.testing.expectEqual(MiniEngine.hash(&b), try firstToken(SlicedPair.B, &p.r0, &sb));
++    try std.testing.expectEqual(MiniEngine.hash(&b), try firstToken(SlicedPair.B, &p.r1, &sb));
++    var covered: usize = 0;
++    for (p.e0.chunk_log.items) |c| covered += c[2] - c[1];
++    try std.testing.expectEqual(@as(usize, 300), covered);
++    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 150 }, .{ 0, 64 }, .{ 64, 150 } }, p.e0.trace.items);
++    try std.testing.expectEqualSlices([2]usize, p.e0.trace.items, p.e1.trace.items);
++    try sameChunks(&p);
++    try std.testing.expectEqual(@as(usize, 0), p.e0.fills_live + p.e1.fills_live);
++    SlicedPair.B.releaseFn(&p.r0, &sa);
++    SlicedPair.B.releaseFn(&p.r1, &sa);
++    SlicedPair.B.releaseFn(&p.r0, &sb);
++    SlicedPair.B.releaseFn(&p.r1, &sb);
++}
++
++test "TF_GLM_MULTI_PREFILL=2: rows left count from where a pass stands, not from its segment's start" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    batchPair(&p, gpa, 8, 32); // one chunk a forward
++    defer p.deinit();
++    const a = testPrompt(3);
++    const b = testPrompt(5);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = b[0..130], .max_new = 4 });
++    defer sb.deinit(gpa);
++    try p.begin(&sa, &sa);
++    var one: [1]be.FillState = undefined;
++    try p.step(&.{&sa}, &.{&sa}, &one); // a: 32 rows in, 118 left
++    try p.begin(&sb, &sb);
++    var two: [2]be.FillState = undefined;
++    try p.step(&.{ &sa, &sb }, &.{ &sa, &sb }, &two);
++    // b has 130 left, a 118: a's chunk (from its segment's start both would have 150 and 130, and b would go)
++    try std.testing.expectEqual(@as(usize, 2), chunksOf(&p, &sa));
++    try std.testing.expectEqual(@as(usize, 0), chunksOf(&p, &sb));
++    try sameChunks(&p);
++    for ([_]*lanes.Stream{ &sa, &sb }) |s| {
++        SlicedPair.B.releaseFn(&p.r0, s);
++        SlicedPair.B.releaseFn(&p.r1, s);
++    }
++}
++
++test "TF_GLM_MULTI_PREFILL=2: a long prompt that never fits beside short ones is left out four steps, then goes first" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    batchPair(&p, gpa, 8, 32); // one chunk's rows: no two pieces fit
++    defer p.deinit();
++    const a = testPrompt(3);
++    const t = testPrompt(1);
++    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
++    defer sa.deinit(gpa);
++    var shorts: [5]lanes.Stream = undefined;
++    for (&shorts, 0..) |*s, i| s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = t[0 .. 20 + i], .max_new = 4 });
++    defer for (&shorts) |*s| s.deinit(gpa);
++    try p.begin(&sa, &sa);
++    for (&shorts) |*s| try p.begin(s, s);
++    var live: [6]*lanes.Stream = .{ &sa, &shorts[0], &shorts[1], &shorts[2], &shorts[3], &shorts[4] };
++    var st: [6]be.FillState = undefined;
++    // each step: the shortest of the rest, a left out (its waits count)
++    for (0..4) |i| {
++        const n = live.len - i;
++        try p.step(live[0..n], live[0..n], st[0..n]);
++        try std.testing.expectEqual(@as(usize, 0), chunksOf(&p, &sa));
++        try std.testing.expectEqual(be.FillState.done, st[1]); // live[1] is the next short one: each is one chunk
++        // (the finished one leaves the list)
++        std.mem.copyForwards(*lanes.Stream, live[1..], live[2..]);
++    }
++    try std.testing.expectEqual(@as(usize, 0), p.e0.batch_log.items.len); // never two pieces
++    // a has waited four steps: it goes first now, the last short one waits
++    const n = live.len - 4;
++    try p.step(live[0..n], live[0..n], st[0..n]);
++    try std.testing.expectEqual(@as(usize, 1), chunksOf(&p, &sa));
++    try std.testing.expectEqualSlices(be.FillState, &.{ .filling, .filling }, st[0..n]);
++    try sameChunks(&p);
++    for ([_]*lanes.Stream{ &sa, &shorts[0], &shorts[1], &shorts[2], &shorts[3], &shorts[4] }) |s| {
++        SlicedPair.B.releaseFn(&p.r0, s);
++        SlicedPair.B.releaseFn(&p.r1, s);
++    }
++}
++
+ test "TF_GLM_FILL: a fill cancelled between its steps frees its fill and sequence on both ranks; its kept marks stay, the next fill runs whole" {
+     const gpa = std.testing.allocator;
+     var p: SlicedPair = undefined;
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index 52740c675957657989d8d40d621d05ad1801dd62..978a45be38db27cfe1adcb5d39921b4de0a3f208 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -108,7 +108,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     // the agreement on every rank alike
+     var sliced = false;
+     // TF_GLM_MULTI_PREFILL: the filling prompts a step advances (in the settings text with TF_GLM_FILL; 1 without it)
+-    var fill_most: usize = 1;
++    var fill_most: fill_pick.Setting = .{};
+     const own = try gpa.create(Own);
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
+@@ -185,8 +185,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     }
+     try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null, sliced);
+     if (sliced) std.log.info("rank {d}: TF_GLM_FILL=1: prompts fill a 2048-row chunk a step between decode rounds", .{o.rank});
+-    own.serving.?.local.fill_most = fill_most;
+-    if (fill_most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ o.rank, fill_most });
++    own.serving.?.local.fill_most = fill_most.most;
++    own.serving.?.local.fill_batch = fill_most.batch;
++    fill_pick.logStartup(o.rank, fill_most, kv_switches.on);
+     if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
+     const build_key = if (agreement == null) buildKey(gpa, io, dir, kernels, o) catch 0 else 0;
+     var budget: u64 = 0;
+@@ -230,13 +231,12 @@ fn fillSetting() anyerror!bool {
+     return error.BadFill;
+ }
+ 
+-/// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head for every stream: a
+-/// fill's chunks would absorb into it between other streams' drafts).
+ /// TF_GLM_MULTI_PREFILL with TF_GLM_MULTI_PREFILL_MOST (cuda_fill_pick.parse): this rank's prompts a step, or its error.
+-fn multiSetting() anyerror!usize {
++fn multiSetting() anyerror!fill_pick.Setting {
+     return fill_pick.parse(envText("TF_GLM_MULTI_PREFILL"), envText("TF_GLM_MULTI_PREFILL_MOST"));
+ }
+ 
++/// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head serves every stream).
+ fn fillAdmit(read: anyerror!bool, o: Options, choice: choice_mod.Choice) !bool {
+     const on = try read;
+     if (on and o.drafts and choice == .mtp) return error.FillWithMtp;
+@@ -254,7 +254,7 @@ pub fn refusal(err: anyerror) ?[]const u8 {
+     return shard.why(err) orelse identity.why(err) orelse switch (err) {
+         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+         error.BadFill => "TF_GLM_FILL: 1 (prompts fill a chunk a step between decode rounds) or 0 (whole passes), nothing else",
+-        error.BadMultiPrefill => "TF_GLM_MULTI_PREFILL: 1 (waiting prompts fill a chunk each a step, TF_GLM_MULTI_PREFILL_MOST of them, 2 to 8) or 0, nothing else",
++        error.BadMultiPrefill => "TF_GLM_MULTI_PREFILL: 1 (waiting prompts fill a chunk each a step, TF_GLM_MULTI_PREFILL_MOST of them, 2 to 8), 2 (their chunks share one forward, 8 by default) or 0, nothing else",
+         error.FillWithMtp => "TF_GLM_FILL=1 does not run with MTP drafts (one MTP head serves every stream); DFlash2 drafts or none",
+         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
+         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: spill v2 does not store the MTP head's state yet (MTP drafts keep prompt states in memory only; DFlash2 drafts or none)",
+@@ -697,7 +697,7 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
+     const fill_words: []const u8 = if (fillSetting()) |on| (if (on) " fill=1" else "") else |_| " fill=unreadable";
+     // TF_GLM_MULTI_PREFILL: its prompts a step with sliced fills on, or a rank that cannot read it (nothing otherwise)
+     var multi_buf: [32]u8 = undefined;
+-    const multi_words: []const u8 = if (multiSetting()) |n| (if (n > 1 and fill_words.len > 0) try std.fmt.bufPrint(&multi_buf, " multi_prefill={d}", .{n}) else "") else |_| " multi_prefill=unreadable";
++    const multi_words: []const u8 = if (multiSetting()) |n| (if (n.most > 1 and fill_words.len > 0) try std.fmt.bufPrint(&multi_buf, " multi_prefill={s}{d}", .{ if (n.batch) "batch" else "", n.most }) else "") else |_| " multi_prefill=unreadable";
+     return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}{s}{s}", .{
+         display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words, fill_words, multi_words,
+     });
+@@ -887,7 +887,7 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
+     const before = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+     defer gpa.free(before);
+     _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "1", 1);
+-    try std.testing.expectEqual(@as(usize, 2), try multiSetting());
++    try std.testing.expectEqual(fill_pick.Setting{ .most = 2 }, try multiSetting());
+     const no_fill = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+     defer gpa.free(no_fill);
+     try std.testing.expectEqualStrings(before, no_fill); // the recipe's default MULTI_PREFILL=1 with FILL=0: as before
+@@ -896,16 +896,28 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
+     const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+     defer gpa.free(on);
+     try std.testing.expect(std.mem.endsWith(u8, on, " fill=1 multi_prefill=3"));
++    // =2: one forward, the ranks must agree on that too (a different word from the turns' three)
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "2", 1);
++    try std.testing.expectEqual(fill_pick.Setting{ .most = 3, .batch = true }, try multiSetting());
++    const batch = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(batch);
++    try std.testing.expect(std.mem.endsWith(u8, batch, " fill=1 multi_prefill=batch3"));
++    _ = TestEnv.unsetenv("TF_GLM_FILL");
++    const batch_no_fill = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
++    defer gpa.free(batch_no_fill);
++    try std.testing.expectEqualStrings(before, batch_no_fill);
++    _ = TestEnv.setenv("TF_GLM_FILL", "1", 1);
+     _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "0", 1);
+     const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+     defer gpa.free(off);
+     try std.testing.expect(std.mem.endsWith(u8, off, " fill=1"));
+-    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "2", 1);
++    _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "3", 1);
+     try std.testing.expectError(error.BadMultiPrefill, multiSetting());
+     const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+     defer gpa.free(bad);
+     try std.testing.expect(std.mem.endsWith(u8, bad, " multi_prefill=unreadable"));
+-    try std.testing.expect(refusal(error.BadMultiPrefill) != null);
++    const words = refusal(error.BadMultiPrefill).?;
++    for ([_][]const u8{ "1 (", "2 (", "or 0" }) |accepted| try std.testing.expect(std.mem.indexOf(u8, words, accepted) != null);
+ }
+ 
+ const TestEnv = struct {
+diff --git a/zig/src/families/glm_cuda/cuda_prefill.zig b/zig/src/families/glm_cuda/cuda_prefill.zig
+index 4a3e8b36957f175e95bd1cf2d1f5c15621fcfa20..fd40f8bb9ba2fcd7cc9386b02f0a8cb1a91a3e1f 100644
+--- a/zig/src/families/glm_cuda/cuda_prefill.zig
++++ b/zig/src/families/glm_cuda/cuda_prefill.zig
+@@ -16,6 +16,7 @@ const split = @import("cuda_prefill_split.zig");
+ const micro = @import("cuda_prompt_micro.zig");
+ const shard_prompt = @import("cuda_shard_prompt.zig");
+ const prompt_index = @import("cuda_prompt_index.zig");
++const many = @import("cuda_prefill_many.zig");
+ 
+ fn cdiv(a: usize, b: usize) usize {
+     return (a + b - 1) / b;
+@@ -609,11 +610,18 @@ pub const Engine = struct {
+         try hc.HC.post(e.tri, e.b, gathered, rows, e.g.world);
+     }
+     fn kdaLayer(e: Engine, w: fw.KdaW, li: usize, rows: usize, pos: usize, parity: *[34]u1, done: ?[2]usize) !void {
++        try e.runFront(.{ .kda = w }, done, rows);
++        try e.kdaRows(w, li, rows, pos, parity);
++        try e.blockOut(.{ .mat = .{ .x = e.s.k_out, .stride = e.g.lin_heads * 128, .w = w.o } }, rows);
++    }
++    /// A KDA block's work on one stream's state, its rows already projected (kdaLayer's middle; a batched chunk runs it
++    /// piece by piece on each piece's own state, `many`): the recurrence at the stream's position, its state commit, the
++    /// conv shift.
++    fn kdaRows(e: Engine, w: fw.KdaW, li: usize, rows: usize, pos: usize, parity: *[34]u1) !void {
+         const ops = e.kda orelse return error.MissingKdaPackage;
+         const heads = e.g.lin_heads;
+         const width = e.g.projWidth();
+         const p = e.s.kproj;
+-        try e.runFront(.{ .kda = w }, done, rows);
+         const cur = parity[li];
+         const layer_bytes = heads * 128 * 128 * 4;
+         const state_in = e.rec + (@as(usize, cur) * 34 + li) * layer_bytes;
+@@ -622,7 +630,6 @@ pub const Engine = struct {
+         parity[li] = 1 - cur;
+         const channels = e.g.convDim();
+         try e.tri.conv_shift(.{ 1, cdiv(channels, 1024), 1 }, e.conv + li * 3 * channels * 2, p, try ci(rows), try ci(3 * channels), try ci(rows * width), try ci(width), .{ .C = cz(channels), .TAPS = 3, .BLOCK = 1024 });
+-        try e.blockOut(.{ .mat = .{ .x = e.s.k_out, .stride = heads * 128, .w = w.o } }, rows);
+     }
+     fn denseBlock(e: Engine, qa: u64, lc: u64, ol: u64, n: usize, pos: u64, nch: usize, hb: usize) !void {
+         if (nch > e.s.nch or n > e.s.part_rows) return error.DenseScratch;
+@@ -711,6 +718,15 @@ pub const Engine = struct {
+         const s = &e.s;
+         const own = e.ownDsa(rows);
+         if (own) try e.dsaOwnFront(w, rows, pos, done) else try e.runFront(.{ .dsa = w }, done, rows);
++        try e.dsaRows(w, ai, rows, pos, own, role);
++        try e.blockOut(.{ .mat = .{ .x = s.o, .stride = h * 256, .w = w.o } }, rows);
++    }
++    /// A DSA block's work on one stream's rows once its front has run (dsaLayer's middle; a batched chunk runs it piece by
++    /// piece on each piece's own cache, `many`): the latent write, the indexer's update, the absorb, the dense or sparse
++    /// attention over the stream's rows and the expand, at the stream's position.
++    fn dsaRows(e: *Engine, w: fw.DsaW, ai: usize, rows: usize, pos: usize, own: bool, role: ?shard_prompt.Role) !void {
++        const h = e.g.heads;
++        const s = &e.s;
+         const lc = e.cache.latent[ai];
+         // (the receiving rank writes the chunk's latents into its copy of the history, after the fetch)
+         if (role == null or role.? == .send) try e.latWrite(lc, e.pos_dev, rows);
+@@ -742,7 +758,6 @@ pub const Engine = struct {
+             }
+         }
+         try e.tri.expand_mma(.{ h, cdiv(rows, 64), 2 }, s.ol, w.wv, s.o, try ci(rows), .{ .H = cz(h), .DV = 256, .LW = 512, .BM = 64, .BN = 128, .BK = 64 });
+-        try e.blockOut(.{ .mat = .{ .x = s.o, .stride = h * 256, .w = w.o } }, rows);
+     }
+     /// The chunk's latents (s.lat, bf16) into latent rows `lc` from the position POS names (`_lat_write`).
+     pub fn latWrite(e: Engine, lc: u64, pos: u64, rows: usize) !void {
+@@ -881,12 +896,111 @@ pub const Engine = struct {
+         if (!split_on) try e.tri.stream_mean(.{ rows, 4, 1 }, e.b.x, e.b.hidden, .{ .D = 4096, .S = 4, .BLOCK = 1024 });
+         try e.norm(e.b.hidden, 4096, e.weights.norm, e.b.normed, 4096, rows);
+         e.last_hidden = e.b.normed + (rows - 1) * 4096 * 2;
+-        if (head) {
+-            const cfg = mm.headConfig(1);
+-            try e.tri.fmm(.{ cdiv(1, cfg.bm), cdiv(e.g.vocab, cfg.bn), 1 }, e.last_hidden, e.weights.head, e.weights.head_scale, e.b.logits, e.b.logits, 1, 4096, .{ .N = cz(e.g.vocab), .K = 4096, .SK = 1, .BM = cz(cfg.bm), .BLOCK_N = cz(cfg.bn), .BK = 64, .F32 = 0, .SEQ = 0 });
+-        }
++        if (head) try e.headRow(e.last_hidden);
+         try e.putI32(e.pos_dev, try ci(pos + rows));
+     }
++    /// The head on one normed row (`hidden`: its address): the one-row logits a prompt's first token is drawn from.
++    pub fn headRow(e: Engine, hidden: u64) !void {
++        const cfg = mm.headConfig(1);
++        try e.tri.fmm(.{ cdiv(1, cfg.bm), cdiv(e.g.vocab, cfg.bn), 1 }, hidden, e.weights.head, e.weights.head_scale, e.b.logits, e.b.logits, 1, 4096, .{ .N = cz(e.g.vocab), .K = 4096, .SK = 1, .BM = cz(cfg.bm), .BLOCK_N = cz(cfg.bn), .BK = 64, .F32 = 0, .SEQ = 0 });
++    }
++
++    /// One stream's rows of a batched chunk (cuda_prefill_many, TF_GLM_MULTI_PREFILL=2) and the state they run on.
++    pub const Piece = struct {
++        /// the piece's first chunk row (a multiple of many.piece_align), its rows and its first row's position
++        lo: usize,
++        rows: usize,
++        pos: usize,
++        cache: state.CacheView,
++        conv: u64,
++        rec: u64,
++        pos_dev: u64,
++        parity: *[34]u1,
++    };
++
++    /// Whether `chunkMany` can run here: the unsharded, unobserved, no-pictures path (the others fill a chunk of their
++    /// own). The row split is no bar: a batched chunk runs its glue unsplit, which the split's design gives the same bits.
++    pub fn manyOk(e: *const Engine) bool {
++        return e.shard == null and e.observer == null and e.inject == null;
++    }
++
++    /// The rows between the pieces (and before the first) of a block's per-row output `buf` (`row_bytes` a row), zeroed: the
++    /// pieces' state work writes only their own rows, the output projection reads every row, and what a gap holds
++    /// there would go on through the glue, the router and the MoE.
++    fn zeroGaps(e: Engine, pieces: []const Piece, buf: u64, row_bytes: usize) !void {
++        var at: usize = 0;
++        for (pieces) |pc| {
++            if (pc.lo > at) try e.memzero(buf + at * row_bytes, (pc.lo - at) * row_bytes);
++            at = pc.lo + pc.rows;
++        }
++    }
++
++    /// recipe patch 0049 (multi_prefill.py PieceMixer) on the unsplit chunk: the pieces' rows back to back (lo, rows) in
++    /// the chunk's ids (the caller staged them, zero tokens in the gaps up to `total`); the row-independent work runs once
++    /// over `total` rows (the glue, each block's front and output projection, the MoE, the final norm) and what reads or
++    /// writes a stream's own state, once for each piece on its state through the calls a chunk of its own makes (the KDA
++    /// recurrence, conv shift and parity; the latent write, indexer update, absorb, dense or sparse attention, expand),
++    /// the piece's rows a view of the buffers (`rowView`). The head is the caller's, per piece (`headRow`). Every piece
++    /// ends at pos + rows. (cuda_aot_coverage_test: no launch looks up a variant the captured set lacks.)
++    pub fn chunkMany(e: *Engine, pieces: []const Piece, total: usize) !void {
++        if (!e.manyOk() or pieces.len == 0 or pieces.len > many.max_pieces or total == 0 or total > e.b.rows or total > e.s.rows) return error.BadRows;
++        if (e.g.world > 1 and (e.comm == null or e.comm.?.world != e.g.world or e.comm.?.rank != e.g.rank)) return error.MissingCommunicator;
++        var views: [many.max_pieces]Engine = undefined;
++        var slot: usize = 0; // attention blocks so far: each takes a slot of the origins
++        var end: usize = 0;
++        for (pieces, views[0..pieces.len]) |pc, *v| {
++            if (pc.rows == 0 or pc.lo < end or pc.lo % many.piece_align != 0 or pc.lo + pc.rows > total) return error.BadRows;
++            if (!pc.cache.hasLatent()) return error.NoLatentRows;
++            end = pc.lo + pc.rows;
++            v.* = e.rowView(pc.lo);
++            v.cache = pc.cache;
++            v.conv = pc.conv;
++            v.rec = pc.rec;
++            v.pos_dev = pc.pos_dev;
++            v.s.origins = e.s.origins + slot * 16;
++            v.run = null;
++            try e.putI32(pc.pos_dev, try ci(pc.pos));
++            for (0..cdiv(pc.rows, grid.att_rows)) |i| {
++                try e.putI32(v.s.origins + i * 16, try ci(pc.pos + i * grid.att_rows));
++                slot += 1;
++            }
++        }
++        if (slot > many.max_slots) return error.BadRows;
++        e.run = null;
++        try e.tri.embed(e.b.ids, e.weights.embed, e.b.x, total, 4);
++        var ki: usize = 0;
++        var ai: usize = 0;
++        const h = e.g.heads;
++        for (e.weights.layers, 0..) |layer, index| {
++            try e.hcPre(layer.attn, total);
++            switch (layer.mixer) {
++                .kda => |w| {
++                    if (ki >= 34) return error.BadRows;
++                    try e.runFront(.{ .kda = w }, null, total);
++                    for (pieces, views[0..pieces.len]) |pc, v| try v.kdaRows(w, ki, pc.rows, pc.pos, pc.parity);
++                    try e.zeroGaps(pieces, e.s.k_out, e.g.lin_heads * 128 * 2);
++                    try e.blockOut(.{ .mat = .{ .x = e.s.k_out, .stride = e.g.lin_heads * 128, .w = w.o } }, total);
++                    ki += 1;
++                },
++                .dsa => |w| {
++                    if (ai >= 11) return error.BadRows;
++                    try e.runFront(.{ .dsa = w }, null, total);
++                    for (pieces, views[0..pieces.len]) |pc, *v| try v.dsaRows(w, ai, pc.rows, pc.pos, false, null);
++                    try e.zeroGaps(pieces, e.s.o, h * 256 * 2);
++                    try e.blockOut(.{ .mat = .{ .x = e.s.o, .stride = h * 256, .w = w.o } }, total);
++                    ai += 1;
++                },
++            }
++            try e.post(total);
++            try e.hcPre(layer.ffn, total);
++            try e.ffn(layer, total, null);
++            try e.post(total);
++            for ([_]usize{ 5, 14, 24, 33, 42 }, 0..) |t, tap| if (index == t) try e.tri.stream_mean(.{ total, 4, 1 }, e.b.x, e.b.taps + tap * e.b.rows * 4096 * 2, .{ .D = 4096, .S = 4, .BLOCK = 1024 });
++        }
++        try e.tri.stream_mean(.{ total, 4, 1 }, e.b.x, e.b.hidden, .{ .D = 4096, .S = 4, .BLOCK = 1024 });
++        try e.norm(e.b.hidden, 4096, e.weights.norm, e.b.normed, 4096, total);
++        for (pieces) |pc| try e.putI32(pc.pos_dev, try ci(pc.pos + pc.rows));
++    }
+ };
+ 
+ /// A sharded chunk's attention launches (cuda_shard_prompt.attend's device calls them): the unsharded chunk's, over
+diff --git a/zig/src/families/glm_cuda/cuda_prefill_loop.zig b/zig/src/families/glm_cuda/cuda_prefill_loop.zig
+index d79852a94accf07e28b9633ca0d7d6adfc403282..18b97f0452cce0fa1600c0a0a941e63e62332465 100644
+--- a/zig/src/families/glm_cuda/cuda_prefill_loop.zig
++++ b/zig/src/families/glm_cuda/cuda_prefill_loop.zig
+@@ -24,7 +24,7 @@ pub fn noteChunk(t: *seg.SegRows, base: usize, pos: usize, rows: usize, ring_bas
+     return t.anySparse();
+ }
+ 
+-fn stageIds(e: *const prefill.Engine, ids: []const i32) !void {
++pub fn stageIds(e: *const prefill.Engine, ids: []const i32) !void {
+     if (ids.len > e.b.rows) return error.BadRows;
+     const view: cuda.DeviceBuffer = .{ .d = e.tri.s.d, .ptr = e.b.ids, .len = e.b.rows * 4 };
+     try view.uploadAsync(0, std.mem.sliceAsBytes(ids), e.tri.s.handle);
+diff --git a/zig/src/families/glm_cuda/cuda_prefill_many.zig b/zig/src/families/glm_cuda/cuda_prefill_many.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd167dd43ae76fd77e674e9625cd5c5713280cf1
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_prefill_many.zig
+@@ -0,0 +1,128 @@
++//! TF_GLM_MULTI_PREFILL=2 (recipe patches 0049 / 0062, multi_prefill.py layout): where each waiting prompt's chunk sits in
++//! one batched prompt chunk, and how many rows the row-independent work runs over.
++//!
++//! The pieces lie back to back as in Python, each starting on a 16-row boundary (a view's pointers into the prompt
++//! buffers keep the 16-byte class a chunk of its own has: the captured Triton variants are keyed by it, and a piece at
++//! an odd row misses them: cuda_aot_coverage_test), and the shared work (embedding, glue, projections, MoE, norm) runs
++//! over `total` rows, the last piece's end (the gap rows between pieces are zero tokens; they go through the shared work
++//! like any row, so the engine zeroes what a piece's state work leaves unwritten there: Engine.chunkMany). Every piece's
++//! launches are its own chunk's (its rows are a lone chunk's: `cuda_aot_coverage_test.chunk_rows`); the shared ones are
++//! over a row count the set has variants for (that test runs random layouts).
++const std = @import("std");
++
++/// Pieces of one chunk at most: the origins scratch holds a slot per attention block (40), a piece's blocks being its
++/// rows / 512 rounded up; 8 is also the most streams.
++pub const max_pieces: usize = 8;
++/// Attention blocks (512 rows each, one origins slot apiece) a batched chunk holds at most: the origins scratch's 40 slots
++/// (prompt chunk rows / 512 plus a partly filled block a piece, 16384 / 512 + 8 at most).
++pub const max_slots: usize = 40;
++/// A piece's first row is a multiple of this.
++pub const piece_align: usize = 16;
++
++pub const Layout = struct {
++    /// pieces placed
++    n: usize = 0,
++    /// each placed piece's index in the wants and its first row
++    who: [max_pieces]usize = undefined,
++    lo: [max_pieces]usize = undefined,
++    /// the last piece's end: the rows the shared work runs over
++    total: usize = 0,
++};
++
++/// The wants (rows each piece asks) in order, placed as they fit in `cap` rows: one that does not fit is skipped and a
++/// later, smaller one may take its room (Python's `_group` goes on the same way); at most `max_pieces`.
++pub fn plan(wants: []const usize, cap: usize) Layout {
++    var l: Layout = .{};
++    var slots: usize = 0;
++    for (wants, 0..) |rows, i| {
++        if (l.n == max_pieces) break;
++        const lo = std.mem.alignForward(usize, l.total, piece_align);
++        const need = (rows + 511) / 512;
++        if (rows == 0 or lo + rows > cap or slots + need > max_slots) continue;
++        slots += need;
++        l.who[l.n] = i;
++        l.lo[l.n] = lo;
++        l.n += 1;
++        l.total = lo + rows;
++    }
++    return l;
++}
++
++test "plan: pieces back to back on 16-row boundaries, what does not fit skipped, at most eight" {
++    const cap = 2048;
++    var l = plan(&.{30}, cap);
++    try std.testing.expectEqual(@as(usize, 1), l.n);
++    try std.testing.expectEqual(@as(usize, 0), l.lo[0]);
++    try std.testing.expectEqual(@as(usize, 30), l.total);
++    // three short prompts: 30 -> 32, 5 -> 48, 17 ends at 65
++    l = plan(&.{ 30, 5, 17 }, cap);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, l.who[0..l.n]);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 32, 48 }, l.lo[0..l.n]);
++    try std.testing.expectEqual(@as(usize, 65), l.total);
++    l = plan(&.{ 5, 3 }, cap);
++    try std.testing.expectEqual(@as(usize, 16), l.lo[1]);
++    try std.testing.expectEqual(@as(usize, 19), l.total);
++    // a piece that does not fit is skipped, a later one takes the room
++    l = plan(&.{ 1024, 1500, 64, 900 }, cap);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, l.who[0..l.n]);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1024, 1088 }, l.lo[0..l.n]);
++    try std.testing.expectEqual(@as(usize, 1988), l.total);
++    // a full chunk is alone
++    l = plan(&.{ 2048, 64 }, cap);
++    try std.testing.expectEqual(@as(usize, 1), l.n);
++    try std.testing.expectEqual(@as(usize, 2048), l.total);
++    // the gap to the next boundary counts: 2040 rows then 16 more does not fit
++    l = plan(&.{ 2033, 15, 16 }, cap);
++    try std.testing.expectEqualSlices(usize, &.{0}, l.who[0..l.n]);
++    l = plan(&.{ 2032, 16 }, cap);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, l.who[0..l.n]);
++    try std.testing.expectEqual(@as(usize, 2048), l.total);
++    // nine short ones: eight placed
++    l = plan(&.{ 1, 1, 1, 1, 1, 1, 1, 1, 1 }, cap);
++    try std.testing.expectEqual(@as(usize, 8), l.n);
++    try std.testing.expectEqual(@as(usize, 113), l.total);
++    l = plan(&.{}, cap);
++    try std.testing.expectEqual(@as(usize, 0), l.n);
++    try std.testing.expectEqual(@as(usize, 0), l.total);
++}
++
++test "plan: a 1-row and a 16320-row piece take 33 origins slots and are placed; slots never pass the scratch's 40" {
++    var l = plan(&.{ 1, 16320 }, 16384);
++    try std.testing.expectEqual(@as(usize, 2), l.n);
++    try std.testing.expectEqual(@as(usize, 16), l.lo[1]);
++    // 8 pieces of 2049 rows: 5 slots each = 40; a ninth is out by count, and by slots
++    l = plan(&.{ 2049, 2049, 2049, 2049, 2049, 2049, 2049, 2049 }, 1 << 20);
++    try std.testing.expectEqual(@as(usize, 8), l.n);
++    const five = [_]usize{ 16384 - 8 * 16, 1, 513, 1, 1 };
++    l = plan(&five, 1 << 20);
++    var slots: usize = 0;
++    for (0..l.n) |i| slots += (five[l.who[i]] + 511) / 512;
++    try std.testing.expect(slots <= max_slots);
++    // a piece past the slots is skipped, a smaller later one takes the room
++    var wants: [8]usize = .{ 20000, 20000, 20000, 20000, 20000, 20000, 1, 1 }; // 40 slots each: only the first
++    l = plan(&wants, 1 << 20);
++    try std.testing.expectEqualSlices(usize, &.{0}, l.who[0..l.n]);
++    wants[0] = 512 * 39;
++    l = plan(&wants, 1 << 20);
++    try std.testing.expectEqualSlices(usize, &.{ 0, 6 }, l.who[0..l.n]);
++}
++
++test "plan: any wants give aligned, disjoint pieces within the chunk" {
++    var prng = std.Random.DefaultPrng.init(0x49);
++    const rnd = prng.random();
++    for (0..5000) |_| {
++        var wants: [10]usize = undefined;
++        const k = rnd.intRangeAtMost(usize, 0, wants.len);
++        for (wants[0..k]) |*w| w.* = if (rnd.boolean()) rnd.intRangeAtMost(usize, 1, 63) else rnd.intRangeAtMost(usize, 1, 32) * 64;
++        const l = plan(wants[0..k], 2048);
++        try std.testing.expect(l.n <= max_pieces);
++        var end: usize = 0;
++        for (0..l.n) |i| {
++            try std.testing.expectEqual(@as(usize, 0), l.lo[i] % piece_align);
++            try std.testing.expect(l.lo[i] >= end);
++            end = l.lo[i] + wants[l.who[i]];
++        }
++        try std.testing.expectEqual(end, l.total);
++        try std.testing.expect(l.total <= 2048);
++    }
++}

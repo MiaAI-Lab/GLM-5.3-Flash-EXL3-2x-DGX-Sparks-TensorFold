@@ -1,0 +1,106 @@
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 6cc5c62a69ae..3c8b05d8bbb7); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: the race's margin is relative past 1, and TF_GLM_NUCLEUS_RACE_CHECK=1 draws every raced row again from whole shards
+
+Review: an absolute 1e-9 rounds back to the bound once |score| passes 2^24 (temperature near its 1e-6 clamp), so the
+margin is 1e-9 * max(1, |bound|). The check mode compares the race's tokens with the whole-shard draw's bit for bit on
+the device (error.RaceMismatch), for GPU receipts; the u range comment now says u can be 1 (+inf scores, as the host).
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0037-zig-glm-nucleus-race-check.patch
+
+diff --git a/zig/kernels/cuda/glm_ops.cu b/zig/kernels/cuda/glm_ops.cu
+index 47674953ce50c1c7234040a447a0001da6ac0fe8..830d329ba6ac5bc8674d78f70589b4c612a3fefd 100644
+--- a/zig/kernels/cuda/glm_ops.cu
++++ b/zig/kernels/cuda/glm_ops.cu
+@@ -87,7 +87,8 @@ extern "C" __global__ void glm_mass_pack(const float* vals,const int64_t* cols,c
+ }
+ 
+ // A sampled row with no top_p cut and no min_p is a Gumbel max over every token (sampling._draw with keep = all):
+-// score = double(logit) / temp - log(-log(u)), u from splitmix64(seed, position, id) as lanes/sampling.uniform. Each
++// score = double(logit) / temp - log(-log(u)), u in [2^-54, 1] from splitmix64(seed, position, id) as lanes/sampling.uniform
++// (u = 1 scores +inf, as on the host). Each
+ // rank keeps its RACE_KEEP best scores and writes them in mass_pack's layout (vals = double(logit) / temp, global ids,
+ // fixed-point mass, the row's mass sum) with the largest score it dropped last; the host rescores them exactly and
+ // takes the winner only past that bound (cuda_nucleus.raceDraw), else sends whole shards as before.
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 604b69ae28a46e14f4aa2ef5ae03557751840d83..6000ab7ac49baf1dc26945d0632dab72b40548cf 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -415,6 +415,7 @@ pub const Engine = struct {
+             .check_greedy = std.c.getenv("TF_GLM_GREEDY_CHECK") != null,
+             .legacy_greedy = std.c.getenv("TF_GLM_GREEDY_TOPK") != null,
+             .race = if (std.c.getenv("TF_GLM_NUCLEUS_RACE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
++            .race_check = std.c.getenv("TF_GLM_NUCLEUS_RACE_CHECK") != null,
+             // TENSORFOLD_NUCLEUS_UNION=1 (the recipe's default; patch 0034 on the Python engine). Every rank must agree, checked below.
+             .union_cover = nucleusUnionOn(),
+         };
+diff --git a/zig/src/families/glm_cuda/cuda_nucleus.zig b/zig/src/families/glm_cuda/cuda_nucleus.zig
+index 2366c09442c36824b61640f1a8d5b2d30dd960ec..e25495b8b80fc9a0221a312fdbdf9ceda1da3cc2 100644
+--- a/zig/src/families/glm_cuda/cuda_nucleus.zig
++++ b/zig/src/families/glm_cuda/cuda_nucleus.zig
+@@ -188,8 +188,11 @@ pub fn drawSharesWithUnion(gpa: Allocator, sh: Shares, positions: []const u64, s
+ /// glm_race_top's kept scores a rank (RACE_KEEP in glm_ops.cu).
+ pub const race_keep: usize = 4;
+ /// The host's exact score may differ from the GPU's by a few ulp (each side's log is within 1 ulp): a winner closer
+-/// than this to the best dropped score is a near tie, drawn from whole shards instead.
++/// than this (relative past 1) to the best dropped score is a near tie, drawn from whole shards instead.
+ pub const race_margin: f64 = 1e-9;
++fn raceBound(bound: f64) f64 {
++    return bound + race_margin * @max(1.0, @abs(bound));
++}
+ 
+ /// A draw with no top_p cut and no min_p keeps every token: the race decides it.
+ pub fn raceable(s: S.Sampling) bool {
+@@ -224,7 +227,7 @@ pub fn raceDraw(words: []const i64, world: usize, rows: usize, positions: []cons
+                 }
+             }
+         }
+-        if (!found or !(best_score > bound + race_margin)) return false;
++        if (!found or !(best_score > raceBound(bound))) return false;
+         out[r] = .{ .token = @intCast(best.id), .share = @as(f64, @floatFromInt(best.m)) / @as(f64, @floatFromInt(total)) };
+     }
+     return true;
+@@ -612,3 +615,10 @@ test "without a top_p cut or a min_p floor no narrow candidates cover, so a narr
+     try std.testing.expect(!try drawSharesWithUnion(gpa, narrow.shares(), &.{5}, plain, &out, false));
+     try std.testing.expect(try drawSharesWithUnion(gpa, narrow.shares(), &.{5}, cutting, &out, true));
+ }
++
++test "the race's margin grows with the score, so a dropped bound past 2^24 still keeps a gap" {
++    const big: f64 = 1 << 30;
++    try std.testing.expect(raceBound(big) > big); // an absolute 1e-9 would round back to the bound here
++    try std.testing.expectEqual(2.0 + 2.0 * race_margin, raceBound(2.0));
++    try std.testing.expectEqual(-0.5 + race_margin, raceBound(-0.5));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_sampler.zig b/zig/src/families/glm_cuda/cuda_sampler.zig
+index 6d5e7595ed31f217a167e9644ed09f6de3a1793a..2e98ce4c5456bec3788f252000fec5a7906ce9f4 100644
+--- a/zig/src/families/glm_cuda/cuda_sampler.zig
++++ b/zig/src/families/glm_cuda/cuda_sampler.zig
+@@ -144,6 +144,8 @@ pub const Sampler = struct {
+     race: bool = true,
+     race_draws: u64 = 0, // rows drawn by the race, and the calls that fell back to whole shards
+     race_fallbacks: u64 = 0,
++    /// TF_GLM_NUCLEUS_RACE_CHECK=1: every raced row is drawn again from whole shards and compared bit for bit.
++    race_check: bool = false,
+     /// TF_GLM_GREEDY_CHECK=1: every greedy pick is recomputed through to_f32 + radix top-k + sort + pack and compared bit for bit.
+     check_greedy: bool = false,
+     /// TF_GLM_GREEDY_TOPK=1: greedy through to_f32 + radix top-k + sort + pack, as before glm_greedy_pick (A/B timing).
+@@ -288,10 +290,18 @@ pub const Sampler = struct {
+         for (parts, plans, 0..) |p, q, i| {
+             if (!q.nucleus) continue;
+             if (raced) {
+-                if (!try s.drawRace(got2, nucleus_rows, row0, q.rows, p)) {
++                const won = try s.drawRace(got2, nucleus_rows, row0, q.rows, p);
++                if (!won or s.race_check) {
+                     const w = s.works[i].?;
++                    var raced_out: [64]u32 = undefined;
++                    const n = @min(q.rows, raced_out.len);
++                    if (won) @memcpy(raced_out[0..n], p.out[0..n]);
+                     try s.th.base.toF32(p.logits, w.f32, q.rows * s.columns);
+                     if (!try s.retry(w, q.rows, s.columns, p)) return error.NucleusUncovered;
++                    if (won and !std.mem.eql(u32, raced_out[0..n], p.out[0..n])) {
++                        std.log.err("TF_GLM_NUCLEUS_RACE_CHECK: race {any} vs whole shards {any}", .{ raced_out[0..n], p.out[0..n] });
++                        return error.RaceMismatch;
++                    }
+                 }
+                 row0 += q.rows;
+                 continue;

@@ -1,0 +1,43 @@
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f190863a4e08..6cc5c62a69ae); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: the ranks agree on TF_GLM_NUCLEUS_RACE with TENSORFOLD_NUCLEUS_UNION (one word, bit 1)
+
+The race, like the union test, changes which collectives a draw issues; a rank with it off would wait on a different
+second gather. Both go in the one word the ranks already exchange at start.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0036-zig-glm-nucleus-agree.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 88f48947b87318d37bece874c961ccbc3d848f19..604b69ae28a46e14f4aa2ef5ae03557751840d83 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -419,17 +419,18 @@ pub const Engine = struct {
+             .union_cover = nucleusUnionOn(),
+         };
+         if (o.comm) |c| {
++            // the union test and the race change which collectives a draw issues, so every rank must have the same two
+             const w: usize = c.world;
+             var words = try cuda.DeviceBuffer.alloc(ctx.d, (1 + w) * 8);
+             defer words.free();
+-            var mine: u64 = @intFromBool(e.sampler.union_cover);
++            var mine: u64 = @as(u64, @intFromBool(e.sampler.union_cover)) | @as(u64, @intFromBool(e.sampler.race)) << 1;
+             try words.upload(0, std.mem.asBytes(&mine));
+             try c.allGather(words.ptr, words.ptr + 8, 1, .u64, e.stream.handle);
+             try e.stream.synchronize();
+             var all: [comm.max_world]u64 = undefined;
+             try words.download(8, std.mem.sliceAsBytes(all[0..w]));
+             if (!allEqual(all[0..w])) {
+-                std.log.err("TENSORFOLD_NUCLEUS_UNION differs between ranks (this rank {d}; all {any}): set it the same on every rank", .{ mine, all[0..w] });
++                std.log.err("TENSORFOLD_NUCLEUS_UNION or TF_GLM_NUCLEUS_RACE differs between ranks (this rank's bits {d}; all {any}): set them the same on every rank", .{ mine, all[0..w] });
+                 return error.NucleusUnionMismatch;
+             }
+         }
+@@ -2235,7 +2236,7 @@ fn nucleusUnionOn() bool {
+     return std.mem.eql(u8, std.mem.span(v), "1");
+ }
+ fn allEqual(words: []const u64) bool {
+-    for (words) |x| if (x != words[0]) return false;
++    for (words[1..]) |x| if (x != words[0]) return false;
+     return true;
+ }
+ test "a setting is agreed only when every rank sent the same word (TP=2, 3, 4)" {

@@ -389,6 +389,17 @@ than `SPILL_MIN_FREE_GIB` (50) GiB free (if dropping old files cannot make that 
 under `SPILL_MIN_TOKENS` (8,192) are not written. Its counters are in `/health` (`spill`) and `/metrics`. Design and credits: `NOTICE`,
 `CREDITS.md`; the tier's core (`tensorfold/cuda/spill.py`) is model-agnostic and is offered to TensorFold itself.
 
+The measurements above are the Python engine's. With `ENGINE=zig` (the default) the tier writes the prompt cache's kept
+states, so it also needs `PROMPT_CACHE_GIB` above 0 and DFlash2 drafts: `./start.sh` refuses `SPILL_GIB` without them,
+and checks `SPILL_DIR` on every Spark before anything is stopped ([`docs/zig-engine.md`](docs/zig-engine.md)). Its files
+are root's, not yours: the ranks run as root and the Zig tier keeps them readable by root only, so removing them takes
+`sudo`. Robert's spill v2 (`SPILL_V2=1`, `zig/patches/0018`-`0023`, off by default) writes every kept state when it is
+kept, in 2,048-token blocks a conversation's turns share, reads it back beside decoding and survives a crash; it also
+runs with KV sharding (`KV_SHARD=1`). Both need the prompt cache's room: at the default `KV_POOL_GIB` its budget is 0,
+so lower `KV_POOL_GIB` with `PROMPT_CACHE_GIB` (`KV_POOL_GIB=4 PROMPT_CACHE_GIB=8` is what the pair was measured with:
+a 6.2 GiB budget for kept states, 5.1 GiB with spill v2 on, whose pinned staging comes first; `./start.sh` warns when
+`PROMPT_CACHE_GIB` is set without `KV_POOL_GIB`).
+
 ## Worker weights over NFS
 
 By default the worker keeps its own copy of the checkpoint and DFlash2 (~166 GiB, copied over the link by
@@ -783,6 +794,8 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `STREAM_SMOOTH` / `STREAM_SMOOTH_MS` | `1` / `400` | streamed replies go out one token an event at a steady pace from a playout buffer of this many ms, so drafted bursts (~3 tokens every ~50-100 ms) and short pauses do not show; text appears that much later, the reply ends when it did, tool calls keep their place; `0`: one event a round |
 | `FILL_BUDGET_MS` | `200` | while other requests decode, a new prompt fills in layer slices of about this many ms with a decode round between them; `0`: whole 1,024-row chunks, each of which froze the other replies ~0.65 s. A request alone fills at full speed either way |
 | `FILL_DRAFTS` | `1` | the rounds between those slices draft as usual (the other replies ~10 tokens/s each during a fill); `0`: one token a reply (the new prompt's first token sooner, the other replies slower while it fills) |
+| `FILL` | `0` | `1`: prompts fill a 2048-row chunk a step between decode rounds; refused with `DRAFTER=mtp` (`ENGINE=zig`, `zig/patches/0026`; `docs/zig-engine.md`). With `PREFIX_WAIT`: prompts that share a system prompt fill it once (the others wait for its cut and resume from it) |
+| `PREFIX_WAIT` | `1` | `ENGINE=zig` with `FILL=1` and a prompt cache: a request whose prompt shares a cut another prompt is still filling waits for it instead of computing it beside it (`TF_GLM_PREFIX_WAIT`; `TF_GLM_PREFIX_WAIT_MS` bounds the wait, 60000 by default); `0` off. Nothing to do with `FILL=0` |
 | `SERVED_NAME` / `PORT` / `HOST` | `GLM-5.3-Flash-EXL3` / `8888` / `0.0.0.0` | the model id in `/v1/models` and replies; where the API listens |
 | `TENSORFOLD_GLM_IMAGE_TOKENS` / `_VIDEO_TOKENS` / `_VIDEO_FRAMES` | `2048` / `16384` / `128` | a picture's and a clip's token caps, and a clip's frames |
 | `TENSORFOLD_GLM_MAX_IMAGES` / `_MAX_VIDEOS` | `50` / `4` | pictures and clips a request |
@@ -984,7 +997,8 @@ start-tp4-switchless.sh  the same on four Sparks cabled as a ring without a swit
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER, ABLIT), prepare.sh (image + checkpoint on
               both Sparks), nodes.sh (ssh and the RoCE links), publish-image.sh (push the image to GHCR),
-              banner.sh (start.sh's banner)
+              banner.sh (start.sh's banner), port.sh (Robert's spill / KV-shard settings), port-patches.sh
+              (zig/patches/0017 and later from the engine's port commits)
 patches/      patches baked into the image
 tests/        CPU tests (cpu/, scripts/test-cpu.sh) and GPU tests (gpu/, scripts/test-gpu.sh) of patches 0098-0109
 tools/        checks against the running server (needle, tool calls, end of turn, prompt reuse, kept prompts under a
