@@ -1,4 +1,4 @@
-# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 0e0518f341f2..1571e7dfdd29); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: keep-p0 @ 820d104ac9ac over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 0e0518f341f2..1571e7dfdd29); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: several waiting prompts fill a chunk each a step (TF_GLM_MULTI_PREFILL, default off; with TF_GLM_FILL=1)
 
 Up to TF_GLM_MULTI_PREFILL_MOST (2) prompts, the oldest always first, then the fewest rows left: a short prompt behind

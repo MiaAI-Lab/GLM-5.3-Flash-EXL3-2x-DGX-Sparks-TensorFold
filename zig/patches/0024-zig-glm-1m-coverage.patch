@@ -1,4 +1,4 @@
-# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1ea862b590e4..95526fcaa650); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: keep-p0 @ 820d104ac9ac over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1ea862b590e4..95526fcaa650); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: an offline test that every Triton lookup at TP=2, up to a 1,048,576-token window, is in the captured kernel set; TF_GLM_MULTI_LONE=1 with KV sharding warns instead of refusing
 
 The recipe pins CONTEXT=131072 at TP=2, and nothing showed a longer window
