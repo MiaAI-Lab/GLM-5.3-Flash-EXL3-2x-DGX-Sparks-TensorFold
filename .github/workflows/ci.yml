@@ -20,6 +20,11 @@ jobs:
             echo "applying $(basename "$p")"
             patch -p0 --forward < "$p" > /dev/null || { echo "::error::$(basename "$p") does not apply to TensorFold v0.6.0"; exit 1; }
           done
+      - name: CPU nucleus sampling regression checks
+        run: |
+          python -m pip install numpy
+          python tools/test_nucleus_union.py --source-root /tmp/tf/src
+          python tools/test_nucleus_order_reuse.py --source-root /tmp/tf/src
       - name: Self-contained tools tests (against the patched tree)
         run: |
           MD="$RUNNER_TEMP/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/rev"
