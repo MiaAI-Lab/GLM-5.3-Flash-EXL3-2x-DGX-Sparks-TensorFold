@@ -1,0 +1,344 @@
+# port-patches.sh: keep-p0 @ 820d104ac9ac over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3155e0ea134a..f190863a4e08); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: read TENSORFOLD_NUCLEUS_UNION so top_p draws stop falling back to whole-shard sorts
+
+From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#228 (patch 0024 there), by Hector Isaza (hecisaza), applied
+on this branch unchanged apart from where it sits beside TF_GLM_NUCLEUS_RACE. The union coverage test was ported but
+Sampler.union_cover never set: Engine.init reads it, the ranks agree on it at start (error.NucleusUnionMismatch), and
+the 16,384-candidate retry is planned only with a top_p cut or a min_p floor.
+
+Credits: Hector Isaza.
+Apply from the checkout root with: git apply 0035-zig-glm-nucleus-union.patch
+
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 34ea04e913d3625e2e060ab340d53c1c499ec62d..88f48947b87318d37bece874c961ccbc3d848f19 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -415,7 +415,24 @@ pub const Engine = struct {
+             .check_greedy = std.c.getenv("TF_GLM_GREEDY_CHECK") != null,
+             .legacy_greedy = std.c.getenv("TF_GLM_GREEDY_TOPK") != null,
+             .race = if (std.c.getenv("TF_GLM_NUCLEUS_RACE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true,
++            // TENSORFOLD_NUCLEUS_UNION=1 (the recipe's default; patch 0034 on the Python engine). Every rank must agree, checked below.
++            .union_cover = nucleusUnionOn(),
+         };
++        if (o.comm) |c| {
++            const w: usize = c.world;
++            var words = try cuda.DeviceBuffer.alloc(ctx.d, (1 + w) * 8);
++            defer words.free();
++            var mine: u64 = @intFromBool(e.sampler.union_cover);
++            try words.upload(0, std.mem.asBytes(&mine));
++            try c.allGather(words.ptr, words.ptr + 8, 1, .u64, e.stream.handle);
++            try e.stream.synchronize();
++            var all: [comm.max_world]u64 = undefined;
++            try words.download(8, std.mem.sliceAsBytes(all[0..w]));
++            if (!allEqual(all[0..w])) {
++                std.log.err("TENSORFOLD_NUCLEUS_UNION differs between ranks (this rank {d}; all {any}): set it the same on every rank", .{ mine, all[0..w] });
++                return error.NucleusUnionMismatch;
++            }
++        }
+         if (mtp_on) {
+             e.mtp = try mtp_mod.Head.init(gpa, ctx.d, e.g, extent);
+         }
+@@ -2212,3 +2229,19 @@ test "TF_GLM_KV_SHARD: /health's parts from the pool, a stream's share of the la
+     try std.testing.expectEqual(@as(u64, 1), k2.prompt_blocked);
+     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), c.sharded(2048)); // not whole parts: never fits
+ }
++
++fn nucleusUnionOn() bool {
++    const v = std.c.getenv("TENSORFOLD_NUCLEUS_UNION") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++fn allEqual(words: []const u64) bool {
++    for (words) |x| if (x != words[0]) return false;
++    return true;
++}
++test "a setting is agreed only when every rank sent the same word (TP=2, 3, 4)" {
++    try std.testing.expect(allEqual(&.{ 1, 1 }));
++    try std.testing.expect(allEqual(&.{ 0, 0, 0, 0 }));
++    try std.testing.expect(!allEqual(&.{ 1, 0 }));
++    try std.testing.expect(!allEqual(&.{ 1, 1, 0 })); // the odd rank last at TP=3
++    try std.testing.expect(!allEqual(&.{ 0, 1, 1, 1 })); // and first at TP=4
++}
+diff --git a/zig/src/families/glm_cuda/cuda_nucleus.zig b/zig/src/families/glm_cuda/cuda_nucleus.zig
+index 2c6030a22cba504dffc8c385d8fe8e16dc7a48e7..2366c09442c36824b61640f1a8d5b2d30dd960ec 100644
+--- a/zig/src/families/glm_cuda/cuda_nucleus.zig
++++ b/zig/src/families/glm_cuda/cuda_nucleus.zig
+@@ -65,8 +65,18 @@ pub fn drawShares(gpa: Allocator, sh: Shares, positions: []const u64, s: S.Sampl
+     return drawSharesWithUnion(gpa, sh, positions, s, out, false);
+ }
+ 
++/// A top_p nucleus cut applies (0 < top_p < 1).
++pub fn nucleusCut(s: S.Sampling) bool {
++    return 0.0 < s.top_p and s.top_p < 1.0;
++}
++
++/// Whether candidates narrower than the whole shard can ever cover this draw: it needs a top_p cut or a min_p floor.
++pub fn narrowCanCover(s: S.Sampling) bool {
++    return nucleusCut(s) or s.min_p > 0.0;
++}
++
+ pub fn drawSharesWithUnion(gpa: Allocator, sh: Shares, positions: []const u64, s: S.Sampling, out: []Drawn, union_cover: bool) !bool {
+-    const cut = 0.0 < s.top_p and s.top_p < 1.0;
++    const cut = nucleusCut(s);
+     const min_log = s.minLog();
+     const list = try gpa.alloc(Entry, sh.world * sh.count);
+     defer gpa.free(list);
+@@ -291,6 +301,16 @@ test "the draws equal Python's _draw on its own candidates, one rank and two, wh
+             try std.testing.expectEqual(try std.fmt.parseInt(u64, want.array.items[0].number_string, 10), got.token);
+             try std.testing.expectEqual(try std.fmt.parseInt(u64, want.array.items[1].number_string, 10), @as(u64, @bitCast(got.share)));
+         }
++        // The union test on the first candidates either asks for more or draws what Python's whole-shard _draw drew.
++        var un: Owned = .{};
++        defer un.deinit(gpa);
++        var out_union: [8]Drawn = undefined;
++        if (try drawSharesWithUnion(gpa, try un.shares(gpa, c.get("first").?.object, world, rows), pos[0..rows], s, out_union[0..rows], true)) {
++            for (c.get("drawn").?.array.items, out_union[0..rows]) |want, got| {
++                try std.testing.expectEqual(try std.fmt.parseInt(u64, want.array.items[0].number_string, 10), got.token);
++                try std.testing.expectEqual(try std.fmt.parseInt(u64, want.array.items[1].number_string, 10), @as(u64, @bitCast(got.share)));
++            }
++        }
+     }
+ }
+ 
+@@ -403,3 +423,192 @@ fn massSum(xs: []const i64) i64 {
+     for (xs) |x| t += x;
+     return t;
+ }
++
++/// Synthetic shards: logits[k][r] is rank k's row r, already divided by the temperature. `count` candidates a rank and row
++/// (ids -1 past the shard's width), masses in fixed point against the row's global top, as the kernels send them.
++const Rig = struct {
++    gpa: Allocator,
++    world: usize,
++    rows: usize,
++    count: usize,
++    vals: []f64,
++    ids: []i64,
++    mass: []i64,
++    sums: []i64,
++    widths: []i64,
++
++    const Order = struct {
++        row: []const f64,
++        fn less(o: Order, a: usize, b: usize) bool {
++            if (o.row[a] != o.row[b]) return o.row[a] > o.row[b];
++            return a < b;
++        }
++    };
++
++    fn init(gpa: Allocator, logits: []const []const []const f64, count: usize) !Rig {
++        const world = logits.len;
++        const rows = logits[0].len;
++        var g: Rig = .{ .gpa = gpa, .world = world, .rows = rows, .count = count, .vals = try gpa.alloc(f64, world * rows * count), .ids = try gpa.alloc(i64, world * rows * count), .mass = try gpa.alloc(i64, world * rows * count), .sums = try gpa.alloc(i64, world * rows), .widths = try gpa.alloc(i64, world * rows) };
++        errdefer g.deinit();
++        for (0..rows) |r| {
++            var top = -std.math.inf(f64);
++            for (logits) |rank| for (rank[r]) |v| {
++                top = @max(top, v);
++            };
++            var offset: usize = 0;
++            for (logits, 0..) |rank, k| {
++                const row = rank[r];
++                const order = try gpa.alloc(usize, row.len);
++                defer gpa.free(order);
++                for (order, 0..) |*o, i| o.* = i;
++                std.mem.sort(usize, order, Order{ .row = row }, Order.less);
++                var sum: i64 = 0;
++                for (row) |v| sum += @intFromFloat(@floor(@exp(v - top) * mass_scale));
++                const at = (k * rows + r) * count;
++                for (0..count) |j| {
++                    if (j < row.len) {
++                        const v = row[order[j]];
++                        g.vals[at + j] = v;
++                        g.ids[at + j] = @intCast(offset + order[j]);
++                        g.mass[at + j] = @intFromFloat(@floor(@exp(v - top) * mass_scale));
++                    } else {
++                        g.vals[at + j] = -std.math.inf(f64);
++                        g.ids[at + j] = -1;
++                        g.mass[at + j] = 0;
++                    }
++                }
++                g.sums[k * rows + r] = sum;
++                g.widths[k * rows + r] = @intCast(row.len);
++                offset += row.len;
++            }
++        }
++        return g;
++    }
++
++    fn deinit(g: *Rig) void {
++        g.gpa.free(g.vals);
++        g.gpa.free(g.ids);
++        g.gpa.free(g.mass);
++        g.gpa.free(g.sums);
++        g.gpa.free(g.widths);
++    }
++
++    fn shares(g: *const Rig) Shares {
++        return .{ .world = g.world, .rows = g.rows, .count = g.count, .vals = g.vals, .ids = g.ids, .mass = g.mass, .sums = g.sums, .widths = g.widths };
++    }
++};
++
++/// Union draw on `narrow` candidates against the per-shard draw on whole shards (what the engine's last retry sends): when
++/// the union test accepts, the token and the share must be bit for bit the whole-shard draw. Returns whether it accepted.
++fn unionMatchesWholeShards(gpa: Allocator, logits: []const []const []const f64, count: usize, positions: []const u64, s: S.Sampling) !bool {
++    var widest: usize = 0;
++    for (logits) |rank| widest = @max(widest, rank[0].len);
++    var narrow = try Rig.init(gpa, logits, count);
++    defer narrow.deinit();
++    var whole = try Rig.init(gpa, logits, widest);
++    defer whole.deinit();
++    const rows = narrow.rows;
++    var want: [8]Drawn = undefined;
++    try std.testing.expect(try drawShares(gpa, whole.shares(), positions, s, want[0..rows]));
++    var got: [8]Drawn = undefined;
++    const accepted = try drawSharesWithUnion(gpa, narrow.shares(), positions, s, got[0..rows], true);
++    if (accepted) for (want[0..rows], got[0..rows]) |w, x| {
++        try std.testing.expectEqual(w.token, x.token);
++        try std.testing.expectEqual(@as(u64, @bitCast(w.share)), @as(u64, @bitCast(x.share)));
++    };
++    return accepted;
++}
++
++/// A peaked row: `head` random slots across the ranks get logits in [-3, 0] (on a 0.5 grid when `grid`, so values tie
++/// within and across shards), every other entry sits near -20.
++fn peakedLogits(arena: Allocator, rng: std.Random, widths: []const usize, rows: usize, head: usize, grid: bool) ![]const []const []const f64 {
++    const logits = try arena.alloc([]const []const f64, widths.len);
++    for (logits, widths) |*rank, w| {
++        const rr = try arena.alloc([]const f64, rows);
++        for (rr) |*row| {
++            const v = try arena.alloc(f64, w);
++            for (v) |*x| x.* = -20.0 - 2.0 * rng.float(f64);
++            row.* = v;
++        }
++        rank.* = rr;
++    }
++    for (0..rows) |r| for (0..head) |_| {
++        const k = rng.uintLessThan(usize, widths.len);
++        const i = rng.uintLessThan(usize, widths[k]);
++        const v = -3.0 * rng.float(f64);
++        @constCast(logits[k][r])[i] = if (grid) @floor(v * 2.0) / 2.0 else v;
++    };
++    return logits;
++}
++
++test "the union draw equals the whole-shard draw: 2, 3 and 4 ranks, unequal widths, widths around 16384, top_p, min_p, rows, ties" {
++    const gpa = std.testing.allocator;
++    const Case = struct { widths: []const usize, count: usize, head: usize, grid: bool };
++    const cases = [_]Case{
++        .{ .widths = &.{ 600, 400 }, .count = 16, .head = 6, .grid = false },
++        .{ .widths = &.{ 70, 10 }, .count = 16, .head = 5, .grid = false },
++        .{ .widths = &.{ 600, 400, 500 }, .count = 16, .head = 6, .grid = false },
++        .{ .widths = &.{ 300, 500, 200, 400 }, .count = 16, .head = 8, .grid = true },
++        .{ .widths = &.{ 500, 500 }, .count = 16, .head = 9, .grid = true },
++        .{ .widths = &.{ 16385, 16383 }, .count = 16384, .head = 5, .grid = false },
++        .{ .widths = &.{ 16384, 16385 }, .count = 16384, .head = 5, .grid = true },
++    };
++    const samplings = [_]S.Sampling{
++        .{ .seed = 11, .top_k = 0, .top_p = 0.9 },
++        .{ .seed = 12, .top_k = 0, .top_p = 0.99 },
++        .{ .seed = 13, .top_k = 0, .top_p = 0.5 },
++        .{ .seed = 14, .top_k = 0, .top_p = 0.9, .min_p = 0.05 },
++        .{ .seed = 15, .top_k = 0, .top_p = 0.9999, .min_p = 0.2 },
++    };
++    const positions = [_]u64{ 101, 202, 303 };
++    var prng = std.Random.DefaultPrng.init(0x5eed);
++    for (cases, 0..) |c, ci| {
++        var accepted: usize = 0;
++        for (samplings) |s| {
++            var arena = std.heap.ArenaAllocator.init(gpa);
++            defer arena.deinit();
++            const logits = try peakedLogits(arena.allocator(), prng.random(), c.widths, positions.len, c.head, c.grid);
++            errdefer std.debug.print("case {d}, seed {d}\n", .{ ci, s.seed });
++            if (try unionMatchesWholeShards(gpa, logits, c.count, &positions, s)) accepted += 1;
++        }
++        // the cases are peaked far above their candidates' edge, so the test is not vacuous
++        try std.testing.expect(accepted >= 3);
++    }
++}
++
++test "the union test asks for more candidates while the nucleus reaches a shard's edge, then draws the whole-shard token" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // eight near-equal head entries, four on each of two ranks, then a tail near -20
++    const logits = try a.alloc([]const []const f64, 2);
++    for (logits, 0..) |*rank, k| {
++        const row = try a.alloc(f64, 64);
++        for (row, 0..) |*x, i| x.* = if (i < 4) -0.01 * @as(f64, @floatFromInt(2 * i + k)) else -20.0 - 0.01 * @as(f64, @floatFromInt(i));
++        const rr = try a.alloc([]const f64, 1);
++        rr[0] = row;
++        rank.* = rr;
++    }
++    const s: S.Sampling = .{ .seed = 3, .top_k = 0, .top_p = 0.9 };
++    try std.testing.expect(!try unionMatchesWholeShards(gpa, logits, 1, &.{9}, s)); // two of eight
++    try std.testing.expect(!try unionMatchesWholeShards(gpa, logits, 4, &.{9}, s)); // the nucleus ends on the edge candidate
++    try std.testing.expect(try unionMatchesWholeShards(gpa, logits, 5, &.{9}, s)); // one tail entry shows the edge is past it
++}
++
++test "without a top_p cut or a min_p floor no narrow candidates cover, so a narrow retry cannot succeed" {
++    const gpa = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var prng = std.Random.DefaultPrng.init(7);
++    const logits = try peakedLogits(arena.allocator(), prng.random(), &.{ 600, 400 }, 1, 4, false);
++    var narrow = try Rig.init(gpa, logits, 16);
++    defer narrow.deinit();
++    var out: [1]Drawn = undefined;
++    const plain: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 1.0 };
++    const cutting: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 0.9 };
++    try std.testing.expect(!narrowCanCover(plain) and narrowCanCover(cutting));
++    try std.testing.expect(!try drawSharesWithUnion(gpa, narrow.shares(), &.{5}, plain, &out, true));
++    try std.testing.expect(!try drawSharesWithUnion(gpa, narrow.shares(), &.{5}, plain, &out, false));
++    try std.testing.expect(try drawSharesWithUnion(gpa, narrow.shares(), &.{5}, cutting, &out, true));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_sampler.zig b/zig/src/families/glm_cuda/cuda_sampler.zig
+index 2605046e8709775d2a1614cbf67dd49f1cb65513..6d5e7595ed31f217a167e9644ed09f6de3a1793a 100644
+--- a/zig/src/families/glm_cuda/cuda_sampler.zig
++++ b/zig/src/families/glm_cuda/cuda_sampler.zig
+@@ -124,6 +124,12 @@ const Exchange = struct {
+         x.world = world;
+     }
+ };
++/// Candidates a rank sends in the retry before whole shards.
++const narrow_count: usize = 16384;
++/// The narrow retry is worth its collective only with the union test on, a shard wider than it, and a draw it can cover.
++fn narrowRetry(union_cover: bool, sampling: S.Sampling, widest: usize) bool {
++    return union_cover and widest > narrow_count and nu.narrowCanCover(sampling);
++}
+ pub const Sampler = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -131,6 +137,7 @@ pub const Sampler = struct {
+     comm: ?*Comm = null,
+     columns: usize,
+     vocab_offset: i64,
++    /// TENSORFOLD_NUCLEUS_UNION=1: with 0 < top_p < 1, coverage is tested on all ranks' candidates together; must match on every rank.
+     union_cover: bool = false,
+     /// TF_GLM_NUCLEUS_RACE (on unless 0): a part with no top_p cut and no min_p draws by a GPU race over every token,
+     /// rescored exactly on the host (cuda_nucleus.raceDraw); a near tie falls back to whole shards, as before.
+@@ -292,7 +299,7 @@ pub const Sampler = struct {
+             var ok = try s.drawNucleus(got2, nucleus_rows, row0, q.rows, count, p);
+             const widest = widestShard(got2, s.world(), nucleus_rows, row0, q.rows, count);
+             const w = s.works[i].?;
+-            if (!ok and s.union_cover and widest > 16384) ok = try s.retry(w, q.rows, 16384, p);
++            if (!ok and narrowRetry(s.union_cover, p.sampling.?, widest)) ok = try s.retry(w, q.rows, narrow_count, p);
+             if (!ok) ok = try s.retry(w, q.rows, widest, p);
+             if (!ok) return error.NucleusUncovered;
+             row0 += q.rows;
+@@ -592,3 +599,15 @@ test "a 28-wide packed greedy row: the global top-1 across ranks and rows, and i
+     const p = try probability(gpa, &vals, &ids, 10, null);
+     try std.testing.expectApproxEqAbs(1.0 / (1.0 + 27.0 * @exp(-5.0)), p, 1e-12);
+ }
++test "the narrow retry is planned only where it can cover: union on, a shard wider than 16384, and a top_p cut or min_p floor" {
++    const nucleus_draw: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 0.95 };
++    const min_p_only: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 1.0, .min_p = 0.05 };
++    const plain: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 1.0 };
++    const top_p_zero: S.Sampling = .{ .seed = 1, .top_k = 0, .top_p = 0.0 };
++    try std.testing.expect(narrowRetry(true, nucleus_draw, 16385));
++    try std.testing.expect(narrowRetry(true, min_p_only, 80000));
++    try std.testing.expect(!narrowRetry(true, nucleus_draw, 16384)); // the narrow send would be the whole shard
++    try std.testing.expect(!narrowRetry(false, nucleus_draw, 80000)); // union off: straight to whole shards
++    try std.testing.expect(!narrowRetry(true, plain, 80000)); // nothing to cut: only whole shards can cover
++    try std.testing.expect(!narrowRetry(true, top_p_zero, 80000));
++}

@@ -1,0 +1,3078 @@
+# port-patches.sh: keep-p0 @ 820d104ac9ac over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits cf4dde927470..820d104ac9ac); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: pool and kept-state observation (P0 of the pool fix): sizing, occupancy, copy timings, spill rates, request trace
+
+Phase P0 of the plan to keep prompt states in the KV pool (Mia #185). It adds
+measurements and log lines and changes no behaviour. Nothing is added to the
+agreed settings text, no note or collective is sent, no allocation, placement,
+keep or admission decision changes. Lines that need the prompt cache, the lane
+host or the tier's leader come from rank 0; what runs on both ranks reads local
+state and sends nothing.
+
+What it logs
+- Pool sizing, every rank: "KV pool sizing" gives the free memory the room was
+  read from, the reserve, the room, the KV_POOL_GIB cap, what the pool was
+  allowed, and the rows and bytes it took. cacheFor then logs "post-pool
+  drift": MemAvailable now against MemAvailable at sizing, less the pool's own
+  bytes, which is the figure the carve's pad has to cover (plan 1.6).
+- Start line, rank 0, also with a 0 budget: "keep in pool: off; pool ..." with
+  the pool and part rows, the largest keepable state, the estimated largest
+  warm resume by a local copy and by a carry, the fixed MiB and bytes a token
+  of a state, the entry cap and what binds it, the byte and per-chat caps, the
+  fixed-state budget for the entries (in integers, rounded up, as the carve
+  will take it), and the display cut. A DRM span gives its cut; dispram's one
+  allocation has none and is logged as reserved, not as none. Each rank that
+  reserves display memory also logs its own "display cut" line.
+- "pool occupancy" every TF_GLM_POOL_LOG_S seconds on rank 0 (60; 0: none): for
+  each part the live, twin, kept (0: no kept state lives in the pool) and free
+  rows, the longest free run, and the published pool_free. The lane layer
+  ticks it between decode rounds, fill steps and whole passes, beside the
+  layout digest, so a server doing nothing logs nothing; it reads the
+  host-side pool and sends nothing.
+- Kept-state copies: takeSnap, restoreSnap, a carry and a state buffer's free
+  are timed in phases (cuMemAlloc, copy calls, stream wait; a free's cuMemFree)
+  with their bytes. Copies of TF_GLM_SNAP_LOG_MIB or more (64; 0: none, and no
+  start-up probe) are logged by rank 0, and every copy is counted on atomics in
+  /health's "snap_timing": for each operation a row for each size class
+  (64 MiB, then each doubling) with the count, the bytes, the phases as totals
+  over the row's copies (alloc_ms_total, copy_ms_total, sync_ms_total; a
+  restore has the last two, a carry only enqueue_ms_total, a free only
+  free_ms_total) and max_ms, the slowest copy. A carry is timed to the enqueue
+  of its calls; its transfer lands in the restore's sync. A restore is timed
+  after its carry returns (the carry has its own line and row), and its rate is
+  over the bytes this rank copied (all but the latent rows it sent or had
+  carried). A start-up probe logs the min, median and max cuMemAlloc and
+  cuMemFree of a buffer the size of a fixed state.
+- Spill tier, from its own counters: a line for each point written (queued to
+  published, or why not), a line for each restore (bytes read, begin to the
+  .validate verdict, the gather itself), and every TF_GLM_POOL_LOG_S seconds a
+  rate line, rank 0's: bytes staged a second while a stream decodes (a lane
+  still filling its prompt is not one) and while idle, restores, drains, and
+  the disk written (GiB an hour, this rank and the other).
+- "request trace v1", rank 0, one line when a request ends: its arrival, the
+  prompt, cached and max_tokens counts, a hash of its conversation id, the time
+  to its first token and to its end, the states its own pass kept (new states
+  only, counted per request, so fills that overlap do not count each other's; a
+  warm pass counts the state at its end), the conversation's states after the
+  pass, the reply tokens and how it ended. Lengths only. TF_GLM_TRACE=0 turns it
+  off; a header line gives the run's salt and the store (store=on
+  budget=<bytes>, or store=off: a host with no prompt cache keeps and resumes
+  nothing, so its lines read chat=0 cached=0 kept=0 entries=0). The Header,
+  header, parseHeader, parse and parseAll of lanes.request_trace are what the
+  P1 replay simulator reads.
+
+Switches, all observation-only and local to each rank: TF_GLM_POOL_LOG_S (60),
+TF_GLM_SNAP_LOG_MIB (64; 0 also skips the start-up probe), TF_GLM_TRACE (on). A
+value that does not parse keeps its default and warns. With the defaults the
+engine allocates, places, keeps and replies as before.
+
+Tests: the formats of every line, the sizing and drift arithmetic, the
+occupancy read of a plain and a sharded pool, its widest line in its buffer and
+its rank gate, the histogram and its /health rows (each phase under its own
+name), the spill rate windows (and the tier rig's write, restore and window),
+the trace and its header round trip, its parse out of a log of all the other
+lines, the lane layer's ticks (a decode round, a fill step, a whole pass) and
+which lanes are decoding, and the lane host's trace of a conversation's turns,
+two prompts filling at once (sliced and stepped), a warm pass, a request
+cancelled before its pass, and a host with the trace off or on at the default
+sink. test-glm-cuda-host: 404 passed (376 before), 2 skipped, the same 9
+loopback failures as r8b. engine_api: 214 passed. Server tests: 203 passed, the
+same recipe-flags failure as r8b (the /metrics 0045 test hangs on macOS
+loopback and was skipped locally, not in this commit). The aarch64 cross build
+is clean. Not GPU-validated.
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
+Apply from the checkout root with: git apply 0039-zig-glm-pool-occupancy.patch
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 2226dec41ed475306b30918707989e2bdd4c8736..1467d25ced241ccefe963798846eb921f4177138 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -422,10 +422,14 @@ pub const Status = struct {
+     cache: ?CacheStats = null,
+     /// A backend whose pool is sharded over its ranks: its parts' rows and counters (/health's kv_shard); null: none.
+     kv_parts: ?KvParts = null,
++    /// A backend's kept-state copy timings by size (/health's snap_timing); null: none counted.
++    snap_timing: ?lanes.snap_timing.Snapshot = null,
+ };
+ 
+ /// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+ pub const KvParts = lanes.kv_parts.Stats;
++/// A backend's kept-state copy timings by operation and size (lanes.snap_timing).
++pub const SnapTiming = lanes.snap_timing;
+ 
+ pub const SubmitError = error{ Closed, Busy, InvalidSpans };
+ 
+@@ -586,6 +590,7 @@ test {
+     _ = @import("lane_host_warm_test.zig");
+     _ = @import("lane_host_tier_test.zig");
+     _ = @import("lane_host_prefix_test.zig");
++    _ = @import("lane_host_trace_test.zig");
+     _ = @import("prompt_cache_media_test.zig");
+     _ = @import("prompt_cache.zig");
+     _ = @import("prompt_media.zig");
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 28c8291feb37dc9574e3d5d46002fd1881b92707..d33309ced69f9cc0a95e33ae904646d46d2ea29e 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -14,6 +14,7 @@ const api = @import("engine_api.zig");
+ const pc = @import("prompt_cache.zig");
+ const status = @import("lane_host_status.zig");
+ const learn = @import("lane_host_learn.zig");
++const request_trace = lanes.request_trace;
+ const Allocator = std.mem.Allocator;
+ const Id = api.Id;
+ const Request = api.Request;
+@@ -83,6 +84,27 @@ pub const LaneHost = struct {
+     /// ends before the next request is admitted, which then finds its cut kept).
+     prefix_wait_ns: i96 = 0,
+     prefixed: std.ArrayList(PrefixWait) = .empty, // requests waiting for a cut another fill is computing, in arrival order
++    /// A line a request when it ends (core/lanes/request_trace.zig): lengths and counts, never content. Null: off.
++    trace: ?Trace = null,
++
++    /// The trace's sink: `boot` salts the conversation hashes, `zero` is the clock at its start, lines go to `out`.
++    pub const Trace = struct {
++        boot: u64,
++        zero: i96,
++        ctx: ?*anyopaque = null,
++        out: *const fn (ctx: ?*anyopaque, line: []const u8) void = logLine,
++
++        /// The default sink. Under test it counts its lines (`logged`) instead of logging them.
++        fn logLine(_: ?*anyopaque, line: []const u8) void {
++            if (@import("builtin").is_test) {
++                _ = logged.fetchAdd(1, .monotonic);
++                return;
++            }
++            std.log.info("{s}", .{line});
++        }
++
++        pub var logged: std.atomic.Value(usize) = .init(0);
++    };
+ 
+     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
+     /// How often an idle host polls work in flight (restores, staged writes, deferred retries).
+@@ -182,6 +204,10 @@ pub const LaneHost = struct {
+         lineage: []pc.Fork = &.{}, // the computation its pass's rows belong to (gpa-owned; Store.passLineage)
+         reached: u32 = 0, // the furthest mark its pass has stood at (kept or refused): a prefix waiter's cut is past then
+         prefix_waited: bool = false, // it waited once for another fill's cut (prefixWait): it never waits again
++        arrived: i96 = 0, // the trace: when it was submitted (0 with the trace off)
++        first: ?i96 = null, // when its first reply token went out
++        kept_pass: u32 = 0, // the states its own pass kept (keepAt)
++        chat_entries: u32 = 0, // its conversation's own states after the pass
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -189,11 +215,20 @@ pub const LaneHost = struct {
+             job.reached = @max(job.reached, at); // (requests waiting for this cut go on: kept or not, it is done)
+             job.reported(); // before a keep can evict the entry the pass restored
+             if (job.host.cache) |store| {
+-                _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
++                _ = job.keepAt(store, at, s);
+                 status.noteKept(job.host);
+             }
+         }
+ 
++        /// `Store.keepWith` for this job's request, counting the states it adds to its own pass (the trace's `kept`).
++        fn keepAt(job: *Job, store: *pc.Store, at: u32, owner: ?*anyopaque) bool {
++            const before = store.counts.kept;
++            const ok = store.keepWith(keyOf(job.request), at, owner, job.request.chunks, job.host.spans(job.request), job.keepInfo());
++            job.kept_pass += @intCast(store.counts.kept - before);
++            if (job.host.trace != null) job.chat_entries = store.chatEntries(job.join.chat);
++            return ok;
++        }
++
+         /// What its keeps record: its conversation, the point its pass resumed and the pass's lineage.
+         fn keepInfo(job: *const Job) pc.KeepInfo {
+             const r = job.request;
+@@ -320,7 +355,7 @@ pub const LaneHost = struct {
+     fn submitFn(ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void {
+         const h = self(ctx);
+         const job = h.gpa.create(Job) catch return error.Busy;
+-        job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
++        job.* = .{ .host = h, .id = id, .request = request, .sink = sink, .arrived = if (h.trace != null) std.Io.Clock.awake.now(h.io).toNanoseconds() else 0 };
+         h.mutex.lockUncancelable(h.io);
+         defer h.mutex.unlock(h.io);
+         if (h.closing) {
+@@ -386,6 +421,7 @@ pub const LaneHost = struct {
+     fn send(h: *LaneHost, job: *Job) void {
+         const emitted = job.stream.emitted();
+         if (emitted.len > job.delivered) {
++            if (job.first == null and h.trace != null) job.first = std.Io.Clock.awake.now(h.io).toNanoseconds();
+             if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.rows.items[job.delivered..emitted.len] });
+             emit(job, .{ .tokens = emitted[job.delivered..] });
+             status.noteDecoded(h, emitted.len - job.delivered);
+@@ -413,6 +449,7 @@ pub const LaneHost = struct {
+         h.gpa.free(job.lineage);
+         const s = &job.stream;
+         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
++        if (h.trace) |t| h.traceJob(t, job, reason);
+         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
+         if (job.started) {
+             if (s.grammar) |g| g.deinit(h.gpa);
+@@ -784,11 +821,50 @@ pub const LaneHost = struct {
+         if (h.cache) |store| {
+             store.continued(job.join, job.stream.cached, job.request.prompt.len);
+             store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
++            if (h.trace != null) job.chat_entries = store.chatEntries(job.join.chat); // (after its pass's keeps)
+         }
+         status.noteKept(h);
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+ 
++    /// Starts the trace, after `cache` is set and before `start`: its header line, then a line a request that ends.
++    pub fn traceOn(h: *LaneHost, boot: u64, ctx: ?*anyopaque, out: ?*const fn (ctx: ?*anyopaque, line: []const u8) void) void {
++        const t: Trace = .{ .boot = boot, .zero = std.Io.Clock.awake.now(h.io).toNanoseconds(), .ctx = ctx, .out = out orelse Trace.logLine };
++        h.trace = t;
++        var buf: [192]u8 = undefined;
++        t.out(t.ctx, request_trace.header(&buf, .{ .boot = boot, .store_budget = if (h.cache) |store| store.budget else null }));
++    }
++
++    /// A request ending: its trace line, from what the host saw of it (before its `finished` event goes out).
++    fn traceJob(h: *LaneHost, t: Trace, job: *const Job, reason: Reason) void {
++        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
++        const rec: request_trace.Record = .{
++            .t_ms = @intCast(@max(0, @divTrunc(job.arrived - t.zero, std.time.ns_per_ms))),
++            .prompt = @intCast(@min(job.request.prompt.len, std.math.maxInt(u32))),
++            .cached = if (job.started) job.stream.cached else 0,
++            .max_tokens = job.request.max_tokens,
++            .chat = request_trace.chatHash(t.boot, job.join.chat),
++            .first_ms = if (job.first) |f| millis(job.arrived, f) else null,
++            .done_ms = millis(job.arrived, now),
++            .kept = job.kept_pass,
++            .chat_entries = job.chat_entries,
++            .gen = @intCast(@min(job.delivered, std.math.maxInt(u32))),
++            .end = switch (reason) {
++                .stop => .stop,
++                .length => .length,
++                .cancelled => .cancelled,
++                .failed => .failed,
++            },
++        };
++        var buf: [256]u8 = undefined;
++        const line = request_trace.format(&buf, rec);
++        if (line.len > 0) t.out(t.ctx, line);
++    }
++
++    fn millis(from: i96, to: i96) u32 {
++        return @intCast(@min(@divTrunc(@max(0, to - from), std.time.ns_per_ms), std.math.maxInt(u32)));
++    }
++
+     /// A request's decoded prompt rows, for a backend that keeps their bits (`decoded_rows`); otherwise none.
+     fn spans(h: *const LaneHost, r: *const Request) []const [2]u32 {
+         return if (h.decoded_rows) r.decode_spans else &.{};
+@@ -804,7 +880,7 @@ pub const LaneHost = struct {
+         };
+         h.prefilled(job, began);
+         if (cacheable(job.request)) if (h.cache) |store| {
+-            _ = store.keepWith(keyOf(job.request), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.keepInfo());
++            _ = job.keepAt(store, @intCast(job.request.prompt.len), &job.stream);
+         };
+         status.noteKept(h);
+         be.release(&job.stream);
+diff --git a/zig/src/core/lane_host_trace_test.zig b/zig/src/core/lane_host_trace_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..9969b6130d01aad2c4c92e8e07ea0ec8f9e54e12
+--- /dev/null
++++ b/zig/src/core/lane_host_trace_test.zig
+@@ -0,0 +1,300 @@
++//! LaneHost's per-request trace: one line a request when it ends, in the format a replay reads.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const LaneHost = api.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const trace = lanes.request_trace;
++
++/// The trace's lines, as the host hands them out (the engine thread appends, the test reads after a request's end).
++const Lines = struct {
++    mutex: std.Io.Mutex = .init,
++    items: std.ArrayList([]u8) = .empty,
++
++    fn out(ctx: ?*anyopaque, line: []const u8) void {
++        const l: *Lines = @ptrCast(@alignCast(ctx.?));
++        l.mutex.lockUncancelable(std.testing.io);
++        defer l.mutex.unlock(std.testing.io);
++        l.items.append(std.testing.allocator, std.testing.allocator.dupe(u8, line) catch return) catch {};
++    }
++
++    fn deinit(l: *Lines) void {
++        for (l.items.items) |s| std.testing.allocator.free(s);
++        l.items.deinit(std.testing.allocator);
++    }
++};
++
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    done: ?Reason = null,
++
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *Box = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .tokens => |t| b.tokens.appendSlice(std.testing.allocator, t) catch {},
++            .finished => |f| b.done = f.reason,
++            else => {},
++        }
++    }
++
++    /// Until the request finishes; a request that never does fails the test after `wait_ms`, it never hangs it.
++    fn wait(b: *Box) !Reason {
++        for (0..wait_ms) |_| {
++            b.mutex.lockUncancelable(std.testing.io);
++            const d = b.done;
++            b.mutex.unlock(std.testing.io);
++            if (d) |r| return r;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.NeverFinished;
++    }
++};
++
++const wait_ms = 20_000;
++
++const Snaps = struct {
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++};
++
++test "a conversation's two turns trace as two lines: lengths, the resume, the pass's keeps and the chat's states" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    var lines: Lines = .{};
++    defer lines.deinit();
++    host.traceOn(0xfeed_beef, &lines, Lines.out);
++    try host.start();
++    defer host.stop();
++    const e = host.engine();
++    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8 };
++    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, try b1.wait());
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try t2.appendSlice(gpa, &t1);
++    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
++    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    const r2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2) };
++    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, try b2.wait());
++
++    try std.testing.expectEqual(@as(usize, 3), lines.items.items.len); // the header, then a line a request
++    try std.testing.expectError(error.Header, trace.parse(lines.items.items[0]));
++    const head = try trace.parseHeader(lines.items.items[0]);
++    try std.testing.expectEqual(@as(u64, 0xfeed_beef), head.boot);
++    try std.testing.expectEqual(@as(?u64, 1 << 20), head.store_budget); // (the store's budget: the replay reads it)
++    const a = try trace.parse(lines.items.items[1]);
++    const b = try trace.parse(lines.items.items[2]);
++    try std.testing.expectEqual(@as(u32, 10), a.prompt);
++    try std.testing.expectEqual(@as(u32, 0), a.cached);
++    try std.testing.expectEqual(@as(u32, 6), a.max_tokens);
++    try std.testing.expectEqual(@as(u32, 6), a.gen);
++    try std.testing.expectEqual(trace.End.length, a.end);
++    try std.testing.expect(a.first_ms != null and a.first_ms.? <= a.done_ms);
++    try std.testing.expectEqual(@as(u32, 1), a.kept);
++    try std.testing.expectEqual(@as(u32, 1), a.chat_entries);
++    try std.testing.expect(a.chat != 0);
++    // the second turn resumes the first's state (8 tokens), keeps one of its own and joins the same conversation
++    try std.testing.expectEqual(@as(u32, @intCast(t2.items.len)), b.prompt);
++    try std.testing.expectEqual(@as(u32, 8), b.cached);
++    try std.testing.expectEqual(@as(u32, 12), b.max_tokens);
++    try std.testing.expectEqual(@as(u32, 12), b.gen);
++    try std.testing.expectEqual(a.chat, b.chat);
++    try std.testing.expectEqual(@as(u32, 1), b.kept);
++    try std.testing.expectEqual(@as(u32, 2), b.chat_entries);
++    try std.testing.expect(b.t_ms >= a.t_ms);
++}
++
++test "a request cancelled before its pass still traces, with no first token and no keeps" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
++    var lines: Lines = .{};
++    defer lines.deinit();
++    host.traceOn(1, &lines, Lines.out);
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    var b: Box = .{};
++    defer b.tokens.deinit(gpa);
++    const r: Request = .{ .prompt = &prompt, .max_tokens = 64 };
++    const e = host.engine();
++    try e.submit(7, &r, .{ .ctx = &b, .event = Box.event }); // (the thread is not running: it waits queued)
++    e.cancel(7);
++    try host.start();
++    defer host.stop();
++    try std.testing.expectEqual(Reason.cancelled, try b.wait());
++    try std.testing.expectEqual(@as(usize, 2), lines.items.items.len);
++    const t = try trace.parse(lines.items.items[1]);
++    try std.testing.expectEqual(@as(u32, 4), t.prompt);
++    try std.testing.expectEqual(@as(u32, 0), t.cached);
++    try std.testing.expectEqual(@as(?u32, null), t.first_ms);
++    try std.testing.expectEqual(@as(u32, 0), t.gen);
++    try std.testing.expectEqual(@as(u32, 0), t.kept);
++    try std.testing.expectEqual(@as(u64, 0), t.chat);
++    try std.testing.expectEqual(trace.End.cancelled, t.end);
++}
++
++/// One request through a one-lane host over the fake backend with the default sink: how many lines it wrote.
++fn defaultSinkLines(trace_on: bool) !usize {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
++    const before = LaneHost.Trace.logged.load(.monotonic);
++    if (trace_on) host.traceOn(1, null, null); // (as the native glue does: no sink of its own)
++    try std.testing.expectEqual(trace_on, host.trace != null);
++    try host.start();
++    defer host.stop();
++    const prompt = [_]u32{ 2, 7, 1, 8 };
++    var b: Box = .{};
++    defer b.tokens.deinit(gpa);
++    const r: Request = .{ .prompt = &prompt, .max_tokens = 4 };
++    try host.engine().submit(1, &r, .{ .ctx = &b, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, try b.wait());
++    try std.testing.expectEqual(@as(usize, 4), b.tokens.items.len); // (served the same either way)
++    return LaneHost.Trace.logged.load(.monotonic) - before;
++}
++
++test "a host with the trace off writes nothing to the default sink; with it on, its header and a line a request" {
++    try std.testing.expectEqual(@as(usize, 0), try defaultSinkLines(false));
++    try std.testing.expectEqual(@as(usize, 2), try defaultSinkLines(true));
++}
++
++test "a warm pass counts the state it keeps at its end with the states of its pass, and the chat after both" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1, .warm_turns = true });
++    host.cache = &store;
++    var lines: Lines = .{};
++    defer lines.deinit();
++    host.traceOn(3, &lines, Lines.out);
++    try host.start();
++    defer host.stop();
++    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++    var b: Box = .{};
++    defer b.tokens.deinit(gpa);
++    const r: Request = .{ .prompt = &prompt, .max_tokens = 0, .history_len = 8 };
++    try host.engine().submit(1, &r, .{ .ctx = &b, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, try b.wait());
++    try std.testing.expectEqual(@as(usize, 2), lines.items.items.len);
++    const t = try trace.parse(lines.items.items[1]);
++    // the mark at the history's end (8) and the end of the prompt (10): two states, both the conversation's own
++    try std.testing.expectEqual(@as(u32, 2), t.kept);
++    try std.testing.expectEqual(@as(u32, 2), t.chat_entries);
++    try std.testing.expectEqual(@as(u64, 2), store.counts.kept);
++    try std.testing.expectEqual(@as(u32, 0), t.gen);
++}
++
++/// Two prompts fill at once on a two-lane host, a long one first: each line's `kept` is its own pass's keeps.
++fn overlappingFills(comptime stepped: bool) !void {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .slice = 1, .prefill_chunks = if (stepped) 6 else 1 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, if (stepped) target.stepped() else target.backendSliced(), clock.clock());
++    defer core.deinit();
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    store.policy = .{ .recipe = true, .shared_least = 16 };
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    var lines: Lines = .{};
++    defer lines.deinit();
++    host.traceOn(0xabc, &lines, Lines.out);
++    var long: [40]u32 = undefined;
++    for (&long, 0..) |*t, i| t.* = 20 + @as(u32, @intCast(i * 7 % 53));
++    var short: [10]u32 = undefined;
++    for (&short, 0..) |*t, i| t.* = 90 + @as(u32, @intCast(i * 3 % 11));
++    var b_long: Box = .{};
++    defer b_long.tokens.deinit(gpa);
++    var b_short: Box = .{};
++    defer b_short.tokens.deinit(gpa);
++    const cuts = [_]u32{ 16, 28 };
++    const r_long: Request = .{ .prompt = &long, .max_tokens = 4, .history_len = 38, .shared_prefixes = &cuts };
++    const r_short: Request = .{ .prompt = &short, .max_tokens = 4, .history_len = 8 };
++    const e = host.engine();
++    try e.submit(1, &r_long, .{ .ctx = &b_long, .event = Box.event }); // (both wait queued: the first admission takes them together)
++    try e.submit(2, &r_short, .{ .ctx = &b_short, .event = Box.event });
++    try host.start();
++    defer host.stop();
++    try std.testing.expectEqual(Reason.length, try b_long.wait());
++    try std.testing.expectEqual(Reason.length, try b_short.wait());
++    try std.testing.expectEqual(@as(usize, 3), lines.items.items.len);
++    var long_line: ?trace.Record = null;
++    var short_line: ?trace.Record = null;
++    for (lines.items.items[1..]) |text| {
++        const r = try trace.parse(text);
++        if (r.prompt == long.len) long_line = r else short_line = r;
++    }
++    const l = long_line orelse return error.NoLongLine;
++    const sh = short_line orelse return error.NoShortLine;
++    try std.testing.expectEqual(@as(u32, 3), l.kept); // (its two shared cuts and its history's end)
++    try std.testing.expectEqual(@as(u32, 1), sh.kept); // (its history's end)
++    try std.testing.expectEqual(@as(u64, 4), store.counts.kept); // (the store's count is their sum)
++    // (a shared cut is no conversation's own state)
++    try std.testing.expectEqual(@as(u32, 1), l.chat_entries);
++    try std.testing.expectEqual(@as(u32, 1), sh.chat_entries);
++    try std.testing.expect(l.chat != sh.chat);
++}
++
++test "overlapping sliced fills: each line's kept is its own pass's keeps, not the store's count while it filled" {
++    try overlappingFills(false);
++}
++
++test "overlapping stepped fills: each line's kept is its own pass's keeps, not the store's count while it filled" {
++    try overlappingFills(true);
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 917d21304434032d0ebee286199f650a6d834bdb..8c03d6df68543433eedddde5e6779bc99738d1a5 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -27,6 +27,8 @@ pub const drafted = @import("drafted.zig");
+ pub const logprob = @import("logprob.zig");
+ pub const grammar = @import("grammar.zig");
+ pub const kv_parts = @import("kv_parts.zig");
++pub const snap_timing = @import("snap_timing.zig");
++pub const request_trace = @import("request_trace.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/request_trace.zig b/zig/src/core/lanes/request_trace.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8d7d86f4a9234ad77c079da11b7130c86525a71
+--- /dev/null
++++ b/zig/src/core/lanes/request_trace.zig
+@@ -0,0 +1,323 @@
++//! One line a request when it ends, for a replay of how a pool and a prompt cache served it: lengths, never content.
++const std = @import("std");
++
++/// What a line starts with after any log prefix.
++pub const marker = "request trace v1 ";
++const header_word = "header";
++
++pub const End = enum { stop, length, cancelled, failed };
++
++/// A request's trace. Times are milliseconds on the host's own clock, `t_ms` since the host started.
++pub const Record = struct {
++    /// when the request arrived
++    t_ms: u64,
++    prompt: u32,
++    /// prompt tokens a kept state served (memory or disk)
++    cached: u32,
++    max_tokens: u32,
++    /// a hash of the conversation's id (0: none), the same for every request of one conversation while the host runs
++    chat: u64,
++    /// arrival to the first reply token delivered (null: none was)
++    first_ms: ?u32,
++    /// arrival to the end
++    done_ms: u32,
++    /// kept states the request's pass added
++    kept: u32,
++    /// the conversation's own kept states after the pass
++    chat_entries: u32,
++    /// reply tokens delivered
++    gen: u32,
++    end: End,
++};
++
++/// TF_GLM_TRACE: on when unset, blank, `1` or `on`; off for `0` or `off`; null for anything else.
++pub fn enabled(raw: ?[]const u8) ?bool {
++    const t = std.mem.trim(u8, raw orelse return true, " \t\r\n");
++    if (t.len == 0 or std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "on")) return true;
++    if (std.mem.eql(u8, t, "0") or std.mem.eql(u8, t, "off")) return false;
++    return null;
++}
++
++/// Whether `rank` writes a trace: rank 0 only (the lane host and the cache are there), unless TF_GLM_TRACE is off.
++pub fn wanted(rank: usize, raw: ?[]const u8) ?bool {
++    const on = enabled(raw) orelse return null;
++    return rank == 0 and on;
++}
++
++/// The conversation id hashed with the host's boot salt: equal ids hash alike within one run and not across runs.
++pub fn chatHash(boot: u64, chat: u32) u64 {
++    if (chat == 0) return 0;
++    return @max(1, std.hash.Wyhash.hash(boot, std.mem.asBytes(&chat)));
++}
++
++/// What a run's header says: the hash salt and the store (with none, a line reads chat=0 cached=0 kept=0 entries=0).
++pub const Header = struct {
++    boot: u64,
++    /// the prompt cache's byte budget (null: the host has no store)
++    store_budget: ?u64 = null,
++};
++
++/// The line a run starts its trace with: the format, the run's salt, the store and the keys.
++pub fn header(buf: []u8, h: Header) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    w.print(marker ++ header_word ++ " boot={x:0>16}", .{h.boot}) catch return "";
++    (if (h.store_budget) |b| w.print(" store=on budget={d}", .{b}) else w.writeAll(" store=off")) catch return "";
++    w.writeAll(" keys=t,prompt,cached,max,chat,first,done,kept,entries,gen,end") catch return "";
++    return w.buffered();
++}
++
++/// The header in `line`, which may carry a log prefix; any other line is `error.NotATrace`.
++pub fn parseHeader(line: []const u8) ParseError!Header {
++    const at = std.mem.indexOf(u8, line, marker) orelse return error.NotATrace;
++    const rest = std.mem.trim(u8, line[at + marker.len ..], " \t\r\n");
++    if (!std.mem.startsWith(u8, rest, header_word)) return error.NotATrace;
++    var boot: ?u64 = null;
++    var store: ?bool = null;
++    var budget: ?u64 = null;
++    var words = std.mem.tokenizeAny(u8, rest, " \t");
++    while (words.next()) |w| {
++        const eq = std.mem.indexOfScalar(u8, w, '=') orelse continue;
++        const key = w[0..eq];
++        const val = w[eq + 1 ..];
++        if (std.mem.eql(u8, key, "boot")) {
++            boot = try number(u64, val, 16);
++        } else if (std.mem.eql(u8, key, "store")) {
++            store = if (std.mem.eql(u8, val, "on")) true else if (std.mem.eql(u8, val, "off")) false else return error.BadNumber;
++        } else if (std.mem.eql(u8, key, "budget")) {
++            budget = try number(u64, val, 10);
++        }
++    }
++    const on = store orelse return error.MissingKey;
++    return .{ .boot = boot orelse return error.MissingKey, .store_budget = if (on) (budget orelse return error.MissingKey) else null };
++}
++
++/// The request's line; empty only when `buf` is under 256 bytes.
++pub fn format(buf: []u8, r: Record) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    w.print(marker ++ "t={d} prompt={d} cached={d} max={d} chat={x:0>16} first=", .{ r.t_ms, r.prompt, r.cached, r.max_tokens, r.chat }) catch return "";
++    (if (r.first_ms) |f| w.print("{d}", .{f}) else w.writeAll("-")) catch return "";
++    w.print(" done={d} kept={d} entries={d} gen={d} end={s}", .{ r.done_ms, r.kept, r.chat_entries, r.gen, @tagName(r.end) }) catch return "";
++    return w.buffered();
++}
++
++pub const ParseError = error{ NotATrace, Header, MissingKey, BadNumber, BadEnd };
++
++fn number(comptime T: type, text: []const u8, base: u8) ParseError!T {
++    return std.fmt.parseInt(T, text, base) catch error.BadNumber;
++}
++
++/// The record in `line`, which may carry a log prefix; keys it does not know are ignored; the header is `error.Header`.
++pub fn parse(line: []const u8) ParseError!Record {
++    const at = std.mem.indexOf(u8, line, marker) orelse return error.NotATrace;
++    const rest = std.mem.trim(u8, line[at + marker.len ..], " \t\r\n");
++    if (std.mem.startsWith(u8, rest, header_word)) return error.Header;
++    var t: ?u64 = null;
++    var prompt: ?u32 = null;
++    var cached: ?u32 = null;
++    var max: ?u32 = null;
++    var chat: ?u64 = null;
++    var first: ?u32 = null;
++    var seen_first = false;
++    var done: ?u32 = null;
++    var kept: ?u32 = null;
++    var entries: ?u32 = null;
++    var gen: ?u32 = null;
++    var end: ?End = null;
++    var words = std.mem.tokenizeAny(u8, rest, " \t");
++    while (words.next()) |w| {
++        const eq = std.mem.indexOfScalar(u8, w, '=') orelse continue;
++        const key = w[0..eq];
++        const val = w[eq + 1 ..];
++        if (std.mem.eql(u8, key, "t")) {
++            t = try number(u64, val, 10);
++        } else if (std.mem.eql(u8, key, "prompt")) {
++            prompt = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "cached")) {
++            cached = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "max")) {
++            max = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "chat")) {
++            chat = try number(u64, val, 16);
++        } else if (std.mem.eql(u8, key, "first")) {
++            seen_first = true;
++            first = if (std.mem.eql(u8, val, "-")) null else try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "done")) {
++            done = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "kept")) {
++            kept = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "entries")) {
++            entries = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "gen")) {
++            gen = try number(u32, val, 10);
++        } else if (std.mem.eql(u8, key, "end")) {
++            end = std.meta.stringToEnum(End, val) orelse return error.BadEnd;
++        }
++    }
++    if (!seen_first) return error.MissingKey;
++    return .{
++        .t_ms = t orelse return error.MissingKey,
++        .prompt = prompt orelse return error.MissingKey,
++        .cached = cached orelse return error.MissingKey,
++        .max_tokens = max orelse return error.MissingKey,
++        .chat = chat orelse return error.MissingKey,
++        .first_ms = first,
++        .done_ms = done orelse return error.MissingKey,
++        .kept = kept orelse return error.MissingKey,
++        .chat_entries = entries orelse return error.MissingKey,
++        .gen = gen orelse return error.MissingKey,
++        .end = end orelse return error.MissingKey,
++    };
++}
++
++/// Every record in a log's text, in order; other lines are skipped, `bad` counts the trace lines that did not parse.
++pub fn parseAll(gpa: std.mem.Allocator, text: []const u8, bad: *usize) std.mem.Allocator.Error![]Record {
++    var out: std.ArrayList(Record) = .empty;
++    errdefer out.deinit(gpa);
++    bad.* = 0;
++    var lines = std.mem.splitScalar(u8, text, '\n');
++    while (lines.next()) |line| {
++        const r = parse(line) catch |err| {
++            if (err != error.NotATrace and err != error.Header) bad.* += 1;
++            continue;
++        };
++        try out.append(gpa, r);
++    }
++    return out.toOwnedSlice(gpa);
++}
++
++const testing = std.testing;
++
++fn sample(i: u32) Record {
++    return .{
++        .t_ms = 1_000 * @as(u64, i) + 17,
++        .prompt = 300_000 + i,
++        .cached = if (i % 2 == 0) 0 else 299_968,
++        .max_tokens = 1024,
++        .chat = chatHash(0xfeed_beef_1234_5678, i % 4 + 1),
++        .first_ms = if (i % 5 == 4) null else 1_900 + i,
++        .done_ms = 40_000 + i,
++        .kept = i % 3,
++        .chat_entries = i % 3 + 1,
++        .gen = if (i % 5 == 4) 0 else 700 + i,
++        .end = @fromBackingInt(@intCast(i % 4)),
++    };
++}
++
++test "a record formats to the documented line" {
++    var buf: [256]u8 = undefined;
++    const r: Record = .{ .t_ms = 61_000, .prompt = 524_224, .cached = 524_160, .max_tokens = 256, .chat = 0xab, .first_ms = 2_345, .done_ms = 9_876, .kept = 2, .chat_entries = 3, .gen = 256, .end = .length };
++    try testing.expectEqualStrings("request trace v1 t=61000 prompt=524224 cached=524160 max=256 chat=00000000000000ab first=2345 done=9876 kept=2 entries=3 gen=256 end=length", format(&buf, r));
++    var none = r;
++    none.first_ms = null;
++    none.end = .cancelled;
++    try testing.expect(std.mem.indexOf(u8, format(&buf, none), " first=- done=9876 ") != null);
++}
++
++test "every record round-trips through its line, with or without a log prefix" {
++    var buf: [256]u8 = undefined;
++    var pre: [320]u8 = undefined;
++    for (0..40) |i| {
++        const r = sample(@intCast(i));
++        const line = format(&buf, r);
++        try testing.expectEqualDeep(r, try parse(line));
++        const prefixed = try std.fmt.bufPrint(&pre, "2026-10-28T10:00:00.123Z info(lane_host): {s}\r", .{line});
++        try testing.expectEqualDeep(r, try parse(prefixed));
++    }
++    // the widest values still fit and come back
++    const wide: Record = .{ .t_ms = std.math.maxInt(u64), .prompt = std.math.maxInt(u32), .cached = std.math.maxInt(u32), .max_tokens = std.math.maxInt(u32), .chat = std.math.maxInt(u64), .first_ms = std.math.maxInt(u32), .done_ms = std.math.maxInt(u32), .kept = std.math.maxInt(u32), .chat_entries = std.math.maxInt(u32), .gen = std.math.maxInt(u32), .end = .failed };
++    try testing.expectEqualDeep(wide, try parse(format(&buf, wide)));
++    var tiny: [32]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), format(&tiny, wide).len);
++}
++
++test "a reader ignores keys it does not know and takes the keys in any order" {
++    const line = "x request trace v1 end=stop gen=5 future=1 entries=1 kept=0 done=900 first=300 chat=0000000000000001 max=64 cached=0 prompt=100 t=5";
++    const r = try parse(line);
++    try testing.expectEqual(@as(u64, 5), r.t_ms);
++    try testing.expectEqual(@as(?u32, 300), r.first_ms);
++    try testing.expectEqual(End.stop, r.end);
++}
++
++test "lines that are not records say why" {
++    try testing.expectError(error.NotATrace, parse("info: prompt cache: 10 tokens, resumed at 0, kept 1"));
++    try testing.expectError(error.Header, parse("request trace v1 header boot=0000000000000001 keys=t"));
++    try testing.expectError(error.MissingKey, parse("request trace v1 t=1 prompt=2"));
++    // `first` has to be there, even as `-`
++    try testing.expectError(error.MissingKey, parse("request trace v1 t=1 prompt=2 cached=0 max=4 chat=00 done=1 kept=0 entries=0 gen=0 end=stop"));
++    try testing.expectError(error.BadNumber, parse("request trace v1 t=1 prompt=two cached=0 max=4 chat=00 first=- done=1 kept=0 entries=0 gen=0 end=stop"));
++    try testing.expectError(error.BadNumber, parse("request trace v1 t=1 prompt=-2 cached=0 max=4 chat=00 first=- done=1 kept=0 entries=0 gen=0 end=stop"));
++    try testing.expectError(error.BadEnd, parse("request trace v1 t=1 prompt=2 cached=0 max=4 chat=00 first=- done=1 kept=0 entries=0 gen=0 end=maybe"));
++}
++
++test "a whole log reads back in order, other lines skipped, torn trace lines counted" {
++    var out: std.ArrayList(u8) = .empty;
++    defer out.deinit(testing.allocator);
++    var buf: [256]u8 = undefined;
++    try out.appendSlice(testing.allocator, "info: starting\n");
++    try out.appendSlice(testing.allocator, header(&buf, .{ .boot = 0xfeed_beef_1234_5678, .store_budget = 1 << 30 }));
++    try out.append(testing.allocator, '\n');
++    for (0..6) |i| {
++        try out.appendSlice(testing.allocator, format(&buf, sample(@intCast(i))));
++        try out.appendSlice(testing.allocator, "\ninfo: prompt cache: something\n");
++    }
++    try out.appendSlice(testing.allocator, "request trace v1 t=1 prom\n");
++    var bad: usize = 99;
++    const all = try parseAll(testing.allocator, out.items, &bad);
++    defer testing.allocator.free(all);
++    try testing.expectEqual(@as(usize, 6), all.len);
++    try testing.expectEqual(@as(usize, 1), bad);
++    for (all, 0..) |r, i| try testing.expectEqualDeep(sample(@intCast(i)), r);
++}
++
++test "a conversation hashes alike within a run, differently across runs, and zero stays zero" {
++    try testing.expectEqual(chatHash(7, 3), chatHash(7, 3));
++    try testing.expect(chatHash(7, 3) != chatHash(7, 4));
++    try testing.expect(chatHash(7, 3) != chatHash(8, 3));
++    try testing.expectEqual(@as(u64, 0), chatHash(7, 0));
++    try testing.expect(chatHash(7, 1) != 0);
++}
++
++test "only rank 0 writes a trace, and only unless the switch is 0 or off" {
++    try testing.expectEqual(@as(?bool, true), wanted(0, null));
++    try testing.expectEqual(@as(?bool, true), wanted(0, "1"));
++    try testing.expectEqual(@as(?bool, false), wanted(0, "0"));
++    try testing.expectEqual(@as(?bool, false), wanted(1, null));
++    try testing.expectEqual(@as(?bool, false), wanted(1, "1"));
++    try testing.expectEqual(@as(?bool, false), wanted(3, "off"));
++    try testing.expectEqual(@as(?bool, null), wanted(0, "maybe"));
++    try testing.expectEqual(@as(?bool, null), wanted(1, "maybe"));
++}
++
++test "the trace switch: on unless 0 or off, and null for a word it does not know" {
++    try testing.expectEqual(@as(?bool, true), enabled(null));
++    try testing.expectEqual(@as(?bool, true), enabled(""));
++    try testing.expectEqual(@as(?bool, true), enabled("1"));
++    try testing.expectEqual(@as(?bool, false), enabled(" 0 "));
++    try testing.expectEqual(@as(?bool, false), enabled("off"));
++    try testing.expectEqual(@as(?bool, null), enabled("maybe"));
++}
++
++test "the header names the run's salt, the store behind it and the keys" {
++    var buf: [256]u8 = undefined;
++    try testing.expectEqualStrings("request trace v1 header boot=feedbeef12345678 store=on budget=2349142016 keys=t,prompt,cached,max,chat,first,done,kept,entries,gen,end", header(&buf, .{ .boot = 0xfeed_beef_1234_5678, .store_budget = 2349142016 }));
++    try testing.expectEqualStrings("request trace v1 header boot=0000000000000001 store=off keys=t,prompt,cached,max,chat,first,done,kept,entries,gen,end", header(&buf, .{ .boot = 1 }));
++    var tiny: [32]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), header(&tiny, .{ .boot = 1 }).len);
++}
++
++test "the header reads back, with or without a log prefix, and records and other lines are not headers" {
++    var buf: [256]u8 = undefined;
++    var pre: [320]u8 = undefined;
++    for ([_]Header{ .{ .boot = 0xfeed_beef_1234_5678, .store_budget = 2349142016 }, .{ .boot = 7 }, .{ .boot = std.math.maxInt(u64), .store_budget = 0 } }) |h| {
++        try testing.expectEqualDeep(h, try parseHeader(header(&buf, h)));
++        const prefixed = try std.fmt.bufPrint(&pre, "2026-10-28T10:00:00.123Z info: {s}\r", .{header(&buf, h)});
++        try testing.expectEqualDeep(h, try parseHeader(prefixed));
++        try testing.expectError(error.Header, parse(prefixed));
++    }
++    try testing.expectError(error.NotATrace, parseHeader(format(&buf, sample(3))));
++    try testing.expectError(error.NotATrace, parseHeader("info: starting"));
++    try testing.expectError(error.MissingKey, parseHeader("request trace v1 header boot=1 keys=t"));
++    try testing.expectError(error.MissingKey, parseHeader("request trace v1 header store=off"));
++    try testing.expectError(error.MissingKey, parseHeader("request trace v1 header boot=1 store=on"));
++    try testing.expectError(error.BadNumber, parseHeader("request trace v1 header boot=1 store=maybe"));
++}
+diff --git a/zig/src/core/lanes/snap_timing.zig b/zig/src/core/lanes/snap_timing.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..437d233d47bd25fa51f5591fbdc55c639d7a0074
+--- /dev/null
++++ b/zig/src/core/lanes/snap_timing.zig
+@@ -0,0 +1,54 @@
++//! A backend's kept-state copy timings for /health: per operation and size class, the copies, bytes and time by phase.
++const std = @import("std");
++
++/// The operations: a state taken from a stream, put back into one, carried between ranks, and a state buffer freed.
++pub const Op = enum(u8) { take, restore, carry, free };
++pub const ops = @typeInfo(Op).@"enum".field_names.len;
++/// Size classes by the bytes a copy moved: under 64 MiB, then each doubling up to 4 GiB and over.
++pub const classes = 8;
++pub const class_floor_mib = [classes]u32{ 0, 64, 128, 256, 512, 1024, 2048, 4096 };
++
++/// The class of a copy of `bytes`.
++pub fn classOf(bytes: u64) usize {
++    const m = bytes >> 20;
++    var c: usize = classes - 1;
++    while (c > 0 and m < class_floor_mib[c]) c -= 1;
++    return c;
++}
++
++/// Totals over `count` copies (ns); `max_ns` is the slowest. A carry is timed to its enqueue, a free by `free_ns`.
++pub const Cell = struct {
++    count: u64 = 0,
++    bytes: u64 = 0,
++    alloc_ns: u64 = 0,
++    copy_ns: u64 = 0,
++    sync_ns: u64 = 0,
++    free_ns: u64 = 0,
++    max_ns: u64 = 0,
++};
++
++pub const Snapshot = struct {
++    cells: [ops][classes]Cell = @splat(@splat(.{})),
++
++    pub fn cell(s: *const Snapshot, op: Op, class: usize) Cell {
++        return s.cells[@backingInt(op)][class];
++    }
++};
++
++test "a copy's class is the doubling its bytes fall in" {
++    try std.testing.expectEqual(@as(usize, 0), classOf(0));
++    try std.testing.expectEqual(@as(usize, 0), classOf((64 << 20) - 1));
++    try std.testing.expectEqual(@as(usize, 1), classOf(64 << 20));
++    try std.testing.expectEqual(@as(usize, 1), classOf((128 << 20) - 1));
++    try std.testing.expectEqual(@as(usize, 2), classOf(128 << 20));
++    try std.testing.expectEqual(@as(usize, 5), classOf(1 << 30));
++    try std.testing.expectEqual(@as(usize, 6), classOf(3 << 30));
++    try std.testing.expectEqual(@as(usize, 7), classOf(4 << 30));
++    try std.testing.expectEqual(@as(usize, 7), classOf(1 << 50));
++}
++
++test "the snapshot starts empty" {
++    const s: Snapshot = .{};
++    try std.testing.expectEqual(@as(u64, 0), s.cell(.carry, 3).count);
++    try std.testing.expectEqual(@as(usize, 4), ops);
++}
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 8fd7d1eb6ac83ced333832917cbaf9caba157ffc..cc0c81f1a128cd6bb4b17320e118f996a6f4a1d3 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -1493,6 +1493,14 @@ pub const Store = struct {
+         return s.newChat(prompt.len);
+     }
+ 
++    /// The conversation's own kept states now: the count the per-chat cap limits (0 for no conversation).
++    pub fn chatEntries(s: *const Store, chat: u32) u32 {
++        if (chat == 0) return 0;
++        var n: u32 = 0;
++        for (s.entries.items) |e| n += @intFromBool(e.own and e.chat == chat);
++        return n;
++    }
++
+     /// The conversation a request's kept states join, decided at its lookup (`hit`: the state it resumes, null: none).
+     /// A hit on a conversation's own turn state keeps that conversation; otherwise (a shared cut, a state read back
+     /// from disk, nothing) the conversation the prompt continues (`continuedChat`; `matchable`: drafted, as the recipe
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index c3c2aca5e46f55d1663ac41f843bf69a3de8c90c..59d4f4f7fe0a695981d072d21b77b5055d33dbf7 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -1092,6 +1092,7 @@ pub const Toy = struct {
+     widest: usize = 0,
+     batched_draws: usize = 0, // sampleWindows calls (one a round with the GLM lanes)
+     batched_commits: usize = 0, // commitWindows calls
++    occupancy_ticks: usize = 0, // occupancyTick calls (GLM's lanes give the engine a look at its pool as they work)
+     snaps: usize = 0,
+     passes: usize = 0,
+     resumed: usize = 0,
+@@ -1316,6 +1317,9 @@ pub const Toy = struct {
+         for (idx, keeps) |i, keep| try t.commitWindow(i, keep);
+         t.batched_commits += 1;
+     }
++    pub fn occupancyTick(t: *Toy) void {
++        t.occupancy_ticks += 1;
++    }
+     pub fn draftMany(t: *Toy, reqs: []DraftReq) !void {
+         for (reqs) |*r| {
+             const q = r.seq;
+diff --git a/zig/src/families/glm_cuda/cuda.zig b/zig/src/families/glm_cuda/cuda.zig
+index f309031131b8936d469ef04910735b9cb566fba8..415dbcdb4e4e72a54a8f57cc67b8039fd73fee53 100644
+--- a/zig/src/families/glm_cuda/cuda.zig
++++ b/zig/src/families/glm_cuda/cuda.zig
+@@ -54,6 +54,11 @@ pub const backend = @import("cuda_lanes.zig");
+ pub const mirror = @import("cuda_mirror.zig");
+ pub const grammar = @import("cuda_grammar.zig");
+ test {
++    _ = @import("cuda_pool_log.zig");
++    _ = @import("cuda_pool_occupancy.zig");
++    _ = @import("cuda_snap_timing.zig");
++    _ = @import("cuda_spill_rates.zig");
++    _ = @import("cuda_pool_trace_test.zig");
+     _ = grammar;
+     _ = sampler;
+     _ = nucleus;
+diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
+index 718ac055dd63c727a566f7f998479183f932f339..df9f6b7f4a22042a0cb8933783cbf4007bb698b3 100644
+--- a/zig/src/families/glm_cuda/cuda_engine.zig
++++ b/zig/src/families/glm_cuda/cuda_engine.zig
+@@ -50,6 +50,12 @@ const shard_dec = @import("cuda_shard_decode.zig");
+ const shard_prompt = @import("cuda_shard_prompt.zig");
+ const shard_keep = @import("cuda_shard_keep.zig");
+ const prompt_index = @import("cuda_prompt_index.zig");
++const pool_log = @import("cuda_pool_log.zig");
++const occupancy = @import("cuda_pool_occupancy.zig");
++const snap_timing = @import("cuda_snap_timing.zig");
++
++/// The engine's log switches: seconds between pool occupancy lines (0: none) and the smallest kept-state copy logged.
++pub const Obs = struct { pool_log_s: u32 = 60, snap: snap_timing.Settings = .{} };
+ 
+ pub const Options = struct {
+     context: usize,
+@@ -69,6 +75,7 @@ pub const Options = struct {
+     kv_shard: ?shard_mod.Switches = null,
+     /// TF_GLM_SPILL_V2=1: spill v2's settings, whose pinned staging is taken before the pool is sized (null: off)
+     spill_v2: ?spill_tier.Settings = null,
++    obs: Obs = .{},
+ };
+ 
+ /// TF_GLM_KV_SHARD's counters (/health's kv_shard): layout digests sent or compared (TF_GLM_KV_SHARD_CHECK; a
+@@ -228,6 +235,11 @@ pub const Engine = struct {
+     kv_dec: ?shard_dec.Decode = null,
+     /// TF_GLM_KV_SHARD: the prompt chunks' history fetch, its kernels, buffers and counters (e.pe.shard points here)
+     kv_prompt: ?shard_prompt.Fetch = null,
++    /// the pool's sizing (for cacheFor's drift), copy timings (for /health), which copies are logged, the line timer
++    sizing: pool_log.Sizing = .{},
++    snap_hist: snap_timing.Hist = .{},
++    snap_log: snap_timing.Settings = .{},
++    occ: occupancy.Timer = .{ .every_ns = 0 },
+     /// TF_GLM_SCORES_CUDA: the prompt indexer's CUDA kernels (e.pe.index points here); null: the Triton ones
+     prompt_idx: ?prompt_index.Kernels = null,
+ 
+@@ -289,6 +301,10 @@ pub const Engine = struct {
+         errdefer if (e.kv_dec) |*k| k.deinit();
+         e.kv_prompt = null;
+         errdefer if (e.kv_prompt) |*k| k.deinit();
++        e.sizing = .{};
++        e.snap_hist = .{};
++        e.snap_log = o.obs.snap;
++        e.occ = .{ .every_ns = @as(u64, o.obs.pool_log_s) * std.time.ns_per_s };
+         e.prompt_idx = null;
+         errdefer if (e.prompt_idx) |*k| k.unload();
+         if (o.kv_shard) |sw| try shard_mod.refuse(sw, o.world, @intCast(streams), false);
+@@ -485,6 +501,7 @@ pub const Engine = struct {
+         var pool_rows = extent;
+         const available = try capacity.room(gpa, io, ctx);
+         const available_room = available.bytes;
++        var sizing: pool_log.Sizing = .{ .available = available.available, .reserve = available.reserve, .parked = available.parked, .room = available_room, .unified = available.unified };
+         if (streams > 1) {
+             if (display.env("TF_GLM_POOL_ROWS")) |t| {
+                 const n = std.fmt.parseInt(usize, t, 10) catch return error.BadPoolRows;
+@@ -493,7 +510,11 @@ pub const Engine = struct {
+             } else {
+             // logged where the room sizes the pool (a lone stream or TF_GLM_POOL_ROWS does not use it)
+             if (available.parked >= 1 << 28) std.log.info("rank {d}: the KV pool's budget counts the {d:.2} GiB free on the per-CPU page lists beyond their resting level (neither MemFree nor MemAvailable does)", .{ o.rank, @as(f64, @floatFromInt(available.parked)) / (1 << 30) });
+-            const spare = @min(available_room, try capacity.gibBytes(display.env("TF_GLM_CACHE_GIB") orelse display.env("KV_POOL_GIB"), 3));
++            const cap = try capacity.gibBytes(display.env("TF_GLM_CACHE_GIB") orelse display.env("KV_POOL_GIB"), 3);
++            const spare = @min(available_room, cap);
++            sizing.cap = cap;
++            sizing.spare = spare;
++            sizing.sized = true;
+             const delta = 65536;
+             const bytes0 = state.Caches.bytes(extent, streams, 2048) + fwd.Scratch.bytes(e.g, window, decodeScratchRows(extent));
+             const bytes1 = state.Caches.bytes(extent + delta, streams, 2048) + fwd.Scratch.bytes(e.g, window, decodeScratchRows(extent + delta));
+@@ -558,6 +579,21 @@ pub const Engine = struct {
+         errdefer e.pool.deinit();
+         e.pool_free = .init(pool_rows);
+         std.log.info("GLM KV pool: {d} tokens, display {d} MiB ({s})", .{ pool_rows, if (streams > 1) display_cfg.bytes >> 20 else 0, @tagName(display_cfg.kind) });
++        if (streams > 1) {
++            // the bytes the pool's final layout takes beyond the provisional caches, by the sizing's own cost model
++            const cost: ShardCost = .{ .g = e.g, .streams = streams, .window = window, .fetch = if (e.shard != null) shard_prompt.bytes(e.context, e.prefill_rows) else 0 };
++            const base = state.Caches.bytes(extent, streams, 2048) + fwd.Scratch.bytes(e.g, window, decodeScratchRows(extent));
++            sizing.rows = pool_rows;
++            sizing.pool_bytes = (if (e.shard != null) cost.sharded(pool_rows) else cost.plain(pool_rows)) -| base;
++            sizing.display_bytes = display_cfg.bytes;
++        }
++        e.sizing = sizing;
++        var sizing_text: [768]u8 = undefined;
++        pool_log.emit(pool_log.sizingLine(&sizing_text, o.rank, sizing));
++        if (e.displayCut()) |d| {
++            var cut_text: [256]u8 = undefined;
++            pool_log.emit(pool_log.cutLine(&cut_text, o.rank, d.cut, d.pool_row, d.bytes));
++        }
+         if (!o.eager) {
+             if (e.drafter) |p| try p.forward.capture();
+             var home = try state.State.bind(e.slots, e.caches, 0, 0, G.extent);
+@@ -763,7 +799,7 @@ pub const Engine = struct {
+     /// TF_GLM_KV_SHARD_CARRY: a resume's latent rows from the home owner's kept state (`send`) into the new extent's
+     /// owner's planes (`recv`), through the prompt fetch's copy (idle between prompt chunks), on the engine's stream;
+     /// counted on both ranks.
+-    fn carryIn(e: *Engine, role: shard_keep.Latent, s: *const Seq, snap: *const Snap, buf: cuda.DeviceBuffer) !void {
++    fn carryIn(e: *Engine, role: shard_keep.Latent, s: *const Seq, snap: *const Snap, buf: cuda.DeviceBuffer) !u64 {
+         const f = &(e.kv_prompt orelse return error.KvShardNeedsTwoRanks);
+         if (role == .send and !snap.sec.rows) return error.NoLatentRows;
+         if (role == .recv and !s.st.cache.hasLatent()) return error.NoLatentRows;
+@@ -772,11 +808,15 @@ pub const Engine = struct {
+             p.* = buf.ptr + snap.sec.latent + i * snap.sec.latentBytes();
+         };
+         var dev: CarryDev = .{ .e = e, .f = f };
++        const t0 = snap_timing.nowNs();
+         _ = try shard_keep.carry(&dev, role, src, s.st.cache.latent, snap.pos, f.b.p.copy, @min(f.lim.piece, f.lim.hist + f.lim.chunk));
++        const took = snap_timing.nowNs() - t0;
+         e.kv_counts.carries += 1;
+         e.kv_counts.moved_tokens += snap.pos;
+         e.kv_counts.moved_bytes += shard_mod.carryBytes(snap.pos);
++        e.noteSnap(.{ .op = .carry, .bytes = shard_mod.carryBytes(snap.pos), .tokens = snap.pos, .t = .{ .copy_ns = took } });
+         if (e.g.rank == 0 and snap.pos >= 8192) std.log.info("kv shard carry: {d} tokens, part {d} -> {d}", .{ snap.pos, snap.home.?, e.pool.partOf(s.st.base) });
++        return took;
+     }
+ 
+     /// TF_GLM_KV_SHARD: where sequence `s`'s extent lies, as rank 0 records it for rank 1 (null: off, or none); with
+@@ -1258,13 +1298,17 @@ pub const Engine = struct {
+         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
+         const snap = try e.gpa.create(Snap);
+         errdefer e.gpa.destroy(snap);
++        const t0 = snap_timing.nowNs();
+         var buf = try cuda.DeviceBuffer.alloc(e.stream.d, sec.total);
+         errdefer buf.free();
++        const t1 = snap_timing.nowNs();
+         const draft: ?snapshot.Draft = if (e.drafter) |p| draftOf(p, s.slot) else null;
+         if (draft != null) if (e.drafter.?.multi.contexts[s.slot].end != at) return error.BadDraftCommit;
+         try snapshot.save(e.copier(), e.g, sec, buf.ptr, &s.st, draft);
+         if (head) |m| try snapshot.mtpCopy(e.copier(), sec, buf.ptr, m.plane(), true);
++        const t2 = snap_timing.nowNs();
+         try e.stream.synchronize();
++        e.noteSnap(.{ .op = .take, .bytes = sec.total, .tokens = at, .t = .{ .alloc_ns = t1 - t0, .copy_ns = t2 - t1, .sync_ns = snap_timing.nowNs() - t2 } });
+         e.snap_next += 1;
+         snap.* = .{ .id = e.snap_next, .pos = at, .mtp_len = if (head != null) at - 1 else 0, .buf = buf, .sec = sec, .home = if (e.shard) |sh| @intCast(sh.owner(s.st.base)) else null };
+         s.tag = snap.id;
+@@ -1282,15 +1326,19 @@ pub const Engine = struct {
+         const head = e.mtpHead();
+         if ((snap.sec.mtp_rows != null) != (head != null)) return error.MtpMismatch;
+         var rows = true;
++        var carried: ?snap_timing.Carried = null;
+         if (e.shard) |sh| {
+             if (s.st.cache.twin) return error.KvShardTwinRestore;
+             const role = shard_keep.latentRole(sh, snap.home orelse return error.KvShardNoHome, sh.owner(s.st.base));
+             rows = role == .copy;
+-            if (role == .send or role == .recv) try e.carryIn(role, s, snap, buf);
++            if (role == .send or role == .recv) carried = .{ .bytes = shard_mod.carryBytes(snap.pos), .ns = try e.carryIn(role, s, snap, buf) };
+         }
++        const t0 = snap_timing.nowNs(); // (after the carry, which has its own line and row; its transfer lands in the sync)
+         try snapshot.restore(e.copier(), e.g, snap.sec, buf.ptr, &s.st, draft, rows);
+         if (head) |m| try snapshot.mtpCopy(e.copier(), snap.sec, buf.ptr, m.plane(), false);
++        const t1 = snap_timing.nowNs();
+         try e.stream.synchronize();
++        e.noteSnap(.{ .op = .restore, .bytes = snap.sec.total, .local = snap.sec.restoredBytes(rows), .tokens = snap.pos, .t = .{ .copy_ns = t1 - t0, .sync_ns = snap_timing.nowNs() - t1 }, .carried = carried });
+         s.st.pos = snap.pos;
+         s.tag = snap.id;
+         if (e.drafter) |p| p.multi.contexts[s.slot].end = snap.pos;
+@@ -1615,10 +1663,64 @@ pub const Engine = struct {
+     fn snapRelease(e: *Engine, snap: *Snap) void {
+         if (snap.refs.fetchSub(1, .acq_rel) != 1) return;
+         e.current();
+-        if (snap.buf) |*b| b.free();
++        if (snap.buf) |*b| {
++            const bytes = b.len;
++            const t0 = snap_timing.nowNs();
++            b.free();
++            e.noteSnap(.{ .op = .free, .bytes = bytes, .t = .{ .free_ns = snap_timing.nowNs() - t0 } });
++        }
+         e.gpa.destroy(snap);
+     }
+ 
++    /// One kept-state copy counted for /health and, from the log threshold up, logged by rank 0 (cuda_snap_timing).
++    fn noteSnap(e: *Engine, c: snap_timing.Copy) void {
++        e.snap_hist.add(c.op, c.bytes, c.t);
++        if (e.g.rank != 0 or !e.snap_log.logs(c.bytes)) return;
++        var text: [512]u8 = undefined;
++        pool_log.emit(snap_timing.line(&text, @intCast(e.g.rank), c));
++    }
++
++    /// The kept-state copy timings as /health shows them (read from any thread).
++    pub fn readSnapTiming(e: *const Engine, out: *lanes.snap_timing.Snapshot) void {
++        e.snap_hist.snapshot(out);
++    }
++
++    /// Rank 0's pool occupancy line, every TF_GLM_POOL_LOG_S while the lane thread works (an idle server logs nothing).
++    pub fn occupancyTick(e: *Engine) void {
++        if (!e.occ.dueOn(e.g.rank, snap_timing.nowNs())) return; // (it reads the host-side pool and sends nothing)
++        var parts: [pool_mod.max_parts]occupancy.Part = undefined;
++        const n = occupancy.read(&e.pool, &parts);
++        var text: [occupancy.max_line]u8 = undefined;
++        pool_log.emit(occupancy.line(&text, parts[0..n], e.pool.rows, e.pool_free.load(.acquire)));
++    }
++
++    /// The display memory reserved here (null: none): a DRM span's cut and pool row; dispram's one span has no cut.
++    pub fn displayCut(e: *const Engine) ?struct { cut: ?pool_log.Cut, pool_row: ?u64, bytes: u64 } {
++        const v = e.caches.span orelse return null;
++        if (v.base == 0) return .{ .cut = null, .pool_row = null, .bytes = e.sizing.display_bytes };
++        const plane: u64 = (if (e.shard) |sh| sh.latentRows() else e.caches.rows) * G.latent_row;
++        const cut = pool_log.displayCut(plane, v.ordinary, G.latent_row);
++        const row: ?u64 = if (e.shard) |sh| (if (cut.row < sh.part) sh.rank * sh.part + cut.row else null) else cut.row;
++        return .{ .cut = cut, .pool_row = row, .bytes = v.display };
++    }
++
++    /// cuMemAlloc and cuMemFree of a fixed kept state's size a few times, logged; off with TF_GLM_SNAP_LOG_MIB=0.
++    pub fn probeAlloc(e: *Engine) void {
++        if (e.snap_log.log_bytes == 0) return;
++        e.current();
++        var p: snap_timing.Probe = .{ .bytes = e.snapBytes(0), .n = 0 };
++        while (p.n < p.alloc.len) : (p.n += 1) {
++            const t0 = snap_timing.nowNs();
++            var b = cuda.DeviceBuffer.alloc(e.stream.d, p.bytes) catch break;
++            const t1 = snap_timing.nowNs();
++            b.free();
++            p.alloc[p.n] = t1 - t0;
++            p.free[p.n] = snap_timing.nowNs() - t1;
++        }
++        var text: [512]u8 = undefined;
++        pool_log.emit(snap_timing.probeLine(&text, @intCast(e.g.rank), p));
++    }
++
+     pub fn forward(e: *Engine, windows: []const rounds.Window, table: []const i32) !void {
+         _ = table;
+         try e.stageVerify(windows);
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index a1a3db448020b1214251832bed8dd441a5376d90..6176d87bd4687bcf235b3979d2a82537a3aafa6a 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -381,6 +381,7 @@ pub fn Lanes(comptime E: type) type {
+         fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []be.FillState) anyerror!void {
+             const self = of(ptr);
+             try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
++            self.obsTick();
+             var oldest: ?usize = null;
+             var order: u64 = std.math.maxInt(u64);
+             for (streams, states, 0..) |s, *st, i| {
+@@ -635,6 +636,7 @@ pub fn Lanes(comptime E: type) type {
+                 if (!here) from = null;
+             }
+             self.placed(l);
++            self.obsTick();
+             e.bind(l.seq);
+             const first = self.pass(s, l, from) catch |err| {
+                 self.dropLane(s, l);
+@@ -909,6 +911,18 @@ pub fn Lanes(comptime E: type) type {
+             n.send(n.ptr, &buf);
+         }
+ 
++        /// Whether any stream is in the rounds (a lane still filling its prompt is not): the spill tier's staging mode.
++        pub fn decoding(self: *const Self) bool {
++            var it = self.lanes.valueIterator();
++            while (it.next()) |l| if (l.*.fill == null) return true;
++            return false;
++        }
++
++        /// The engine's once-a-minute pool line: a look at the host-side pool, no note and no collective.
++        fn obsTick(self: *Self) void {
++            if (comptime @hasDecl(E, "occupancyTick")) self.e.occupancyTick();
++        }
++
+         /// Both ranks' answer to a yes/no both must share (one rank: its own).
+         fn agreeOn(self: *Self, ok: bool) !bool {
+             const g = self.gate orelse return ok;
+@@ -1385,6 +1399,7 @@ pub fn Lanes(comptime E: type) type {
+                 self.opened.append(self.gpa, l) catch |err| return self.lost("a window's bookkeeping", err);
+             }
+             self.layoutNote();
++            self.obsTick();
+         }
+ 
+         /// The windows' checks and rows, the last round committed.
+@@ -1787,6 +1802,7 @@ const MiniEngine = struct {
+     lent_fills: usize = 0, // prefillWith calls whose sequence held borrowed rows, held (pinned) all along
+     carries: usize = 0, // resumes whose state's rows a carry brought
+     refused_small: usize = 0,
++    occupancy_ticks: usize = 0, // the lane layer's calls to the engine's once-a-minute pool line
+     chunk: usize = 32, // a sliced fill's rows a step
+     fill_rows: usize = 64, // fillStepMany: the rows one shared forward holds
+     batch_log: std.ArrayList(usize) = .empty, // each shared forward's pieces
+@@ -2053,6 +2069,9 @@ const MiniEngine = struct {
+         for (e.disk.items) |d| if (d.key == key and d.at == at) return .{ .snap = try e.snapOf(d.tokens), .tokens = try e.gpa.dupe(u32, d.tokens) };
+         return error.NotStored;
+     }
++    pub fn occupancyTick(e: *MiniEngine) void {
++        e.occupancy_ticks += 1;
++    }
+     pub fn spillStats(_: *MiniEngine, out: *[8]u64) void {
+         out.* = @splat(0);
+     }
+@@ -2145,6 +2164,9 @@ test "kept states that hold their rows: a pass keeps at its marks, a later pass
+     try B.prefillFn(&r0, &s1);
+     try B.prefillFn(&r1, &s1); // rank 1 runs the same call
+     try std.testing.expectEqual(@as(usize, 2), adopter.n);
++    // a whole pass gives the engine its once-a-minute look at the pool (the engine decides which rank logs)
++    try std.testing.expectEqual(@as(usize, 1), e0.occupancy_ticks);
++    try std.testing.expectEqual(@as(usize, 1), e1.occupancy_ticks);
+     const fresh_first = try firstToken(B, &r0, &s1);
+     try std.testing.expectEqual(MiniEngine.hash(&prompt), fresh_first);
+     // 2. the store adopted both on rank 0 (and wrote the first early, in the pass); the pass's end tells rank 1 which, and
+@@ -2947,6 +2969,29 @@ const SlicedPair = struct {
+     }
+ };
+ 
++test "a lane is decoding once its prompt is in, not while it fills" {
++    const gpa = std.testing.allocator;
++    var p: SlicedPair = undefined;
++    p.init(gpa, all_yes, all_yes);
++    defer p.deinit();
++    const prompt = testPrompt(7);
++    var s = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4 });
++    defer s.deinit(gpa);
++    try std.testing.expect(!p.r0.decoding());
++    try p.begin(&s, &s);
++    try std.testing.expect(!p.r0.decoding()); // a lane, filling
++    var st: [1]be.FillState = undefined;
++    try p.step(&.{&s}, &.{&s}, &st);
++    try std.testing.expectEqual(be.FillState.filling, st[0]);
++    try std.testing.expect(!p.r0.decoding());
++    while (st[0] != .done) try p.step(&.{&s}, &.{&s}, &st);
++    try std.testing.expect(p.r0.decoding());
++    try std.testing.expect(p.r1.decoding());
++    SlicedPair.B.releaseFn(&p.r0, &s);
++    SlicedPair.B.releaseFn(&p.r1, &s);
++    try std.testing.expect(!p.r0.decoding());
++}
++
+ /// The kept states' positions of a rank, sorted.
+ fn keptAts(gpa: std.mem.Allocator, r: anytype) ![]u32 {
+     const out = try gpa.alloc(u32, r.kept.items.len);
+@@ -2993,7 +3038,12 @@ test "TF_GLM_FILL: a prompt fills a chunk a step and ends as its whole pass: the
+     var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+     defer s1.deinit(gpa);
+     // 64, 64 and 22 rows: two chunks, two, one
++    try std.testing.expect(!p.r0.decoding());
+     try std.testing.expectEqual(@as(usize, 5), try p.fill(&s1, &s1));
++    try std.testing.expect(p.r0.decoding()); // (in the rounds once the prompt is in)
++    // every fill step gives the engine its once-a-minute look at the pool
++    try std.testing.expectEqual(@as(usize, 5), p.e0.occupancy_ticks);
++    try std.testing.expectEqual(@as(usize, 5), p.e1.occupancy_ticks);
+     try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s1));
+     try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s1));
+     try std.testing.expectEqual(@as(usize, 2), adopter.n);
+@@ -3687,7 +3737,10 @@ test "a keep batch with a bad path commits nothing and leaves every window pendi
+     var sampled: [2][3]u32 = undefined;
+     var drafts: [2][2]u32 = undefined;
+     for (&out, 0..) |*o, i| o.* = .{ .sampled = &sampled[i], .drafts = &drafts[i] };
++    const ticks = t.occupancy_ticks;
+     try B.verifyFn(&b, &windows, &out);
++    // a decode round gives the engine its once-a-minute look at the pool, once
++    try std.testing.expectEqual(ticks + 1, t.occupancy_ticks);
+     const commits = t.batched_commits;
+     // the second path is empty: nothing commits, both windows stay pending
+     const good = [_]u32{ 0, 1 };
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index 978a45be38db27cfe1adcb5d39921b4de0a3f208..ceacb90eb12ec751131dfa7977f42cab274fed37 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -21,6 +21,9 @@ const spill_state = @import("cuda_spill_state.zig");
+ const spill_wire = @import("cuda_spill_wire.zig");
+ const spill_tier = @import("cuda_spill_tier.zig");
+ const format = @import("core").spill.format;
++const pool_log = @import("cuda_pool_log.zig");
++const occupancy = @import("cuda_pool_occupancy.zig");
++const snap_timing = @import("cuda_snap_timing.zig");
+ 
+ pub const model_type = "glm5_next";
+ pub const formats: []const []const u8 = &.{"exl3"};
+@@ -82,6 +85,10 @@ pub const Loaded = struct {
+     context: ?usize = null,
+     /// TF_GLM_SPILL_V2=1 on rank 0: the prompt cache's tier (native/cuda.zig sets it on the store; null: off)
+     tier: ?*SpillLeader = null,
++    /// the kept-state copy timings for /health, counted on atomics (read from the HTTP threads)
++    read_timing: ?*const fn (*anyopaque, *lanes.snap_timing.Snapshot) void = null,
++    /// rank 0 logs a line a request when it ends (TF_GLM_TRACE, on unless 0; core/lanes/request_trace.zig)
++    trace: bool = false,
+ };
+ 
+ /// Spill v2's tier on rank 0 and on the other ranks (cuda_spill_tier).
+@@ -153,6 +160,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         fill_most = fill_pick.admit(multiSetting(), sliced) catch |e| return kvRefused(e);
+     }
+     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
++    const obs = obsSettings();
+     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
+         .context = o.context,
+         .drafts = o.drafts,
+@@ -167,6 +175,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .tower = o.tower,
+         .kv_shard = if (kv_switches.on) kv_switches else null,
+         .spill_v2 = if (spill_env != null) tierSettings(o, 0) else null,
++        .obs = obs,
+     });
+     errdefer own.engine.?.deinit();
+     // spill v2: every rank's fingerprint, agreed over the control link before any store opens (TP=2: spillAdmit)
+@@ -193,6 +202,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     var budget: u64 = 0;
+     const cache = cacheFor(own, o, build_key, agreement != null, &budget);
+     if (agreement) |a| openTier(own, gpa, io, o, a, budget) catch |e| return kvRefused(e);
++    if (own.tier) |t| t.side.rates.every_ns = @as(u64, obs.pool_log_s) * std.time.ns_per_s;
++    const trace = lanes.request_trace.wanted(o.rank, envText("TF_GLM_TRACE")) orelse blk: {
++        std.log.warn("TF_GLM_TRACE: 1 (the default) or 0; keeping the request trace on", .{});
++        break :blk o.rank == 0;
++    };
++    own.engine.?.probeAlloc();
+     return .{
+         .backend = own.serving.?.laneBackend(),
+         .facts = own.serving.?.facts(),
+@@ -206,6 +221,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .kv_parts = if (own.engine.?.shard != null) .{ .ctx = own.engine.?, .read = engine.Engine.readKvParts } else null,
+         .context = if (context != o.context) context else null,
+         .tier = own.tier,
++        .read_timing = Own.readTiming,
++        .trace = trace,
+     };
+ }
+ 
+@@ -470,6 +487,48 @@ fn spillV1Refusal(mtp: bool) ?[]const u8 {
+     return if (mtp) "MTP drafts: the spill tier does not store the MTP head's state yet; kept states stay in memory" else null;
+ }
+ 
++/// Log switches only: a bad value keeps its default, and TF_GLM_SNAP_LOG_MIB=0 also skips the start-up alloc probe.
++fn obsSettings() engine.Obs {
++    var o: engine.Obs = .{};
++    if (occupancy.logSeconds(envText("TF_GLM_POOL_LOG_S"))) |s| o.pool_log_s = s else std.log.warn("TF_GLM_POOL_LOG_S: whole seconds (0: none); keeping {d}", .{o.pool_log_s});
++    if (snap_timing.Settings.parse(envText("TF_GLM_SNAP_LOG_MIB"))) |s| o.snap = s else std.log.warn("TF_GLM_SNAP_LOG_MIB: whole MiB (0: none); keeping {d}", .{o.snap.log_bytes >> 20});
++    return o;
++}
++
++/// The start-up line of what a kept state is and what the pool and the store can hold of it (rank 0).
++fn keepLine(e: *engine.Engine, p: cache_plan.Plan, budget: u64) void {
++    const part: ?u64 = if (e.shard) |sh| sh.part else null;
++    const fixed = e.snapBytes(0);
++    const largest: u64 = if (budget == 0) 0 else pool_log.largestWithin(e, snapAt, budget, e.context);
++    var k: pool_log.Keep = .{
++        .pool_rows = e.pool.rows,
++        .part_rows = part,
++        .context = e.context,
++        .window = e.window,
++        .fixed = fixed,
++        .per_token = (e.snapBytes(131072) - e.snapBytes(65536)) / 65536,
++        .budget = budget,
++        .largest = largest,
++        .configured = cache_plan.cacheEntries(envText("TF_GLM_CACHE_ENTRIES")) catch p.entries,
++        .entries = p.entries,
++        .entries_capped = p.entries_capped,
++        .bytes_cap = p.bytes_cap,
++        .per_chat = p.per_chat,
++        .warm = pool_log.warmLimits(e.pool.rows, part, e.window, e.context),
++    };
++    if (e.displayCut()) |d| {
++        k.cut = d.cut;
++        k.cut_pool_row = d.pool_row;
++        k.display_bytes = d.bytes;
++    }
++    var text: [1536]u8 = undefined;
++    pool_log.emit(pool_log.startLine(&text, k));
++}
++
++fn snapAt(e: *engine.Engine, at: u64) u64 {
++    return e.snapBytes(@intCast(at));
++}
++
+ /// The recipe's prompt cache for this process (rank 0 holds the store; both ranks hold the states and the reserve):
+ /// budget and caps from the environment as the Python engine reads them, the machine's memory less the reserve.
+ /// `v2` (TF_GLM_SPILL_V2=1): every rank meets one gather for the smallest budget (a rank's kept states and restores
+@@ -501,6 +560,8 @@ fn cacheFor(own: *Own, o: Options, build_key: u64, v2: bool, agreed: *u64) ?lane
+     const e = own.engine.?;
+     const unified = if (e.ctx) |c| (c.attribute(.integrated) catch 0) != 0 else false;
+     const mem = if (unified) cache_plan.counting(read, cache_plan.parkedNow(own.gpa)) else read;
++    var drift_text: [768]u8 = undefined;
++    pool_log.emit(pool_log.driftLine(&drift_text, o.rank, e.sizing, mem.available));
+     const p = cache_plan.plan(env, o.prompt_cache_gib, mem, e.snapBytes(0)) catch |err| {
+         std.log.err("prompt cache: bad setting ({s}); no prompt cache", .{@errorName(err)});
+         return null;
+@@ -513,6 +574,7 @@ fn cacheFor(own: *Own, o: Options, build_key: u64, v2: bool, agreed: *u64) ?lane
+     met = true;
+     const budget = if (v2) agreeBudget(own, p.budget) else p.budget;
+     agreed.* = budget;
++    if (o.rank == 0) keepLine(e, p, budget);
+     // every rank writes and reads its own copies (rank 0 decides, rank 1 follows its notes)
+     const spill = if (budget > 0 and !v2) openSpill(own, o, build_key) else null;
+     if (o.rank != 0) return null;
+@@ -565,6 +627,11 @@ const Own = struct {
+         }
+     }
+ 
++    fn readTiming(p: *anyopaque, out: *lanes.snap_timing.Snapshot) void {
++        const own: *Own = @ptrCast(@alignCast(p));
++        if (own.engine) |e| e.readSnapTiming(out);
++    }
++
+     fn closeLink(own: *Own) void {
+         if (own.watch) |*w| {
+             w.quiet();
+diff --git a/zig/src/families/glm_cuda/cuda_pool_capacity.zig b/zig/src/families/glm_cuda/cuda_pool_capacity.zig
+index ae671aa37655a90f02874be3f0c2b880f8aefe2f..67700a157c49c5626d65716ee8f45453632c86b0 100644
+--- a/zig/src/families/glm_cuda/cuda_pool_capacity.zig
++++ b/zig/src/families/glm_cuda/cuda_pool_capacity.zig
+@@ -45,7 +45,14 @@ pub fn meminfo(text: []const u8) !Counts {
+     return .{ .total = t, .available = a };
+ }
+ /// What the pool may take, and the pages parked on the per-CPU lists its reading counted (cache_plan.parkedBytes).
+-pub const Room = struct { bytes: usize, parked: u64 = 0 };
++pub const Room = struct {
++    bytes: usize,
++    parked: u64 = 0,
++    /// the free memory the room was read from, the reserve it left, and whether that was MemAvailable (a unified GPU)
++    available: usize = 0,
++    reserve: usize = 0,
++    unified: bool = false,
++};
+ pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Room {
+     const unified = (try ctx.attribute(.integrated)) != 0;
+     var parked: u64 = 0;
+@@ -70,7 +77,7 @@ pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Room
+     if (counts.available < res) return error.PoolMemoryBudget;
+     var left = counts.available - res;
+     if (display.env("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) |limit| left = @min(left, (try gibBytes(limit, 0)) -| cuda.usage(false).device);
+-    return .{ .bytes = left, .parked = parked };
++    return .{ .bytes = left, .parked = parked, .available = counts.available, .reserve = res, .unified = unified };
+ }
+ /// Whole extents, with display credited above the ordinary-memory cap. No kept-state charge until caching exists.
+ pub fn rows(capacity: usize, spare: usize, display_bytes: usize, per_token: usize) !usize {
+diff --git a/zig/src/families/glm_cuda/cuda_pool_log.zig b/zig/src/families/glm_cuda/cuda_pool_log.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..6af5629496bae382d069c5cf442020c778a12cef
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_pool_log.zig
+@@ -0,0 +1,347 @@
++//! What the start-up logs about the KV pool and the kept-state budget: its sizing, the drift after it, the start line.
++const std = @import("std");
++
++const gib: f64 = 1 << 30;
++const mib: u64 = 1 << 20;
++/// The grid kept states stand on (cuda_lanes' CacheRules.grid).
++const grid: u64 = 64;
++
++fn gb(bytes: u64) f64 {
++    return @as(f64, @floatFromInt(bytes)) / gib;
++}
++
++fn mb(bytes: u64) f64 {
++    return @as(f64, @floatFromInt(bytes)) / @as(f64, mib);
++}
++
++/// Logs a line unless it is empty: the formats below give "" when their buffer is too small, never a torn line.
++pub fn emit(text: []const u8) void {
++    if (text.len > 0) std.log.info("{s}", .{text});
++}
++
++/// What `Engine.init` read when it sized the pool, and what the sizing took.
++pub const Sizing = struct {
++    /// free memory the room was read from (counting the parked pages), the reserve, and the parked pages in it
++    available: u64 = 0,
++    reserve: u64 = 0,
++    parked: u64 = 0,
++    /// the room above the reserve, the cap on it (KV_POOL_GIB or TF_GLM_CACHE_GIB) and what the pool was allowed
++    room: u64 = 0,
++    cap: u64 = 0,
++    spare: u64 = 0,
++    /// the pool's rows, the bytes its layout takes beyond the provisional caches, the display bytes credited to it
++    rows: u64 = 0,
++    pool_bytes: u64 = 0,
++    display_bytes: u64 = 0,
++    /// MemAvailable counts (a unified GPU); false: the device's free memory, which the kept-state plan does not read
++    unified: bool = false,
++    /// the room sized the pool; false for one stream or TF_GLM_POOL_ROWS
++    sized: bool = false,
++};
++
++/// The memory the pool took out of what `s.available` counted: its bytes less the display ones, which are not ordinary.
++pub fn poolNet(s: Sizing) u64 {
++    return s.pool_bytes -| s.display_bytes;
++}
++
++/// Memory gone since the pool was sized, less the pool's own bytes (negative when pages came back).
++pub fn drift(s: Sizing, available_now: u64) i64 {
++    const gone: i128 = @as(i128, s.available) - @as(i128, available_now);
++    return @intCast(std.math.clamp(gone - @as(i128, poolNet(s)), std.math.minInt(i64), std.math.maxInt(i64)));
++}
++
++/// The line `Engine.init` logs where the room sizes the pool, on every rank (each machine has its own room).
++pub fn sizingLine(buf: []u8, rank: u32, s: Sizing) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    sizingInto(&w, rank, s) catch return "";
++    return w.buffered();
++}
++
++fn sizingInto(w: *std.Io.Writer, rank: u32, s: Sizing) !void {
++    const kind = if (s.unified) "MemAvailable" else "free device memory";
++    try w.print("rank {d}: KV pool sizing: {s} {d:.2} GiB ({d:.2} GiB of it parked pages) less the {d:.2} GiB reserve leaves a room of {d:.2} GiB", .{ rank, kind, gb(s.available), gb(s.parked), gb(s.reserve), gb(s.room) });
++    if (!s.sized) return w.writeAll("; the room did not size the pool (one stream, or TF_GLM_POOL_ROWS gave its rows)");
++    try w.print("; the cap {d:.2} GiB lets the pool spare {d:.2} GiB; its {d} rows take {d:.2} GiB ({d:.2} GiB of display credited)", .{ gb(s.cap), gb(s.spare), s.rows, gb(s.pool_bytes), gb(s.display_bytes) });
++}
++
++/// The line `cacheFor` logs when it reads the memory again: the post-pool drift the carve's pad has to cover.
++pub fn driftLine(buf: []u8, rank: u32, s: Sizing, available_now: u64) []const u8 {
++    if (!s.unified) return std.fmt.bufPrint(buf, "rank {d}: post-pool drift: not measured (the pool was sized from device memory, not MemAvailable)", .{rank}) catch "";
++    const d = drift(s, available_now);
++    const sign: []const u8 = if (d < 0) "-" else "";
++    return std.fmt.bufPrint(buf, "rank {d}: post-pool drift: MemAvailable {d:.2} GiB now against {d:.2} GiB when the pool was sized; the pool took {d:.2} GiB, so {s}{d:.2} GiB went elsewhere after it (graph capture, serving and mirror buffers)", .{ rank, gb(available_now), gb(s.available), gb(poolNet(s)), sign, gb(@abs(d)) }) catch "";
++}
++
++/// Where the DRM display memory starts in the latent planes (plane, row): the rows from there on are display memory.
++pub const Cut = struct { plane: u64, row: u64 };
++
++pub fn displayCut(plane_bytes: u64, ordinary: u64, row_bytes: u64) Cut {
++    return .{ .plane = ordinary / plane_bytes, .row = (ordinary % plane_bytes) / row_bytes };
++}
++
++/// The largest `at` on the grid, at most `max`, whose `bytes(ctx, at)` fits `limit` (0: none); `bytes` never shrinks.
++pub fn largestWithin(ctx: anytype, comptime bytes: fn (@TypeOf(ctx), u64) u64, limit: u64, max: u64) u64 {
++    var lo: u64 = 0;
++    var hi: u64 = max / grid;
++    while (lo < hi) {
++        const mid = lo + (hi - lo + 1) / 2;
++        if (bytes(ctx, mid * grid) <= limit) lo = mid else hi = mid - 1;
++    }
++    return lo * grid;
++}
++
++/// Est. longest prompt (rows) a kept extent could resume warm: two extents in a part (copy), one in each part (carry).
++pub const Warm = struct { copy: u64, carry: ?u64 };
++
++pub fn warmLimits(pool_rows: u64, part_rows: ?u64, window: u64, context: u64) Warm {
++    const home = part_rows orelse pool_rows;
++    const copy = (home / 2) -| window;
++    const carry = if (part_rows) |p| p -| window else null;
++    return .{ .copy = @min(context, copy) / grid * grid, .carry = if (carry) |c| @min(context, c) / grid * grid else null };
++}
++
++/// The budget that holds `entries` fixed states under the entry ceiling (three quarters of it), in integers rounded up.
++pub fn fixedBudget(entries: u32, fixed: u64) u64 {
++    const need: u128 = @as(u128, entries) * fixed;
++    return @intCast(@min((need * 4 + 2) / 3, std.math.maxInt(u64)));
++}
++
++/// What the start line says (cuda_native cacheFor fills it).
++pub const Keep = struct {
++    /// the switch's mode ("off": the pool keeps no prompt state) and the eviction the Store applies now
++    mode: []const u8 = "off",
++    eviction: []const u8 = "oldest superseded state first, then least recently used",
++    pool_rows: u64,
++    /// rows of a part (null: one pool)
++    part_rows: ?u64 = null,
++    context: u64,
++    window: u64,
++    /// the bytes of a state at `at` tokens, the fixed part and the marginal bytes a token
++    fixed: u64,
++    per_token: u64,
++    /// the Store's budget, its entry cap and what bound it, the byte cap (0: none) and the per-chat cap (0: none)
++    budget: u64,
++    largest: u64,
++    /// the entries configured (TF_GLM_CACHE_ENTRIES) and the cap the budget leaves them (`entries_capped`: it binds)
++    configured: u32,
++    entries: u32,
++    entries_capped: bool,
++    bytes_cap: u64 = 0,
++    per_chat: u32 = 0,
++    warm: Warm,
++    /// the display cut (null: no DRM span)
++    cut: ?Cut = null,
++    cut_pool_row: ?u64 = null,
++    display_bytes: u64 = 0,
++};
++
++/// The one line of §1.7: what a kept state is and what the pool and the Store can hold of it.
++pub fn startLine(buf: []u8, k: Keep) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    startInto(&w, k) catch return "";
++    return w.buffered();
++}
++
++fn startInto(w: *std.Io.Writer, k: Keep) !void {
++    try w.print("keep in pool: {s}; pool {d} rows", .{ k.mode, k.pool_rows });
++    if (k.part_rows) |p| try w.print(" in parts of {d}", .{p});
++    try w.print("; largest keepable state {d} tokens", .{k.largest});
++    if (k.largest == 0) try w.writeAll(" (none: the budget is 0 or under one state)") else if (k.largest >= k.context) try w.print(" (the whole {d}-token context)", .{k.context}) else try w.print(" (budget {d} MiB)", .{k.budget / mib});
++    try w.print("; est. largest warm resume by a local copy {d} rows", .{k.warm.copy});
++    if (k.warm.carry) |c| try w.print(", by a carry {d} rows", .{c}) else try w.writeAll(", no carry (one part)");
++    try w.print("; state {d:.1} MiB fixed + {d} B a token", .{ mb(k.fixed), k.per_token });
++    if (k.budget == 0) {
++        try w.print("; no store (budget 0), {d} entries configured", .{k.configured});
++    } else {
++        try w.print("; entry cap {d} of {d} configured", .{ k.entries, k.configured });
++        try w.writeAll(if (k.entries_capped) " (three quarters of the budget binds)" else " (the configured count binds)");
++        if (k.bytes_cap > 0) try w.print(", bytes cap {d} MiB", .{k.bytes_cap / mib}) else try w.writeAll(", no bytes cap");
++        if (k.per_chat > 0) try w.print(", {d} a chat", .{k.per_chat}) else try w.writeAll(", no per-chat cap");
++    }
++    const held = if (k.budget == 0) k.configured else k.entries;
++    try w.print("; fixed states of {d} entries need {d:.2} GiB at the ceiling; eviction: {s}", .{ held, gb(fixedBudget(held, k.fixed)), k.eviction });
++    try w.writeAll("; ");
++    try cutInto(w, k.cut, k.cut_pool_row, k.display_bytes);
++}
++
++/// `c` null with display bytes reserved is dispram: one allocation, so no cut, but the memory is reserved all the same.
++fn cutInto(w: *std.Io.Writer, c: ?Cut, pool_row: ?u64, display_bytes: u64) !void {
++    const cut = c orelse {
++        if (display_bytes == 0) return w.writeAll("display cut: none");
++        return w.print("display cut: none (dispram: one allocation), {d} MiB of display reserved", .{display_bytes / mib});
++    };
++    try w.print("display cut: latent plane {d} row {d}", .{ cut.plane, cut.row });
++    if (pool_row) |r| try w.print(" (pool row {d} on this rank)", .{r});
++    try w.print(", {d} MiB of DRM display from there", .{display_bytes / mib});
++}
++
++/// A rank's own display cut, logged by every rank that reserves display memory (the start line shows rank 0's).
++pub fn cutLine(buf: []u8, rank: u32, c: ?Cut, pool_row: ?u64, display_bytes: u64) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    w.print("rank {d}: ", .{rank}) catch return "";
++    cutInto(&w, c, pool_row, display_bytes) catch return "";
++    return w.buffered();
++}
++
++const testing = std.testing;
++
++fn testBytes(_: void, at: u64) u64 {
++    return 107_986_944 + 6204 * at;
++}
++
++test "the room line names every figure it sized from, and says when the room did not size the pool" {
++    var buf: [1024]u8 = undefined;
++    const g: u64 = 1 << 30;
++    var s: Sizing = .{ .available = 96 * g, .reserve = 14 * g + g / 2, .parked = g / 4, .room = 81 * g + g / 2, .cap = 4 * g, .spare = 4 * g, .rows = 3_133_440, .pool_bytes = 4 * g, .display_bytes = 0, .unified = true, .sized = true };
++    const line = sizingLine(&buf, 1, s);
++    try testing.expectEqualStrings("rank 1: KV pool sizing: MemAvailable 96.00 GiB (0.25 GiB of it parked pages) less the 14.50 GiB reserve leaves a room of 81.50 GiB; the cap 4.00 GiB lets the pool spare 4.00 GiB; its 3133440 rows take 4.00 GiB (0.00 GiB of display credited)", line);
++    s.sized = false;
++    const lone = sizingLine(&buf, 0, s);
++    try testing.expect(std.mem.endsWith(u8, lone, "the room did not size the pool (one stream, or TF_GLM_POOL_ROWS gave its rows)"));
++    try testing.expect(std.mem.startsWith(u8, lone, "rank 0: KV pool sizing: MemAvailable 96.00 GiB"));
++    s.unified = false;
++    try testing.expect(std.mem.indexOf(u8, sizingLine(&buf, 0, s), "free device memory 96.00 GiB") != null);
++}
++
++test "the drift is what left the machine after the pool was sized, less the pool's own bytes" {
++    const g: u64 = 1 << 30;
++    const s: Sizing = .{ .available = 90 * g, .pool_bytes = 6 * g, .display_bytes = g, .unified = true, .sized = true };
++    try testing.expectEqual(@as(u64, 5 * g), poolNet(s));
++    // 90 GiB at sizing, 82 GiB now: 8 GiB gone, 5 of them the pool's ordinary bytes
++    try testing.expectEqual(@as(i64, @intCast(3 * g)), drift(s, 82 * g));
++    try testing.expectEqual(@as(i64, 0), drift(s, 85 * g));
++    // pages that came back make it negative, and the line says so
++    try testing.expectEqual(-@as(i64, @intCast(g)), drift(s, 86 * g));
++    var buf: [1024]u8 = undefined;
++    const line = driftLine(&buf, 0, s, 86 * g);
++    try testing.expectEqualStrings("rank 0: post-pool drift: MemAvailable 86.00 GiB now against 90.00 GiB when the pool was sized; the pool took 5.00 GiB, so -1.00 GiB went elsewhere after it (graph capture, serving and mirror buffers)", line);
++    var disc = s;
++    disc.unified = false;
++    try testing.expect(std.mem.indexOf(u8, driftLine(&buf, 0, disc, 0), "not measured") != null);
++    // a pool with no sizing (the room read nothing) never underflows
++    try testing.expectEqual(@as(i64, 0), drift(.{}, 0));
++}
++
++test "the display cut is the first row past the ordinary bytes, across the planes the span holds" {
++    const row: u64 = 528;
++    const plane: u64 = 1000 * row;
++    // 300 rows of display in the last bytes of plane 0: the ordinary part ends at row 700
++    try testing.expectEqual(Cut{ .plane = 0, .row = 700 }, displayCut(plane, plane - 300 * row, row));
++    // 1500 rows of display need two planes: the span is 2 planes, ordinary bytes 500 rows in
++    try testing.expectEqual(Cut{ .plane = 0, .row = 500 }, displayCut(plane, 2 * plane - 1500 * row, row));
++    // the ordinary bytes end exactly on a plane edge
++    try testing.expectEqual(Cut{ .plane = 1, .row = 0 }, displayCut(plane, plane, row));
++}
++
++test "a rank's own cut line" {
++    var buf: [256]u8 = undefined;
++    try testing.expectEqualStrings("rank 1: display cut: latent plane 0 row 700 (pool row 1567420 on this rank), 256 MiB of DRM display from there", cutLine(&buf, 1, .{ .plane = 0, .row = 700 }, 1_567_420, 256 * mib));
++    try testing.expectEqualStrings("rank 0: display cut: latent plane 2 row 5, 64 MiB of DRM display from there", cutLine(&buf, 0, .{ .plane = 2, .row = 5 }, null, 64 * mib));
++    // dispram's span is one allocation: no cut to give, and the reservation is still said
++    try testing.expectEqualStrings("rank 1: display cut: none (dispram: one allocation), 256 MiB of display reserved", cutLine(&buf, 1, null, null, 256 * mib));
++    try testing.expectEqualStrings("rank 1: display cut: none", cutLine(&buf, 1, null, null, 0));
++    var tiny: [12]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), cutLine(&tiny, 1, null, null, 256 * mib).len);
++}
++
++test "the largest keepable state is the last grid point whose bytes fit the budget" {
++    const budget: u64 = 2240 * mib;
++    const at = largestWithin({}, testBytes, budget, 1 << 20);
++    try testing.expectEqual(@as(u64, 361_152), at);
++    try testing.expect(testBytes({}, at) <= budget);
++    try testing.expect(testBytes({}, at + 64) > budget);
++    // a budget that holds a state exactly keeps it, and a byte less does not
++    try testing.expectEqual(@as(u64, 640), largestWithin({}, testBytes, testBytes({}, 640), 1 << 20));
++    try testing.expectEqual(@as(u64, 576), largestWithin({}, testBytes, testBytes({}, 640) - 1, 1 << 20));
++    // a budget under the fixed state keeps nothing; a roomy one reaches the context
++    try testing.expectEqual(@as(u64, 0), largestWithin({}, testBytes, 50 * mib, 1 << 20));
++    try testing.expectEqual(@as(u64, 1 << 20), largestWithin({}, testBytes, 100 << 30, 1 << 20));
++    // a context that is not on the grid stops at the last grid point
++    try testing.expectEqual(@as(u64, 1000 - 1000 % 64), largestWithin({}, testBytes, 100 << 30, 1000));
++}
++
++test "warm resume estimates: half a part or pool by copy, a whole part by carry, the window off" {
++    const w = warmLimits(3_133_440, 1_566_720, 64, 1 << 20);
++    try testing.expectEqual(@as(u64, (1_566_720 / 2 - 64) / 64 * 64), w.copy);
++    // (the context, 1 Mi rows, is the shorter of the two)
++    try testing.expectEqual(@as(u64, 1 << 20), w.carry.?);
++    try testing.expectEqual(@as(u64, (1_566_720 - 64) / 64 * 64), warmLimits(3_133_440, 1_566_720, 64, 1 << 21).carry.?);
++    const lone = warmLimits(2_101_248, null, 64, 1 << 21);
++    try testing.expectEqual(@as(u64, (2_101_248 / 2 - 64) / 64 * 64), lone.copy);
++    try testing.expect(lone.carry == null);
++    // the context caps both
++    try testing.expectEqual(@as(u64, 524_224), warmLimits(3_133_440, 1_566_720, 64, 524_224).carry.?);
++    try testing.expectEqual(@as(u64, 0), warmLimits(2048, null, 4096, 1 << 20).copy);
++}
++
++test "the fixed-state budget inverts the entry ceiling in integers, rounded up" {
++    // 8 entries of 103 MiB under a three-quarters ceiling: about 1.07 GiB
++    const f = fixedBudget(8, 107_986_944);
++    try testing.expectEqual(@as(u64, 1_151_860_736), f);
++    try testing.expectEqual(@as(u64, 0), fixedBudget(0, 107_986_944));
++    // a figure that is not a multiple of 3 rounds up to the byte: 4/3, 8/3, 4, 16/3 of a byte
++    try testing.expectEqual(@as(u64, 2), fixedBudget(1, 1));
++    try testing.expectEqual(@as(u64, 3), fixedBudget(2, 1));
++    try testing.expectEqual(@as(u64, 4), fixedBudget(3, 1));
++    try testing.expectEqual(@as(u64, 6), fixedBudget(4, 1));
++    // a size past 2^53 keeps its last byte (an f64 does not hold it): 16 states of 2^49 + 1 bytes need (2^55 + 66) / 3
++    try testing.expectEqual(@as(u64, ((1 << 55) + 66) / 3), fixedBudget(16, (1 << 49) + 1));
++    // and the figure saturates instead of wrapping
++    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), fixedBudget(std.math.maxInt(u32), std.math.maxInt(u64)));
++}
++
++test "the start line, sharded and unsharded, with and without a cut" {
++    var buf: [2048]u8 = undefined;
++    var k: Keep = .{
++        .pool_rows = 3_133_440,
++        .part_rows = 1_566_720,
++        .context = 1_048_576,
++        .window = 64,
++        .fixed = 107_986_944,
++        .per_token = 6204,
++        .budget = 2240 * mib,
++        .largest = 336_000,
++        .configured = 32,
++        .entries = 16,
++        .entries_capped = true,
++        .bytes_cap = 0,
++        .per_chat = 1,
++        .warm = warmLimits(3_133_440, 1_566_720, 64, 1_048_576),
++        .cut = .{ .plane = 0, .row = 700 },
++        .cut_pool_row = 700,
++        .display_bytes = 256 * mib,
++    };
++    const line = startLine(&buf, k);
++    try testing.expectEqualStrings("keep in pool: off; pool 3133440 rows in parts of 1566720; largest keepable state 336000 tokens (budget 2240 MiB); est. largest warm resume by a local copy 783296 rows, by a carry 1048576 rows; state 103.0 MiB fixed + 6204 B a token; entry cap 16 of 32 configured (three quarters of the budget binds), no bytes cap, 1 a chat; fixed states of 16 entries need 2.15 GiB at the ceiling; eviction: oldest superseded state first, then least recently used; display cut: latent plane 0 row 700 (pool row 700 on this rank), 256 MiB of DRM display from there", line);
++    k.part_rows = null;
++    k.pool_rows = 2_101_248;
++    k.warm = warmLimits(2_101_248, null, 64, 1_048_576);
++    k.configured = 8;
++    k.entries_capped = false;
++    k.entries = 8;
++    k.bytes_cap = 4096 * mib;
++    k.per_chat = 0;
++    k.cut = null;
++    // display memory with no cut is dispram's one allocation: the line says the memory is reserved, not "none"
++    try testing.expect(std.mem.endsWith(u8, startLine(&buf, k), "; display cut: none (dispram: one allocation), 256 MiB of display reserved"));
++    k.display_bytes = 0;
++    const lone = startLine(&buf, k);
++    try testing.expect(std.mem.startsWith(u8, lone, "keep in pool: off; pool 2101248 rows; largest keepable state 336000 tokens (budget 2240 MiB); "));
++    try testing.expect(std.mem.indexOf(u8, lone, "no carry (one part)") != null);
++    try testing.expect(std.mem.indexOf(u8, lone, "entry cap 8 of 8 configured (the configured count binds), bytes cap 4096 MiB, no per-chat cap") != null);
++    try testing.expect(std.mem.endsWith(u8, lone, "; display cut: none"));
++    // a budget of 0 has no store: no cap to bind, and the fixed states of the configured entries are what it would need
++    k.budget = 0;
++    k.largest = 0;
++    const none = startLine(&buf, k);
++    try testing.expect(std.mem.indexOf(u8, none, "largest keepable state 0 tokens (none: the budget is 0 or under one state)") != null);
++    try testing.expect(std.mem.indexOf(u8, none, "; no store (budget 0), 8 entries configured; fixed states of 8 entries need 1.07 GiB at the ceiling; ") != null);
++    try testing.expect(std.mem.indexOf(u8, none, "entry cap") == null);
++    k.budget = 2240 * mib;
++    // the whole context fits
++    k.largest = k.context;
++    try testing.expect(std.mem.indexOf(u8, startLine(&buf, k), "(the whole 1048576-token context)") != null);
++    // a buffer too small gives an empty line, never a torn one
++    var tiny: [32]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), startLine(&tiny, k).len);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_pool_occupancy.zig b/zig/src/families/glm_cuda/cuda_pool_occupancy.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..150b4eddb4f720d85de9f07984342570dcdbc7a9
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_pool_occupancy.zig
+@@ -0,0 +1,182 @@
++//! The KV pool's occupancy by part for the once-a-minute line: live, twin, kept, free rows and the longest free run.
++const std = @import("std");
++const pool = @import("cuda_pool.zig");
++
++/// One part's rows now. `kept_rows` sums the extents' `kept` rows.
++pub const Part = struct {
++    rows: u64 = 0,
++    live_rows: u64 = 0,
++    live: u32 = 0,
++    twin_rows: u64 = 0,
++    kept_rows: u64 = 0,
++    free: u64 = 0,
++    largest_free: u64 = 0,
++};
++
++/// Every part of `p` (one for an unsharded pool) into `out`; how many.
++pub fn read(p: *const pool.Pool, out: *[pool.max_parts]Part) usize {
++    const n = @min(p.parts(), pool.max_parts);
++    for (out[0..n], 0..) |*q, i| {
++        const r = p.partRange(i);
++        q.* = .{ .rows = r.len() };
++        var at = r.lo;
++        for (p.extents.items) |x| {
++            if (!r.has(x.base)) continue;
++            q.largest_free = @max(q.largest_free, x.base -| at);
++            at = @max(at, x.end());
++            if (x.twin != null) {
++                q.twin_rows += x.size;
++            } else if (x.owner != null) {
++                q.live_rows += x.size;
++                q.live += 1;
++            }
++            q.kept_rows += x.kept;
++        }
++        q.largest_free = @max(q.largest_free, r.hi -| at);
++        q.free = p.freeIn(i);
++    }
++    return n;
++}
++
++/// The most the occupancy line holds: the pool's figures, then `pool.max_parts` parts of the widest figures.
++pub const max_line = 192 + pool.max_parts * 256;
++
++/// The occupancy line: the pool's free rows as /health publishes them, then each part.
++pub fn line(buf: []u8, parts: []const Part, pool_rows: u64, pool_free: u64) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    lineInto(&w, parts, pool_rows, pool_free) catch return "";
++    return w.buffered();
++}
++
++fn lineInto(w: *std.Io.Writer, parts: []const Part, pool_rows: u64, pool_free: u64) !void {
++    try w.print("pool occupancy: pool_free {d} of {d} rows", .{ pool_free, pool_rows });
++    for (parts, 0..) |q, i| {
++        try w.print("; part {d} of {d} rows: live {d} ({d} streams), twin {d}, kept {d}, free {d}, largest free run {d}", .{ i, q.rows, q.live_rows, q.live, q.twin_rows, q.kept_rows, q.free, q.largest_free });
++    }
++}
++
++/// TF_GLM_POOL_LOG_S: seconds between occupancy and spill rate lines; 60 unset, 0 none, null if not a whole number.
++pub fn logSeconds(raw: ?[]const u8) ?u32 {
++    const t = std.mem.trim(u8, raw orelse return 60, " \t\r\n");
++    if (t.len == 0) return 60;
++    return std.fmt.parseInt(u32, t, 10) catch null;
++}
++
++/// Fires at the first look and then once every `every_ns` (0: never).
++pub const Timer = struct {
++    every_ns: u64,
++    next_ns: u64 = 0,
++
++    pub fn due(t: *Timer, now_ns: u64) bool {
++        if (t.every_ns == 0 or now_ns < t.next_ns) return false;
++        t.next_ns = now_ns +| t.every_ns;
++        return true;
++    }
++
++    /// `due`, for rank 0 alone: the line is the leader's, and another rank's timer is never touched.
++    pub fn dueOn(t: *Timer, rank: usize, now_ns: u64) bool {
++        return rank == 0 and t.due(now_ns);
++    }
++};
++
++const testing = std.testing;
++
++test "an unsharded pool is one part: live, free and the longest free run" {
++    var p = try pool.Pool.init(testing.allocator, 8 * pool.alignment);
++    defer p.deinit();
++    const a = try p.add(0, pool.alignment);
++    (try p.get(a)).owner = 0;
++    const b = try p.add(3 * pool.alignment, 2 * pool.alignment);
++    (try p.get(b)).owner = 1;
++    var out: [pool.max_parts]Part = undefined;
++    try testing.expectEqual(@as(usize, 1), read(&p, &out));
++    const q = out[0];
++    try testing.expectEqual(@as(u64, 8 * pool.alignment), q.rows);
++    try testing.expectEqual(@as(u64, 3 * pool.alignment), q.live_rows);
++    try testing.expectEqual(@as(u32, 2), q.live);
++    try testing.expectEqual(@as(u64, 0), q.twin_rows);
++    try testing.expectEqual(@as(u64, 5 * pool.alignment), q.free);
++    // the gap between them is 2 extents, the tail after the second 3
++    try testing.expectEqual(@as(u64, 3 * pool.alignment), q.largest_free);
++    try testing.expectEqual(@as(u64, p.freeRows()), q.free);
++}
++
++test "a sharded pool reads each part alone, twins counted apart from live streams" {
++    var p = try pool.Pool.initParts(testing.allocator, 8 * pool.alignment, 2);
++    defer p.deinit();
++    const a = try p.add(pool.alignment, 2 * pool.alignment); // part 0: a 1-extent gap before it and a 1-extent tail
++    (try p.get(a)).owner = 0;
++    const b = try p.add(4 * pool.alignment, pool.alignment); // part 1, at its start
++    (try p.get(b)).owner = 1;
++    try testing.expect(try p.borrow(a)); // a twin of a in part 1, right after b
++    var out: [pool.max_parts]Part = undefined;
++    try testing.expectEqual(@as(usize, 2), read(&p, &out));
++    const x = out[0];
++    const y = out[1];
++    try testing.expectEqual(@as(u64, 4 * pool.alignment), x.rows);
++    try testing.expectEqual(@as(u64, 2 * pool.alignment), x.live_rows);
++    try testing.expectEqual(@as(u32, 1), x.live);
++    try testing.expectEqual(@as(u64, 2 * pool.alignment), x.free);
++    try testing.expectEqual(@as(u64, pool.alignment), x.largest_free);
++    try testing.expectEqual(@as(u64, pool.alignment), y.live_rows);
++    try testing.expectEqual(@as(u32, 1), y.live);
++    try testing.expectEqual(@as(u64, 2 * pool.alignment), y.twin_rows);
++    try testing.expectEqual(@as(u64, pool.alignment), y.free);
++    try testing.expectEqual(@as(u64, pool.alignment), y.largest_free);
++    // every row is live, twin or free
++    try testing.expectEqual(y.rows, y.live_rows + y.twin_rows + y.free);
++    try testing.expectEqual(@as(u64, p.freeRows()), x.free + y.free);
++}
++
++test "the occupancy line reads the same figures the parts hold" {
++    var buf: [512]u8 = undefined;
++    const parts = [_]Part{
++        .{ .rows = 1_566_720, .live_rows = 100_352, .live = 3, .twin_rows = 4096, .free = 1_462_272, .largest_free = 1_000_000 },
++        .{ .rows = 1_566_720, .free = 1_566_720, .largest_free = 1_566_720 },
++    };
++    try testing.expectEqualStrings("pool occupancy: pool_free 3028992 of 3133440 rows; part 0 of 1566720 rows: live 100352 (3 streams), twin 4096, kept 0, free 1462272, largest free run 1000000; part 1 of 1566720 rows: live 0 (0 streams), twin 0, kept 0, free 1566720, largest free run 1566720", line(&buf, &parts, 3_133_440, 3_028_992));
++    var tiny: [16]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), line(&tiny, &parts, 3_133_440, 3_028_992).len);
++}
++
++test "the log interval: 60 s unless set, a whole number of seconds, 0 for none" {
++    try testing.expectEqual(@as(?u32, 60), logSeconds(null));
++    try testing.expectEqual(@as(?u32, 60), logSeconds(" "));
++    try testing.expectEqual(@as(?u32, 10), logSeconds("10"));
++    try testing.expectEqual(@as(?u32, 0), logSeconds("0"));
++    try testing.expectEqual(@as(?u32, null), logSeconds("1.5"));
++    try testing.expectEqual(@as(?u32, null), logSeconds("-3"));
++    try testing.expectEqual(@as(?u32, null), logSeconds("often"));
++}
++
++test "the timer fires at its first look, then once an interval, and never at 0" {
++    var t: Timer = .{ .every_ns = 60 * std.time.ns_per_s };
++    try testing.expect(t.due(5 * std.time.ns_per_s)); // the first look, whatever the clock reads
++    try testing.expect(!t.due(30 * std.time.ns_per_s));
++    try testing.expect(!t.due(64 * std.time.ns_per_s));
++    try testing.expect(t.due(65 * std.time.ns_per_s));
++    try testing.expect(!t.due(66 * std.time.ns_per_s));
++    var off: Timer = .{ .every_ns = 0 };
++    try testing.expect(!off.due(0));
++    try testing.expect(!off.due(1 << 60));
++}
++
++test "only rank 0 takes the line, and another rank leaves the timer as it was" {
++    var t: Timer = .{ .every_ns = 60 * std.time.ns_per_s };
++    try testing.expect(!t.dueOn(1, 5 * std.time.ns_per_s));
++    try testing.expect(!t.dueOn(3, 1 << 50));
++    try testing.expectEqual(@as(u64, 0), t.next_ns);
++    try testing.expect(t.dueOn(0, 5 * std.time.ns_per_s));
++    try testing.expect(!t.dueOn(0, 6 * std.time.ns_per_s));
++    try testing.expect(!t.dueOn(1, 1 << 50));
++    var off: Timer = .{ .every_ns = 0 };
++    try testing.expect(!off.dueOn(0, 1 << 50));
++}
++
++test "a pool of the most parts, at the widest figures, still fits the line's buffer" {
++    var parts: [pool.max_parts]Part = @splat(.{ .rows = std.math.maxInt(u64), .live_rows = std.math.maxInt(u64), .live = std.math.maxInt(u32), .twin_rows = std.math.maxInt(u64), .kept_rows = std.math.maxInt(u64), .free = std.math.maxInt(u64), .largest_free = std.math.maxInt(u64) });
++    var buf: [max_line]u8 = undefined;
++    const got = line(&buf, &parts, std.math.maxInt(u64), std.math.maxInt(u64));
++    try testing.expect(got.len > 0);
++    try testing.expect(std.mem.indexOf(u8, got, "part 7 of ") != null);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_pool_trace_test.zig b/zig/src/families/glm_cuda/cuda_pool_trace_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c6ee6929ba6086a795dcb6fdcc08c85d5f9ba39
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_pool_trace_test.zig
+@@ -0,0 +1,50 @@
++//! The request trace is found in a log full of the pool's observation lines, and none of them is taken for a trace.
++const std = @import("std");
++const lanes = @import("lanes");
++const trace = lanes.request_trace;
++const occupancy = @import("cuda_pool_occupancy.zig");
++const pool_log = @import("cuda_pool_log.zig");
++const snap_timing = @import("cuda_snap_timing.zig");
++const spill_rates = @import("cuda_spill_rates.zig");
++
++fn addLine(log: *std.ArrayList(u8), level: []const u8, line: []const u8) !void {
++    try std.testing.expect(line.len > 0);
++    try log.print(std.testing.allocator, "2026-10-28T10:00:00.000Z {s}: {s}\n", .{ level, line });
++}
++
++test "a log of every line the pool phase writes yields the trace lines, in order, and only those" {
++    const gpa = std.testing.allocator;
++    var log: std.ArrayList(u8) = .empty;
++    defer log.deinit(gpa);
++    var buf: [2048]u8 = undefined;
++    const g: u64 = 1 << 30;
++    const sizing: pool_log.Sizing = .{ .available = 96 * g, .reserve = 14 * g, .room = 82 * g, .cap = 4 * g, .spare = 4 * g, .rows = 3_133_440, .pool_bytes = 4 * g, .unified = true, .sized = true };
++    try addLine(&log, "info", pool_log.sizingLine(&buf, 0, sizing));
++    try addLine(&log, "info", pool_log.driftLine(&buf, 0, sizing, 90 * g));
++    try addLine(&log, "info", pool_log.cutLine(&buf, 1, .{ .plane = 0, .row = 700 }, 700, 256 << 20));
++    try addLine(&log, "info", pool_log.cutLine(&buf, 0, null, null, 256 << 20));
++    try addLine(&log, "info", trace.header(&buf, .{ .boot = 0xabc, .store_budget = 2240 << 20 }));
++    var parts = [_]occupancy.Part{ .{ .rows = 1_566_720, .free = 1_000_000, .largest_free = 900_000 }, .{ .rows = 1_566_720, .free = 1_566_720, .largest_free = 1_566_720 } };
++    try addLine(&log, "info", occupancy.line(&buf, &parts, 3_133_440, 2_566_720));
++    var want: [5]trace.Record = undefined;
++    for (&want, 0..) |*r, i| {
++        r.* = .{ .t_ms = 1000 * i, .prompt = @intCast(300_000 + i), .cached = if (i == 0) 0 else 299_968, .max_tokens = 1024, .chat = trace.chatHash(0xabc, @intCast(i % 2 + 1)), .first_ms = if (i == 3) null else 2000, .done_ms = 30_000, .kept = @intCast(i % 2), .chat_entries = @intCast(i % 3), .gen = if (i == 3) 0 else 800, .end = if (i == 3) .cancelled else .length };
++        try addLine(&log, "info", trace.format(&buf, r.*));
++        try addLine(&log, "info", snap_timing.line(&buf, 0, .{ .op = .take, .bytes = 1 << 30, .tokens = 262_144, .t = .{ .alloc_ns = 3_000_000, .copy_ns = 1_000_000, .sync_ns = 50_000_000 } }));
++        try addLine(&log, "info", "prompt cache: 300000 tokens, resumed at 0, kept 1; 1 states, 5000 MiB and 3000 MiB spare of 8000 MiB");
++    }
++    try addLine(&log, "info", spill_rates.windowLine(&buf, 0, .{ .ns = 60 * std.time.ns_per_s, .written = 1 << 30 }, 3.5));
++    try addLine(&log, "warn", "request trace v1 t=5 prom"); // a line cut off mid-write
++    var bad: usize = 0;
++    const got = try trace.parseAll(gpa, log.items, &bad);
++    defer gpa.free(got);
++    try std.testing.expectEqual(@as(usize, 1), bad);
++    try std.testing.expectEqual(want.len, got.len);
++    // the header is no record, and reads back where the replay takes its salt and its store from
++    const head = try trace.parseHeader(std.mem.sliceTo(std.mem.sliceTo(log.items[std.mem.indexOf(u8, log.items, trace.marker ++ "header").?..], '\n'), 0));
++    try std.testing.expectEqual(trace.Header{ .boot = 0xabc, .store_budget = 2240 << 20 }, head);
++    for (want, got) |w, r| try std.testing.expectEqualDeep(w, r);
++    // the two turns of one chat hash alike, the other chat differently
++    try std.testing.expectEqual(got[0].chat, got[2].chat);
++    try std.testing.expect(got[0].chat != got[1].chat);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_snap_timing.zig b/zig/src/families/glm_cuda/cuda_snap_timing.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d284b8843eb023dbc79a71432ea6c53613af326
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_snap_timing.zig
+@@ -0,0 +1,235 @@
++//! Times kept-state copies (take, restore, carry, free) by phase, counts them by size for /health, logs the big ones.
++const std = @import("std");
++const lanes = @import("lanes");
++const timing = lanes.snap_timing;
++
++pub const Op = timing.Op;
++const mib: f64 = 1 << 20;
++const gib: f64 = 1 << 30;
++
++/// A monotonic clock, ns.
++pub fn nowNs() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++/// One copy's phases, ns: the device allocation, the copy calls' enqueue, the stream wait; a free times its cuMemFree.
++pub const Times = struct {
++    alloc_ns: u64 = 0,
++    copy_ns: u64 = 0,
++    sync_ns: u64 = 0,
++    free_ns: u64 = 0,
++
++    pub fn total(t: Times) u64 {
++        return t.alloc_ns + t.copy_ns + t.sync_ns + t.free_ns;
++    }
++};
++
++/// TF_GLM_SNAP_LOG_MIB: copies of this many MiB or more are logged (64; 0: none, no start-up probe); /health counts all
++pub const Settings = struct {
++    log_bytes: u64 = 64 << 20,
++
++    /// The setting's text; null for anything but a whole number of MiB (the caller keeps the default and says so).
++    pub fn parse(raw: ?[]const u8) ?Settings {
++        const t = std.mem.trim(u8, raw orelse return .{}, " \t\r\n");
++        if (t.len == 0) return .{};
++        const n = std.fmt.parseInt(u32, t, 10) catch return null;
++        return .{ .log_bytes = @as(u64, n) << 20 };
++    }
++
++    pub fn logs(s: Settings, bytes: u64) bool {
++        return s.log_bytes != 0 and bytes >= s.log_bytes;
++    }
++};
++
++/// Counters by operation and size class, written on the lane thread and the spill threads, read by the HTTP threads.
++pub const Hist = struct {
++    const Cell = struct {
++        count: std.atomic.Value(u64) = .init(0),
++        bytes: std.atomic.Value(u64) = .init(0),
++        alloc_ns: std.atomic.Value(u64) = .init(0),
++        copy_ns: std.atomic.Value(u64) = .init(0),
++        sync_ns: std.atomic.Value(u64) = .init(0),
++        free_ns: std.atomic.Value(u64) = .init(0),
++        max_ns: std.atomic.Value(u64) = .init(0),
++    };
++
++    cells: [timing.ops][timing.classes]Cell = @splat(@splat(.{})),
++
++    pub fn add(h: *Hist, op: Op, bytes: u64, t: Times) void {
++        const c = &h.cells[@backingInt(op)][timing.classOf(bytes)];
++        _ = c.count.fetchAdd(1, .monotonic);
++        _ = c.bytes.fetchAdd(bytes, .monotonic);
++        _ = c.alloc_ns.fetchAdd(t.alloc_ns, .monotonic);
++        _ = c.copy_ns.fetchAdd(t.copy_ns, .monotonic);
++        _ = c.sync_ns.fetchAdd(t.sync_ns, .monotonic);
++        _ = c.free_ns.fetchAdd(t.free_ns, .monotonic);
++        _ = c.max_ns.fetchMax(t.total(), .monotonic);
++    }
++
++    pub fn snapshot(h: *const Hist, out: *timing.Snapshot) void {
++        for (&out.cells, &h.cells) |*row, *src| {
++            for (row, src) |*c, *a| c.* = .{
++                .count = a.count.load(.monotonic),
++                .bytes = a.bytes.load(.monotonic),
++                .alloc_ns = a.alloc_ns.load(.monotonic),
++                .copy_ns = a.copy_ns.load(.monotonic),
++                .sync_ns = a.sync_ns.load(.monotonic),
++                .free_ns = a.free_ns.load(.monotonic),
++                .max_ns = a.max_ns.load(.monotonic),
++            };
++        }
++    }
++};
++
++fn ms(ns: u64) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e6;
++}
++
++/// A carry made before a restore, in its line: the bytes exchanged and the time its calls took to enqueue.
++pub const Carried = struct { bytes: u64, ns: u64 };
++
++/// One copy as its log line states it.
++pub const Copy = struct {
++    op: Op,
++    /// the state's bytes (the size class it is counted in)
++    bytes: u64,
++    /// the bytes this rank copied itself (null: all): a restore that sends or carries latent rows copies fewer
++    local: ?u64 = null,
++    /// the state's position (0: unknown)
++    tokens: u64 = 0,
++    t: Times,
++    carried: ?Carried = null,
++};
++
++/// One copy's log line.
++pub fn line(buf: []u8, rank: u32, c: Copy) []const u8 {
++    var w = std.Io.Writer.fixed(buf);
++    lineInto(&w, rank, c) catch return "";
++    return w.buffered();
++}
++
++fn lineInto(w: *std.Io.Writer, rank: u32, c: Copy) !void {
++    const size = @as(f64, @floatFromInt(c.bytes));
++    const t = c.t;
++    try w.print("rank {d}: kept-state {s}: {d:.1} MiB", .{ rank, @tagName(c.op), size / mib });
++    if (c.tokens > 0) try w.print(" at {d} tokens", .{c.tokens});
++    switch (c.op) {
++        .free => return w.print("; cuMemFree {d:.3} ms", .{ms(t.free_ns)}),
++        .carry => try w.print("; calls enqueued in {d:.3} ms (the stream's wait is the restore's sync)", .{ms(t.copy_ns)}),
++        else => try w.print("; alloc {d:.3} ms, copy {d:.3} ms, sync {d:.3} ms", .{ ms(t.alloc_ns), ms(t.copy_ns), ms(t.sync_ns) }),
++    }
++    if (c.op == .take or c.op == .restore) {
++        const moved = t.copy_ns + t.sync_ns;
++        const local = c.local orelse c.bytes;
++        try w.print("; total {d:.3} ms", .{ms(t.total())});
++        if (moved > 0) try w.print(", {d:.2} GiB/s over the copy and the wait", .{@as(f64, @floatFromInt(local)) / gib / (@as(f64, @floatFromInt(moved)) / 1e9)});
++        if (local != c.bytes) try w.print(" (the {d:.1} MiB copied on this rank)", .{@as(f64, @floatFromInt(local)) / mib});
++    }
++    if (c.carried) |k| try w.print("; carried {d:.1} MiB before the copy (enqueued in {d:.3} ms, its transfer lands in the sync)", .{ @as(f64, @floatFromInt(k.bytes)) / mib, ms(k.ns) });
++}
++
++/// What the start-up probe of cuMemAlloc and cuMemFree on a buffer the size of a fixed state measured, ns.
++pub const Probe = struct {
++    bytes: u64,
++    n: usize,
++    alloc: [8]u64 = @splat(0),
++    free: [8]u64 = @splat(0),
++};
++
++fn spread(samples: []const u64, scratch: []u64) [3]u64 {
++    const s = scratch[0..samples.len];
++    @memcpy(s, samples);
++    std.mem.sort(u64, s, {}, std.sort.asc(u64));
++    return .{ s[0], s[s.len / 2], s[s.len - 1] };
++}
++
++pub fn probeLine(buf: []u8, rank: u32, p: Probe) []const u8 {
++    if (p.n == 0 or p.n > p.alloc.len) return "";
++    var scratch: [8]u64 = undefined;
++    const a = spread(p.alloc[0..p.n], &scratch);
++    const f = spread(p.free[0..p.n], &scratch);
++    return std.fmt.bufPrint(buf, "rank {d}: cuMemAlloc and cuMemFree of a {d:.1} MiB buffer, {d} tries (min / median / max): alloc {d:.3} / {d:.3} / {d:.3} ms, free {d:.3} / {d:.3} / {d:.3} ms", .{ rank, @as(f64, @floatFromInt(p.bytes)) / mib, p.n, ms(a[0]), ms(a[1]), ms(a[2]), ms(f[0]), ms(f[1]), ms(f[2]) }) catch "";
++}
++
++const testing = std.testing;
++
++test "the log threshold: 64 MiB by default, a whole number of MiB, 0 for none" {
++    try testing.expectEqual(@as(u64, 64 << 20), Settings.parse(null).?.log_bytes);
++    try testing.expectEqual(@as(u64, 64 << 20), Settings.parse("  ").?.log_bytes);
++    try testing.expectEqual(@as(u64, 256 << 20), Settings.parse("256").?.log_bytes);
++    try testing.expect(Settings.parse("many") == null);
++    try testing.expect(Settings.parse("-1") == null);
++    const s = Settings.parse(null).?;
++    try testing.expect(!s.logs((64 << 20) - 1));
++    try testing.expect(s.logs(64 << 20));
++    try testing.expect(!Settings.parse("0").?.logs(1 << 40));
++}
++
++test "a take's line splits the time into its phases and gives the rate over the copy and the wait" {
++    var buf: [512]u8 = undefined;
++    const t: Times = .{ .alloc_ns = 3_200_000, .copy_ns = 1_100_000, .sync_ns = 61_000_000 };
++    const got = line(&buf, 0, .{ .op = .take, .bytes = 1_700_000_000, .tokens = 262_144, .t = t });
++    try testing.expectEqualStrings("rank 0: kept-state take: 1621.2 MiB at 262144 tokens; alloc 3.200 ms, copy 1.100 ms, sync 61.000 ms; total 65.300 ms, 25.50 GiB/s over the copy and the wait", got);
++}
++
++test "a restore's line carries its carry and rates the bytes it copied here; a free's line its one latency, a carry's its enqueue" {
++    var buf: [512]u8 = undefined;
++    const carry: Carried = .{ .bytes = 3_100_000_000, .ns = 400_000 };
++    // the receiving rank copies the state less the latent rows the carry brings
++    const r = line(&buf, 1, .{ .op = .restore, .bytes = 3_200_000_000, .local = 100_000_000, .tokens = 524_224, .t = .{ .copy_ns = 2_000_000, .sync_ns = 100_000_000 }, .carried = carry });
++    try testing.expect(std.mem.indexOf(u8, r, "kept-state restore: 3051.8 MiB at 524224 tokens; alloc 0.000 ms, copy 2.000 ms, sync 100.000 ms; total 102.000 ms, 0.91 GiB/s over the copy and the wait (the 95.4 MiB copied on this rank)") != null);
++    try testing.expect(std.mem.endsWith(u8, r, "; carried 2956.4 MiB before the copy (enqueued in 0.400 ms, its transfer lands in the sync)"));
++    // a restore that copied all of it states no basis for its rate
++    const whole = line(&buf, 0, .{ .op = .restore, .bytes = 1 << 30, .t = .{ .copy_ns = 1_000_000, .sync_ns = 99_000_000 } });
++    try testing.expectEqualStrings("rank 0: kept-state restore: 1024.0 MiB; alloc 0.000 ms, copy 1.000 ms, sync 99.000 ms; total 100.000 ms, 10.00 GiB/s over the copy and the wait", whole);
++    var b2: [512]u8 = undefined;
++    const f = line(&b2, 0, .{ .op = .free, .bytes = 107_986_944, .t = .{ .free_ns = 1_250_000 } });
++    try testing.expectEqualStrings("rank 0: kept-state free: 103.0 MiB; cuMemFree 1.250 ms", f);
++    var b3: [512]u8 = undefined;
++    const c = line(&b3, 0, .{ .op = .carry, .bytes = 3_100_000_000, .tokens = 524_224, .t = .{ .copy_ns = 400_000 } });
++    try testing.expectEqualStrings("rank 0: kept-state carry: 2956.4 MiB at 524224 tokens; calls enqueued in 0.400 ms (the stream's wait is the restore's sync)", c);
++    // a copy with no time at all gives no rate (never a division by zero)
++    try testing.expect(std.mem.indexOf(u8, line(&buf, 0, .{ .op = .take, .bytes = 1 << 30, .t = .{} }), "GiB/s") == null);
++    // a buffer too small gives an empty line, never a torn one
++    var tiny: [24]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), line(&tiny, 0, .{ .op = .take, .bytes = 1 << 30, .t = .{} }).len);
++}
++
++test "the histogram counts by operation and size class and reads back whole" {
++    var h: Hist = .{};
++    h.add(.take, 100 << 20, .{ .alloc_ns = 5, .copy_ns = 7, .sync_ns = 11 });
++    h.add(.take, 120 << 20, .{ .alloc_ns = 1, .copy_ns = 1, .sync_ns = 1 });
++    h.add(.take, 30 << 20, .{ .sync_ns = 9 });
++    h.add(.restore, 2 << 30, .{ .copy_ns = 3, .sync_ns = 4 });
++    h.add(.free, 100 << 20, .{ .free_ns = 13 });
++    h.add(.free, 100 << 20, .{ .free_ns = 2 });
++    var s: timing.Snapshot = .{};
++    h.snapshot(&s);
++    const mid = s.cell(.take, 1);
++    try testing.expectEqual(@as(u64, 2), mid.count);
++    try testing.expectEqual(@as(u64, 220 << 20), mid.bytes);
++    try testing.expectEqual(@as(u64, 6), mid.alloc_ns);
++    try testing.expectEqual(@as(u64, 8), mid.copy_ns);
++    try testing.expectEqual(@as(u64, 12), mid.sync_ns);
++    try testing.expectEqual(@as(u64, 23), mid.max_ns);
++    try testing.expectEqual(@as(u64, 1), s.cell(.take, 0).count);
++    try testing.expectEqual(@as(u64, 9), s.cell(.take, 0).sync_ns);
++    try testing.expectEqual(@as(u64, 1), s.cell(.restore, 6).count);
++    try testing.expectEqual(@as(u64, 0), s.cell(.carry, 6).count);
++    try testing.expectEqual(@as(u64, 7), s.cell(.restore, 6).max_ns);
++    // a free's time is its own, and counts toward the slowest
++    try testing.expectEqual(@as(u64, 15), s.cell(.free, 1).free_ns);
++    try testing.expectEqual(@as(u64, 0), s.cell(.free, 1).alloc_ns);
++    try testing.expectEqual(@as(u64, 13), s.cell(.free, 1).max_ns);
++}
++
++test "the probe line gives min, median and max of the tries, in order whatever order they came in" {
++    var buf: [512]u8 = undefined;
++    var p: Probe = .{ .bytes = 107_986_944, .n = 5 };
++    p.alloc[0..5].* = .{ 3_000_000, 1_000_000, 2_000_000, 9_000_000, 2_500_000 };
++    p.free[0..5].* = .{ 400_000, 300_000, 500_000, 350_000, 450_000 };
++    try testing.expectEqualStrings("rank 0: cuMemAlloc and cuMemFree of a 103.0 MiB buffer, 5 tries (min / median / max): alloc 1.000 / 2.500 / 9.000 ms, free 0.300 / 0.400 / 0.500 ms", probeLine(&buf, 0, p));
++    try testing.expectEqual(@as(usize, 0), probeLine(&buf, 0, .{ .bytes = 1, .n = 0 }).len);
++}
+diff --git a/zig/src/families/glm_cuda/cuda_snapshot.zig b/zig/src/families/glm_cuda/cuda_snapshot.zig
+index 364423b2a163755b5209ad1d972c6bc69c749557..583c3e360b7fbeb315c1ea067e27f09a1809cc93 100644
+--- a/zig/src/families/glm_cuda/cuda_snapshot.zig
++++ b/zig/src/families/glm_cuda/cuda_snapshot.zig
+@@ -69,6 +69,14 @@ pub const Sections = struct {
+     pub fn latentBytes(s: Sections) usize {
+         return s.at * G.latent_row;
+     }
++    /// The latent section's bytes (0 when the buffer holds no rows).
++    pub fn latentSectionBytes(s: Sections) usize {
++        return if (s.rows) std.mem.alignForward(usize, G.dsa_layers * s.latentBytes(), 256) else 0;
++    }
++    /// The buffer's bytes a restore copies: all, less the latent section when `rows` is off (the other rank has them).
++    pub fn restoredBytes(s: Sections, rows: bool) usize {
++        return if (rows) s.total else s.total - s.latentSectionBytes();
++    }
+     pub fn pooledBytes(s: Sections) usize {
+         return (s.at / 4 + 1) * G.pool_row;
+     }
+@@ -383,6 +391,11 @@ test "TF_GLM_KV_SHARD: latent rows a view does not have here are neither saved n
+     const t = sectionsOf(a.g, 192, 64, 0, false);
+     try std.testing.expectEqual(s.total - std.mem.alignForward(usize, G.dsa_layers * s.latentBytes(), 256), t.total);
+     try std.testing.expectEqual(s.conv - s.pooled, t.conv - t.pooled);
++    // a restore copies the whole buffer, or all but the latent section when those rows are the other rank's
++    try std.testing.expectEqual(s.total, s.restoredBytes(true));
++    try std.testing.expectEqual(t.total, s.restoredBytes(false));
++    try std.testing.expectEqual(t.total, t.restoredBytes(false));
++    try std.testing.expectEqual(@as(usize, 0), t.latentSectionBytes());
+ }
+ 
+ test "TF_GLM_KV_SHARD: a state kept without its latent rows saves and restores everything else, the latent rows left alone" {
+diff --git a/zig/src/families/glm_cuda/cuda_spill_rates.zig b/zig/src/families/glm_cuda/cuda_spill_rates.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..969fec3e7bf82c680a160dced75fc1ac8fe8fe26
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_spill_rates.zig
+@@ -0,0 +1,230 @@
++//! Spill tier rates for the once-a-minute and per-point lines: staging by mode, restores, write drains, disk written.
++const std = @import("std");
++
++const mib: f64 = 1 << 20;
++const gib: f64 = 1 << 30;
++const hour_ns: f64 = 3600e9;
++
++fn secs(ns: u64) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e9;
++}
++
++fn perSec(bytes: u64, ns: u64) f64 {
++    return if (ns == 0) 0 else @as(f64, @floatFromInt(bytes)) / (@as(f64, @floatFromInt(ns)) / 1e9);
++}
++
++/// Whether a stream was in the rounds when the tier staged (not one still filling): the pump between rounds, or idle.
++pub const Mode = enum(u8) { decoding, idle };
++
++/// One mode's staging in a window: blocks and bytes staged, the calls that staged any, and the time inside them.
++pub const Stage = struct { bytes: u64 = 0, blocks: u64 = 0, calls: u64 = 0, busy_ns: u64 = 0 };
++
++/// What a window of staging, restores and drained writes did.
++pub const Window = struct {
++    ns: u64 = 0,
++    stage: [2]Stage = @splat(.{}),
++    restores: u64 = 0,
++    restore_bytes: u64 = 0,
++    restore_ns: u64 = 0,
++    validate_ns: u64 = 0,
++    validate_max_ns: u64 = 0,
++    drained: u64 = 0,
++    drained_bytes: u64 = 0,
++    drain_ns: u64 = 0,
++    drain_max_ns: u64 = 0,
++    /// the bytes this rank's store wrote to disk in the window, and the other rank's (null: not known)
++    written: u64 = 0,
++    peer_written: ?u64 = null,
++
++    fn active(w: Window) bool {
++        return w.stage[0].blocks + w.stage[1].blocks + w.restores + w.drained + w.written > 0 or (w.peer_written orelse 0) > 0;
++    }
++};
++
++pub const Rates = struct {
++    every_ns: u64 = 60 * std.time.ns_per_s,
++    cur: Window = .{},
++    start_ns: u64 = 0,
++    started: bool = false,
++    written0: u64 = 0,
++    peer0: ?u64 = null,
++    boot_ns: u64 = 0,
++    boot_written: u64 = 0,
++    boot_started: bool = false,
++
++    pub fn staged(r: *Rates, mode: Mode, bytes: u64, blocks: u64, busy_ns: u64) void {
++        const s = &r.cur.stage[@backingInt(mode)];
++        s.bytes += bytes;
++        s.blocks += blocks;
++        s.calls += 1;
++        s.busy_ns += busy_ns;
++    }
++
++    /// A restore became ready (or its verdict came): `bytes` it read and copied, begin to verdict, the .validate ask.
++    pub fn restored(r: *Rates, bytes: u64, total_ns: u64, validate_ns: u64) void {
++        r.cur.restores += 1;
++        r.cur.restore_bytes += bytes;
++        r.cur.restore_ns += total_ns;
++        r.cur.validate_ns += validate_ns;
++        r.cur.validate_max_ns = @max(r.cur.validate_max_ns, validate_ns);
++    }
++
++    /// A write left the queue published.
++    pub fn drain(r: *Rates, bytes: u64, ns: u64) void {
++        r.cur.drained += 1;
++        r.cur.drained_bytes += bytes;
++        r.cur.drain_ns += ns;
++        r.cur.drain_max_ns = @max(r.cur.drain_max_ns, ns);
++    }
++
++    /// The ended window once `every_ns` passed (the first look starts the clock); `written`, `peer`: bytes so far.
++    pub fn tick(r: *Rates, now_ns: u64, written: u64, peer: ?u64) ?Window {
++        if (r.every_ns == 0) return null;
++        if (!r.started) {
++            r.started = true;
++            r.start_ns = now_ns;
++            r.written0 = written;
++            r.peer0 = peer;
++            if (!r.boot_started) {
++                r.boot_started = true;
++                r.boot_ns = now_ns;
++                r.boot_written = written;
++            }
++            return null;
++        }
++        if (now_ns -| r.start_ns < r.every_ns) return null;
++        var w = r.cur;
++        w.ns = now_ns - r.start_ns;
++        w.written = written -| r.written0;
++        w.peer_written = if (peer) |p| (if (r.peer0) |p0| p -| p0 else null) else null;
++        r.cur = .{};
++        r.start_ns = now_ns;
++        r.written0 = written;
++        r.peer0 = peer orelse r.peer0;
++        return w;
++    }
++
++    /// The disk written an hour since the first window, this rank's.
++    pub fn sinceBoot(r: *const Rates, now_ns: u64, written: u64) f64 {
++        const ns = now_ns -| r.boot_ns;
++        return if (ns == 0) 0 else @as(f64, @floatFromInt(written -| r.boot_written)) / gib / (@as(f64, @floatFromInt(ns)) / hour_ns);
++    }
++};
++
++fn perHour(bytes: u64, ns: u64) f64 {
++    return if (ns == 0) 0 else @as(f64, @floatFromInt(bytes)) / gib / (@as(f64, @floatFromInt(ns)) / hour_ns);
++}
++
++/// The window's line; empty when nothing moved.
++pub fn windowLine(buf: []u8, rank: u32, w: Window, since_boot_gib_hour: f64) []const u8 {
++    if (!w.active()) return "";
++    var out = std.Io.Writer.fixed(buf);
++    windowInto(&out, rank, w, since_boot_gib_hour) catch return "";
++    return out.buffered();
++}
++
++fn windowInto(out: *std.Io.Writer, rank: u32, w: Window, since_boot: f64) !void {
++    try out.print("rank {d}: spill rates over {d:.0} s (this rank's staging, restores and drains)", .{ rank, secs(w.ns) });
++    for (w.stage, [2][]const u8{ "decoding", "idle" }) |s, name| {
++        if (s.blocks == 0) continue;
++        try out.print("; staged while {s} {d:.1} MiB in {d} blocks ({d:.1} MiB/s of the {d:.2} s serviced, {d:.2} MiB/s of the window)", .{ name, @as(f64, @floatFromInt(s.bytes)) / mib, s.blocks, perSec(s.bytes, s.busy_ns) / mib, secs(s.busy_ns), perSec(s.bytes, w.ns) / mib });
++    }
++    if (w.restores > 0) {
++        try out.print("; {d} restores read {d:.1} MiB ({d:.1} MiB/s begin to verdict), the .validate gather {d:.1} ms on average and {d:.1} ms at most", .{ w.restores, @as(f64, @floatFromInt(w.restore_bytes)) / mib, perSec(w.restore_bytes, w.restore_ns) / mib, secs(w.validate_ns) * 1e3 / @as(f64, @floatFromInt(w.restores)), secs(w.validate_max_ns) * 1e3 });
++    }
++    if (w.drained > 0) {
++        try out.print("; {d} writes drained {d:.1} MiB in {d:.1} s on average and {d:.1} s at most", .{ w.drained, @as(f64, @floatFromInt(w.drained_bytes)) / mib, secs(w.drain_ns) / @as(f64, @floatFromInt(w.drained)), secs(w.drain_max_ns) });
++    }
++    try out.print("; disk written {d:.2} GiB ({d:.2} GiB/hour, {d:.2} GiB/hour since the first window)", .{ @as(f64, @floatFromInt(w.written)) / gib, perHour(w.written, w.ns), since_boot });
++    if (w.peer_written) |p| try out.print("; the other rank wrote {d:.2} GiB ({d:.2} GiB/hour)", .{ @as(f64, @floatFromInt(p)) / gib, perHour(p, w.ns) });
++}
++
++/// One point's write, when it left the queue: queued to published, with the bytes its blocks hold.
++pub fn drainLine(buf: []u8, rank: u32, at: u32, bytes: u64, ns: u64, outcome: []const u8) []const u8 {
++    return std.fmt.bufPrint(buf, "rank {d}: spill write of {d} tokens ({d:.1} MiB): {s} after {d:.2} s in the queue", .{ rank, at, @as(f64, @floatFromInt(bytes)) / mib, outcome, secs(ns) }) catch "";
++}
++
++/// One restore, begin to verdict: what it read, how fast, and what its .validate gather cost.
++pub fn restoreLine(buf: []u8, rank: u32, at: u32, bytes: u64, total_ns: u64, validate_ns: u64, verdict: []const u8) []const u8 {
++    return std.fmt.bufPrint(buf, "rank {d}: spill restore of {d} tokens: {s}; read {d:.1} MiB in {d:.2} s from begin to the .validate verdict ({d:.1} MiB/s), the .validate gather itself {d:.2} ms", .{ rank, at, verdict, @as(f64, @floatFromInt(bytes)) / mib, secs(total_ns), perSec(bytes, total_ns) / mib, secs(validate_ns) * 1e3 }) catch "";
++}
++
++const testing = std.testing;
++
++test "the first look starts the clock; a window ends once the interval passed and starts the next" {
++    var r: Rates = .{ .every_ns = 60 * std.time.ns_per_s };
++    try testing.expect(r.tick(1000, 5 << 30, 2 << 30) == null);
++    r.staged(.decoding, 8 << 20, 2, 10_000_000);
++    r.staged(.decoding, 8 << 20, 2, 10_000_000);
++    r.staged(.idle, 1 << 30, 256, 500_000_000);
++    r.restored(1 << 30, 8 * std.time.ns_per_s, 12_000_000);
++    r.restored(1 << 30, 4 * std.time.ns_per_s, 4_000_000);
++    r.drain(100 << 20, 40 * std.time.ns_per_s);
++    r.drain(100 << 20, 20 * std.time.ns_per_s);
++    try testing.expect(r.tick(1000 + 59 * std.time.ns_per_s, 5 << 30, null) == null);
++    const w = r.tick(1000 + 60 * std.time.ns_per_s, (5 << 30) + (3 << 30), (2 << 30) + (1 << 30)).?;
++    try testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), w.ns);
++    try testing.expectEqual(@as(u64, 4), w.stage[0].blocks);
++    try testing.expectEqual(@as(u64, 2), w.stage[0].calls);
++    try testing.expectEqual(@as(u64, 20_000_000), w.stage[0].busy_ns);
++    try testing.expectEqual(@as(u64, 1 << 30), w.stage[1].bytes);
++    try testing.expectEqual(@as(u64, 2), w.restores);
++    try testing.expectEqual(@as(u64, 12_000_000), w.validate_max_ns);
++    try testing.expectEqual(@as(u64, 2), w.drained);
++    try testing.expectEqual(@as(u64, 40 * std.time.ns_per_s), w.drain_max_ns);
++    try testing.expectEqual(@as(u64, 3 << 30), w.written);
++    try testing.expectEqual(@as(u64, 1 << 30), w.peer_written.?);
++    // the counters start over, and so does the clock
++    try testing.expect(r.tick(1000 + 61 * std.time.ns_per_s, 8 << 30, null) == null);
++    const next = r.tick(1000 + 120 * std.time.ns_per_s, 8 << 30, null).?;
++    try testing.expectEqual(@as(u64, 0), next.restores);
++    try testing.expectEqual(@as(u64, 0), next.written);
++    try testing.expectEqual(@as(?u64, null), next.peer_written);
++    // the other rank's total, first known late, is a base and not a window's worth
++    var late: Rates = .{ .every_ns = 10 };
++    try testing.expect(late.tick(100, 0, null) == null);
++    try testing.expectEqual(@as(?u64, null), late.tick(200, 0, 5 << 30).?.peer_written);
++    try testing.expectEqual(@as(?u64, 1 << 30), late.tick(300, 0, 6 << 30).?.peer_written);
++}
++
++test "an off interval never fires, and a quiet window gives no line" {
++    var off: Rates = .{ .every_ns = 0 };
++    try testing.expect(off.tick(0, 0, null) == null);
++    try testing.expect(off.tick(1 << 50, 1 << 40, null) == null);
++    var buf: [1024]u8 = undefined;
++    try testing.expectEqual(@as(usize, 0), windowLine(&buf, 0, .{ .ns = 60 * std.time.ns_per_s }, 0).len);
++}
++
++test "the window's line gives each mode's rates, the restores, the drains and the disk written an hour" {
++    var buf: [2048]u8 = undefined;
++    const w: Window = .{
++        .ns = 60 * std.time.ns_per_s,
++        .stage = .{ .{ .bytes = 16 << 20, .blocks = 4, .calls = 2, .busy_ns = 20_000_000 }, .{ .bytes = 1 << 30, .blocks = 256, .calls = 4, .busy_ns = 500_000_000 } },
++        .restores = 2,
++        .restore_bytes = 2 << 30,
++        .restore_ns = 12 * std.time.ns_per_s,
++        .validate_ns = 16_000_000,
++        .validate_max_ns = 12_000_000,
++        .drained = 2,
++        .drained_bytes = 200 << 20,
++        .drain_ns = 60 * std.time.ns_per_s,
++        .drain_max_ns = 40 * std.time.ns_per_s,
++        .written = 3 << 30,
++        .peer_written = 1 << 30,
++    };
++    try testing.expectEqualStrings("rank 0: spill rates over 60 s (this rank's staging, restores and drains); staged while decoding 16.0 MiB in 4 blocks (800.0 MiB/s of the 0.02 s serviced, 0.27 MiB/s of the window); staged while idle 1024.0 MiB in 256 blocks (2048.0 MiB/s of the 0.50 s serviced, 17.07 MiB/s of the window); 2 restores read 2048.0 MiB (170.7 MiB/s begin to verdict), the .validate gather 8.0 ms on average and 12.0 ms at most; 2 writes drained 200.0 MiB in 30.0 s on average and 40.0 s at most; disk written 3.00 GiB (180.00 GiB/hour, 12.50 GiB/hour since the first window); the other rank wrote 1.00 GiB (60.00 GiB/hour)", windowLine(&buf, 0, w, 12.5));
++}
++
++test "the since-first-window rate is the disk written over the time since, per hour" {
++    var r: Rates = .{};
++    _ = r.tick(10 * std.time.ns_per_s, 1 << 30, null);
++    // 2 GiB written in the 1800 s since: 4 GiB an hour
++    try testing.expectApproxEqAbs(@as(f64, 4), r.sinceBoot(10 * std.time.ns_per_s + 1800 * std.time.ns_per_s, 3 << 30), 1e-9);
++    try testing.expectEqual(@as(f64, 0), r.sinceBoot(10 * std.time.ns_per_s, 3 << 30));
++}
++
++test "a drained write's and a restore's lines" {
++    var buf: [512]u8 = undefined;
++    try testing.expectEqualStrings("rank 1: spill write of 262144 tokens (1700.0 MiB): published after 41.25 s in the queue", drainLine(&buf, 1, 262_144, 1700 << 20, 41_250_000_000, "published"));
++    try testing.expectEqualStrings("rank 0: spill restore of 524224 tokens: ready; read 3000.0 MiB in 8.20 s from begin to the .validate verdict (365.9 MiB/s), the .validate gather itself 12.30 ms", restoreLine(&buf, 0, 524_224, 3000 << 20, 8_200_000_000, 12_300_000, "ready"));
++}
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier.zig b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+index 0c75eb9be36e85fa474bf81185dc8f5c5263582b..fff16d4e1fdf914196b03234a60dd59cd22281e3 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+@@ -35,6 +35,8 @@ const core = @import("core");
+ const lane_backend = @import("cuda_lanes.zig");
+ const st = @import("cuda_spill_state.zig");
+ const wire = @import("cuda_spill_wire.zig");
++const rates_mod = @import("cuda_spill_rates.zig");
++const snap_timing = @import("cuda_snap_timing.zig");
+ 
+ const spill = core.spill;
+ const format = spill.format;
+@@ -256,11 +258,7 @@ pub fn followerIds(own: []const u32, at: u32, media: []const format.Media, place
+     return true;
+ }
+ 
+-fn monotonicNs() u64 {
+-    var ts: std.c.timespec = undefined;
+-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+-}
++const monotonicNs = snap_timing.nowNs;
+ 
+ /// A failed restore's reason as an error the prompt cache logs.
+ fn failureError(why: wire.Failure) anyerror {
+@@ -328,7 +326,14 @@ pub fn Side(comptime E: type) type {
+ 
+         /// A kept state's write in flight here, by its Snap id: `snap` while its rows may still be read (null once its
+         /// release let it go: nothing of it is staged again).
+-        const Write = struct { job: spill.JobId, key: Digest, snap: ?*Snap };
++        const Write = struct {
++            job: spill.JobId,
++            key: Digest,
++            snap: ?*Snap,
++            at: u32 = 0, // the drain line's figures: the point's tokens and bytes, and when it was queued (monotonic ns)
++            bytes: u64 = 0,
++            t_ns: u64 = 0,
++        };
+         const Copy = struct {
+             ev: u32,
+             what: union(enum) {
+@@ -369,6 +374,9 @@ pub fn Side(comptime E: type) type {
+             inflight: u32 = 0, // of those, copies whose event has not completed
+             small: enum { none, pending, done } = .none,
+             why: wire.Failure = .none,
++            /// the bytes its blocks and sections moved, and when it began (monotonic ns): the restore line's figures
++            bytes: u64 = 0,
++            t_ns: u64 = 0,
+ 
+             pub fn fail(rx: *Rx, why: wire.Failure) void {
+                 if (rx.why == .none) rx.why = why;
+@@ -409,6 +417,9 @@ pub fn Side(comptime E: type) type {
+         /// (ids and media disagree, image cache off): its counters' pictures_kept / pictures_refused
+         pictures_kept: u64 = 0,
+         pictures_refused: u64 = 0,
++        /// what the tier moved and how fast (rank 0's windows); `mode`: a stream decodes (is not a fill) as it stages
++        rates: rates_mod.Rates = .{},
++        mode: rates_mod.Mode = .idle,
+ 
+         /// Opens this rank's store under `s.dir` (namespace `prefix` + `compat`) over `staging` (pinned, at least
+         /// plan's bytes, 4 KiB aligned; the caller's), its events made by the engine (eventCount). `layout`: the
+@@ -539,7 +550,7 @@ pub fn Side(comptime E: type) type {
+                 return .refused;
+             }
+             self.copies.appendAssumeCapacity(.{ .ev = ev, .what = .{ .capture = .{ .job = q.job, .snap = k.snap.id } } });
+-            self.writes.putAssumeCapacity(k.snap.id, .{ .job = q.job, .key = k.key, .snap = k.snap });
++            self.writes.putAssumeCapacity(k.snap.id, .{ .job = q.job, .key = k.key, .snap = k.snap, .at = @intCast(at), .bytes = self.layout.pointBytesOf(at, own) catch 0, .t_ns = monotonicNs() });
+             return .queued;
+         }
+ 
+@@ -660,16 +671,24 @@ pub fn Side(comptime E: type) type {
+         /// blocks staged within `budget_ns`, finished writes collected, held states nothing reads let go. Bounded;
+         /// never waits. The copies retired and blocks staged (0: nothing moved).
+         pub fn service(self: *Self, budget_ns: u64, max_blocks: usize) usize {
+-            const deadline = monotonicNs() +| budget_ns;
++            const began = monotonicNs();
++            const deadline = began +| budget_ns;
+             var moved = self.retire();
+             var left = max_blocks;
++            var staged_blocks: u64 = 0;
++            var staged_bytes: u64 = 0;
+             while (left > 0 and monotonicNs() < deadline) {
+                 const n = self.store.stage(self.reqs[0..@min(self.reqs.len, left)]);
+                 if (n == 0) break;
+-                for (self.reqs[0..n]) |req| self.packReq(req);
++                for (self.reqs[0..n]) |req| {
++                    self.packReq(req);
++                    staged_bytes += req.dst.len;
++                }
+                 left -= n;
+                 moved += n;
++                staged_blocks += n;
+             }
++            if (staged_blocks > 0) self.rates.staged(self.mode, staged_bytes, staged_blocks, monotonicNs() - began);
+             self.collect();
+             moved += self.guard.settle(self, idleFn, dropFn);
+             self.refresh();
+@@ -687,6 +706,7 @@ pub fn Side(comptime E: type) type {
+                     };
+                     var it = self.writes.iterator();
+                     while (it.next()) |kv| if (kv.value_ptr.job == job) {
++                        self.drained(kv.value_ptr.*, c);
+                         _ = self.writes.remove(kv.key_ptr.*);
+                         break;
+                     };
+@@ -695,6 +715,21 @@ pub fn Side(comptime E: type) type {
+             }
+         }
+ 
++        /// A write left the queue: its line (queued to published, or why not) and, published, the drain in the rates.
++        fn drained(self: *Self, w: Write, c: spill.Completion) void {
++            const ns = monotonicNs() -| w.t_ns;
++            var why: [48]u8 = undefined;
++            const outcome: []const u8 = switch (c) {
++                .published => "published",
++                .failed => |x| std.fmt.bufPrint(&why, "failed ({t})", .{x.why}) catch "failed",
++                .cancelled => |x| std.fmt.bufPrint(&why, "cancelled ({t})", .{x.why}) catch "cancelled",
++            };
++            if (c == .published) self.rates.drain(w.bytes, ns);
++            var text: [256]u8 = undefined;
++            const line = rates_mod.drainLine(&text, @intCast(self.layout.g.rank), w.at, w.bytes, ns, outcome);
++            if (line.len > 0) std.log.info("{s}", .{line});
++        }
++
+         fn idleFn(ctx: *anyopaque, snap: *Snap) bool {
+             const self: *Self = @ptrCast(@alignCast(ctx));
+             return !self.store.pins(st.sourceOf(snap.id), 0) and !self.hasCopies(snap.id);
+@@ -734,7 +769,7 @@ pub fn Side(comptime E: type) type {
+             const blocks = self.layout.blocks(at) catch return error.BadPoint;
+             try self.rxs.ensureUnusedCapacity(self.gpa, 1);
+             const rx = try self.gpa.create(Rx);
+-            rx.* = .{ .id = id, .key = key, .at = at, .blocks = @intCast(blocks) };
++            rx.* = .{ .id = id, .key = key, .at = at, .blocks = @intCast(blocks), .t_ns = monotonicNs() };
+             self.rxs.putAssumeCapacity(id, rx);
+             return rx;
+         }
+@@ -793,6 +828,7 @@ pub fn Side(comptime E: type) type {
+                     return rx.fail(.unpack);
+                 }
+                 self.copies.appendAssumeCapacity(.{ .ev = ev, .what = .{ .read = .{ .rx = rx.id, .slot = b.slot } } });
++                rx.bytes += b.data.len;
+                 rx.inflight += 1;
+                 rx.copied = b.index + 1;
+                 if (monotonicNs() >= deadline) return;
+@@ -823,6 +859,7 @@ pub fn Side(comptime E: type) type {
+                 return rx.fail(.unpack);
+             }
+             self.copies.appendAssumeCapacity(.{ .ev = ev, .what = .{ .small = .{ .rx = rx.id } } });
++            rx.bytes += view.bytes.len;
+             rx.small = .pending;
+         }
+ 
+@@ -1340,15 +1377,19 @@ pub fn Leader(comptime E: type) type {
+             defer done_.lineage.deinit(self.gpa);
+             _ = self.jobs.remove(txn);
+             const at = rx.at;
++            const bytes = rx.bytes;
++            const began = rx.t_ns;
+             const snap = side.rxTake(rx);
+             const dest = job.dest;
+             const point = job.point;
+             const mine = [1]u64{@backingInt(wire.Failure.none)};
+             var all: [wire.max_world]u64 = undefined;
++            const asked = monotonicNs();
+             const v: wire.Verdict = blk: {
+                 const ranks = self.ask(.{ .validate = .{ .txn = txn, .shared = job.shared } }, &mine, &all) catch break :blk .{ .ok = false, .code = @backingInt(wire.Failure.read) };
+                 break :blk wire.validation(all[0..ranks]);
+             };
++            self.noteRestore(at, bytes, began, asked, v.ok);
+             self.gpa.destroy(job);
+             if (!v.ok) {
+                 if (v.forget) {
+@@ -1368,6 +1409,26 @@ pub fn Leader(comptime E: type) type {
+             return .{ .ready = .{ .saved = dest, .lineage = lin } };
+         }
+ 
++        /// A restore reached its .validate verdict: its line and the rates.
++        fn noteRestore(self: *Self, at: u32, bytes: u64, began: u64, asked: u64, ok: bool) void {
++            const now = monotonicNs();
++            self.side.rates.restored(bytes, now -| began, now -| asked);
++            var text: [320]u8 = undefined;
++            const line = rates_mod.restoreLine(&text, @intCast(self.side.layout.g.rank), at, bytes, now -| began, now -| asked, if (ok) "ready" else "refused by the verdict");
++            if (line.len > 0) std.log.info("{s}", .{line});
++        }
++
++        /// The once-a-minute rates line; the other rank's written bytes are as its last stats answer carried them.
++        fn rateTick(self: *Self) void {
++            const now = monotonicNs();
++            const written = self.side.cached.written_bytes;
++            const peer: ?u64 = if (self.peers_n > 0) self.peers[0].written_bytes else null;
++            const w = self.side.rates.tick(now, written, peer) orelse return;
++            var text: [1536]u8 = undefined;
++            const line = rates_mod.windowLine(&text, @intCast(self.side.layout.g.rank), w, self.side.rates.sinceBoot(now, written));
++            if (line.len > 0) std.log.info("{s}", .{line});
++        }
++
+         /// A job ends without a commit: here (its copies waited for, its destination freed) and on every other rank
+         /// (a `cancel` note, with `forget` when the point is damaged).
+         fn fail(self: *Self, txn: u64, job: *Job, why: wire.Failure, outcome: spill.Store.Outcome) Poll {
+@@ -1393,7 +1454,9 @@ pub fn Leader(comptime E: type) type {
+         /// may have moved.
+         pub fn pump(self: *Self, budget_ns: u64) void {
+             self.side.e.current();
++            self.side.mode = if (self.lanes.decoding()) .decoding else .idle;
+             const moved = self.side.service(budget_ns, pump_blocks);
++            self.rateTick();
+             if (!self.paired()) return;
+             const now = monotonicNs();
+             if ((moved > 0 or self.side.busy() or self.peer_writes) and now -| self.pump_at >= pump_every_ns) {
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
+index 3cb70f54627b5b71f6570442a8ca3fcb256ae0ad..abe0283913c0b68c171deac96aa706913295807f 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_test.zig
+@@ -9,6 +9,8 @@ const st = @import("cuda_spill_state.zig");
+ const wire = @import("cuda_spill_wire.zig");
+ const lane_backend = @import("cuda_lanes.zig");
+ const shard_keep = @import("cuda_shard_keep.zig");
++const spill_rates = @import("cuda_spill_rates.zig");
++const snap_clock = @import("cuda_snap_timing.zig");
+ 
+ const spill = core.spill;
+ const format = spill.format;
+@@ -85,6 +87,42 @@ test "a kept state written at keep on both ranks, evicted, restored byte for byt
+     try testing.expectEqual(@as(usize, 0), p.pg.fatals);
+ }
+ 
++test "the tier counts what it stages, drains and restores, and a window reports them once" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.init(gpa, "rates", rig.Pair.settingsFor(1));
++    defer p.deinit();
++    var buf: [2200]u32 = undefined;
++    const ids = rig.idsOf(&buf, 4);
++    const rates = &p.lead0().side.rates;
++    try testing.expectEqual(@as(u64, 0), rates.cur.drained);
++    const k = try p.keepPass(ids, at, 1 << 32 | 1);
++    try p.settle();
++    // the whole block went off the device with no stream decoding; the write drained and published
++    const idle = rates.cur.stage[@backingInt(spill_rates.Mode.idle)];
++    try testing.expect(idle.blocks >= 1 and idle.bytes > 0 and idle.calls >= 1);
++    try testing.expectEqual(@as(u64, 0), rates.cur.stage[@backingInt(spill_rates.Mode.decoding)].blocks);
++    try testing.expectEqual(@as(u64, 1), rates.cur.drained);
++    const disk = p.lead0().side.store.counts();
++    try testing.expectEqual(disk.written_bytes + disk.written_small_bytes, rates.cur.drained_bytes);
++    try testing.expect(idle.bytes <= disk.written_bytes);
++    try testing.expectEqual(@as(u64, 0), rates.cur.restores);
++    try p.evict(k.saved);
++    const r = try p.restore(ids);
++    try testing.expect(r == .ready);
++    // a restore reads the whole point back: its blocks and its sections
++    try testing.expectEqual(@as(u64, 1), rates.cur.restores);
++    try testing.expectEqual(rates.cur.drained_bytes, rates.cur.restore_bytes);
++    try testing.expect(rates.cur.restore_ns > 0 and rates.cur.validate_max_ns <= rates.cur.restore_ns);
++    // a window ends once its interval has passed: the counters go out in it and start over
++    rates.every_ns = 1;
++    const w = rates.tick(snap_clock.nowNs() +| std.time.ns_per_s, 1 << 40, 1024) orelse return error.TestNoWindow;
++    try testing.expectEqual(@as(u64, 1), w.restores);
++    try testing.expectEqual(@as(u64, 1), w.drained);
++    try testing.expectEqual(@as(u64, 0), rates.cur.restores);
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
+ test "a point is found again after a restart on both ranks; one a rank lost is restored on no rank, and both forget it" {
+     const gpa = testing.allocator;
+     var p: rig.Pair = undefined;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index d3fd877d29f01e076e3e52863ac65365a461034e..25a5a66d273af0274f4392a7dc5ca77101870b0e 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -168,13 +168,20 @@ const Host = struct {
+     follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
+     read_status: ?*const fn (*anyopaque, *?u64, *?u64) void = null,
+     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
++    read_timing: ?*const fn (*anyopaque, *lanes.snap_timing.Snapshot) void = null, // its copy timings (any thread)
++    trace: bool = false, // the family asks for a line a request (rank 0): the lane host's trace
+     store_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family-kept store's snapshot calls (Loaded.cache)
+     flush_ns: u64 = 0, // a clean stop stores the kept states not on disk yet, within this long (0: not at all)
+     spill: ?api.Spill = null, // spill v2's service bounds (LaneHost.configure) when the family set a tier on the store
+ 
+     fn readExtraStatus(p: *anyopaque, out: *api.Status) void {
+         const h: *Host = @ptrCast(@alignCast(p));
+-        h.read_status.?(h.family, &out.pool_tokens, &out.pool_free_tokens);
++        if (h.read_status) |f| f(h.family, &out.pool_tokens, &out.pool_free_tokens);
++        if (h.read_timing) |f| {
++            var t: lanes.snap_timing.Snapshot = .{};
++            f(h.family, &t);
++            out.snap_timing = t;
++        }
+     }
+ 
+     fn close(p: *anyopaque) void {
+@@ -227,9 +234,14 @@ const Host = struct {
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+-        if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
++        if (h.read_status != null or h.read_timing != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
+         h.host.kv_parts = h.kv_parts;
+         h.host.cache = h.store;
++        if (h.trace) {
++            var salt: [8]u8 = undefined;
++            io.random(&salt);
++            h.host.traceOn(std.mem.readInt(u64, &salt, .little), null, null);
++        }
+         // GLM vision: TF_GLM_IMAGE_MARK_SNAP=1 keeps no state cut inside a picture (LaneHost.mark_snap)
+         if (info.media) h.host.mark_snap = api.prompt_cache.markSnapOn(getenv("TF_GLM_IMAGE_MARK_SNAP"));
+         // GLM's TF_GLM_FILL: a request whose prompt shares a cut another fill is still computing waits for it
+@@ -514,6 +526,8 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
+     h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
+     h.read_status = if (@hasField(@TypeOf(loaded), "read_status")) loaded.read_status else null;
+     h.kv_parts = if (@hasField(@TypeOf(loaded), "kv_parts")) loaded.kv_parts else null;
++    h.read_timing = if (@hasField(@TypeOf(loaded), "read_timing")) loaded.read_timing else null;
++    h.trace = if (@hasField(@TypeOf(loaded), "trace")) loaded.trace else false;
+     // a family that had to shorten --context (GLM's TF_GLM_KV_SHARD: a part's) serves the window it holds
+     const served: i64 = if (@hasField(@TypeOf(loaded), "context")) (if (loaded.context) |c| @intCast(c) else window) else window;
+     if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
+diff --git a/zig/src/server/status_routes.zig b/zig/src/server/status_routes.zig
+index 499fc605b73660e5ce21ca25d8a4c112468ac7c5..b8916d1cbbed3ea1d94d8652864e5a4c090362fe 100644
+--- a/zig/src/server/status_routes.zig
++++ b/zig/src/server/status_routes.zig
+@@ -34,6 +34,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     if (status.kept) |k| try keptFields(a, o, k);
+     if (status.cache) |c| try putCache(a, o, c);
+     if (status.kv_parts) |k| try putKvParts(a, o, k);
++    if (status.snap_timing) |t| try putSnapTiming(a, o, t);
+     try o.put(a, "live", try live.snapshot(a, srv.engine));
+     if (srv.config.recipe.glm) try @import("glm_health.zig").add(srv, a, o, status);
+     routes.sendValue(conn, a, 200, .{ .object = o });
+@@ -125,6 +126,43 @@ pub fn putKvParts(a: Allocator, o: *json.Object, k: api.KvParts) Allocator.Error
+     try o.put(a, "kv_shard", .{ .object = ks });
+ }
+ 
++/// Copy timings under `snap_timing`: a row per operation and size class; `*_ms_total` sum its copies, `max_ms` one's.
++pub fn putSnapTiming(a: Allocator, o: *json.Object, t: api.SnapTiming.Snapshot) Allocator.Error!void {
++    const st = try json.newObject(a);
++    inline for (@typeInfo(api.SnapTiming.Op).@"enum".field_names, 0..) |name, op| {
++        var rows: std.ArrayList(Value) = .empty;
++        for (t.cells[op], api.SnapTiming.class_floor_mib) |c, floor| {
++            if (c.count == 0) continue;
++            const row = try json.newObject(a);
++            try row.put(a, "from_mib", try json.intValue(a, floor));
++            try row.put(a, "count", try json.intValue(a, c.count));
++            try row.put(a, "bytes", try json.intValue(a, c.bytes));
++            switch (@as(api.SnapTiming.Op, @fromBackingInt(@intCast(op)))) {
++                .take => {
++                    try putMs(a, row, "alloc_ms_total", c.alloc_ns);
++                    try putMs(a, row, "copy_ms_total", c.copy_ns);
++                    try putMs(a, row, "sync_ms_total", c.sync_ns);
++                },
++                .restore => {
++                    try putMs(a, row, "copy_ms_total", c.copy_ns);
++                    try putMs(a, row, "sync_ms_total", c.sync_ns);
++                },
++                .carry => try putMs(a, row, "enqueue_ms_total", c.copy_ns), // (the calls' enqueue: the transfer is the restore's sync)
++                .free => try putMs(a, row, "free_ms_total", c.free_ns), // (cuMemFree)
++            }
++            try putMs(a, row, "max_ms", c.max_ns);
++            try rows.append(a, .{ .object = row });
++        }
++        try st.put(a, name, .{ .array = try rows.toOwnedSlice(a) });
++    }
++    try o.put(a, "snap_timing", .{ .object = st });
++}
++
++/// `ns` as milliseconds to the microsecond.
++fn putMs(a: Allocator, o: *json.Object, key: []const u8, ns: u64) Allocator.Error!void {
++    try o.put(a, key, .{ .float = @round(@as(f64, @floatFromInt(ns)) / 1e3) / 1e3 });
++}
++
+ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+     const created = std.Io.Clock.real.now(srv.io).toSeconds();
+     const data = try a.alloc(Value, srv.config.model_ids.len);
+@@ -292,6 +330,44 @@ test "health's v2 tier counters: the continuation names on top, every counter un
+     try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
+ }
+ 
++test "health's snap timing: one row for each size class that saw a copy, by operation, each phase under its own name" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = try json.newObject(a);
++    var t: api.SnapTiming.Snapshot = .{};
++    t.cells[@backingInt(api.SnapTiming.Op.take)][1] = .{ .count = 2, .bytes = 220 << 20, .alloc_ns = 6_000_000, .copy_ns = 1_500_000, .sync_ns = 120_000_000, .max_ns = 70_000_000 };
++    t.cells[@backingInt(api.SnapTiming.Op.take)][6] = .{ .count = 1, .bytes = 3 << 30 };
++    t.cells[@backingInt(api.SnapTiming.Op.restore)][5] = .{ .count = 1, .bytes = 1 << 30, .copy_ns = 2_000_000, .sync_ns = 90_000_000, .max_ns = 92_000_000 };
++    t.cells[@backingInt(api.SnapTiming.Op.carry)][5] = .{ .count = 3, .bytes = 3 << 30, .copy_ns = 1_200_000, .max_ns = 500_000 };
++    t.cells[@backingInt(api.SnapTiming.Op.free)][0] = .{ .count = 5, .bytes = 5 << 20, .free_ns = 2_500_000, .max_ns = 900_000 };
++    try putSnapTiming(a, o, t);
++    const st = o.get("snap_timing").?.object;
++    const take = st.get("take").?.array;
++    try std.testing.expectEqual(@as(usize, 2), take.len);
++    try std.testing.expectEqualStrings("64", take[0].object.get("from_mib").?.int);
++    try std.testing.expectEqualStrings("2", take[0].object.get("count").?.int);
++    try std.testing.expectEqual(@as(f64, 6), take[0].object.get("alloc_ms_total").?.float);
++    try std.testing.expectEqual(@as(f64, 1.5), take[0].object.get("copy_ms_total").?.float);
++    try std.testing.expectEqual(@as(f64, 120), take[0].object.get("sync_ms_total").?.float);
++    try std.testing.expectEqual(@as(f64, 70), take[0].object.get("max_ms").?.float);
++    try std.testing.expect(take[0].object.get("free_ms_total") == null);
++    try std.testing.expectEqualStrings("2048", take[1].object.get("from_mib").?.int);
++    // a restore has no allocation; a carry has only its enqueue; a free only its cuMemFree
++    const restore = st.get("restore").?.array[0].object;
++    try std.testing.expectEqual(@as(f64, 90), restore.get("sync_ms_total").?.float);
++    try std.testing.expect(restore.get("alloc_ms_total") == null);
++    const carry = st.get("carry").?.array[0].object;
++    try std.testing.expectEqualStrings("3", carry.get("count").?.int);
++    try std.testing.expectEqual(@as(f64, 1.2), carry.get("enqueue_ms_total").?.float);
++    try std.testing.expect(carry.get("copy_ms_total") == null and carry.get("sync_ms_total") == null);
++    const free = st.get("free").?.array[0].object;
++    try std.testing.expectEqualStrings("5", free.get("count").?.int);
++    try std.testing.expectEqual(@as(f64, 2.5), free.get("free_ms_total").?.float);
++    try std.testing.expectEqual(@as(f64, 0.9), free.get("max_ms").?.float);
++    try std.testing.expect(free.get("alloc_ms_total") == null);
++}
++
+ test "health's kv shard counters: every counter under kv_shard, each part's rows under per_part" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();

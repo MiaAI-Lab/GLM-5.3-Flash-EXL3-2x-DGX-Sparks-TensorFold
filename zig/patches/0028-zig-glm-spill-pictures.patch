@@ -1,0 +1,1259 @@
+# port-patches.sh: keep-p0 @ 820d104ac9ac over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f4bdb3247840..7ffb37f42b63); regenerate with scripts/port-patches.sh, do not edit
+glm_cuda: spill v2 for prompts with pictures: points with pictures before their cut written as format v3 on every rank, found only for the same pictures in the same places, with KV sharding too (port of the DeepSeek port's spill-pictures)
+
+The GLM tier kept every point as text (pointKey(keyed, block, no media))
+and its keep and lookup dropped the prompt cache's pictures. core/spill's
+store side was ready (format v3, pictureId, mediaIds, recovery checks);
+this is the tier's half.
+
+- Leader.keep: a write whose key holds pictures records those starting
+  before the cut (pointPictures: the keyed ids derive from each digest, the
+  model ids hold the placeholder at every picture row and equal the keyed
+  ids elsewhere; at most 256), its key adds them (format.pointKey with
+  media) and the store keeps the model ids beside the keyed ones; any
+  disagreement, more pictures, or TF_GLM_IMAGE_CACHE=0 writes nothing
+  (pictures_refused). A cut before every picture is a text point, unchanged.
+- Leader.lookupMedia (Tier.lookup with Want.images/media): every picture of
+  the key named by its full identity (keyedMedia = prompt_cache.mediaKeys
+  over the store's media) or a miss; the store then matches each point's
+  pictures before its cut by span and digest, so a changed picture at the
+  same rows, the same seed bytes of another digest and a straddling picture
+  of another length all miss, a picture past the cut does not matter.
+- The keep note: a new op keep_pictures (a keep's fields, then the
+  pictures and the placeholder, bounded: 1..256, in order, not overlapping,
+  starting before the cut, the placeholder a model id); a text keep is
+  `keep`, byte for byte. Rank 1 rebuilds rank 0's keyed and raw ids from its
+  own model ids and the noted pictures (followerIds) and writes only when
+  the point key is rank 0's: a follower whose picture sits elsewhere writes
+  nothing, and rank 0's restore then finds it on no rank and both forget it.
+- Counters pictures_kept and pictures_refused (each rank's own, appended to
+  TierCounts and the stats ask; /metrics names them).
+- Settings.image_cache (TF_GLM_IMAGE_CACHE, both ranks); the fingerprint's
+  features carry "image_cache=0;" only when it is off, so the default
+  namespace is the one before. The wire version stays 1 (a new op, text
+  bytes unchanged). core/spill's format.Media is the prompt cache's Media
+  byte for byte (checked at comptime).
+- KV sharding (the kv-shard patches): no code change; the lineage's part salt, the home
+  part, carries and borrowing are the text paths', and tests pin them for
+  pictures.
+
+Switches: none new (TF_GLM_IMAGE_CACHE from the patch before). Text points,
+their keys and their bytes are unchanged.
+
+Tests (host): pointPictures and followerIds; a picture point written on both
+ranks, restored from disk byte for byte and resumed exactly, also after a
+restart, while two different same-size pictures at the same rows and a
+forged equal-seed digest miss; a picture straddling the cut (another length
+misses), pictures before / straddling / after the cut, a later turn with one
+more; a follower whose picture is elsewhere; the image cache off; the
+keep_pictures round trip, its refusals and 257 pictures; the features
+string. KV sharding: picture keeps salted with their home part and restored
+into it, a picture state carried into the other part, a picture prompt
+borrowing rows with its pictures attached once and in every segment, SH-1's
+refusal order with a real NoVisionTower (reserveMedia before newSeq).
+
+Measured on the pair: not run yet (a picture point restored from disk and
+after a restart equal to a cold prefill, with and without KV sharding).
+
+Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo); spill v2's block
+store design (2,048-token blocks, lineage, the write-at-keep ring, release
+and fsync order): BadAd84 (https://github.com/BadAd84),
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#118; the DeepSeek Zig
+port's spill-pictures.
+Apply from the checkout root with: git apply 0028-zig-glm-spill-pictures.patch
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index f4b01ff776308e9f14294f88bf30a505318f623d..35adf0c9c2c5ca515ed0c5044a25cd38bb1710d5 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -344,6 +344,8 @@ pub const TierCounts = struct {
+     dropped_temporaries: u64 = 0, // incomplete records removed at start
+     points_part0: u64 = 0, // gauge: KV sharding (an owner-sharded store): published points whose home is part 0
+     points_part1: u64 = 0, // gauge: ... part 1
++    pictures_kept: u64 = 0, // points written with pictures before their cut (each rank its own)
++    pictures_refused: u64 = 0, // keeps and lookups with pictures turned away: ids and media disagree, or image cache off
+ 
+     pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending", "points_part0", "points_part1" };
+ 
+@@ -385,6 +387,8 @@ pub const TierCounts = struct {
+         .dropped_temporaries = "Incomplete records removed at start.",
+         .points_part0 = "Published points whose home is KV part 0 (an owner-sharded disk tier; 0 when replicated).",
+         .points_part1 = "Published points whose home is KV part 1 (an owner-sharded disk tier; 0 when replicated).",
++        .pictures_kept = "Points written to disk with pictures before their cut.",
++        .pictures_refused = "Disk keeps and lookups with pictures turned away (ids and media disagree, or image cache off).",
+     };
+ };
+ 
+diff --git a/zig/src/core/spill/format.zig b/zig/src/core/spill/format.zig
+index aa6afe330da25c928c3aedc5d28fc6407472f194..30c084cea70365cab67db55bef3c1731c9305c3b 100644
+--- a/zig/src/core/spill/format.zig
++++ b/zig/src/core/spill/format.zig
+@@ -95,8 +95,8 @@ pub const Limits = struct {
+ 
+ /// A picture inside a point: its prompt positions and the full SHA-256 of its payload (per-position picture keys are
+ /// shortened; disk identity takes the whole digest and the span). A picture may run past the point's cut
+-/// (`start < at < start + len`). (extern, so a tier can hand over its prompt cache's records as they are; v1.0.7's
+-/// prompt cache keeps no pictures, so a tier here passes none.)
++/// (`start < at < start + len`). (extern, so a tier can hand over its prompt cache's records as they are:
++/// core/prompt_media's Media is the same bytes, checked by the GLM tier at comptime.)
+ pub const Media = extern struct {
+     start: u32,
+     len: u32,
+@@ -111,7 +111,7 @@ pub const Media = extern struct {
+ pub const picture_ids: u32 = 0x8000_0000;
+ 
+ /// Scheme 1's keyed id for position `j` of a picture whose payload's SHA-256 is `digest`. A prompt cache that keys
+-/// pictures must make the same ids (DeepSeek's prompt_cache.pictureId does; v1.0.7's keys no pictures).
++/// pictures must make the same ids (core/prompt_media.pictureId does, as DeepSeek's prompt_cache.pictureId).
+ pub fn pictureId(digest: *const Digest, j: u32) u32 {
+     const seed = std.mem.readInt(u64, digest[0..8], .little);
+     return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);
+diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
+index c42a03980418fb9b6a139cd7b5a6f524bc7e822e..9d9eef83e1f553f55a77dd09bab5209d212f27c2 100644
+--- a/zig/src/families/glm_cuda/cuda_lanes.zig
++++ b/zig/src/families/glm_cuda/cuda_lanes.zig
+@@ -2435,6 +2435,131 @@ test "TF_GLM_KV_SHARD: a fresh prompt fills with borrowed rows on both ranks, he
+     try std.testing.expectEqual(@as(usize, 0), e0.pool.?.extents.items.len);
+ }
+ 
++test "TF_GLM_KV_SHARD with pictures: a fresh picture prompt borrows the other part's rows on both ranks with its pictures in every segment; its kept state carries when its home is full, the tower only past the cut" {
++    const gpa = std.testing.allocator;
++    const Pool = @import("cuda_pool.zig").Pool;
++    const B = Lanes(MiniEngine);
++    var e0: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
++    defer e0.deinit();
++    var e1: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
++    defer e1.deinit();
++    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
++    defer r0.deinit();
++    var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
++    defer r1.deinit();
++    r1.follower = true;
++    var sink: NoteSink = .{ .gpa = gpa };
++    defer sink.deinit();
++    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
++    const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
++    var big: [2200]u32 = undefined;
++    for (&big, 0..) |*t, i| t.* = @intCast(i * 13 % 997);
++    const px: [3 * 28 * 84]u8 = @splat(5);
++    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
++    const rows = [_]u32{ 100, 101, 102, 2150, 2151, 2152 };
++    for (rows) |r| big[r] = 99;
++    const media: lanes.Media = .{ .rows = &rows, .items = &items };
++    const follower_media: lanes.Media = .{ .rows = &.{}, .follower_rows = rows.len }; // (rank 1's copy: the count only)
++    // 1. the fresh pass (marks 64 and 2,112) borrows part 1's rows on both ranks, pictures attached throughout
++    var adopter: Adopter = .{ .hooks = hooks };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 2112 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
++    defer s1.deinit(gpa);
++    var s1b = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .media = &follower_media, .reuse = .{ .marks = &.{ 64, 2112 } } });
++    defer s1b.deinit(gpa);
++    try B.prefillFn(&r0, &s1);
++    try B.prefillFn(&r1, &s1b);
++    try std.testing.expectEqual(@as(usize, 3), e0.lent_fills);
++    try std.testing.expectEqual(@as(usize, 3), e1.lent_fills);
++    for ([_]*MiniEngine{ &e0, &e1 }) |e| {
++        try std.testing.expectEqual(@as(usize, 1), e.media_attaches);
++        try std.testing.expectEqual(@as(usize, 3), e.media_calls.items.len);
++        for (e.media_calls.items) |c| try std.testing.expect(c.attached);
++        try std.testing.expect(e.media_attached == null);
++    }
++    try std.testing.expectEqual(@as(usize, 0), e0.pool.?.rowsIn(1).twins + e1.pool.?.rowsIn(1).twins);
++    try sink.take(&r1);
++    const k2112 = adopter.saved[1];
++    try std.testing.expectEqual(@as(?usize, 0), r0.keptOf(k2112).?.snap.home);
++    // 2. part 0 full (s1 and another): a resume of the 2,112-token state stays in part 1 with its rows carried; the
++    // tower runs only for the second picture (the first is wholly in the state)
++    const fill0 = (try e0.pool.?.placeIn(4096, null, 0)).?;
++    const fill1 = (try e1.pool.?.placeIn(4096, null, 0)).?;
++    const o0 = try e0.pool.?.add(fill0, 4096);
++    const o1 = try e1.pool.?.add(fill1, 4096);
++    e0.media_calls.clearRetainingCapacity();
++    e1.media_calls.clearRetainingCapacity();
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &big, .max_new = 4, .media = &media, .reuse = .{ .saved = k2112, .at = 2112 } });
++    defer s2.deinit(gpa);
++    var s2b = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &big, .max_new = 4, .media = &follower_media, .reuse = .{ .saved = r1.savedFor(r0.keptOf(k2112).?.key), .at = 2112 } });
++    defer s2b.deinit(gpa);
++    try B.prefillFn(&r0, &s2);
++    try B.prefillFn(&r1, &s2b);
++    try sink.take(&r1);
++    try std.testing.expectEqual(@as(usize, 1), e0.carries);
++    try std.testing.expectEqual(@as(usize, 1), e1.carries);
++    try std.testing.expect(s2.cached == 2112 and !s2.reuse_failed);
++    try std.testing.expectEqual(@as(usize, 1), e0.media_calls.items[0].from_item);
++    try std.testing.expectEqual(MiniEngine.hash(&big), try firstToken(B, &r0, &s2));
++    try std.testing.expectEqual(e0.pool.?.digest(), e1.pool.?.digest());
++    B.releaseFn(&r0, &s1);
++    B.releaseFn(&r1, &s1b);
++    B.releaseFn(&r0, &s2);
++    B.releaseFn(&r1, &s2b);
++    try e0.pool.?.remove(o0);
++    try e1.pool.?.remove(o1);
++}
++
++test "TF_GLM_KV_SHARD (SH-1): rank 0 refuses a picture prompt (no tower) before its sequence, rank 1 drops the one it opened; the next placements and digests still check" {
++    const gpa = std.testing.allocator;
++    const Pool = @import("cuda_pool.zig").Pool;
++    const B = Lanes(MiniEngine);
++    var e0: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1, .vision = false };
++    defer e0.deinit();
++    var e1: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
++    defer e1.deinit();
++    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
++    defer r0.deinit();
++    var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
++    defer r1.deinit();
++    r1.follower = true;
++    var sink: NoteSink = .{ .gpa = gpa };
++    defer sink.deinit();
++    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
++    var gate: TestGate = .{ .other = &.{ true, false, true, true, true, true } };
++    r0.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
++    r1.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
++    var prompt = testPrompt(7);
++    const px: [3 * 28 * 84]u8 = @splat(5);
++    const items = [_]lanes.MediaItem{.{ .h = 28, .w = 84, .data = &px }};
++    const rows = [_]u32{ 10, 11, 12 };
++    for (rows) |r| prompt[r] = 99;
++    const media: lanes.Media = .{ .rows = &rows, .items = &items };
++    const follower_media: lanes.Media = .{ .rows = &.{}, .follower_rows = rows.len };
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media });
++    defer s1.deinit(gpa);
++    var s1b = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &follower_media });
++    defer s1b.deinit(gpa);
++    try std.testing.expectError(error.NoVisionTower, B.prefillFn(&r0, &s1));
++    try std.testing.expectError(error.OtherRankFailed, B.prefillFn(&r1, &s1b));
++    try std.testing.expectEqual(@as(u64, 0), e0.pool.?.next_id); // (refused before newSeq)
++    try std.testing.expectEqual(@as(u64, 1), e1.pool.?.next_id);
++    try std.testing.expect(!e0.media_reserved and !e1.media_reserved);
++    // the next prompts (text): the same extents at the same bases on both ranks, under other ids; each note checks
++    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = prompt[0..50], .max_new = 4 });
++    defer s2.deinit(gpa);
++    var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = prompt[0..50], .max_new = 4 });
++    defer s3.deinit(gpa);
++    for ([_]*lanes.Stream{ &s2, &s3 }) |s| {
++        try B.prefillFn(&r0, s);
++        try B.prefillFn(&r1, s);
++        try std.testing.expectEqual(@as(usize, 1), sink.notes.items.len);
++        try sink.take(&r1);
++    }
++    r0.round = 1;
++    r0.layoutNote();
++    try sink.take(&r1);
++}
++
+ fn firstToken(comptime B: type, r: *B, s: *lanes.Stream) !u32 {
+     return B.readFn(r, try B.firstFn(r, s, s.prompt_len));
+ }
+diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
+index b8395fc96a9f1d514ed28c91745511c1aee8fab8..3835749d32d527f69868e1195ca0a55e432ee167 100644
+--- a/zig/src/families/glm_cuda/cuda_native.zig
++++ b/zig/src/families/glm_cuda/cuda_native.zig
+@@ -278,7 +278,12 @@ fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choic
+ /// Spill v2's settings from the server's (`hold`: the release guard's limit, a quarter of the kept-state budget: held
+ /// buffers sit outside it until their blocks are out).
+ fn tierSettings(o: Options, budget: u64) spill_tier.Settings {
+-    return .{ .dir = o.spill_dir orelse "", .gib = o.spill_gib, .min_free_gib = o.spill_min_free_gib, .min_tokens = o.spill_min_tokens, .quota = o.spill_quota, .turns = o.spill_turns, .read_blocks = o.spill_read_blocks, .stage_mib = o.spill_stage_mib, .hold_bytes = budget / 4 };
++    return .{ .dir = o.spill_dir orelse "", .gib = o.spill_gib, .min_free_gib = o.spill_min_free_gib, .min_tokens = o.spill_min_tokens, .quota = o.spill_quota, .turns = o.spill_turns, .read_blocks = o.spill_read_blocks, .stage_mib = o.spill_stage_mib, .hold_bytes = budget / 4, .image_cache = imageCache() };
++}
++
++/// TF_GLM_IMAGE_CACHE on this rank: on unless exactly "0" (prompt_cache.imageCacheOn's reading; the server's too).
++fn imageCache() bool {
++    return !std.mem.eql(u8, envText("TF_GLM_IMAGE_CACHE") orelse return true, "0");
+ }
+ 
+ /// Spill v2's tier on this rank, once the ranks agreed on their identities and on one kept-state budget: this rank's
+@@ -320,6 +325,7 @@ fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identi
+             side.close();
+             return err;
+         };
++        own.follower_tier.?.image_cache = s.image_cache;
+         own.serving.?.local.spill_side = own.follower_tier.?.spillSide();
+     }
+ }
+@@ -347,7 +353,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
+         .driver = try ctx.d.version(),
+         .state_format = spill_state.format_version,
+         .wire = spill_wire.version,
+-        .features = try identity.featureString(&fbuf, .{ .spill_min_tokens = o.spill_min_tokens, .kv_shard = kv.on, .drafts = o.drafts, .streams = @intCast(streams), .prefill_rows = @intCast(e.prefill_rows) }),
++        .features = try identity.featureString(&fbuf, .{ .spill_min_tokens = o.spill_min_tokens, .kv_shard = kv.on, .drafts = o.drafts, .streams = @intCast(streams), .prefill_rows = @intCast(e.prefill_rows), .image_cache = imageCache() }),
+         .env = env,
+     };
+     const fp = try identity.build(gpa, io, r);
+diff --git a/zig/src/families/glm_cuda/cuda_spill_identity.zig b/zig/src/families/glm_cuda/cuda_spill_identity.zig
+index 33d121c5130df211690f8ab7a4840c8b458c86fb..cda781ce6b1be253e3926561f2de206673b78965 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_identity.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_identity.zig
+@@ -498,10 +498,22 @@ pub const Features = struct {
+     drafts: bool,
+     streams: u32,
+     prefill_rows: u32,
++    /// TF_GLM_IMAGE_CACHE (Settings.image_cache): written only when off ("image_cache=0;"), so the default's string,
++    /// and the namespace it feeds, are the same as before pictures were kept
++    image_cache: bool = true,
+ };
+ 
+ pub fn featureString(buf: []u8, f: Features) ![]const u8 {
+-    return std.fmt.bufPrint(buf, "spill=2;spill_min={d};kv_shard={d};drafts={d};streams={d};prefill_rows={d};", .{ f.spill_min_tokens, @intFromBool(f.kv_shard), @intFromBool(f.drafts), f.streams, f.prefill_rows });
++    return std.fmt.bufPrint(buf, "spill=2;spill_min={d};kv_shard={d};drafts={d};streams={d};prefill_rows={d};{s}", .{ f.spill_min_tokens, @intFromBool(f.kv_shard), @intFromBool(f.drafts), f.streams, f.prefill_rows, if (f.image_cache) "" else "image_cache=0;" });
++}
++
++test "featureString: the image cache's switch is named only when off" {
++    var a: [256]u8 = undefined;
++    var b: [256]u8 = undefined;
++    const on = try featureString(&a, .{ .spill_min_tokens = 8192, .drafts = true, .streams = 8, .prefill_rows = 2048 });
++    try testing.expectEqualStrings("spill=2;spill_min=8192;kv_shard=0;drafts=1;streams=8;prefill_rows=2048;", on);
++    const off = try featureString(&b, .{ .spill_min_tokens = 8192, .drafts = true, .streams = 8, .prefill_rows = 2048, .image_cache = false });
++    try testing.expectEqualStrings("spill=2;spill_min=8192;kv_shard=0;drafts=1;streams=8;prefill_rows=2048;image_cache=0;", off);
+ }
+ 
+ /// Every rank's share of the model (cuda_geometry), as text: the TP split every rank computes alike.
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier.zig b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+index 3cb35382a6cbe4adb83775f090ac1da491316ae0..0c75eb9be36e85fa474bf81185dc8f5c5263582b 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier.zig
+@@ -78,6 +78,10 @@ pub const Settings = struct {
+     direct: bool = true,
+     /// The release guard's limit: released kept states held while their writes still read them (cuda_spill_state.Guard).
+     hold_bytes: u64 = 4 << 30,
++    /// Pictures' points kept and found (TF_GLM_IMAGE_CACHE, on unless exactly "0": prompt_cache.imageCacheOn; the
++    /// fingerprint's features carry it when off, so every rank agrees). Off: a prompt with pictures keeps nothing on
++    /// disk and finds nothing there, and a follower skips a picture keep.
++    image_cache: bool = true,
+ 
+     pub fn enabled(s: Settings) bool {
+         return s.dir.len > 0 and s.gib > 0;
+@@ -178,8 +182,80 @@ pub const Counts = struct {
+     dropped_temporaries: u64 = 0,
+     points_part0: u64 = 0,
+     points_part1: u64 = 0,
++    pictures_kept: u64 = 0,
++    pictures_refused: u64 = 0,
+ };
+ 
++// -- pictures (the server's content keys, recorded with their full digests: core/spill format v3) ----------------------
++
++/// A point's pictures as the store records them: the prompt's pictures that start before the cut (a prefix of them),
++/// and the model id their rows hold (the placeholder, the same for every picture).
++pub const Pictures = struct { media: []const format.Media = &.{}, placeholder: u32 = 0 };
++
++/// The pictures of the point `keyed[0..at]` of a prompt whose pictures are `media` (all of them, in order) and whose
++/// model ids are `raw`: null when the ids do not agree with the media (a picture `media` does not name, ids not made
++/// from its digest, a raw id that is not the placeholder: the point is then not written), or past
++/// wire.max_note_media. A point no picture reaches is a text point (`media` empty).
++pub fn pointPictures(keyed: []const u32, raw: []const u32, media: []const format.Media, at: u32) ?Pictures {
++    if (keyed.len < at or !keyedMedia(keyed[0..at], media)) return null;
++    var n: usize = 0;
++    while (n < media.len and media[n].start < at) n += 1;
++    if (n == 0) return .{};
++    if (n > wire.max_note_media or raw.len < at) return null;
++    const placeholder = raw[media[0].start];
++    if (placeholder >= format.picture_ids) return null;
++    var i: usize = 0;
++    for (media[0..n]) |m| {
++        if (!std.mem.eql(u32, keyed[i..m.start], raw[i..m.start])) return null;
++        const stop = @min(@as(usize, m.start) + m.len, at);
++        for (raw[m.start..stop]) |x| if (x != placeholder) return null;
++        i = stop;
++    }
++    if (!std.mem.eql(u32, keyed[i..at], raw[i..at])) return null;
++    return .{ .media = media[0..n], .placeholder = placeholder };
++}
++
++/// prompt_cache.mediaKeys over the store's media: every picture id of `keyed` named by a span of `media` and made
++/// from its digest, nothing else (spans may run past the ids; those starting past them are not looked at).
++pub fn keyedMedia(keyed: []const u32, media: []const format.Media) bool {
++    var at: usize = 0;
++    var prev_end: u64 = 0;
++    for (media) |m| {
++        if (m.len == 0 or m.start < prev_end) return false;
++        prev_end = @as(u64, m.start) + m.len;
++        if (m.start >= keyed.len) continue;
++        for (keyed[at..m.start]) |id| if (id >= format.picture_ids) return false;
++        const stop: usize = @intCast(@min(prev_end, keyed.len));
++        for (keyed[m.start..stop], 0..) |id, j| if (id != format.pictureId(&m.digest, @intCast(j))) return false;
++        at = stop;
++    }
++    for (keyed[at..]) |id| if (id >= format.picture_ids) return false;
++    return true;
++}
++
++/// A follower's ids for the point rank 0 noted: from its own model ids `own` (its Kept's tokens), each noted
++/// picture's rows keyed by its digest (format.pictureId) and their raw id the noted placeholder. False when this
++/// rank's ids are not rank 0's prompt: a noted picture's row that does not hold the placeholder here, or a
++/// placeholder outside every noted picture before `at` (a picture this rank has elsewhere).
++pub fn followerIds(own: []const u32, at: u32, media: []const format.Media, placeholder: u32, keyed: []u32, raw: []u32) bool {
++    if (own.len < at or keyed.len != at or raw.len != at) return false;
++    var mi: usize = 0;
++    for (own[0..at], 0..) |q, i| {
++        while (mi < media.len and i >= @as(u64, media[mi].start) + media[mi].len) mi += 1;
++        const in = mi < media.len and i >= media[mi].start;
++        if (q >= format.picture_ids) return false;
++        if (in) {
++            if (q != placeholder) return false;
++            keyed[i] = format.pictureId(&media[mi].digest, @intCast(i - media[mi].start));
++        } else {
++            if (q == placeholder) return false;
++            keyed[i] = q;
++        }
++        raw[i] = q;
++    }
++    return true;
++}
++
+ fn monotonicNs() u64 {
+     var ts: std.c.timespec = undefined;
+     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+@@ -307,6 +383,9 @@ pub fn Side(comptime E: type) type {
+             origin: ?format.Origin = null,
+             shared: bool = false,
+             group: u64 = 0,
++            /// with pictures before `at`: the prompt's model ids [0, at) and the pictures (a point's media, in order)
++            raw: ?[]const u32 = null,
++            media: []const format.Media = &.{},
+         };
+         pub const Kept = enum { queued, stored, refused };
+ 
+@@ -326,6 +405,10 @@ pub fn Side(comptime E: type) type {
+         guard: Guard,
+         cached: Counts = .{},
+         cancelled_shutdown: u64 = 0,
++        /// this rank's points written with pictures before their cut, and keeps and lookups with pictures turned away
++        /// (ids and media disagree, image cache off): its counters' pictures_kept / pictures_refused
++        pictures_kept: u64 = 0,
++        pictures_refused: u64 = 0,
+ 
+         /// Opens this rank's store under `s.dir` (namespace `prefix` + `compat`) over `staging` (pinned, at least
+         /// plan's bytes, 4 KiB aligned; the caller's), its events made by the engine (eventCount). `layout`: the
+@@ -433,7 +516,7 @@ pub fn Side(comptime E: type) type {
+             if (self.writes.contains(k.snap.id)) return .stored;
+             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
+-            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
++            const r = self.store.keep(.{ .keyed = k.keyed, .raw = if (k.media.len > 0) k.raw else null, .media = k.media, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
+             const q = switch (r) {
+                 .queued => |q| q,
+                 .stored => return .stored,
+@@ -885,6 +968,8 @@ pub fn Side(comptime E: type) type {
+                 .quota_trims = c.quota_trims,
+                 .recovered_points = c.recovered_points,
+                 .dropped_temporaries = c.temps_removed + c.recovered_dropped,
++                .pictures_kept = self.pictures_kept,
++                .pictures_refused = self.pictures_refused,
+             };
+             if (self.layout.owner == .owner_sharded) { // (two parts: this rank's own and the other's)
+                 const own = self.layout.g.rank;
+@@ -922,6 +1007,10 @@ pub fn Leader(comptime E: type) type {
+             parent: ?u64 = null,
+             fork: u32 = 0,
+             lineage: []const Fork = &.{},
++            /// its key holds pictures' ids: every picture's identity and the prompt's model ids (prompt_cache.Write's)
++            images: bool = false,
++            media: []const format.Media = &.{},
++            raw: []const u32 = &.{},
+         };
+ 
+         gpa: Allocator,
+@@ -948,11 +1037,12 @@ pub fn Leader(comptime E: type) type {
+         pump_at: u64 = 0,
+         presence_refused: u64 = 0,
+         misses: u64 = 0,
++        image_cache: bool = true, // Settings.image_cache: pictures' points kept and found
+ 
+         /// `side` is moved in (closed by destroy). `boot` salts this process's lineage names.
+         pub fn create(gpa: Allocator, side: *S, lanes: *L, s: Settings, boot: [16]u8) !*Self {
+             const self = try gpa.create(Self);
+-            self.* = .{ .gpa = gpa, .side = side, .lanes = lanes, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, side.plan.restore))), .boot = boot };
++            self.* = .{ .gpa = gpa, .side = side, .lanes = lanes, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, side.plan.restore))), .boot = boot, .image_cache = s.image_cache };
+             return self;
+         }
+ 
+@@ -1035,9 +1125,21 @@ pub fn Leader(comptime E: type) type {
+         /// any): rank 0's own index, no disk I/O. A longer point off the starts is passed over for the longest start
+         /// under it, and the index asked again there.
+         pub fn lookup(self: *Self, key: []const u32, beyond: u32, max_at: u32, starts: []const u32, lookahead: u32) ?Point {
++            return self.lookupMedia(key, beyond, max_at, starts, lookahead, false, &.{});
++        }
++
++        /// `lookup` for a key with pictures (`images`, their identities `media`): every picture of the key accounted
++        /// for by its full identity, or no point at all (pictures_refused); the store then matches each point's
++        /// pictures before its cut by span and digest.
++        pub fn lookupMedia(self: *Self, key: []const u32, beyond: u32, max_at: u32, starts: []const u32, lookahead: u32, images: bool, media: []const format.Media) ?Point {
++            if (images or media.len > 0) if (!self.image_cache or !keyedMedia(key, media)) {
++                self.side.pictures_refused += 1;
++                self.misses += 1;
++                return null;
++            };
+             var top = max_at;
+             const found = while (top > beyond) {
+-                const h = self.side.store.lookup(.{ .keyed = key, .longer_than = beyond, .max_at = top, .grid = st.grid }) orelse break null;
++                const h = self.side.store.lookup(.{ .keyed = key, .media = media, .longer_than = beyond, .max_at = top, .grid = st.grid }) orelse break null;
+                 if (starts.len == 0 or std.mem.indexOfScalar(u32, starts, h.at) != null) break h;
+                 top = startBelow(starts, h.at);
+             } else null;
+@@ -1059,6 +1161,20 @@ pub fn Leader(comptime E: type) type {
+             if (at == 0 or at % st.grid != 0 or at < self.min_tokens or w.key.len < at) return null;
+             const kp: *L.Kept = @ptrCast(@alignCast(w.saved));
+             if (kp.at != at) return null;
++            // pictures: recorded with their spans and full digests (those before the cut), the keyed ids checked to
++            // derive from them and the prompt's model ids kept beside them; any disagreement keeps nothing on disk
++            // (a cut before every picture is a text point, written with the image cache off too)
++            var pics: Pictures = .{};
++            if (w.images or w.media.len > 0) {
++                pics = pointPictures(w.key, w.raw, w.media, at) orelse {
++                    self.side.pictures_refused += 1;
++                    return null;
++                };
++                if (pics.media.len > 0 and !self.image_cache) {
++                    self.side.pictures_refused += 1;
++                    return null;
++                }
++            }
+             var forks: std.ArrayList(format.Fork) = .empty;
+             defer forks.deinit(self.gpa);
+             // (owner-sharded: salted with the state's home, which every rank's keep note then carries)
+@@ -1066,15 +1182,17 @@ pub fn Leader(comptime E: type) type {
+             if (lin.forks.len > wire.max_forks) return null; // (a keep note carries no more: no rank holds a point another lacks)
+             const origin: ?format.Origin = if (w.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = w.fork } else null) else null;
+             const keyed = w.key[0..at];
+-            const key = format.pointKey(keyed, @intCast(st.block_tokens), &.{});
++            const key = format.pointKey(keyed, @intCast(st.block_tokens), pics.media);
++            const raw: ?[]const u32 = if (pics.media.len > 0) w.raw[0..at] else null;
+             // (room first: once the write is queued nothing may fail, or the cache, holding no point, never releases
+             // the state the write reads)
+             self.points.ensureUnusedCapacity(self.gpa, 1) catch return null;
+-            if (self.side.keepPoint(.{ .keyed = keyed, .key = key, .snap = kp.snap, .lineage = lin, .origin = origin, .shared = w.shared, .group = w.group }) == .refused) return null;
++            if (self.side.keepPoint(.{ .keyed = keyed, .key = key, .snap = kp.snap, .lineage = lin, .origin = origin, .shared = w.shared, .group = w.group, .raw = raw, .media = pics.media }) == .refused) return null;
++            if (pics.media.len > 0) self.side.pictures_kept += 1;
+             const id = pointId(key);
+             self.points.putAssumeCapacity(id, .{ .key = key, .at = at });
+             if (self.paired()) {
+-                self.note(.{ .keep = .{ .kept = kp.key, .at = at, .point = key, .group = w.group, .shared = w.shared, .lineage = lin, .origin = origin } }, false) catch {};
++                self.note(.{ .keep = .{ .kept = kp.key, .at = at, .point = key, .group = w.group, .shared = w.shared, .lineage = lin, .origin = origin, .media = pics.media, .placeholder = pics.placeholder } }, false) catch {};
+                 self.peer_writes = true;
+             }
+             return id;
+@@ -1337,6 +1455,8 @@ pub fn Leader(comptime E: type) type {
+             var c = self.side.cached;
+             c.presence_refused = self.presence_refused;
+             c.compatible_misses = self.misses;
++            c.pictures_kept = self.side.pictures_kept;
++            c.pictures_refused = self.side.pictures_refused;
+             out[0] = c;
+             const n = @min(self.peers_n, out.len - 1);
+             @memcpy(out[1..][0..n], self.peers[0..n]);
+@@ -1362,6 +1482,11 @@ pub fn Follower(comptime E: type) type {
+         lanes: *L,
+         restores: std.AutoHashMapUnmanaged(u64, Fx) = .empty, // by transaction
+         skipped: u64 = 0, // keeps this rank wrote no copy of (its ids or state not rank 0's, or its store refused)
++        /// Settings.image_cache on this rank (set after create; the fingerprints agreed, so rank 0's): off, a keep with
++        /// pictures is skipped
++        image_cache: bool = true,
++        keyed: std.ArrayList(u32) = .empty, // a picture keep's ids rebuilt from this rank's own (followerIds)
++        raw: std.ArrayList(u32) = .empty,
+ 
+         /// `side` is moved in (closed by destroy).
+         pub fn create(gpa: Allocator, side: *S, lanes: *L) !*Self {
+@@ -1377,6 +1502,8 @@ pub fn Follower(comptime E: type) type {
+                 self.lanes.unreserve(fx.dest);
+             }
+             self.restores.deinit(self.gpa);
++            self.keyed.deinit(self.gpa);
++            self.raw.deinit(self.gpa);
+             self.side.close();
+             self.gpa.destroy(self);
+         }
+@@ -1399,11 +1526,29 @@ pub fn Follower(comptime E: type) type {
+                     // this rank's own ids must name rank 0's point, and (owner-sharded) its state the home rank 0's lineage
+                     // is salted with, or a restore could never agree on it
+                     const home = side.e.tierKept(kp.snap).home;
+-                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point) or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
++                    if (kp.at != k.at or kp.tokens.len < k.at or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
+                         self.skipped += 1;
+                         return;
+                     }
+-                    if (side.keepPoint(.{ .keyed = kp.tokens[0..k.at], .key = k.point, .snap = kp.snap, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group }) == .refused) self.skipped += 1;
++                    // pictures: rank 0's keyed and raw ids rebuilt from this rank's own model ids and the noted pictures
++                    var keyed: []const u32 = kp.tokens[0..k.at];
++                    var raw: ?[]const u32 = null;
++                    if (k.media.len > 0) {
++                        if (!self.image_cache) return self.skipPictures();
++                        self.keyed.resize(self.gpa, k.at) catch return self.skipPictures();
++                        self.raw.resize(self.gpa, k.at) catch return self.skipPictures();
++                        if (!followerIds(kp.tokens, k.at, k.media, k.placeholder, self.keyed.items, self.raw.items)) return self.skipPictures();
++                        keyed = self.keyed.items;
++                        raw = self.raw.items;
++                    }
++                    if (!std.mem.eql(u8, &format.pointKey(keyed, @intCast(st.block_tokens), k.media), &k.point)) {
++                        if (k.media.len > 0) return self.skipPictures();
++                        self.skipped += 1;
++                        return;
++                    }
++                    if (side.keepPoint(.{ .keyed = keyed, .key = k.point, .snap = kp.snap, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .raw = raw, .media = k.media }) == .refused) {
++                        self.skipped += 1;
++                    } else if (k.media.len > 0) side.pictures_kept += 1;
+                 },
+                 .begin => |b| try self.begin(b),
+                 .progress => |p| {
+@@ -1429,6 +1574,12 @@ pub fn Follower(comptime E: type) type {
+             }
+         }
+ 
++        /// A keep with pictures this rank turned away: skipped, and counted as rank 0 counts its refusals.
++        fn skipPictures(self: *Self) void {
++            self.skipped += 1;
++            self.side.pictures_refused += 1;
++        }
++
+         /// Rank 0's restore here: the destination's wrapper under rank 0's key, this rank's reads, its destination.
+         fn begin(self: *Self, b: wire.Begin) !void {
+             const side = self.side;
+@@ -1536,8 +1687,15 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
+             @compileError("prompt_cache.Fork and the tier's Fork differ");
+         for (@typeInfo(pc.TierCounts).@"struct".field_names) |n| if (!@hasField(Counts, n)) @compileError("the tier's Counts lack prompt_cache.TierCounts." ++ n);
+         for (@typeInfo(Counts).@"struct".field_names) |n| if (!@hasField(pc.TierCounts, n)) @compileError("prompt_cache.TierCounts lacks the tier's " ++ n);
++        // the prompt cache's media are the store's, byte for byte (Want.media and Write.media go to the store as they are)
++        if (@sizeOf(pc.Media) != @sizeOf(format.Media) or @alignOf(pc.Media) != @alignOf(format.Media) or @offsetOf(pc.Media, "start") != @offsetOf(format.Media, "start") or @offsetOf(pc.Media, "len") != @offsetOf(format.Media, "len") or @offsetOf(pc.Media, "digest") != @offsetOf(format.Media, "digest") or pc.picture_ids != format.picture_ids)
++            @compileError("prompt_cache.Media and core/spill's format.Media differ");
+     }
+     return struct {
++        fn asFormat(m: []const pc.Media) []const format.Media {
++            return @ptrCast(m);
++        }
++
+         pub const vtable: pc.Tier.VTable = .{
+             .lookup = lookupFn,
+             .begin = beginFn,
+@@ -1565,7 +1723,7 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
+         }
+ 
+         fn lookupFn(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
+-            const p = of(ptr).lookup(want.key, want.beyond, want.max_at, want.starts, want.lookahead) orelse return null;
++            const p = of(ptr).lookupMedia(want.key, want.beyond, want.max_at, want.starts, want.lookahead, want.images, asFormat(want.media)) orelse return null;
+             return .{ .id = p.id, .at = p.at, .tokens = p.tokens, .group = p.group, .shared = p.shared };
+         }
+         fn beginFn(ptr: *anyopaque, point: *const pc.Point) anyerror!u64 {
+@@ -1588,7 +1746,7 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
+             of(ptr).cancel(job);
+         }
+         fn keepFn(ptr: *anyopaque, w: *const pc.Write) ?u64 {
+-            return of(ptr).keep(.{ .saved = w.saved, .key = w.key, .at = w.at, .group = w.group, .shared = w.shared, .parent = w.parent, .fork = w.fork, .lineage = @ptrCast(w.lineage) });
++            return of(ptr).keep(.{ .saved = w.saved, .key = w.key, .at = w.at, .group = w.group, .shared = w.shared, .parent = w.parent, .fork = w.fork, .lineage = @ptrCast(w.lineage), .images = w.images, .media = asFormat(w.media), .raw = w.raw });
+         }
+         fn releaseFn(ptr: *anyopaque, _: u64, saved: pc.Saved) void {
+             of(ptr).release(saved);
+@@ -1625,4 +1783,5 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
+ 
+ test {
+     _ = @import("cuda_spill_tier_test.zig");
++    _ = @import("cuda_spill_tier_pictures_test.zig");
+ }
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_pictures_test.zig b/zig/src/families/glm_cuda/cuda_spill_tier_pictures_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a55ca0e91fffc23313aec12be99608d1827133b
+--- /dev/null
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_pictures_test.zig
+@@ -0,0 +1,363 @@
++//! Spill v2's GLM tier with pictures (the DeepSeek port's spill-pictures tests, in GLM's shapes): a point whose cut a
++//! picture reaches is written as format v3 with each picture's span and full SHA-256 and the prompt's model ids, found
++//! only for the same pictures in the same places, restored from disk and after a restart byte for byte, and rank 1
++//! writes its copy from its own model ids and the keep note's pictures. Two ranks in one thread (cuda_spill_tier_rig).
++const std = @import("std");
++const core = @import("core");
++const lanes = @import("lanes");
++const tier = @import("cuda_spill_tier.zig");
++const rig = @import("cuda_spill_tier_rig.zig");
++const st = @import("cuda_spill_state.zig");
++const wire = @import("cuda_spill_wire.zig");
++
++const spill = core.spill;
++const format = spill.format;
++const testing = std.testing;
++const HostEngine = rig.HostEngine;
++
++const at = 2112; // one whole block and a 64-token tail
++/// GLM's image token: the model id at every picture row
++const placeholder: u32 = 154854;
++
++fn digestOf(tag: []const u8) format.Digest {
++    var d: format.Digest = undefined;
++    std.crypto.hash.sha2.Sha256.hash(tag, &d, .{});
++    return d;
++}
++
++/// A prompt with pictures: `raw` the model ids (the placeholder at every picture row and nowhere else), `keyed` its
++/// content key (each picture's rows made from its digest, as the server makes them), `media` each picture's identity.
++const Pics = struct {
++    gpa: std.mem.Allocator,
++    raw: []u32,
++    keyed: []u32,
++    media: []format.Media,
++
++    fn init(gpa: std.mem.Allocator, n: usize, seed: u32, spans: []const [2]u32, digests: []const format.Digest) !Pics {
++        const raw = try gpa.alloc(u32, n);
++        errdefer gpa.free(raw);
++        _ = rig.idsOf(raw, seed);
++        for (raw) |*t| if (t.* == placeholder) {
++            t.* = 7; // (a text id, never the placeholder)
++        };
++        const media = try gpa.alloc(format.Media, spans.len);
++        errdefer gpa.free(media);
++        for (spans, digests, media) |sp, d, *m| {
++            m.* = .{ .start = sp[0], .len = sp[1], .digest = d };
++            @memset(raw[sp[0]..][0..sp[1]], placeholder);
++        }
++        const keyed = try gpa.dupe(u32, raw);
++        for (media) |m| for (0..m.len) |j| {
++            keyed[m.start + j] = format.pictureId(&m.digest, @intCast(j));
++        };
++        return .{ .gpa = gpa, .raw = raw, .keyed = keyed, .media = media };
++    }
++    fn deinit(p: *Pics) void {
++        p.gpa.free(p.raw);
++        p.gpa.free(p.keyed);
++        p.gpa.free(p.media);
++    }
++};
++
++fn pointKeyOf(keyed: []const u32, media: []const format.Media) format.Digest {
++    return format.pointKey(keyed, @intCast(st.block_tokens), media);
++}
++
++test "pointPictures: the pictures before the cut, the placeholder; disagreeing ids, an unnamed picture or 257 pictures give none" {
++    const gpa = testing.allocator;
++    var p = try Pics.init(gpa, 400, 1, &.{ .{ 10, 20 }, .{ 100, 50 }, .{ 300, 10 } }, &.{ digestOf("a"), digestOf("b"), digestOf("c") });
++    defer p.deinit();
++    const pp = tier.pointPictures(p.keyed, p.raw, p.media, 120).?; // the second straddles the cut, the third past it
++    try testing.expectEqual(@as(usize, 2), pp.media.len);
++    try testing.expectEqual(placeholder, pp.placeholder);
++    try testing.expectEqual(@as(usize, 0), tier.pointPictures(p.keyed, p.raw, p.media, 10).?.media.len); // a text point
++    try testing.expect(tier.pointPictures(p.keyed, p.raw, p.media[1..], 120) == null); // the first picture unnamed
++    var other = p.media[0];
++    other.digest[0] ^= 1; // another picture's ids
++    try testing.expect(tier.pointPictures(p.keyed, p.raw, &.{ other, p.media[1], p.media[2] }, 120) == null);
++    p.raw[15] = 5; // a picture row that does not hold the placeholder
++    try testing.expect(tier.pointPictures(p.keyed, p.raw, p.media, 120) == null);
++    p.raw[15] = placeholder;
++    p.raw[50] = 6; // raw and keyed apart outside the pictures
++    try testing.expect(tier.pointPictures(p.keyed, p.raw, p.media, 120) == null);
++    // 256 pictures before the cut are recorded, 257 are not (a keep note carries 256 at most)
++    var spans: [wire.max_note_media + 1][2]u32 = undefined;
++    var ds: [wire.max_note_media + 1]format.Digest = undefined;
++    for (&spans, &ds, 0..) |*sp, *d, i| {
++        sp.* = .{ @intCast(2 * i), 1 };
++        d.* = digestOf(std.mem.asBytes(&i));
++    }
++    var many = try Pics.init(gpa, 1024, 2, &spans, &ds);
++    defer many.deinit();
++    try testing.expectEqual(@as(usize, wire.max_note_media), tier.pointPictures(many.keyed, many.raw, many.media, 2 * wire.max_note_media).?.media.len);
++    try testing.expect(tier.pointPictures(many.keyed, many.raw, many.media, 2 * wire.max_note_media + 1) == null);
++}
++
++test "followerIds: rank 0's ids from this rank's own and the noted pictures; a picture this rank has elsewhere gives none" {
++    const gpa = testing.allocator;
++    var p = try Pics.init(gpa, 200, 3, &.{ .{ 10, 20 }, .{ 100, 50 } }, &.{ digestOf("a"), digestOf("b") });
++    defer p.deinit();
++    var keyed: [120]u32 = undefined;
++    var raw: [120]u32 = undefined;
++    try testing.expect(tier.followerIds(p.raw, 120, p.media, placeholder, &keyed, &raw));
++    try testing.expectEqualSlices(u32, p.keyed[0..120], &keyed);
++    try testing.expectEqualSlices(u32, p.raw[0..120], &raw);
++    // this rank's pictures one row later: a placeholder outside the noted span, and a noted row without one
++    var moved = try gpa.dupe(u32, p.raw);
++    defer gpa.free(moved);
++    moved[10] = 9;
++    moved[30] = placeholder;
++    try testing.expect(!tier.followerIds(moved, 120, p.media, placeholder, &keyed, &raw));
++    try testing.expect(!tier.followerIds(p.raw, 120, p.media, placeholder + 1, &keyed, &raw)); // another placeholder
++}
++
++test "pictures: a point is written on both ranks with its pictures, restored from disk byte for byte and resumes exactly; after a restart too; two different same-size pictures at the same rows, or the same seed bytes of another digest, miss" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.init(gpa, "pictures", rig.Pair.settingsFor(1));
++    defer p.deinit();
++    const da = digestOf("picture a");
++    var pa = try Pics.init(gpa, 2200, 11, &.{.{ 300, 400 }}, &.{da});
++    defer pa.deinit();
++    const k = try p.keepPictures(pa.raw, pa.keyed, pa.media, at, 1 << 32 | 1);
++    const key = pointKeyOf(pa.keyed[0..at], pa.media);
++    try testing.expectEqual(tier.pointId(key), k.point.?);
++    try testing.expect(!std.mem.eql(u8, &key, &pointKeyOf(pa.keyed[0..at], &.{}))); // (the pictures are in the key)
++    try p.settle();
++    try testing.expect(p.lead0().side.store.presence(key));
++    try testing.expect(p.fol.?.side.store.presence(key)); // rank 1 rebuilt rank 0's ids from its own and the note
++    try testing.expectEqual(@as(u64, 0), p.fol.?.skipped);
++    // each rank's own picture counters, rank 1's by the stats ask
++    p.lead0().stats_at = 0;
++    p.lead0().pump(1);
++    var counts: [4]tier.Counts = undefined;
++    try testing.expectEqual(@as(usize, 2), p.lead0().counts(&counts));
++    try testing.expectEqual(@as(u64, 1), counts[0].pictures_kept);
++    try testing.expectEqual(@as(u64, 1), counts[1].pictures_kept);
++    const original = try gpa.dupe(u8, HostEngine.bytesOf(@as(*rig.Lanes.Kept, @ptrCast(@alignCast(k.saved))).snap));
++    defer gpa.free(original);
++    try p.evict(k.saved);
++    // a picture of the same size at the same rows: other ids, no point
++    var pb = try Pics.init(gpa, 2200, 11, &.{.{ 300, 400 }}, &.{digestOf("picture b")});
++    defer pb.deinit();
++    try testing.expectEqualSlices(u32, pa.raw, pb.raw); // (the model's ids are the same placeholders)
++    try testing.expectError(error.TestNoPoint, p.restoreMedia(pb.keyed, true, pb.media));
++    // the same ids from another payload (the first 8 bytes seed the ids): only the full digest tells them apart
++    var forged = pa.media[0];
++    forged.digest[20] ^= 1;
++    try testing.expectError(error.TestNoPoint, p.restoreMedia(pa.keyed, true, &.{forged}));
++    // pictures the key holds but no identity named, or the image cache off: refused before the store
++    const refused = p.lead0().side.pictures_refused;
++    try testing.expectError(error.TestNoPoint, p.restoreMedia(pa.keyed, true, &.{}));
++    try testing.expectEqual(refused + 1, p.lead0().side.pictures_refused);
++    // the same pictures: restored on both ranks byte for byte, resuming as a fresh pass of the model ids
++    const r = try p.restoreMedia(pa.keyed, true, pa.media);
++    try testing.expect(r == .ready);
++    const k0: *rig.Lanes.Kept = @ptrCast(@alignCast(r.ready.saved));
++    try testing.expect(HostEngine.same(&p.layout, k0.snap.sec, original, HostEngine.bytesOf(k0.snap)));
++    const k1: *rig.Lanes.Kept = @ptrCast(@alignCast(p.r[1].savedFor(k0.key) orelse return error.TestNotOnRank1));
++    try testing.expect(HostEngine.same(&p.layout, k1.snap.sec, original, HostEngine.bytesOf(k1.snap)));
++    const firsts = try p.resumeBoth(pa.raw, r.ready.saved, at);
++    try testing.expectEqual(HostEngine.first(pa.raw), firsts[0]);
++    try testing.expectEqual(HostEngine.first(pa.raw), firsts[1]);
++    // a restart: both stores recover the picture point (its ids checked against its media) and it restores again
++    try p.restart();
++    try testing.expectEqual(@as(u64, 1), p.lead0().side.store.counts().recovered_points);
++    try testing.expectEqual(@as(u64, 1), p.fol.?.side.store.counts().recovered_points);
++    try testing.expectError(error.TestNoPoint, p.restoreMedia(pb.keyed, true, pb.media));
++    const r2 = try p.restoreMedia(pa.keyed, true, pa.media);
++    try testing.expect(r2 == .ready);
++    const f2 = try p.resumeBoth(pa.raw, r2.ready.saved, at);
++    try testing.expectEqual(HostEngine.first(pa.raw), f2[0]);
++    try testing.expectEqual(HostEngine.first(pa.raw), f2[1]);
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "pictures: one straddling the cut is recorded whole and another length misses; pictures before, straddling and after the cut; a later turn with one more resumes" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.init(gpa, "straddle", rig.Pair.settingsFor(1));
++    defer p.deinit();
++    const d1 = digestOf("one");
++    const d2 = digestOf("two");
++    const d3 = digestOf("three");
++    // [100, 400) before the cut, [2000, 2200) across it (at 2112), [2250, 2260) past it
++    var pp = try Pics.init(gpa, 2400, 21, &.{ .{ 100, 300 }, .{ 2000, 200 }, .{ 2250, 10 } }, &.{ d1, d2, d3 });
++    defer pp.deinit();
++    const k = try p.keepPictures(pp.raw, pp.keyed, pp.media, at, 1);
++    try p.settle();
++    // the point holds the two pictures that start before its cut, the second whole (its span runs past the cut)
++    const key = pointKeyOf(pp.keyed[0..at], pp.media[0..2]);
++    try testing.expectEqual(tier.pointId(key), k.point.?);
++    try testing.expect(p.fol.?.side.store.presence(key));
++    try p.evict(k.saved);
++    // the straddling picture one row shorter (its ids the same through the cut): a miss
++    var short = try Pics.init(gpa, 2400, 21, &.{ .{ 100, 300 }, .{ 2000, 199 }, .{ 2250, 10 } }, &.{ d1, d2, d3 });
++    defer short.deinit();
++    try testing.expectEqualSlices(u32, pp.keyed[0..at], short.keyed[0..at]);
++    try testing.expectError(error.TestNoPoint, p.restoreMedia(short.keyed, true, short.media));
++    // another picture past the cut does not matter
++    var later = try Pics.init(gpa, 2400, 21, &.{ .{ 100, 300 }, .{ 2000, 200 }, .{ 2250, 10 } }, &.{ d1, d2, digestOf("four") });
++    defer later.deinit();
++    const r = try p.restoreMedia(later.keyed, true, later.media);
++    try testing.expect(r == .ready);
++    const firsts = try p.resumeBoth(later.raw, r.ready.saved, at);
++    try testing.expectEqual(HostEngine.first(later.raw), firsts[0]);
++    try testing.expectEqual(HostEngine.first(later.raw), firsts[1]);
++    // a later turn: the same prompt, a reply and one more picture after it, finds the point too
++    var turn = try Pics.init(gpa, 3000, 21, &.{ .{ 100, 300 }, .{ 2000, 200 }, .{ 2250, 10 }, .{ 2600, 100 } }, &.{ d1, d2, d3, digestOf("five") });
++    defer turn.deinit();
++    @memcpy(turn.raw[0..2400], pp.raw);
++    @memcpy(turn.keyed[0..2400], pp.keyed);
++    try testing.expectEqual(@as(?u32, at), if (p.lead0().lookupMedia(turn.keyed, 0, 2999, &.{}, 0, true, turn.media)) |x| x.at else null);
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "pictures: a follower whose picture sits elsewhere writes no copy (counted refused), and the point restores on no rank" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.init(gpa, "picelse", rig.Pair.settingsFor(1));
++    defer p.deinit();
++    var pa = try Pics.init(gpa, 2200, 31, &.{.{ 300, 400 }}, &.{digestOf("a")});
++    defer pa.deinit();
++    // rank 1's prompt holds the picture one row later (its own ids are not rank 0's)
++    const moved = try gpa.dupe(u32, pa.raw);
++    defer gpa.free(moved);
++    moved[300] = 9;
++    moved[700] = placeholder;
++    var w: Hook = .{ .p = &p, .pa = &pa };
++    var s0 = try lanes.Stream.init(gpa, .{ .id = "k", .prompt = pa.raw, .max_new = 4, .reuse = .{ .marks = &.{at}, .hook = .{ .ptr = &w, .at = Hook.at } } });
++    defer s0.deinit(gpa);
++    var s1 = try lanes.Stream.init(gpa, .{ .id = "k", .prompt = moved, .max_new = 4, .reuse = .{ .marks = &.{at} } });
++    defer s1.deinit(gpa);
++    try rig.Lanes.prefillFn(&p.r[0], &s0);
++    try rig.Lanes.prefillFn(&p.r[1], &s1);
++    rig.Lanes.releaseFn(&p.r[0], &s0);
++    rig.Lanes.releaseFn(&p.r[1], &s1);
++    try p.sink.take(&p.r[1]);
++    try testing.expect(w.point != null);
++    try p.settle();
++    const key = pointKeyOf(pa.keyed[0..at], pa.media);
++    try testing.expect(p.lead0().side.store.presence(key));
++    try testing.expect(!p.fol.?.side.store.presence(key));
++    try testing.expectEqual(@as(u64, 1), p.fol.?.skipped);
++    try testing.expectEqual(@as(u64, 1), p.fol.?.side.pictures_refused);
++    try p.evict(w.saved.?);
++    try testing.expectError(error.SpillNotOnEveryRank, p.restoreMedia(pa.keyed, true, pa.media));
++    try testing.expect(!p.lead0().side.store.presence(key)); // (every rank forgot it)
++}
++
++const Hook = struct {
++    p: *rig.Pair,
++    pa: *const Pics,
++    saved: ?*anyopaque = null,
++    point: ?u64 = null,
++    fn at(ptr: *anyopaque, s: *lanes.Stream, mark: u32) void {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        const saved = h.p.hooks.save(h.p.hooks.ptr, null, mark) catch return;
++        h.saved = saved;
++        h.point = h.p.lead0().keep(.{ .saved = saved, .key = h.pa.keyed[0..mark], .at = mark, .group = 1, .images = true, .media = h.pa.media, .raw = s.prompt() });
++    }
++};
++
++test "pictures: the image cache off (TF_GLM_IMAGE_CACHE=0) writes no picture point and finds none; a follower with it off skips the note; a text point is unchanged" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    var s = rig.Pair.settingsFor(1);
++    s.image_cache = false;
++    try p.init(gpa, "picoff", s);
++    defer p.deinit();
++    var pa = try Pics.init(gpa, 2200, 41, &.{.{ 300, 400 }}, &.{digestOf("a")});
++    defer pa.deinit();
++    const k = try p.keepPictures(pa.raw, pa.keyed, pa.media, at, 1);
++    try testing.expect(k.point == null);
++    try testing.expectEqual(@as(u64, 1), p.lead0().side.pictures_refused);
++    try testing.expect(p.lead0().lookupMedia(pa.keyed, 0, 2199, &.{}, 0, true, pa.media) == null);
++    try testing.expectEqual(@as(u64, 2), p.lead0().side.pictures_refused);
++    // a cut before every picture is a text point: written as before, its key without pictures
++    const t = try p.keepPictures(pa.raw, pa.keyed, pa.media, 256, 2);
++    try testing.expectEqual(tier.pointId(pointKeyOf(pa.raw[0..256], &.{})), t.point.?);
++    try p.settle();
++    try testing.expect(p.fol.?.side.store.presence(pointKeyOf(pa.raw[0..256], &.{})));
++    // rank 0 on, rank 1 off (the fingerprints keep this from pairing; the follower still refuses): a skipped note
++    p.lead0().image_cache = true;
++    p.fol.?.image_cache = false;
++    const k2 = try p.keepPictures(pa.raw, pa.keyed, pa.media, at, 3);
++    try testing.expect(k2.point != null);
++    try p.settle();
++    try testing.expect(!p.fol.?.side.store.presence(pointKeyOf(pa.keyed[0..at], pa.media)));
++    try testing.expectEqual(@as(u64, 1), p.fol.?.side.pictures_refused);
++}
++
++test "TF_GLM_KV_SHARD: picture points are written under each rank's view of their home part (the lineage salted with it), the same pictures kept from the other part name other blocks, and each restores into its home exactly" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-pictures", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var pa = try Pics.init(gpa, 2200, 71, &.{ .{ 300, 400 }, .{ 2050, 100 } }, &.{ digestOf("a"), digestOf("b") });
++    defer pa.deinit();
++    var pb = try Pics.init(gpa, 2200, 72, &.{.{ 500, 200 }}, &.{digestOf("c")});
++    defer pb.deinit();
++    // a kept in part 0 (an empty pool), b in part 1 (part 0 taken by another stream meanwhile)
++    const ka = try p.keepPictures(pa.raw, pa.keyed, pa.media, at, 1);
++    try p.settle();
++    const other = try p.occupy(0, rig.pool_rows / 2);
++    const kb = try p.keepPictures(pb.raw, pb.keyed, pb.media, at, 2);
++    try p.settle();
++    try p.vacate(other);
++    const keys = [2]format.Digest{ pointKeyOf(pa.keyed[0..at], pa.media), pointKeyOf(pb.keyed[0..at], pb.media) };
++    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
++        try testing.expectEqual(@as(?u32, 0), side.store.partOf(keys[0]).?.part);
++        try testing.expectEqual(@as(?u32, 1), side.store.partOf(keys[1]).?.part);
++        try testing.expectEqual(@as(u64, 2), side.pictures_kept);
++    }
++    try testing.expectEqual(@as(u64, 0), p.fol.?.skipped);
++    var originals: [2][2][]u8 = undefined; // [point][rank]
++    for ([2]*anyopaque{ ka.saved, kb.saved }, 0..) |sv, i| for (0..2) |r| {
++        const snap = try p.snapOn(r, sv);
++        try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
++        originals[i][r] = try gpa.dupe(u8, HostEngine.bytesOf(snap));
++    };
++    defer for (originals) |o| for (o) |x| gpa.free(x);
++    try p.evict(ka.saved);
++    try p.evict(kb.saved);
++    for ([_]*const Pics{ &pa, &pb }, 0..) |q, i| {
++        const r = try p.restoreMedia(q.keyed, true, q.media);
++        try testing.expect(r == .ready);
++        for (0..2) |rank| {
++            const snap = try p.snapOn(rank, r.ready.saved);
++            try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
++            try testing.expect(HostEngine.same(&p.layouts[rank], snap.sec, originals[i][rank], HostEngine.bytesOf(snap)));
++        }
++        const firsts = try p.resumeBoth(q.raw, r.ready.saved, at);
++        try testing.expectEqual(HostEngine.first(q.raw), firsts[0]);
++        try testing.expectEqual(HostEngine.first(q.raw), firsts[1]);
++    }
++    for (&p.e) |*e| try testing.expectEqual(@as(usize, 0), e.carries);
++    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
++}
++
++test "TF_GLM_KV_SHARD: a restored picture state whose home part has no room resumes carried into the other part, exactly on both ranks" {
++    const gpa = testing.allocator;
++    var p: rig.Pair = undefined;
++    try p.initWith(gpa, "shard-piccarry", rig.Pair.settingsFor(1), .{ .sharded = true });
++    defer p.deinit();
++    var pa = try Pics.init(gpa, 2200, 73, &.{.{ 300, 400 }}, &.{digestOf("a")});
++    defer pa.deinit();
++    const k = try p.keepPictures(pa.raw, pa.keyed, pa.media, at, 1);
++    try p.settle();
++    try p.evict(k.saved);
++    const full = try p.occupy(0, rig.pool_rows / 2);
++    const r = try p.restoreMedia(pa.keyed, true, pa.media);
++    try testing.expect(r == .ready);
++    try testing.expectEqual(@as(?u8, 0), (try p.snapOn(0, r.ready.saved)).home);
++    const firsts = try p.resumeBoth(pa.raw, r.ready.saved, at);
++    try testing.expectEqual(HostEngine.first(pa.raw), firsts[0]);
++    try testing.expectEqual(HostEngine.first(pa.raw), firsts[1]);
++    for (&p.e) |*e| {
++        try testing.expectEqual(@as(usize, 1), e.carries);
++        try testing.expectEqual(e.resumed, e.exact);
++    }
++    try p.vacate(full);
++    try testing.expectEqual(p.e[0].pool.?.digest(), p.e[1].pool.?.digest());
++}
+diff --git a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+index 370552d4972941e63c077827130550f7271f9ca6..e9a6cfdcd6cb14a14cec0ebe094c46815bbe6fe6 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_tier_rig.zig
+@@ -533,16 +533,31 @@ pub const Pair = struct {
+         return first;
+     }
+ 
++    /// A pass of the model ids `raw` on both ranks keeping its state at `mark` as a prompt with pictures: the prompt
++    /// cache's write carries the content key `keyed`, every picture's identity `media` and `raw` (Tier.keep's
++    /// images/media/raw). Rank 0's kept state and its point's id (null: not written).
++    pub fn keepPictures(p: *Pair, raw: []const u32, keyed: []const u32, media: []const format.Media, mark: u32, group: u64) !struct { saved: *anyopaque, point: ?u64 } {
++        var w: Writer = .{ .p = p, .group = group, .keyed = keyed, .media = media, .pictures = true };
++        _ = try p.passBoth(raw, &.{mark}, .{ .ptr = &w, .at = Writer.at }, null);
++        return .{ .saved = w.saved orelse return error.TestNothingKept, .point = w.point };
++    }
++
+     const Writer = struct {
+         p: *Pair,
+         group: u64,
+         saved: ?*anyopaque = null,
+         point: ?u64 = null,
++        keyed: []const u32 = &.{},
++        media: []const format.Media = &.{},
++        pictures: bool = false,
+         fn at(ptr: *anyopaque, s: *lanes.Stream, mark: u32) void {
+             const w: *Writer = @ptrCast(@alignCast(ptr));
+             const saved = w.p.hooks.save(w.p.hooks.ptr, null, mark) catch return;
+             w.saved = saved;
+-            w.point = w.p.lead0().keep(.{ .saved = saved, .key = s.prompt()[0..mark], .at = mark, .group = w.group });
++            w.point = if (w.pictures)
++                w.p.lead0().keep(.{ .saved = saved, .key = w.keyed[0..mark], .at = mark, .group = w.group, .images = true, .media = w.media, .raw = s.prompt() })
++            else
++                w.p.lead0().keep(.{ .saved = saved, .key = s.prompt()[0..mark], .at = mark, .group = w.group });
+         }
+     };
+ 
+@@ -598,8 +613,13 @@ pub const Pair = struct {
+ 
+     /// A restore of the longest point `prompt` extends, polled to its end; rank 1 hears every note on the way.
+     pub fn restore(p: *Pair, prompt: []const u32) !tier.Poll {
++        return p.restoreMedia(prompt, false, &.{});
++    }
++
++    /// `restore` of a key with pictures (`images`, their identities `media`: Want.images/media).
++    pub fn restoreMedia(p: *Pair, prompt: []const u32, images: bool, media: []const format.Media) !tier.Poll {
+         const l = p.lead0();
+-        const pt = l.lookup(prompt, 0, @intCast(prompt.len - 1), &.{}, 0) orelse return error.TestNoPoint;
++        const pt = l.lookupMedia(prompt, 0, @intCast(prompt.len - 1), &.{}, 0, images, media) orelse return error.TestNoPoint;
+         const job = try l.begin(pt.id, pt.at, pt.shared);
+         try p.sink.take(&p.r[1]);
+         var i: usize = 0;
+diff --git a/zig/src/families/glm_cuda/cuda_spill_wire.zig b/zig/src/families/glm_cuda/cuda_spill_wire.zig
+index 8ca9e71d152efd97ef87e2d7c5635bda90a26a23..4d8eed96074af885beddbdec62ea2ce4270ff935 100644
+--- a/zig/src/families/glm_cuda/cuda_spill_wire.zig
++++ b/zig/src/families/glm_cuda/cuda_spill_wire.zig
+@@ -12,6 +12,9 @@
+ //! A message is op u8, then its fields in this order, little endian, no padding, nothing after it:
+ //!   keep      kept u64, at u32, point [32], group u64, shared u8, root [16], part opt u32, forks (u32 count, then
+ //!             name [16] and at u32 each), origin opt (key [32], at u32)
++//!   keep_pictures   a keep's fields, then its pictures: u32 count (1..max_note_media), each start u32, len u32,
++//!             SHA-256 [32] (in order, not overlapping, starting before `at`), then placeholder u32 (a model id): a
++//!             point with pictures before its cut (a text point's keep is `keep`, its bytes unchanged)
+ //!   begin     txn u64, kept u64, point [32], at u32, blocks u32
+ //!   progress  txn u64, upto u32
+ //!   cancel    txn u64, why u8 (Failure), forget u8
+@@ -35,7 +38,8 @@ pub const Digest = [32]u8;
+ /// before: points_part0/1), which only ranks of two builds could disagree on, and two builds pair only under forced
+ /// identity exports (TF_GLM_ENGINE_ID and TF_GLM_RECIPE_PATCHES are in the fingerprint; the recipe's differ per build).
+ /// The version is in every store's namespace too: at 1, spill v2 alone's stays ef6eb5b0's under the same identity
+-/// exports (gpu-validation SA1).
++/// exports (gpu-validation SA1). Pictures' `keep_pictures` is a new op beside `keep`, not a bump: a text keep's bytes
++/// are unchanged, and only ranks of two builds (forced identity exports, as above) could disagree on it.
+ pub const version: u16 = 1;
+ 
+ pub const Op = enum(u8) {
+@@ -49,6 +53,7 @@ pub const Op = enum(u8) {
+     forget = 7, // drop the point, published or queued
+     pump = 8, // rank 0 staged its queued writes for `budget_ns`: stage this rank's as long
+     flush = 9, // a clean stop: stage and drain this rank's writes within `budget_ns`
++    keep_pictures = 10, // `keep` of a point with pictures before its cut: its pictures and the placeholder follow
+     // asks
+     has = 16, // does this rank hold every block of the point, published?
+     validate = 17, // did this rank's copies of restore `txn` pass their checks?
+@@ -103,6 +108,10 @@ pub const Keep = struct {
+     /// the store's lineage of the write (its forks live in the decode arena)
+     lineage: format.Lineage,
+     origin: ?format.Origin = null,
++    /// the point's pictures (those starting before `at`, in order; empty: a text point, sent as `keep`) and the model
++    /// id their rows hold: the follower rebuilds rank 0's keyed and raw ids from its own model ids with them
++    media: []const format.Media = &.{},
++    placeholder: u32 = 0,
+ };
+ pub const Begin = struct { txn: u64, kept: u64, point: Digest, at: u32, blocks: u32 };
+ pub const Progress = struct { txn: u64, upto: u32 };
+@@ -149,6 +158,11 @@ pub const max_world = 4;
+ 
+ /// A forks count past this is refused (core/spill format.Limits' default).
+ pub const max_forks = 4096;
++/// A keep's pictures past this are refused (encode: TooManyPictures; decode: BadMessage); the tier writes no point
++/// with more (the DeepSeek port's max_keep_media).
++pub const max_note_media = 256;
++/// One picture's bytes in `keep_pictures`.
++const media_entry_bytes = 4 + 4 + 32;
+ /// `has`: its blocks word's bit 31, set when a part follows (no point has 2^31 blocks).
+ const has_part: u32 = 1 << 31;
+ 
+@@ -174,7 +188,9 @@ const Out = struct {
+ /// `m`'s bytes, appended to `list`.
+ pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
+     const o: Out = .{ .list = list, .gpa = gpa };
+-    try o.int(u8, @backingInt(m.op()));
++    const pictures = m == .keep and m.keep.media.len > 0;
++    if (pictures) if (m.keep.media.len > max_note_media) return error.TooManyPictures;
++    try o.int(u8, @backingInt(if (pictures) Op.keep_pictures else m.op()));
+     switch (m) {
+         .keep => |k| {
+             if (k.lineage.forks.len > max_forks) return error.TooManyForks;
+@@ -196,6 +212,15 @@ pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
+                 try o.bytes(&g.key);
+                 try o.int(u32, g.at);
+             }
++            if (pictures) {
++                try o.int(u32, @intCast(k.media.len));
++                for (k.media) |md| {
++                    try o.int(u32, md.start);
++                    try o.int(u32, md.len);
++                    try o.bytes(&md.digest);
++                }
++                try o.int(u32, k.placeholder);
++            }
+         },
+         .begin => |b| {
+             try o.int(u64, b.txn);
+@@ -268,7 +293,7 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
+     var i: In = .{ .bytes = bytes };
+     const op: Op = @fromBackingInt(try i.int(u8));
+     const m: Msg = switch (op) {
+-        .keep => blk: {
++        .keep, .keep_pictures => blk: {
+             var k: Keep = .{ .kept = try i.int(u64), .at = try i.end(), .point = try i.fixed(32), .group = try i.int(u64), .shared = try i.flag(), .lineage = .{ .root = try i.fixed(16) } };
+             if (try i.flag()) k.lineage.part = try i.int(u32);
+             const n = try i.int(u32);
+@@ -278,6 +303,22 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
+             for (forks) |*f| f.* = .{ .name = try i.fixed(16), .at = try i.int(u32) };
+             k.lineage.forks = forks;
+             if (try i.flag()) k.origin = .{ .key = try i.fixed(32), .at = try i.int(u32) };
++            if (op == .keep_pictures) {
++                const np = try i.int(u32);
++                if (np == 0 or np > max_note_media) return error.BadMessage;
++                if (np > (bytes.len - i.at) / media_entry_bytes) return error.ShortMessage;
++                const media = try arena.alloc(format.Media, np);
++                var end: u64 = 0;
++                for (media) |*md| {
++                    md.* = .{ .start = try i.int(u32), .len = try i.int(u32), .digest = try i.fixed(32) };
++                    // in order, not overlapping, not empty, each starting before the cut
++                    if (md.len == 0 or md.start < end or md.start >= k.at) return error.BadMessage;
++                    end = @as(u64, md.start) + md.len;
++                }
++                k.media = media;
++                k.placeholder = try i.int(u32);
++                if (k.placeholder >= format.picture_ids) return error.BadMessage;
++            }
+             break :blk .{ .keep = k };
+         },
+         .begin => .{ .begin = .{ .txn = try i.int(u64), .kept = try i.int(u64), .point = try i.fixed(32), .at = try i.end(), .blocks = try i.end() } },
+@@ -443,6 +484,74 @@ test "every message survives its bytes, a cut or longer one is refused, and only
+     try std.testing.expectEqual(@as(?usize, null), (Msg{ .keep = keep }).width());
+ }
+ 
++test "keep_pictures: a point's pictures and placeholder survive their bytes; a text keep is `keep`, byte for byte; 257 pictures and bad spans are refused" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const media = [_]format.Media{ .{ .start = 3, .len = 4, .digest = @splat(7) }, .{ .start = 100, .len = 64, .digest = @splat(9) } };
++    const keep: Keep = .{ .kept = 7, .at = 128, .point = @splat(3), .group = 2, .shared = false, .lineage = .{ .root = @splat(1) }, .media = &media, .placeholder = 154854 };
++    const k = (try roundTrip(a, .{ .keep = keep })).keep;
++    try std.testing.expectEqual(@as(usize, 2), k.media.len);
++    try std.testing.expect(k.media[0].eql(media[0]) and k.media[1].eql(media[1])); // (the second straddles the cut)
++    try std.testing.expectEqual(@as(u32, 154854), k.placeholder);
++    var list: std.ArrayList(u8) = .empty;
++    defer list.deinit(gpa);
++    try encode(&list, gpa, .{ .keep = keep });
++    try std.testing.expectEqual(@as(u8, @backingInt(Op.keep_pictures)), list.items[0]);
++    // the same keep without pictures is `keep`, and its bytes are the pictures' prefix
++    var text = keep;
++    text.media = &.{};
++    var plain: std.ArrayList(u8) = .empty;
++    defer plain.deinit(gpa);
++    try encode(&plain, gpa, .{ .keep = text });
++    try std.testing.expectEqual(@as(u8, @backingInt(Op.keep)), plain.items[0]);
++    try std.testing.expectEqualSlices(u8, plain.items[1..], list.items[1..plain.items.len]);
++    try std.testing.expectEqual(plain.items.len + 4 + 2 * 40 + 4, list.items.len);
++    // a `keep` with picture bytes behind it is refused (they are trailing bytes there)
++    list.items[0] = @backingInt(Op.keep);
++    try std.testing.expectError(error.TrailingBytes, decode(a, list.items));
++    list.items[0] = @backingInt(Op.keep_pictures);
++    // bad pictures: none, out of order, overlapping, past the cut, empty, a placeholder above the model's ids
++    const base = plain.items.len;
++    const Bad = struct { fn put(l: []u8, at: usize, v: u32) void {
++        std.mem.writeInt(u32, l[at..][0..4], v, .little);
++    } };
++    const bad = try gpa.dupe(u8, list.items);
++    defer gpa.free(bad);
++    Bad.put(bad, base, 0);
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, base + 4 + 40, 2); // the second starts before the first
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, base + 4 + 40, 5); // inside the first (3..7)
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, base + 4 + 40, 128); // at the cut
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, base + 4 + 4, 0); // empty
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, bad.len - 4, format.picture_ids);
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    @memcpy(bad, list.items);
++    Bad.put(bad, base, 1_000_000); // a count past what the bytes hold
++    try std.testing.expectError(error.BadMessage, decode(a, bad));
++    Bad.put(bad, base, 3);
++    try std.testing.expectError(error.ShortMessage, decode(a, bad));
++    // 256 pictures go, 257 do not
++    var many: [max_note_media + 1]format.Media = undefined;
++    for (&many, 0..) |*md, i| md.* = .{ .start = @intCast(i), .len = 1, .digest = @splat(1) };
++    var wide = keep;
++    wide.at = 4096;
++    wide.media = many[0..max_note_media];
++    try std.testing.expectEqual(@as(usize, max_note_media), (try roundTrip(a, .{ .keep = wide })).keep.media.len);
++    wide.media = &many;
++    try std.testing.expectError(error.TooManyPictures, encode(&list, gpa, .{ .keep = wide }));
++}
++
+ test "the message layout is the documented one, and bad values are refused" {
+     const gpa = std.testing.allocator;
+     var list: std.ArrayList(u8) = .empty;
