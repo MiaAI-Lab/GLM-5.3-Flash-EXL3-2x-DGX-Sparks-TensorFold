@@ -1,4 +1,4 @@
-# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1571e7dfdd29..3155e0ea134a); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 1571e7dfdd29..3155e0ea134a); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: a sampled row with no top_p cut and no min_p draws by a GPU race over every token (TF_GLM_NUCLEUS_RACE, default on)
 
 With top_p 1 (what most chat clients send) no first pass of 1024 candidates covers the nucleus, so every sampled row,

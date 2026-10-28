@@ -1,4 +1,4 @@
-# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f190863a4e08..6cc5c62a69ae); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits f190863a4e08..6cc5c62a69ae); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: the ranks agree on TF_GLM_NUCLEUS_RACE with TENSORFOLD_NUCLEUS_UNION (one word, bit 1)
 
 The race, like the union test, changes which collectives a draw issues; a rank with it off would wait on a different

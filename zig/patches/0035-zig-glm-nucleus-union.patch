@@ -1,4 +1,4 @@
-# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3155e0ea134a..f190863a4e08); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3155e0ea134a..f190863a4e08); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: read TENSORFOLD_NUCLEUS_UNION so top_p draws stop falling back to whole-shard sorts
 
 From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold#228 (patch 0024 there), by Hector Isaza (hecisaza), applied

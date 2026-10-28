@@ -1,9 +1,11 @@
-# port-patches.sh: glm/r8b @ 70fd9f5b8d6d over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3c8b05d8bbb7..70fd9f5b8d6d); regenerate with scripts/port-patches.sh, do not edit
+# port-patches.sh: glm/r8b @ cf4dde927470 over glm/zig-engine-fixes-on-186 @ e027c49cd06d (commits 3c8b05d8bbb7..cf4dde927470); regenerate with scripts/port-patches.sh, do not edit
 glm_cuda: several prompts' prefill chunks in one forward (TF_GLM_MULTI_PREFILL=2, with TF_GLM_FILL=1; default 0, as today)
 
 Commits:
 - glm_cuda: TF_GLM_MULTI_PREFILL=2 runs several waiting prompts' next chunks in ONE forward
 - glm_cuda: batched fills: origins slots up to 40, zeroed gap rows, true rows left, capped fallback
+- glm_cuda: the TF_GLM_MULTI_PREFILL=2 startup line says what a step does under TF_GLM_KV_SHARD
+- glm_cuda: the refusal for a bad TF_GLM_MULTI_PREFILL names =2 among the values it takes
 
 Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo).
 Apply from the checkout root with: git apply 0038-zig-glm-batched-fill.patch
@@ -73,18 +75,19 @@ index 836cd26f4b4d0802e1af59b295ae490ecdd2b53d..d5ef543c71018494671be04b9c5329d5
      var prng = std.Random.DefaultPrng.init(0x64);
      const rnd = prng.random();
 diff --git a/zig/src/families/glm_cuda/cuda_engine.zig b/zig/src/families/glm_cuda/cuda_engine.zig
-index 6000ab7ac49baf1dc26945d0632dab72b40548cf..05215678a77ffc8c9234adaad12743a639740fbc 100644
+index 6000ab7ac49baf1dc26945d0632dab72b40548cf..718ac055dd63c727a566f7f998479183f932f339 100644
 --- a/zig/src/families/glm_cuda/cuda_engine.zig
 +++ b/zig/src/families/glm_cuda/cuda_engine.zig
-@@ -27,6 +27,7 @@ const mirror = @import("cuda_mirror.zig");
+@@ -27,6 +27,8 @@ const mirror = @import("cuda_mirror.zig");
  const ops = @import("cuda_torch_ops.zig");
  const prefill_mod = @import("cuda_prefill.zig");
  const prefill_loop = @import("cuda_prefill_loop.zig");
 +const many = @import("cuda_prefill_many.zig");
++const fill_pick = @import("cuda_fill_pick.zig");
  const draft_pkg = @import("cuda_dflash_package.zig");
  const dflash = @import("cuda_dflash.zig");
  const dflash_config = @import("cuda_dflash_config.zig");
-@@ -978,23 +979,38 @@ pub const Engine = struct {
+@@ -978,23 +980,38 @@ pub const Engine = struct {
                  e.prompt_tokens = &.{};
              }
              _ = try prefill_loop.chunkAt(&e.pe, &st.cur, .{ .tokens = fl.ids[0..r.end], .begin = r.begin, .limit = e.prefill_rows, .head = r.head, .tap_ctx = e, .on_taps = promptTaps }, ch.pos, ch.rows);
@@ -139,7 +142,7 @@ index 6000ab7ac49baf1dc26945d0632dab72b40548cf..05215678a77ffc8c9234adaad12743a6
          fl.done = true;
          if (!fl.plan.draws) return true;
          st.pos = fl.prompt.len;
-@@ -1007,6 +1023,83 @@ pub const Engine = struct {
+@@ -1007,6 +1024,82 @@ pub const Engine = struct {
          return true;
      }
  
@@ -149,28 +152,27 @@ index 6000ab7ac49baf1dc26945d0632dab72b40548cf..05215678a77ffc8c9234adaad12743a6
 +        return if (fl.cursor.step == 0) fl.plan.runs[fl.cursor.run].begin else fl.cursor.pos;
 +    }
 +
-+    /// Fills a step runs when they cannot share a forward (turn-taking's default most).
-+    const turn_most = 2;
-+
 +    /// TF_GLM_MULTI_PREFILL=2: the next chunks of `fls` (in the order given) in ONE forward where they fit (recipe patches
 +    /// 0049 / 0062: cuda_prefill.Engine.chunkMany over cuda_prefill_many's layout: the chunk's rows hold them back to
 +    /// back, one that does not fit waits for a later step, `ran` false). Each fill's chunk is the one it would run alone
 +    /// (same rows, position, head and keep), so what it computes is its own; its keep and first token follow as alone.
 +    /// `done[i]`: fill i's pass is in. One piece, or an engine that cannot share (pictures, the sharded KV, an observer):
-+    /// each fill's chunk runs on its own, in order, as fillStep runs it.
++    /// a chunk each of the first fill_pick.fallback_most, in order, as fillStep runs it.
 +    pub fn fillStepMany(e: *Engine, fls: []const *Fill, ran: []bool, done: []bool) !void {
 +        const cap = 64;
 +        if (ran.len != fls.len or done.len != fls.len or fls.len > cap) return error.BadFills;
 +        @memset(ran, false);
 +        @memset(done, false);
-+        if (!e.pe.manyOk()) {
-+            // a chunk each of the first few (turn-taking's default most): not 8 x a whole chunk between decode rounds
-+            const n = @min(fls.len, turn_most);
-+            for (fls[0..n], ran[0..n], done[0..n]) |fl, *r, *d| {
-+                r.* = true;
-+                d.* = try e.passChunk(fl);
-+            }
-+            return;
++        switch (fill_pick.batched(fls.len, !e.pe.manyOk())) {
++            .shared => {},
++            .turns => |n| {
++                // a chunk each of the first few: not 8 x a whole chunk between decode rounds
++                for (fls[0..n], ran[0..n], done[0..n]) |fl, *r, *d| {
++                    r.* = true;
++                    d.* = try e.passChunk(fl);
++                }
++                return;
++            },
 +        }
 +        var chs: [cap]?prefill_loop.Chunk = undefined;
 +        var wants: [cap]usize = undefined;
@@ -224,10 +226,10 @@ index 6000ab7ac49baf1dc26945d0632dab72b40548cf..05215678a77ffc8c9234adaad12743a6
  
      /// This engine's state buffer for `at` tokens: rows, rings, recurrent states and (with drafts) DFlash2's rings.
 diff --git a/zig/src/families/glm_cuda/cuda_fill_pick.zig b/zig/src/families/glm_cuda/cuda_fill_pick.zig
-index 31e1a7a47588267d38c1d562cb705539a318486f..354ab88f9be8d4d09c93e74e906def27310fc445 100644
+index 31e1a7a47588267d38c1d562cb705539a318486f..cf7ca1c9189224ac5248de3dd74a098dcad19aa1 100644
 --- a/zig/src/families/glm_cuda/cuda_fill_pick.zig
 +++ b/zig/src/families/glm_cuda/cuda_fill_pick.zig
-@@ -4,31 +4,66 @@
+@@ -4,31 +4,89 @@
  //! (orders and rows left are the same on every rank).
  const std = @import("std");
  
@@ -254,6 +256,17 @@ index 31e1a7a47588267d38c1d562cb705539a318486f..354ab88f9be8d4d09c93e74e906def27
 +/// A batched step's prompt left out this many steps in a row goes first (so a long prompt is not starved by short
 +/// ones that keep coming: they take the chunk's rows, it does not fit beside them).
 +pub const starved: u32 = 4;
++
++/// Prompts a batched step runs a chunk of, one forward each, where the engine cannot share a forward (fillStepMany).
++pub const fallback_most: usize = default_most;
++
++/// What a batched step does: `shared` prompts' chunks in ONE forward, or a chunk each of `turns` prompts in turn.
++pub const Batched = union(enum) { shared: usize, turns: usize };
++
++/// A batched step's choice for up to `most` prompts; `cannot_share`: the engine's prompt chunks cannot share a forward.
++pub fn batched(most: usize, cannot_share: bool) Batched {
++    return if (cannot_share) .{ .turns = @min(most, fallback_most) } else .{ .shared = most };
++}
 +
 +/// What TF_GLM_MULTI_PREFILL asks: `most` prompts a step (1: the oldest alone), and whether they share ONE forward
 +/// (`batch`, TF_GLM_MULTI_PREFILL=2: cuda_prefill_many) or take turns, a chunk each in separate forwards (=1).
@@ -286,6 +299,18 @@ index 31e1a7a47588267d38c1d562cb705539a318486f..354ab88f9be8d4d09c93e74e906def27
 +    return if (sliced) n else .{};
 +}
 +
++/// The startup line for the setting (`sharded`: TF_GLM_KV_SHARD=1, where =2 takes turns, as `batched` says).
++pub fn logStartup(rank: u32, s: Setting, sharded: bool) void {
++    if (!s.batch) {
++        if (s.most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ rank, s.most });
++        return;
++    }
++    switch (batched(s.most, sharded)) {
++        .shared => |n| std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=2: a step fills the next chunks of up to {d} waiting prompts in ONE forward (fewest rows left first, as many as the chunk's rows hold)", .{ rank, n }),
++        .turns => |n| std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=2 with TF_GLM_KV_SHARD=1: the sharded KV cannot share a forward, so a step fills a chunk of each of up to {d} waiting prompts, one forward each (fewest rows left first)", .{ rank, n }),
++    }
++}
++
 +/// A batched step's prompts (indices into `cands`, up to `most`, in `out`) in the order their chunks claim the forward's
 +/// rows (Python's `_group`): those left out `starved` steps first (oldest first), then the fewest rows left, the older on a
 +/// tie. A short prompt's first token does not wait behind a long one.
@@ -308,7 +333,7 @@ index 31e1a7a47588267d38c1d562cb705539a318486f..354ab88f9be8d4d09c93e74e906def27
  }
  
  /// Up to `most` of `cands` (indices into it) in `out`, by begin order (the chunks run oldest first).
-@@ -73,15 +108,37 @@ test "pick: the oldest, then the fewest rows left (the older on a tie), oldest f
+@@ -73,15 +131,48 @@ test "pick: the oldest, then the fewest rows left (the older on a tie), oldest f
      try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, pick(&c, 8, out[0..2]));
  }
  
@@ -355,6 +380,17 @@ index 31e1a7a47588267d38c1d562cb705539a318486f..354ab88f9be8d4d09c93e74e906def27
 +    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, order(&d, 2, &out));
 +    try std.testing.expectEqual(@as(usize, 0), order(&.{}, 8, &out).len);
 +    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, order(&c, 8, out[0..2]));
++}
++
++test "batched: up to most prompts share a forward; where they cannot, a forward each for two, whatever most is" {
++    try std.testing.expectEqual(Batched{ .shared = 8 }, batched(8, false));
++    try std.testing.expectEqual(Batched{ .shared = 3 }, batched(3, false));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(8, true));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(3, true));
++    try std.testing.expectEqual(Batched{ .turns = 2 }, batched(2, true));
++    const asked = try parse("2", null); // TF_GLM_MULTI_PREFILL=2 alone: most is 8, the line still says 2 turns under the shard
++    try std.testing.expectEqual(Batched{ .shared = asked.most }, batched(asked.most, false));
++    try std.testing.expectEqual(Batched{ .turns = fallback_most }, batched(asked.most, true));
 +}
 diff --git a/zig/src/families/glm_cuda/cuda_lanes.zig b/zig/src/families/glm_cuda/cuda_lanes.zig
 index bd0e0037df672a0699d8223245f252f880e5139d..a1a3db448020b1214251832bed8dd441a5376d90 100644
@@ -685,7 +721,7 @@ index bd0e0037df672a0699d8223245f252f880e5139d..a1a3db448020b1214251832bed8dd441
      const gpa = std.testing.allocator;
      var p: SlicedPair = undefined;
 diff --git a/zig/src/families/glm_cuda/cuda_native.zig b/zig/src/families/glm_cuda/cuda_native.zig
-index 52740c675957657989d8d40d621d05ad1801dd62..d9aef1bc1ea2ecd6a810823f9dcc416cdd399e81 100644
+index 52740c675957657989d8d40d621d05ad1801dd62..978a45be38db27cfe1adcb5d39921b4de0a3f208 100644
 --- a/zig/src/families/glm_cuda/cuda_native.zig
 +++ b/zig/src/families/glm_cuda/cuda_native.zig
 @@ -108,7 +108,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
@@ -705,20 +741,36 @@ index 52740c675957657989d8d40d621d05ad1801dd62..d9aef1bc1ea2ecd6a810823f9dcc416c
 -    if (fill_most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ o.rank, fill_most });
 +    own.serving.?.local.fill_most = fill_most.most;
 +    own.serving.?.local.fill_batch = fill_most.batch;
-+    if (fill_most.batch) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=2: a step fills the next chunks of up to {d} waiting prompts in ONE forward (fewest rows left first, as many as the chunk's rows hold)", .{ o.rank, fill_most.most }) else if (fill_most.most > 1) std.log.info("rank {d}: TF_GLM_MULTI_PREFILL=1: a step fills a chunk of each of up to {d} waiting prompts (the oldest, then the fewest rows left)", .{ o.rank, fill_most.most });
++    fill_pick.logStartup(o.rank, fill_most, kv_switches.on);
      if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
      const build_key = if (agreement == null) buildKey(gpa, io, dir, kernels, o) catch 0 else 0;
      var budget: u64 = 0;
-@@ -233,7 +234,7 @@ fn fillSetting() anyerror!bool {
- /// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head for every stream: a
- /// fill's chunks would absorb into it between other streams' drafts).
+@@ -230,13 +231,12 @@ fn fillSetting() anyerror!bool {
+     return error.BadFill;
+ }
+ 
+-/// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head for every stream: a
+-/// fill's chunks would absorb into it between other streams' drafts).
  /// TF_GLM_MULTI_PREFILL with TF_GLM_MULTI_PREFILL_MOST (cuda_fill_pick.parse): this rank's prompts a step, or its error.
 -fn multiSetting() anyerror!usize {
 +fn multiSetting() anyerror!fill_pick.Setting {
      return fill_pick.parse(envText("TF_GLM_MULTI_PREFILL"), envText("TF_GLM_MULTI_PREFILL_MOST"));
  }
  
-@@ -697,7 +698,7 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
++/// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head serves every stream).
+ fn fillAdmit(read: anyerror!bool, o: Options, choice: choice_mod.Choice) !bool {
+     const on = try read;
+     if (on and o.drafts and choice == .mtp) return error.FillWithMtp;
+@@ -254,7 +254,7 @@ pub fn refusal(err: anyerror) ?[]const u8 {
+     return shard.why(err) orelse identity.why(err) orelse switch (err) {
+         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+         error.BadFill => "TF_GLM_FILL: 1 (prompts fill a chunk a step between decode rounds) or 0 (whole passes), nothing else",
+-        error.BadMultiPrefill => "TF_GLM_MULTI_PREFILL: 1 (waiting prompts fill a chunk each a step, TF_GLM_MULTI_PREFILL_MOST of them, 2 to 8) or 0, nothing else",
++        error.BadMultiPrefill => "TF_GLM_MULTI_PREFILL: 1 (waiting prompts fill a chunk each a step, TF_GLM_MULTI_PREFILL_MOST of them, 2 to 8), 2 (their chunks share one forward, 8 by default) or 0, nothing else",
+         error.FillWithMtp => "TF_GLM_FILL=1 does not run with MTP drafts (one MTP head serves every stream); DFlash2 drafts or none",
+         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
+         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: spill v2 does not store the MTP head's state yet (MTP drafts keep prompt states in memory only; DFlash2 drafts or none)",
+@@ -697,7 +697,7 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
      const fill_words: []const u8 = if (fillSetting()) |on| (if (on) " fill=1" else "") else |_| " fill=unreadable";
      // TF_GLM_MULTI_PREFILL: its prompts a step with sliced fills on, or a rank that cannot read it (nothing otherwise)
      var multi_buf: [32]u8 = undefined;
@@ -727,7 +779,7 @@ index 52740c675957657989d8d40d621d05ad1801dd62..d9aef1bc1ea2ecd6a810823f9dcc416c
      return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}{s}{s}", .{
          display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words, fill_words, multi_words,
      });
-@@ -887,7 +888,7 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
+@@ -887,7 +887,7 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
      const before = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
      defer gpa.free(before);
      _ = TestEnv.setenv("TF_GLM_MULTI_PREFILL", "1", 1);
@@ -736,7 +788,7 @@ index 52740c675957657989d8d40d621d05ad1801dd62..d9aef1bc1ea2ecd6a810823f9dcc416c
      const no_fill = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
      defer gpa.free(no_fill);
      try std.testing.expectEqualStrings(before, no_fill); // the recipe's default MULTI_PREFILL=1 with FILL=0: as before
-@@ -896,11 +897,22 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
+@@ -896,16 +896,28 @@ test "TF_GLM_MULTI_PREFILL: in the settings text after fill=1 only when both are
      const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
      defer gpa.free(on);
      try std.testing.expect(std.mem.endsWith(u8, on, " fill=1 multi_prefill=3"));
@@ -760,6 +812,13 @@ index 52740c675957657989d8d40d621d05ad1801dd62..d9aef1bc1ea2ecd6a810823f9dcc416c
      try std.testing.expectError(error.BadMultiPrefill, multiSetting());
      const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
      defer gpa.free(bad);
+     try std.testing.expect(std.mem.endsWith(u8, bad, " multi_prefill=unreadable"));
+-    try std.testing.expect(refusal(error.BadMultiPrefill) != null);
++    const words = refusal(error.BadMultiPrefill).?;
++    for ([_][]const u8{ "1 (", "2 (", "or 0" }) |accepted| try std.testing.expect(std.mem.indexOf(u8, words, accepted) != null);
+ }
+ 
+ const TestEnv = struct {
 diff --git a/zig/src/families/glm_cuda/cuda_prefill.zig b/zig/src/families/glm_cuda/cuda_prefill.zig
 index 4a3e8b36957f175e95bd1cf2d1f5c15621fcfa20..fd40f8bb9ba2fcd7cc9386b02f0a8cb1a91a3e1f 100644
 --- a/zig/src/families/glm_cuda/cuda_prefill.zig
