@@ -5,6 +5,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The Anthropic frontend accepts what the cloud accepts** (patch `0130-anthropic-frontend-tolerances`, by
+  [Maciej Kowalik](https://github.com/koniaik)): three request shapes the cloud API takes and the frontend here
+  refused with a non-retryable 400 `invalid_request`, each ending a client's turn — a `context_management` edit
+  other than `clear_thinking_20251015` with `keep "all"` (a client that clears the earlier thinking when the user
+  sends a message mid-conversation sends the original `clear_thinking_20250929` with `keep "none"`), a system
+  turn not directly between a user and an assistant turn (a reminder injected right before the newest user
+  turn), and `thinking {"type": "enabled"}` with no `budget_tokens` (the server's own thinking budget now
+  applies, as an OpenAI request without `thinking_budget` already did). The DeepSeek-V4.1 recipe fixed the same
+  three (`0029`, `0030`, `0031`, all merged); this is that fix on the Python frontend. Anything else is still
+  refused: an edit whose type is not `clear_thinking_*`, turn-scoped `clear_at`, per-message `output_config`.
+  Tested on the pair: the three 400s go 200 on the patched image, a bogus edit type is still 400, and a Zcode
+  agent session (~300k tokens, cold prefill) through a Cloudflare tunnel completed in 3m24s with no reconnects.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
