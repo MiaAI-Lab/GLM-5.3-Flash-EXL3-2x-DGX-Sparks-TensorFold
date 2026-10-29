@@ -1,0 +1,63 @@
+# The Anthropic frontend accepts what the cloud accepts: any clear_thinking_* context edit with any keep,
+# a system turn anywhere in messages, and thinking enabled with no budget_tokens (the server's own thinking
+# budget then applies, as an OpenAI request without thinking_budget already does).
+# Three strict refusals, all 400 invalid_request ending a client's turn:
+#   - a client that clears the earlier thinking when the user sends a message mid-conversation sends the
+#     original clear_thinking_20250929 with keep "none" (the cloud accepts both dates and both keeps):
+#     "context_management supports clear_thinking with keep: all only"
+#   - a system reminder injected right before the newest user turn (the placement the cloud accepts):
+#     "mid-conversation system messages must follow a user turn and precede an assistant or end"
+#   - thinking {"type": "enabled"} with no budget_tokens: "thinking.budget_tokens must be positive and less
+#     than max_tokens" (the same asymmetry the DeepSeek-V4.1 recipe fixed in its 0029, by Maciej Kowalik)
+# The same three, fixed the same way, are that recipe's 0030 and 0031 (both merged). Turn-scoped clear_at
+# and per-message output_config are still refused. By Maciej Kowalik (koniaik).
+diff --git tensorfold/server/anthropic_translate.py tensorfold/server/anthropic_translate.py
+--- tensorfold/server/anthropic_translate.py
++++ tensorfold/server/anthropic_translate.py
+@@ -54,11 +54,9 @@
+             raise RequestError("message role must be user, assistant or system")
+         role = message["role"]
+         if role == "system":
+-            previous = value[index - 1] if index else {}
+-            following = value[index + 1] if index + 1 < len(value) else {"role": "assistant"}
+-            if (not isinstance(previous, dict) or previous.get("role") not in ("user", "system")
+-                    or not isinstance(following, dict) or following.get("role") not in ("assistant", "system")):
+-                raise RequestError("mid-conversation system messages must follow a user turn and precede an assistant or end")
++            # Anywhere in messages: a client that injects a system reminder before the newest user turn — the
++            # placement the cloud accepts — sent it right before a user turn and failed every mid-conversation
++            # message with a 400; the chat render takes a system-role message anywhere (fixed here).
+             if message.get("clear_at") not in (None, "never") or message.get("output_config"):
+                 raise RequestError("turn-scoped system messages and per-message output_config are unsupported")
+         content, calls, thoughts = [], [], []
+@@ -134,10 +132,13 @@
+             raise RequestError("stop_sequences must be an array of nonempty strings")
+         chat["stop"] = stops
+     context = body.get("context_management")
+-    # Claude Code keeps all thinking; the client supplies history and there is no stored context to edit.
++    # Any clear_thinking_<date> edit with any keep: the cloud accepts both dates and both keeps, and a client that
++    # clears the earlier thinking when the user sends a message mid-conversation sends the original
++    # clear_thinking_20250929 with keep "none" (fixed here after every such message failed with a 400).
+     if context is not None and (not isinstance(context, dict) or not isinstance(context.get("edits", []), list)
+-            or any(edit != {"type": "clear_thinking_20251015", "keep": "all"} for edit in context.get("edits", []))):
+-        raise RequestError("context_management supports clear_thinking with keep: all only")
++            or any(not isinstance(edit, dict) or not isinstance(edit.get("type"), str)
++                   or not edit["type"].startswith("clear_thinking_") for edit in context["edits"])):
++        raise RequestError("context_management supports clear_thinking edits only")
+     for field in ("container", "mcp_servers", "service_tier"):
+         if body.get(field) not in (None, [], "auto"):
+             raise RequestError(f"{field} is not supported by this server")
+@@ -200,9 +201,11 @@
+             chat["reasoning_effort"] = "none"
+         if thinking["type"] == "enabled":
+             budget = thinking.get("budget_tokens")
+-            if type(budget) is not int or budget <= 0 or (not count and budget >= body["max_tokens"]):
+-                raise RequestError("thinking.budget_tokens must be positive and less than max_tokens")
+-            chat["thinking_budget"] = budget
++            if budget is not None:
++                if type(budget) is not int or budget <= 0 or (not count and budget >= body["max_tokens"]):
++                    raise RequestError("thinking.budget_tokens must be positive and less than max_tokens")
++                chat["thinking_budget"] = budget
++            # absent: the server's own thinking budget applies, as an OpenAI request without thinking_budget
+     return chat
+ 
+ 
