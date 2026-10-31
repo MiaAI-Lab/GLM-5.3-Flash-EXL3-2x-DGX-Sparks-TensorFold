@@ -109,7 +109,7 @@ def test_cache_identity_is_keyed_on_the_agreed_settings():
 
 @pytest.mark.parametrize("name", CHOICES)
 def test_cache_identity_differs(tmp_path, switch, name):
-    from tensorfold.cuda.spill import SpillConfig, SpillStore
+    from tensorfold.cuda.spill import SpillConfig, SpillStore, unhold
 
     def folder(on):
         env = switch(name, on)
@@ -118,6 +118,7 @@ def test_cache_identity_differs(tmp_path, switch, name):
         sig = "|".join(["single", "build", "", "", "tp2", "[]", repr(agreed)])
         store = SpillStore(SpillConfig(str(tmp_path), 1.0, min_free_gib=0.0), rank=0, world=1, device="cpu",
                            signature=sig, weights="w", model_id="m", quiet=True)
+        unhold(getattr(store, "_held", None))           # main 0128: the store holds the folder's rank lock
         return store.compat
 
     off, on = folder(False), folder(True)

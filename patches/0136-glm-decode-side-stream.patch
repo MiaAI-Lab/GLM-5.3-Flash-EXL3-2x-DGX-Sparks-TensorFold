@@ -1,27 +1,5 @@
-# A decode window's MoE shared expert on a second stream beside the router, the expert selection and the routed EXL3
-# experts (TF_GLM_SIDE=1; off by default until measured on the Sparks):
-#
-# - forward.Buffers: decode buffers get a second CUDA stream with TF_GLM_SIDE=1 (prompt buffers none).
-# - forward.moe_block (decode windows, an EXL3 checkpoint's 4-bit shared expert, TF_GLM_DENSE=q4): the shared expert
-#   (gate/up, SwiGLU, down into b.sy) is queued on the side stream after everything the main stream has queued, the
-#   routed experts run on the main stream, and the main stream waits for the side before the combine reads b.sy. Both
-#   are stream-event edges under CUDA graph capture, joined inside the block. 4-bit matmuls keep no split-K scratch, so
-#   the two streams share no buffer; BF16 / FP8 shared experts (whose matmuls share b.sk) keep one stream.
-#
-# Every kernel gets the same arguments as on one stream: the same bits. Tested on one GB10 (tests/gpu/
-# test_decode_side_stream_gpu.py: the tiny checkpoint with an EXL3 MoE layer, decode windows of 1, 4 and 16 rows,
-# eager and replayed from a CUDA graph, logits equal to one stream's, the shared expert seen on the side stream).
-#
-# Measured on one GB10 (one MoE layer of a decode window, CUDA-graph replays, a rank's shapes, random routing): one /
-# two streams 281.0 / 262.9 us at 1 row (TP=2), 890.1 / 906.3 at 4, 2936.2 / 2907.8 at 16; TP=4 135.0 / 121.3,
-# 466.0 / 456.3, 1583.7 / 1521.7. Flash has 42 MoE layers a window.
-#
-# Provenance and credit: ported from the GLM-5.3 recipe's patch 0144 (Mia's AI Lab), which takes its idea (the key path
-# beside the query path, the shared expert beside the routed experts on a second stream in decode) from BertholomusAI
-# (Albert Lee)'s commit f14e7f7 (github.com/bertholomus/TensorFold, branch glm-dsa-tp4, Apache 2.0). Only the shared
-# expert's part is done here; no code of theirs.
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index dc7f510..93407f1 100644
+index f321342..1fccfdb 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -21,6 +21,16 @@ from .weights import LayerW, Weights
@@ -50,7 +28,7 @@ index dc7f510..93407f1 100644
  
      def set_taps(self, layers: tuple[int, ...], hidden: int) -> None:
          self.tap_at = {}
-@@ -791,13 +803,26 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
+@@ -940,13 +952,26 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
          # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
          from . import exl3_mm
  

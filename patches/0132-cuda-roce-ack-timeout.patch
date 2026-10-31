@@ -1,7 +1,3 @@
-# The RoCE all-gather's queue pairs wait for an ACK as NCCL does: timeout 20 (4.096 us x 2^20, ~4 s a try) instead of
-# b12x's 14 (~0.5 s in all over 7 retries), with TF_ROCE_IB_TIMEOUT (1-31) to override it. On the four-Spark ring a
-# momentary stall of one cable once failed an RDMA write and stopped the server while NCCL rode it out.
-# Ported from the GLM-5.3 recipe's patch 0155 (Mia's AI Lab).
 diff --git tensorfold/cuda/roce_proxy.c tensorfold/cuda/roce_proxy.c
 index fdcf1dc..b2c1501 100644
 --- tensorfold/cuda/roce_proxy.c

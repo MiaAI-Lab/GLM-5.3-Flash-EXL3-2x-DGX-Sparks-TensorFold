@@ -1,41 +1,5 @@
-# A prompt whose client left stops at its next chunk instead of filling to its end (TF_GLM_PROMPT_STOP):
-#
-# - Why: a single-stream prompt ran every chunk to the end before a reply's stop vote (0070's StopVote, one round after
-#   the first token) could end the request, so a dropped long prompt held both ranks for the whole prefill. Under
-#   --parallel only sliced fills (TF_GLM_FILL_BUDGET_MS>0) noticed a client that left while its prompt filled.
-# - Single stream: decode.PromptStop (this rank's wish: rank 0 polls the request's `cancelled`, other ranks never wish)
-#   and decode.PromptStopped. After each prompt chunk but the last, prefill() asks the vote: every rank all-gathers its
-#   wish as one int32 (one tiny collective a chunk, a chunk runs for seconds) and all stop when any rank wishes, so all
-#   ranks stop after the same chunk. Engine.prompt_stop carries it; GlmEngine._run_once sets it for the request
-#   (rank 0's `on_tokens.cancelled`), catches PromptStopped, leaves `live` as the prompt's rows before the stop, remembers
-#   the states kept on the way and reports `prompt_stopped`; generate() then raises RequestCancelled.
-# - decode.prompt_stop_on: TF_GLM_PROMPT_STOP = 1 (default) or 0 (every prompt fills to its end); other values are an
-#   error. It joins the ranks' startup comparison (the vote is a collective: ranks with different settings would hang).
-# - Multi-stream (--parallel): MultiDecoder._iterate polls every filling stream's `cancelled` before its next chunk, not
-#   only with TF_GLM_FILL_BUDGET_MS>0 (the sliced path already did): a stream whose client left ends at once; rank 0
-#   polls, the FINISH it sends makes both ranks drop it.
-#
-# What Flash already had: the sliced-fill cancellation poll in _iterate (kept; now unconditional), queued-request
-# cancellation in the scheduler (_cancel_waiting), the reply's StopVote in decode, and `feed.cancelled` on the single
-# stream's on_tokens (cuda/server.py). It had no stop inside a prompt on the single-stream path.
-#
-# Bits: a stop only ends the prefill after a whole chunk, so the committed rows are those of a prefix run of the
-# prompt in the same chunking, and a later prompt that extends it resumes from them as from any prefix state. Without a
-# wish, or with TF_GLM_PROMPT_STOP=0, every chunk runs as before (the vote reads no model state).
-#
-# Tests (CPU, tests/cpu/test_prompt_stop.py in the recipe): the setting; the vote across 2 / 3 / 4 ranks as threads
-# (any rank's wish, a broken poll never wishes, sticky); all ranks stop after the same chunk; committed rows equal a
-# prefix run's and resume a longer prompt exactly; no stop without a wish, on the last chunk or with the setting off;
-# _run_once and generate() report the stop and raise RequestCancelled; the startup comparison; and a real tiny model
-# on two gloo ranks (the chunk forward in Triton's interpreter) whose stopped caches equal a prefix run's bit for bit.
-# The scheduler half is in test_multi_quick_fills.py (a filling stream whose client left ends before its next chunk,
-# with and without sliced fills).
-#
-# Provenance and credit: ported from the GLM-5.3 recipe's patch 0168 (Mia's AI Lab), after upstream TensorFold's prompt
-# stop at chunk boundaries by Ash Hart (ashhart), commit 05dfb7b, Apache 2.0. The multi-rank prompt vote and the
-# scheduler's cancelled fills are our code.
 diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
-index 2e4b01e..9998a2e 100644
+index f9760db..1e74f97 100644
 --- tensorfold/families/glm5_next/cuda/decode.py
 +++ tensorfold/families/glm5_next/cuda/decode.py
 @@ -62,6 +62,58 @@ class StopVote:
@@ -97,7 +61,7 @@ index 2e4b01e..9998a2e 100644
  def stopped(e) -> bool:
      """Whether every rank agreed to end this run (``StopVote``); False outside a voting run."""
  
-@@ -200,6 +252,7 @@ class Engine:
+@@ -216,6 +268,7 @@ class Engine:
          self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
          self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
          self.vote: StopVote | None = None               # a serial run's stop vote, carried by each verify sample
@@ -105,7 +69,7 @@ index 2e4b01e..9998a2e 100644
          self.draft_n = w.head.n
          self.graphs = None
          self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
-@@ -581,10 +634,15 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+@@ -597,10 +650,15 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
          last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
      else:
          prof.active = True
@@ -126,10 +90,10 @@ index 2e4b01e..9998a2e 100644
      if not sample:
          return None
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 53878f3..1fc3089 100644
+index 78320c1..8cc953f 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -709,6 +709,9 @@ class GlmEngine:
+@@ -717,6 +717,9 @@ class GlmEngine:
                                   parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                   sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
                                   KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), int(MSA)] + prompt_arith_code(self.split)
@@ -139,7 +103,7 @@ index 53878f3..1fc3089 100644
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -721,7 +724,7 @@ class GlmEngine:
+@@ -733,7 +736,7 @@ class GlmEngine:
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_PROMPT_OWN_FRONT, "
                                 "TF_GLM_PROMPT_MICROBATCH*, "
@@ -148,7 +112,7 @@ index 53878f3..1fc3089 100644
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
                                 "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
-@@ -1363,8 +1366,8 @@ class GlmEngine:
+@@ -1412,8 +1415,8 @@ class GlmEngine:
      def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                    on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
                    feed=None, shared=()) -> dict[str, Any]:
@@ -159,7 +123,7 @@ index 53878f3..1fc3089 100644
          from .drafter_choice import DrafterChoice, auto_decode
  
          auto, use_mtp, use_dflash = self._drafters(code)
-@@ -1393,19 +1396,34 @@ class GlmEngine:
+@@ -1442,19 +1445,34 @@ class GlmEngine:
          if point is not None and point < len(prompt):
              stops.append(point)
          resume, kept = hit, []
@@ -207,7 +171,7 @@ index 53878f3..1fc3089 100644
          prefill_s = time.perf_counter() - t0
          if end:
              snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
-@@ -1553,6 +1571,10 @@ class GlmEngine:
+@@ -1602,6 +1620,10 @@ class GlmEngine:
              self._spill_wait()
          stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
                            shared)
@@ -219,10 +183,10 @@ index 53878f3..1fc3089 100644
          if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
              self.comm.check()
 diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
-index 775b2a5..ced0e68 100644
+index 7b6016b..3526cb9 100644
 --- tensorfold/families/glm5_next/cuda/multi.py
 +++ tensorfold/families/glm5_next/cuda/multi.py
-@@ -1689,16 +1689,17 @@ class MultiDecoder:
+@@ -2498,16 +2498,17 @@ class MultiDecoder:
          return self.lanes[s.sid]
  
      def _iterate(self) -> list[Stream]:

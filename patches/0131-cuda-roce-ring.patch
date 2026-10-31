@@ -1,8 +1,3 @@
-# The one-shot RoCE all-gather (COMM=roce) on four Sparks cabled as a ring without a switch (TF_ROCE_RING=1, set by
-# scripts/nodes.sh on a ring): each rank writes its shard to its two neighbours, whose proxies relay it to the rank
-# across the ring, half its stripes each way (roce_proxy.c ABI 6, roce_set_ring); the GPU kernel and the bits are
-# unchanged. roce.py: plan_routes(ring=True), the relayed peer listed; the engine's startup line names it.
-# Ported from the GLM-5.3 recipe's patch 0143 (Mia's AI Lab), on b12x's RoCEnante transport (local-inference-lab).
 diff --git tensorfold/cuda/roce.py tensorfold/cuda/roce.py
 index 4ee4ac0..add8498 100644
 --- tensorfold/cuda/roce.py
@@ -450,7 +445,7 @@ index d8ba88c..fdcf1dc 100644
          return 0;
      }
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 9ff932d..e93d9b9 100644
+index a263996..93a755e 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
 @@ -553,6 +553,8 @@ class GlmEngine:

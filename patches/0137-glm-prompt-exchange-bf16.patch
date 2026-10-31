@@ -1,29 +1,3 @@
-# A row-split prompt chunk's partials as bf16 (half the bytes), and the ring exchange's link all-gathers in place:
-#
-# - TF_GLM_PROMPT_PARTIALS=fp32|bf16 (default fp32 on every TP; opt-in, with TF_GLM_HC_SPLIT=1). bf16: each rank's
-#   partial of the peers' rows goes out as bf16 (p2p; staged in the all-gather buffer's unused part, also in a
-#   micro-batch half's region), and every rank's partial of a row is rounded to bf16 before the sum, which stays in fp32
-#   rank 0 first, then rounded to bf16 as before; the owner rounds its own partial as the others round theirs. An
-#   unsplit chunk (shorter than TF_GLM_HC_SPLIT_MIN_ROWS) and the all-gather exchange round the same way in hc_post
-#   (glue.hc_post / hc_post_pair / hc_post_ranks: round_parts; the kernel takes fp32 or bf16 partials), so a row's bits
-#   do not depend on the chunking, the exchange, the own-row front or the micro-batches. Decode windows, verify and the
-#   MTP head keep fp32 partials. The setting is in the ranks' startup comparison (SplitSettings.code).
-# - TF_NCCL_RING_INPLACE (default 1, with TF_NCCL_RING=1): the ring exchange's link all-gathers run in place (a rank
-#   packs what it sends into its own slot of the link's output, nothing zero-filled), each link's steps on its own
-#   stream, joined to the other link's only where relayed bytes pass; 0 keeps 0098's pack / all-gather / unpack steps.
-#   The same bytes arrive either way (0098's exchange is the same design as the GLM-5.3 recipe's 0142).
-#
-# Bits: bf16 partials change a prompt's bits once against fp32 (each partial rounded before the sum) and have not been
-# quality-checked on Flash, hence opt-in. fp32 is untouched: the kernel's fp32 path is the old arithmetic bit for bit.
-# The ring exchange moves bytes only: in place equals the steps byte for byte.
-#
-# Tests (CPU): tests/cpu/test_prompt_partials_bf16.py (the kernel against a torch reference: fp32 unchanged, rounded,
-# bf16; the settings; 2 / 3 / 4 ranks over gloo in the interpreter, p2p and all-gather: unsplit, split, micro-batch
-# halves, own-row front with layer-sliced halves leave the same bits, fp32 split == unsplit and differs from bf16, p2p
-# sends exactly half the partials' bytes less; the full matrix with TF_SLOW_TESTS=1) and tests/cpu/test_ring_inplace.py
-# (rings of 3 to 6 ranks, mixed dtypes and odd sizes: in place == the steps byte for byte, no local copy in place).
-#
-# Provenance and credit: ported from the GLM-5.3 recipe's patch 0153 (Mia's AI Lab) to Flash's hyper-connection glue.
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
 index d8ffcad..070329c 100644
 --- tensorfold/cuda/comm.py
@@ -144,23 +118,23 @@ index d8ffcad..070329c 100644
          main = torch.cuda.current_stream()
          for h in range(1, N // 2 + 1):
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index e513896..e5e4ef3 100644
+index 271a12f..c3b975a 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -716,7 +716,7 @@ class GlmEngine:
+@@ -728,7 +728,7 @@ class GlmEngine:
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
                                 "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
--                               "TF_GLM_MSA): "
-+                               "TF_GLM_PROMPT_PARTIALS, TF_GLM_MSA): "
+-                               "TF_GLM_DRAFT_PRELAUNCH, TF_GLM_KV_SHARD, TF_GLM_MSA): "
++                               "TF_GLM_DRAFT_PRELAUNCH, TF_GLM_KV_SHARD, TF_GLM_MSA, TF_GLM_PROMPT_PARTIALS): "
                                 f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                 "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                 "every rank the same flags")
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 93407f1..c27b66a 100644
+index 1fccfdb..33193d1 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -895,16 +895,21 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+@@ -1046,16 +1046,21 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
      c = w.cfg
      x = b.x[:R]
      h = layer.attn_hc
