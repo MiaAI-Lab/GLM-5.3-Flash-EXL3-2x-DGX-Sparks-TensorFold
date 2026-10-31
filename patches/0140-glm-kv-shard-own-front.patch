@@ -1,0 +1,50 @@
+# TF_GLM_KV_SHARD (patch 0129) on the own-row prompt front (patch 0134): a sharded stream's latents live on its owner
+# only, so the front writes them there and reaches the owner's rows through forward._sharded_attend. The own_front.py
+# hunk of wojo's kv-shard-tp4-exp 0118 (#152, by Robert Wojciechowski), unchanged. Inert without TF_GLM_KV_SHARD=1.
+diff --git tensorfold/families/glm5_next/cuda/own_front.py tensorfold/families/glm5_next/cuda/own_front.py
+index 0d7a9a5..158378e 100644
+--- tensorfold/families/glm5_next/cuda/own_front.py
++++ tensorfold/families/glm5_next/cuda/own_front.py
+@@ -153,19 +153,40 @@ def rest(layer, w, st, b, R: int, nch: int | None, host_pos: int, f: Front):
+     lc = st.kc[st.dsa_index[layer.index]]
+     pos_dev = st.pos_dev
+     HL = a.heads
++    # TF_GLM_KV_SHARD: the stream's latents live on its owner only (``lc`` None elsewhere), as in ``forward.dsa_rows``;
++    # a twin (rows borrowed in this rank's own part) attends locally, as unsharded
++    from . import shard
++
++    sharded = shard.ON and w.comm is not None and getattr(st, "twin_base", None) is None
+     # 4. every row: q_b on the other ranks' rows, the latent write, the queries
+     sp.wait(f.ev_rows)
+     with prof.timed("dsa: projections"):
+         for x, z in _others(R, f.lo, f.hi):
+             mm(b, b.qr[x:z], a.q_b, b.xs_qr[x:z], b.q[x:z].view(z - x, HL * c.qk_dim))
+     s = b.lat_s
+-    with prof.timed("dsa: latent write"):
+-        latent.latent_write(b.lat[:R], lc, pos_dev)
++    if not sharded or lc is not None:       # (sharded, not the owner: into its copy of the history below)
++        with prof.timed("dsa: latent write"):
++            latent.latent_write(b.lat[:R], lc, pos_dev)
+     with prof.timed("dsa: absorb"):
+         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=latent.PROMPT_MMA)
+     l2pf.site(layer.index, "o")
+     ol = s.ol[:R]
+     scale = c.qk_dim ** -0.5
++    if sharded:                             # every row's tokens from the shared pools, then the owner's rows fetched
++        from .forward import _sharded_attend
++
++        tokens = counts = None
++        if f.sparse_rows:
++            pools, tokens, counts = _lists(b)
++            sp.wait(f.ev_pools)
++            with prof.timed("dsa: select tokens"):
++                sparse.pool_tokens(pools[:R], pos_dev, tokens[:R], counts[:R])
++            tokens, counts = tokens[:R], counts[:R]
++        _sharded_attend(a, w, lc, pos_dev, b, R, nch, host_pos, slice(0, R), qa, ol, scale, f.all_sparse,
++                        f.sparse_rows, tokens, counts, shard.owner(st.base) if shard.HALF else -1)
++        with prof.timed("dsa: expand"):
++            o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=latent.PROMPT_MMA).view(R, HL * c.v_dim)
++        return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
+     if not f.all_sparse:
+         dense = dense_rows(c, R, host_pos) if f.sparse_rows else R
+         with prof.timed("dsa: dense attention"):
