@@ -95,6 +95,7 @@ def main():
         obj.waiting, obj.held, obj.boxes, obj.yields, obj.gather_s = ns["Waiting"](), None, {}, 0, 0
         # patch 0088's spill tier (off): its scheduler state
         obj.flushing, obj.flush_lock, obj.loading, obj.ready, obj.staged = None, threading.Lock(), [], [], set()
+        obj.prefix = []
         obj.max_in_system = None              # patch 0082's admission cap: off
         for _ in range(holders):
             stream = Stream([1], 100)
@@ -161,6 +162,59 @@ def main():
     cancelled_reply(thread, reply)
     assert obj.held is None and not obj.decoder.admitted
     checks.append("memory-held cancellation")
+
+    # A request held by NoRoom must not start its stored prompt's read again on every retry round: admit's own room
+    # making evicts the loaded state before it raises NoRoom, so each prestage would read it from the disk anew
+    # (6 reads in 6 rounds on stock code, 1 with the discard after admit). A prestage that read nothing (no room for
+    # the read yet) is looked for again, so the prompt is read once there is room.
+    class SpillDecoder(Decoder):
+        def __init__(self, no_room_for_read=0):
+            super().__init__()
+            self.can_admit, self.resident, self.reads, self.skip = False, False, 0, no_room_for_read
+
+        def prestage(self, stream):
+            if self.resident:
+                return None
+            if self.skip:
+                self.skip -= 1                           # (no room for the read: nothing read, the request waits)
+                return None
+            self.reads += 1
+            return object()
+
+        def step_loads(self):
+            pass                                         # (0128's block reads move their rows between rounds)
+
+        def load_ready(self, handle):
+            return True
+
+        def complete_load(self, handle):
+            self.resident = True
+
+        def admit(self, stream):
+            if not self.can_admit:
+                self.resident = False                    # (its room making evicted the state just loaded)
+                raise ns["NoRoom"]("no room in KV cache")
+            super().admit(stream)
+
+    for no_room_for_read, name in ((0, "repeated NoRoom does not re-read a held request's stored prompt"),
+                                   (1, "a prestage that read nothing is looked for again while the request waits")):
+        obj = scheduler()
+        obj.decoder = SpillDecoder(no_room_for_read)
+        thread, reply = ask(obj, lambda: False)
+        for _ in range(8):
+            obj._iteration()
+        assert obj.decoder.reads == 1 and obj.held is not None and not obj.decoder.admitted, obj.decoder.reads
+        obj.decoder.can_admit = True
+        obj._iteration()
+        assert obj.decoder.reads == 1 and obj.held is None
+        stream = next(iter(obj.decoder.streams.values()))
+        assert obj.decoder.admitted == [stream] and id(stream) not in obj.staged
+        stream.take([2])
+        stream.done = True
+        obj._iteration()
+        thread.join(2)
+        assert not thread.is_alive() and reply.get("stats") is not None
+        checks.append(name)
 
     obj = scheduler()
     thread, reply = ask(obj, lambda: True)

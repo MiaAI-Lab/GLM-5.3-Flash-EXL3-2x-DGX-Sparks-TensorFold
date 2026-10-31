@@ -1,0 +1,706 @@
+# The decode windows' latent attention chunk pass (latent._seg_chunks, in every DSA layer of a decode round) as a CUDA
+# kernel (seg_chunks.cu) that computes every chunk partial (o, m, l) with the Triton kernel's own instruction sequence,
+# read from its GPU IR / PTX: _tile's chains as patch 0106 reproduces them for _sparse_onepass, in _seg_chunks' kWidth-4
+# dot layout, and its p-sum tree over the permuted keys; tiles past a chunk's last key (Triton runs and masks them) are
+# skipped, a provable no-op. Triton's _merge reads the partials as before. Every output and every chunk partial is the
+# Triton kernel's bit for bit. FP8 arenas and 17-24 heads a rank only (TP=3's 22 / 21); TP=2's 32 heads keep Triton.
+# Built / loaded by decode.Engine's constructor, and like patch 0105's not used (logged once; the Triton kernel serves)
+# under another Triton release than sparse.TRITON_PTX (3.7) or when the build fails. TF_GLM_SEG_CHUNKS_CUDA=0: the
+# Triton kernel. Applies after patches 0104 (seg_head_block(R, H)), 0105 (sparse.TRITON_PTX) and 0106 (decode.py's
+# start-up loads). tools/seg_chunks_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -203,6 +203,8 @@ class Engine:
+             if sparse.prompt_scores_cuda():
+                 sparse._scores_ext()
+             from . import latent
++            if latent.seg_chunks_cuda():                # patch 0108: the decode windows' latent attention, likewise
++                latent._seg_chunks_ext()
+ 
+             if latent.onepass_cuda():                   # patch 0106: the prompt chunks' sparse attention, likewise
+                 latent._onepass_ext()
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -865,6 +865,46 @@ def seg_head_block(R: int, H: int) -> int:
+     return HB_WIDE if R >= (SEG_FEW_WIDE_ROWS if HB < H <= SEG_FEW_HEADS else SEG_WIDE_ROWS) else HB
+ 
+ 
++def seg_chunks_cuda() -> bool:
++    """TF_GLM_SEG_CHUNKS_CUDA (default on): seg_attention's chunk pass on an FP8 arena with 17-24 heads a
++    rank (TP=3's 22 / 21) runs seg_chunks.cu, which computes every chunk partial with _seg_chunks' own instruction
++    sequence (its PTX: _tile's mma chains and their K order, the online softmax's roundings, ex2.approx, the p-sum's
++    reduction tree), so the same bits, with the keys gathered and converted by producer warps and the work items
++    (row, chunk) run as one tile stream a CTA (SEG_CHUNKS_CTAS); _merge reads the partials as before. 0: the Triton
++    kernel. Off as well when the extension is not used (another Triton release than sparse.TRITON_PTX, or a failed
++    build or load: ``_seg_chunks_ext``). tools/seg_chunks_check.py."""
++    return __import__("os").environ.get("TF_GLM_SEG_CHUNKS_CUDA", "1") != "0" and _SEG_CHUNKS_FAILED is None
++
++
++SEG_CHUNKS_CTAS = 0      # patch 0108: CTAs of the CUDA chunk pass (0: one a work item, R x chunks); speed only
++_SEG_CHUNKS_EXT = None
++_SEG_CHUNKS_FAILED = None  # why seg_chunks.cu is not used (then _seg_chunks serves)
++
++
++def _seg_chunks_ext():
++    """The extension, built / loaded once; None when it is not used (as patch 0105's ``sparse._scores_ext``)."""
++    global _SEG_CHUNKS_EXT, _SEG_CHUNKS_FAILED
++    if _SEG_CHUNKS_EXT is None and _SEG_CHUNKS_FAILED is None:
++        from pathlib import Path
++
++        from tensorfold.cuda.build import load
++
++        from . import sparse
++
++        try:
++            if not sparse.triton_matches_ptx():
++                raise RuntimeError(f"Triton {triton.__version__}: the kernel reproduces Triton "
++                                   f"{sparse.TRITON_PTX}'s PTX")
++            _SEG_CHUNKS_EXT = load(name="tensorfold_glm_segchunks_v1",
++                                   sources=[str(Path(__file__).parent / "seg_chunks.cu")],
++                                   extra_cuda_cflags=["-O3"], verbose=False)
++        except Exception as exc:
++            _SEG_CHUNKS_FAILED = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[-1][:200]}"
++            print(f"[tensorfold] seg_chunks.cu is not used ({_SEG_CHUNKS_FAILED}); decode windows' latent attention "
++                  "runs the Triton kernel", flush=True)
++    return _SEG_CHUNKS_EXT
++
++
+ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Tensor | None,
+                   counts: torch.Tensor | None, s: LatentScratch, *, scale: float, out: torch.Tensor,
+                   hb: int | None = None) -> torch.Tensor:
+@@ -886,9 +926,17 @@ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Ten
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"segmented attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
+-    _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, rows.pos, rows.base, rows.sparse, tokens, counts,
+-                                              s.po[:n * LW], s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK,
+-                                              SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
+-                                              num_stages=chunk_stages())
++    ext = (_seg_chunks_ext() if fp8 and LW == 512 and 16 < H <= 24 and tokens.dtype == torch.int32
++           and counts.dtype == torch.int32 and qa.is_contiguous() and tokens.is_contiguous() and seg_chunks_cuda()
++           else None)
++    if ext is not None:
++        # patch 0108: the same partials (either head tile: 16- and 32-head tiles give the same bits)
++        ext.seg_chunks(qa, cache, rs, rows.pos, rows.base, rows.sparse, tokens.view(-1, W), counts, s.po, s.pm, s.pl,
++                       nch, scale, SEG_CHUNKS_CTAS)                         # (the dummy list as [1, 1])
++    else:
++        _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, rows.pos, rows.base, rows.sparse, tokens, counts,
++                                                  s.po[:n * LW], s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK,
++                                                  SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
++                                                  num_stages=chunk_stages())
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+diff --git tensorfold/families/glm5_next/cuda/seg_chunks.cu tensorfold/families/glm5_next/cuda/seg_chunks.cu
+new file mode 100644
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/seg_chunks.cu
+@@ -0,0 +1,606 @@
++// Patch 0108: the decode windows' latent attention chunk pass (latent._seg_chunks as seg_attention launches it by
++// default: an FP8 latent arena, 512-wide rows, TP=3's 22 / 21 heads in 16- or 32-head tiles, 32-key tiles, 512-key
++// chunks, 8 warps, TF_GLM_LATENT_STAGES' pipeline) as a CUDA kernel that computes every chunk partial (o, m, l) with
++// the Triton kernel's own instruction sequence, so every bit is the same; _merge (Triton) then reads them as before.
++// tools/seg_chunks_check.py.
++//
++// _seg_chunks runs _tile, the function _sparse_onepass runs, and its GPU IR has _sparse_onepass' layouts and counts
++// (Triton 3.7 on a GB10: mma warpsPerCTA [1, 8], instrShape [16, 8]; a 32-head tile's loop body 96
++// mma.sync, 12 ex2.approx, 20 shfl, 18 max.f32, 2 fma.rn.f32, 100 mul.f32, 14 add.f32 in both; a 16-head tile the
++// same chains over one m16 row block, and the head_block contract: 16- and 32-head tiles give the same bits).
++// So a chunk partial is patch 0106's chain (sparse_onepass.cu) over the chunk's keys from m = -inf, l = 0,
++// o = 0, stored before the division:
++//   - the tile's 32 cache rows: e4m3 codes -> bf16 (cvt.rn.f16x2.e4m3x2, then cvt.bf16.f16 each), keys past the
++//     chunk's last zeros, their scales 1;
++//   - scores[heads, keys] = mma.sync m16n8k16 bf16 -> fp32 of q (heads past H zero) and the keys, each output one
++//     chain over the 32 k16 steps in ascending order from +0;
++//   - per element (dot * ks[key]) * SCALE, keys past the chunk's last -> -inf;
++//   - tile_m = max over the keys, active = tile_m != -inf, next_m = active ? max(m, tile_m) : m, alpha = active ?
++//     (m == -inf ? 0 : ex2.approx((m - next_m) * log2e)) : 1;
++//   - p = (key valid and active) ? ex2.approx((score - next_m) * log2e) : 0;
++//   - o = the mma chain over the two 16-key steps (in order) of bf16(p * ks) and the keys, from o * alpha;
++//   - l = fma(l, alpha, sum_k p), the sum in the layout's tree: a lane's keys 2 u, 2 u + 1, then the lanes ^ 2, then
++//     ^ 1 over a warp's 8 keys, then the four 8-key partials (s0 + s2) + (s1 + s3);
++//   - PO / PM / PL [chunk, row, head] = o, m, l for heads below H; a chunk past the row's keys (Triton's c * CH >= n)
++//     o 0, m -inf, l 0.
++// Triton's tiles past the chunk's keys (its loop always runs CH / KT tiles) are skipped: every key of such a tile is
++// masked, so tile_m = -inf, alpha = 1, p = 0, and o * 1 + 0 . keys, l * 1 + 0 change no bit of what the chunk's last
++// key tile left (finite o and l are never -0 after an mma / fma from +0; a NaN stays the canonical NaN it already is).
++// The layout is sparse_onepass.cu's (patch 0106): 3 QK warps (q^T in registers, 8 heads each), 5 PV warps a tile
++// behind, 4 producer warps gathering and converting two tiles ahead into three bf16 key-tile buffers; here a CTA takes
++// work items (row, chunk) i = blockIdx.x, + gridDim.x, ... in Triton's chunk-major order and runs all their key tiles
++// as one stream, the buffers, barriers and the producers' prefetch carrying on across items.
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++#include <torch/extension.h>
++
++namespace {
++
++constexpr int HQ = 24, LW = 512, KT = 32, NB = 3;    // heads kept, latent width, keys a tile, key-tile buffers
++constexpr int CHUNK = 512;                           // keys a chunk (latent.CHUNK): a work item's partial
++constexpr int NV = 5, NQ = 3, NPW = 4;               // PV, QK, producer warps (warp roles: see the kernel)
++// PV warp v's share of the 32 latent m16 tiles (6 mma a tile each). A warp's scheduler is warp & 3; the QK warps
++// (64 mma a tile, latency-bound score chains: ncu put 15% of their time in math-pipe stalls) sit on schedulers 0-2, so
++// PV 0-2 take 6 tiles there and PV 3 / 4 (warps 3 and 7, both on scheduler 3) 7 each: 100 / 100 / 100 / 84 mma a
++// tile a scheduler, where four PV warps of 8 tiles gave 112 / 112 / 112 / 48
++__device__ __forceinline__ constexpr int pv_tiles(int v) { return v < 3 ? 6 : 7; }
++constexpr int PV_MAX = 7;                            // the most tiles a PV warp takes
++constexpr int NT = (NV + NQ + NPW) * 32;
++constexpr int CH = LW * 2 / 16;                      // 16-byte chunks of a bf16 latent row (64)
++constexpr int BAR_FULL = 1, BAR_EMPTY = 4, BAR_PREADY = 7, BAR_PFREE = 8;
++constexpr int N_FULL = (NPW + NQ) * 32, N_EMPTY = (NV + NPW) * 32, N_QV = (NQ + NV) * 32;
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], unsigned s) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], unsigned s) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++__device__ __forceinline__ void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
++__device__ __forceinline__ void bar_arrive(int id, int n) {
++    asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
++}
++
++__device__ __forceinline__ float ex2(float x) {
++    float y;
++    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++__device__ __forceinline__ uint16_t bf16(float x) {
++    uint16_t r;
++    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(r) : "f"(x));
++    return r;
++}
++
++// Two e4m3 codes (low byte first) -> bf16x2 (low first) by Triton's own instruction sequence (its PTX: the codes to
++// f16x2, then cvt.bf16.f16 each): used only for a tile holding a NaN code, whose NaN bits this keeps.
++__device__ __forceinline__ uint32_t e4m3x2_bf16x2_tri(uint32_t two) {
++    uint32_t r;
++    const unsigned short v = (unsigned short)two;
++    asm("{\n .reg .b32 a;\n .reg .f16 a<2>;\n .reg .b16 b<2>;\n cvt.rn.f16x2.e4m3x2 a, %1;\n mov.b32 {a0, a1}, a;\n"
++        " cvt.bf16.f16 b0, a0;\n cvt.bf16.f16 b1, a1;\n mov.b32 %0, {b0, b1};\n}" : "=r"(r) : "h"(v));
++    return r;
++}
++
++// Four e4m3 codes -> two bf16x2 (codes 0, 1 and 2, 3) on the integer and bf16 pipes, exactly for every code but NaN:
++// a code's sign-extended 16 bits, shifted left 4 and masked, are the bf16 with its sign, the 4 exponent bits and
++// the 3 mantissa bits in place and 2^-120 of the value (a subnormal code a subnormal bf16), then times 2^120 (exact).
++__device__ __forceinline__ void e4m3x4_bf16(uint32_t w, uint32_t& lo, uint32_t& hi) {
++    uint32_t a, b;
++    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(a) : "r"(w), "r"(0u), "r"(0x9180u));   // [sext b1 | sext b0]
++    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(b) : "r"(w), "r"(0u), "r"(0xB3A2u));   // [sext b3 | sext b2]
++    a = (a << 4) & 0x87F087F0u;
++    b = (b << 4) & 0x87F087F0u;
++    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(lo) : "r"(a), "r"(0x7B807B80u));   // 2^120
++    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(hi) : "r"(b), "r"(0x7B807B80u));
++}
++
++// a key tile's 16-byte chunk c of key r: c ^ ((r ^ (c >> 3)) & 7). Eight consecutive keys of one chunk (an ldmatrix's
++// 8 rows, QK and PV) still fall in eight bank groups; a producer lane stores chunks 2 l and 2 l + 1 of one key, and
++// with the (c >> 3) term lanes 0-3 and 4-7 of every quarter-warp land in different bank groups (a plain c ^ (r & 7):
++// 2-way conflicts, 37 M of a 113k chunk's 243 M shared-memory wavefronts, ncu)
++__device__ __forceinline__ int swz(int r, int c) { return c ^ ((r ^ (c >> 3)) & 7); }
++__device__ __forceinline__ int pswz(int r, int c) { return c ^ ((r >> 1) & 3); }
++// Triton's kWidth = 4 dot operands (_seg_chunks' GPU IR; _sparse_onepass' are kWidth 2): k =
++// 32 b + 16 u + 4 t + 2 h + e is step 2 b + h, mma slot 8 u + 2 t + e (patch 0105's reading of that layout), in both
++// dots, so a step's 16 products are not a contiguous k16 group. The key tiles hold, in each 32-wide block, at place
++// 16 h + 8 u + 2 t + e the value k = 16 u + 4 t + 2 h + e - latent columns so along a row (the QK dot's k), keys so
++// down the rows (the P.V dot's k) - and a plain k16 step of that layout is Triton's step.
++__device__ __forceinline__ int kw4(int p) {           // place -> k
++    return (p & ~31) | ((p & 8) << 1) | ((p & 6) << 1) | ((p >> 3) & 2) | (p & 1);
++}
++__device__ __forceinline__ int kw4_place(int k) {     // k -> place
++    return (k & ~31) | ((k & 2) << 3) | ((k >> 1) & 8) | ((k >> 1) & 6) | (k & 1);
++}
++
++constexpr float LOG2E = 1.44269502162933349609375f;   // 0f3FB8AA3B
++
++struct Smem {
++    uint4 kt[NB][KT * CH];      // 96 KB: key tiles, bf16 [key][64 chunks], swizzled
++    uint16_t ps[HQ * KT];       // P [head][key] bf16, 4 chunks a row, chunk-swizzled
++    float ks[NB][KT];
++    float alpha[HQ];
++};
++
++struct Raw {
++    uint4 v[8];
++    float s[8];
++};
++
++// The window: R rows, each a dense row (keys base + 0 .. base + pos) or a sparse one (keys base + its first cnt
++// selected tokens, list order); work item i = chunk i / R of row i % R (Triton's program order, chunk-major), its keys
++// CHUNK c .. c + CHUNK - 1 of the row's list. A CTA takes items blockIdx.x, + gridDim.x, ... and runs their key tiles
++// as one stream (the tile buffers, barriers and the producers' prefetch run on across items).
++struct Win {
++    const int32_t* __restrict__ POS;
++    const int32_t* __restrict__ BASE;
++    const int32_t* __restrict__ SPR;
++    const int32_t* __restrict__ TOK;
++    const int32_t* __restrict__ CNT;
++    int W, R, items, step;
++};
++
++struct Cur {        // an item and one of its tiles
++    int i, t, nt, r, c, nk, b;
++    bool sp;
++};
++
++__device__ __forceinline__ void cur_item(const Win& w, Cur& u, int i) {
++    u.i = i;
++    u.t = 0;
++    if (i >= w.items) {
++        u.nt = 0;
++        return;
++    }
++    u.r = i % w.R;
++    u.c = i / w.R;
++    const int sp = w.SPR[u.r], pos = w.POS[u.r], b = w.BASE[u.r];
++    u.sp = sp != 0;
++    const int cnt = u.sp ? w.CNT[u.r] : 0;                  // Triton's masked load (CNT: 1 entry without sparse rows)
++    const int n = u.sp ? cnt : pos + 1;                      // selected tokens, or keys 0 .. pos
++    u.nk = min(n - u.c * CHUNK, CHUNK);                      // <= 0: an empty chunk
++    u.nt = u.nk > 0 ? (u.nk + KT - 1) / KT : 0;
++    u.b = b;
++}
++
++// the CTA's first tile / the next one (past the last: u.i >= items)
++__device__ __forceinline__ void cur_skip(const Win& w, Cur& u) {
++    while (u.i < w.items && u.nt == 0) cur_item(w, u, u.i + w.step);
++}
++__device__ __forceinline__ void cur_next(const Win& w, Cur& u) {
++    if (u.i >= w.items) return;
++    if (++u.t < u.nt) return;
++    cur_item(w, u, u.i + w.step);
++    cur_skip(w, u);
++}
++
++// the tile's keys as row tokens (-1 past the chunk's last) and their base: the token loads stay in flight until
++// raw_load adds the base (an add here stalled the producer on each load: ncu, 27% of the kernel's samples)
++__device__ __forceinline__ void ids_load(const Win& w, const Cur& u, int pw, int (&id)[8], int& base) {
++    base = u.b;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int k = u.t * KT + pw + 4 * i;                 // the key within the item's chunk
++        const int x = u.c * CHUNK + k;                       // its place in the row's list
++        id[i] = u.i < w.items && k < u.nk ? (u.sp ? w.TOK[(size_t)u.r * w.W + x] : x) : -1;
++    }
++}
++
++__device__ __forceinline__ void raw_load(const uint8_t* __restrict__ LC, int RS, const int (&id)[8], int base,
++                                         int lane, Raw& r) {
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const uint8_t* src = LC + (size_t)(id[i] < 0 ? 0 : base + id[i]) * RS;
++        r.v[i] = id[i] < 0 ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4*>(src + 16 * lane);
++        r.s[i] = id[i] < 0 || lane ? 1.0f : *reinterpret_cast<const float*>(src + LW);
++    }
++}
++
++__device__ __forceinline__ void convert(const Raw& r, uint4* kt, float* ks, int pw, int lane) {
++    uint32_t nan = 0;                                     // bit 7 of a byte: some code of it was 0x7F / 0xFF
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const uint32_t in[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
++#pragma unroll
++        for (int q = 0; q < 4; ++q) nan |= (in[q] & 0x7F7F7F7Fu) + 0x01010101u;
++    }
++    if (__any_sync(0xffffffffu, nan & 0x80808080u)) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int key = kw4_place(pw + 4 * i);    // the key's row
++            const uint32_t in[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
++            uint32_t w[8];
++#pragma unroll
++            for (int m = 0; m < 8; ++m) w[m] = e4m3x2_bf16x2_tri(in[m >> 1] >> (16 * (m & 1)));
++            // lane l's latent columns 16 l .. 16 l + 15 (b = l / 2, u = l % 2): words 2 t + h to chunk 4 b + 2 h + u
++            kt[key * CH + swz(key, 2 * lane - (lane & 1))] = make_uint4(w[0], w[2], w[4], w[6]);
++            kt[key * CH + swz(key, 2 * lane - (lane & 1) + 2)] = make_uint4(w[1], w[3], w[5], w[7]);
++            if (lane == 0) ks[key] = r.s[i];
++        }
++        return;
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int key = kw4_place(pw + 4 * i);
++        const uint32_t in[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
++        uint32_t w[8];
++#pragma unroll
++        for (int q = 0; q < 4; ++q) e4m3x4_bf16(in[q], w[2 * q], w[2 * q + 1]);
++        kt[key * CH + swz(key, 2 * lane - (lane & 1))] = make_uint4(w[0], w[2], w[4], w[6]);
++        kt[key * CH + swz(key, 2 * lane - (lane & 1) + 2)] = make_uint4(w[1], w[3], w[5], w[7]);
++        if (lane == 0) ks[key] = r.s[i];
++    }
++}
++
++__global__ void __launch_bounds__(NT, 1) seg_chunks_kernel(const __nv_bfloat16* __restrict__ QA,
++                                                           const uint8_t* __restrict__ LC, int RS, Win w,
++                                                           float* __restrict__ PO, float* __restrict__ PM,
++                                                           float* __restrict__ PL, int H, float scale) {
++    extern __shared__ __align__(16) uint8_t smem_raw[];
++    Smem& S = *reinterpret_cast<Smem*>(smem_raw);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
++    int ntot = 0;                                         // the CTA's key tiles, all its items
++    {
++        Cur u;
++        for (int i = blockIdx.x; i < w.items; i += w.step) {
++            cur_item(w, u, i);
++            ntot += u.nt;
++        }
++    }
++
++    // warps 0-3 PV 0-3, 4-6 QK, 7 PV 4, 8-11 producers
++    if (warp >= 8) {
++        // ---------------------------------------------------- producers: keys pw + 4 i, 16 B a lane, two tiles ahead
++        const int pw = warp - 8;
++        Raw A, B;
++        int ia[8], ib[8], ba, bb;
++        Cur uc;                                           // the tile ia's ids are for (two ahead of A's)
++        cur_item(w, uc, blockIdx.x);
++        cur_skip(w, uc);
++        Cur ud = uc;                                      // ib's
++        cur_next(w, ud);
++        ids_load(w, uc, pw, ia, ba);
++        ids_load(w, ud, pw, ib, bb);
++        raw_load(LC, RS, ia, ba, lane, A);
++        raw_load(LC, RS, ib, bb, lane, B);
++        cur_next(w, uc);
++        cur_next(w, uc);
++        cur_next(w, ud);
++        cur_next(w, ud);
++        ids_load(w, uc, pw, ia, ba);
++        ids_load(w, ud, pw, ib, bb);
++        int b = 0;
++        for (int t = 0; t < ntot; t += 2) {
++            if (t >= NB) bar_sync(BAR_EMPTY + b, N_EMPTY);
++            convert(A, S.kt[b], S.ks[b], pw, lane);
++            bar_arrive(BAR_FULL + b, N_FULL);
++            b = b + 1 == NB ? 0 : b + 1;
++            if (t + 2 < ntot) {
++                raw_load(LC, RS, ia, ba, lane, A);
++                cur_next(w, uc);
++                cur_next(w, uc);
++                ids_load(w, uc, pw, ia, ba);
++            }
++            if (t + 1 >= ntot) break;
++            if (t + 1 >= NB) bar_sync(BAR_EMPTY + b, N_EMPTY);
++            convert(B, S.kt[b], S.ks[b], pw, lane);
++            bar_arrive(BAR_FULL + b, N_FULL);
++            b = b + 1 == NB ? 0 : b + 1;
++            if (t + 3 < ntot) {
++                raw_load(LC, RS, ib, bb, lane, B);
++                cur_next(w, ud);
++                cur_next(w, ud);
++                ids_load(w, ud, pw, ib, bb);
++            }
++        }
++        return;
++    }
++
++    if (warp >= 4 && warp < 7) {
++        // ------------------------------------------------- QK warps: heads 8 j .. 8 j + 7 (an n8 tile), all 32 keys
++        const int j = warp - 4;
++        const int hq = 8 * j + g;                         // this lane's B column (head)
++        const int ar = lane & 15, ac = lane >> 4;
++        uint32_t qf[32][2];                               // q^T B fragments: step s, k = 16 s + 2 t (+ 8)
++        // QK(t + 1)'s 32 steps are issued between softmax(t)'s stages, so the in-order warp has the score chains'
++        // mma in flight while it waits on the softmax's shuffles and ex2 (and the other way round)
++        uint32_t a[3][2][4];
++        unsigned ktn;
++        float acc[2][4], accn[2][4];
++#define LOADA(slot, s)                                                                                   \
++    {                                                                                                    \
++        ldsm_x4(a[slot][0], ktn + 16 * (ar * CH + swz(ar, 2 * (s) + ac)));                              \
++        ldsm_x4(a[slot][1], ktn + 16 * ((16 + ar) * CH + swz(16 + ar, 2 * (s) + ac)));                   \
++    }
++#define QKSTEP(s)                                                                                        \
++    {                                                                                                    \
++        if ((s) + 2 < 32) LOADA(((s) + 2) % 3, (s) + 2)                                                  \
++        mma16816(accn[0], a[(s) % 3][0], qf[s][0], qf[s][1]);                                            \
++        mma16816(accn[1], a[(s) % 3][1], qf[s][0], qf[s][1]);                                            \
++    }
++#define QKBEGIN()                                                                                        \
++    {                                                                                                    \
++        for (int i_ = 0; i_ < 2; ++i_)                                                                   \
++            for (int e_ = 0; e_ < 4; ++e_) accn[i_][e_] = 0.0f;                                          \
++        LOADA(0, 0)                                                                                      \
++        LOADA(1, 1)                                                                                      \
++    }
++        int b = 0, T = 0;                                 // the tile buffer, the CTA's tile count so far
++        Cur u;
++        for (int i = blockIdx.x; i < w.items; i += w.step) {
++            cur_item(w, u, i);
++            const int pb = (u.c * w.R + u.r) * H;         // the item's partials
++            if (u.nt == 0) {                              // an empty chunk: m -inf, l 0 (Triton's stores)
++                if (g == 0)
++#pragma unroll
++                    for (int e = 0; e < 2; ++e)
++                        if (8 * j + 2 * t4 + e < H) {
++                            PM[pb + 8 * j + 2 * t4 + e] = -INFINITY;
++                            PL[pb + 8 * j + 2 * t4 + e] = 0.0f;
++                        }
++                continue;
++            }
++            const int ntile = u.nt, nk = u.nk;
++#pragma unroll
++            for (int s = 0; s < 32; ++s) {                // step s = 2 b + h: k 32 b + 4 t + 2 h (+ 1), + 16
++                const __nv_bfloat16* q =
++                    QA + ((size_t)u.r * H + (hq < H ? hq : 0)) * LW + 32 * (s >> 1) + 4 * t4 + 2 * (s & 1);
++                qf[s][0] = hq < H ? *reinterpret_cast<const uint32_t*>(q) : 0u;
++                qf[s][1] = hq < H ? *reinterpret_cast<const uint32_t*>(q + 16) : 0u;
++            }
++            float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};   // heads 8 j + 2 t, + 1
++            bar_sync(BAR_FULL + b, N_FULL);
++            ktn = (unsigned)__cvta_generic_to_shared(S.kt[b]);
++            QKBEGIN()
++#pragma unroll
++            for (int s = 0; s < 32; ++s) QKSTEP(s)
++#pragma unroll
++            for (int i2 = 0; i2 < 2; ++i2)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) acc[i2][e] = accn[i2][e];
++            for (int t = 0; t < ntile; ++t, ++T) {
++                const int t0 = t * KT, bn = b + 1 == NB ? 0 : b + 1;
++                if (t + 1 < ntile) bar_sync(BAR_FULL + bn, N_FULL);
++                // the item's last tile's "next" scores run on its own buffer and are dropped (no branch below)
++                ktn = (unsigned)__cvta_generic_to_shared(S.kt[t + 1 < ntile ? bn : b]);
++                QKBEGIN()
++#pragma unroll
++                for (int s = 0; s < 8; ++s) QKSTEP(s)
++                // acc[i][e]: row q = 16 i + g (e < 2) or 16 i + 8 + g (e >= 2) of the tile, key kw4(q), head
++                // 8 j + 2 t + (e & 1)
++                float sc[2][4], kk[2][2];
++                bool val[2][2];
++#pragma unroll
++                for (int i2 = 0; i2 < 2; ++i2)
++#pragma unroll
++                    for (int hi = 0; hi < 2; ++hi) {
++                        const int key = 16 * i2 + 8 * hi + g;
++                        kk[i2][hi] = S.ks[b][key];
++                        val[i2][hi] = t0 + kw4(key) < nk;
++#pragma unroll
++                        for (int e = 0; e < 2; ++e)
++                            sc[i2][2 * hi + e] =
++                                val[i2][hi] ? __fmul_rn(__fmul_rn(acc[i2][2 * hi + e], kk[i2][hi]), scale) : -INFINITY;
++                    }
++                float nm[2], alpha[2];
++                bool act[2];
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {
++                    float x = fmaxf(fmaxf(sc[0][e], sc[0][2 + e]), fmaxf(sc[1][e], sc[1][2 + e]));
++                    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 4));
++                    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 8));
++                    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 16));
++                    act[e] = x != -INFINITY;
++                    nm[e] = act[e] ? fmaxf(m[e], x) : m[e];
++                    const float a_ = m[e] == -INFINITY ? 0.0f : ex2(__fmul_rn(__fsub_rn(m[e], nm[e]), LOG2E));
++                    alpha[e] = act[e] ? a_ : 1.0f;
++                }
++#pragma unroll
++                for (int s = 8; s < 16; ++s) QKSTEP(s)
++                float p[2][4];
++#pragma unroll
++                for (int i2 = 0; i2 < 2; ++i2)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) {
++                        const int e = x & 1;
++                        p[i2][x] = val[i2][x >> 1] && act[e] ? ex2(__fmul_rn(__fsub_rn(sc[i2][x], nm[e]), LOG2E)) : 0.0f;
++                    }
++#pragma unroll
++                for (int s = 16; s < 24; ++s) QKSTEP(s)
++                // the p sums in Triton's tree over the keys k = kw4(q) of this lane's rows q = 16 i + 8 hi + g: k, k ^ 1
++                // (q ^ 1: lanes ^ 4), then k ^ 4 (q ^ 2: lanes ^ 8), then k ^ 2 (q ^ 16: i) - a warp's 8-key partial
++                // s_w, w = k >> 3 = 2 q3 + q2 = 2 hi + (lane ^ 16) - then (s0 + s2) + (s1 + s3) (an add commutes)
++                float z[2][2];
++#pragma unroll
++                for (int hi = 0; hi < 2; ++hi)
++#pragma unroll
++                    for (int e = 0; e < 2; ++e) {
++                        float y0 = p[0][2 * hi + e], y1 = p[1][2 * hi + e];
++                        y0 = __fadd_rn(y0, __shfl_xor_sync(0xffffffffu, y0, 4));
++                        y1 = __fadd_rn(y1, __shfl_xor_sync(0xffffffffu, y1, 4));
++                        y0 = __fadd_rn(y0, __shfl_xor_sync(0xffffffffu, y0, 8));
++                        y1 = __fadd_rn(y1, __shfl_xor_sync(0xffffffffu, y1, 8));
++                        z[hi][e] = __fadd_rn(y0, y1);
++                    }
++#pragma unroll
++                for (int e = 0; e < 2; ++e) {
++                    const float s02 = __fadd_rn(z[0][e], z[1][e]);    // s0 + s2 (s1 + s3 on lanes 16-31)
++                    const float tot = __fadd_rn(s02, __shfl_xor_sync(0xffffffffu, s02, 16));
++                    l[e] = __fmaf_rn(l[e], alpha[e], tot);
++                    m[e] = nm[e];
++                }
++#pragma unroll
++                for (int s = 24; s < 32; ++s) QKSTEP(s)
++                if (T > 0) bar_sync(BAR_PFREE, N_QV);         // the PV warps have read the previous P and alphas
++#pragma unroll
++                for (int i2 = 0; i2 < 2; ++i2)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) {
++                        const int h = 8 * j + 2 * t4 + (x & 1), key = 16 * i2 + 8 * (x >> 1) + g;
++                        S.ps[h * KT + 8 * pswz(h, key >> 3) + (key & 7)] = bf16(__fmul_rn(p[i2][x], kk[i2][x >> 1]));
++                    }
++                if (g == 0) {
++                    S.alpha[8 * j + 2 * t4] = alpha[0];
++                    S.alpha[8 * j + 2 * t4 + 1] = alpha[1];
++                }
++                bar_arrive(BAR_PREADY, N_QV);
++#pragma unroll
++                for (int i2 = 0; i2 < 2; ++i2)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) acc[i2][e] = accn[i2][e];
++                b = bn;
++            }
++            if (g == 0)
++#pragma unroll
++                for (int e = 0; e < 2; ++e)
++                    if (8 * j + 2 * t4 + e < H) {
++                        PM[pb + 8 * j + 2 * t4 + e] = m[e];
++                        PL[pb + 8 * j + 2 * t4 + e] = l[e];
++                    }
++        }
++#undef QKSTEP
++#undef QKBEGIN
++#undef LOADA
++        return;
++    }
++
++    // ------------------------------------------------- PV warps: latent rows 16 tb .. 16 (tb + nt) - 1 (nt m16 tiles)
++    const int v = warp < 4 ? warp : 4;
++    const int nt = pv_tiles(v);
++    int tb = 0;
++#pragma unroll
++    for (int k = 0; k < NV - 1; ++k) tb += k < v ? pv_tiles(k) : 0;
++    const unsigned psb = (unsigned)__cvta_generic_to_shared(S.ps);
++    const int vk = (lane & 7) + 8 * (lane >> 4), vc = (lane >> 3) & 1;
++    int b = 0, T = 0;
++    Cur u;
++    for (int it = blockIdx.x; it < w.items; it += w.step) {
++        cur_item(w, u, it);
++        float* po = PO + (size_t)((u.c * w.R + u.r) * H) * LW;
++        float o[PV_MAX][3][4];
++#pragma unroll
++        for (int i = 0; i < PV_MAX; ++i)
++#pragma unroll
++            for (int nh = 0; nh < 3; ++nh)
++#pragma unroll
++                for (int e = 0; e < 4; ++e) o[i][nh][e] = 0.0f;
++        for (int t = 0; t < u.nt; ++t, ++T) {
++            const unsigned ktb = (unsigned)__cvta_generic_to_shared(S.kt[b]);
++            bar_sync(BAR_PREADY, N_QV);
++            uint32_t pf[3][4];                            // P^T B fragments: heads 8 nh .., keys 0-15 (0, 1), 16-31
++#pragma unroll
++            for (int nh = 0; nh < 3; ++nh) {
++                const int h = 8 * nh + (lane & 7), c = lane >> 3;
++                ldsm_x4(pf[nh], psb + 2 * (h * KT + 8 * pswz(h, c)));
++            }
++            float al[3][2];
++#pragma unroll
++            for (int nh = 0; nh < 3; ++nh) {
++                al[nh][0] = S.alpha[8 * nh + 2 * t4];
++                al[nh][1] = S.alpha[8 * nh + 2 * t4 + 1];
++            }
++            if (T + 1 < ntot) bar_arrive(BAR_PFREE, N_QV);    // the QK warps write the next P only after this
++            bool one = true;
++#pragma unroll
++            for (int nh = 0; nh < 3; ++nh) one = one && al[nh][0] == 1.0f && al[nh][1] == 1.0f;
++            if (!__all_sync(0xffffffffu, one)) {
++#pragma unroll
++                for (int i = 0; i < PV_MAX; ++i)
++                    if (i < nt)
++#pragma unroll
++                        for (int nh = 0; nh < 3; ++nh)
++#pragma unroll
++                            for (int e = 0; e < 4; ++e) o[i][nh][e] = __fmul_rn(o[i][nh][e], al[nh][e & 1]);
++            }
++            uint32_t a[2][2][4];                          // K^T A fragments, two m16 tiles in flight
++#define LOADV(slot, i)                                                                                    \
++    {                                                                                                     \
++        ldsm_x4_t(a[slot][0], ktb + 16 * (vk * CH + swz(vk, 2 * (tb + (i)) + vc)));                       \
++        ldsm_x4_t(a[slot][1], ktb + 16 * ((16 + vk) * CH + swz(16 + vk, 2 * (tb + (i)) + vc)));           \
++    }
++            LOADV(0, 0)
++#pragma unroll
++            for (int i = 0; i < PV_MAX; ++i) {
++                if (i < nt) {
++                    if (i + 1 < nt) LOADV((i + 1) & 1, i + 1)
++#pragma unroll
++                    for (int nh = 0; nh < 3; ++nh) mma16816(o[i][nh], a[i & 1][0], pf[nh][0], pf[nh][1]);
++#pragma unroll
++                    for (int nh = 0; nh < 3; ++nh) mma16816(o[i][nh], a[i & 1][1], pf[nh][2], pf[nh][3]);
++                }
++            }
++#undef LOADV
++            if (T + NB < ntot) bar_arrive(BAR_EMPTY + b, N_EMPTY);
++            b = b + 1 == NB ? 0 : b + 1;
++        }
++        // the item's partial o (unnormalized, fp32), heads below H; an empty chunk's zeros (Triton's stores)
++#pragma unroll
++        for (int i = 0; i < PV_MAX; ++i)
++            if (i < nt)
++#pragma unroll
++                for (int nh = 0; nh < 3; ++nh)
++#pragma unroll
++                    for (int e = 0; e < 4; ++e) {
++                        // the tile's latent place 16 (tb + i) + g + 8 (e >> 1) holds latent column kw4(place)
++                        const int h = 8 * nh + 2 * t4 + (e & 1), lat = kw4(16 * (tb + i) + g + 8 * (e >> 1));
++                        if (h < H) po[(size_t)h * LW + lat] = o[i][nh][e];
++                    }
++    }
++}
++
++}  // namespace
++
++// latent.seg_attention's chunk pass on an FP8 cache: QA [R, H, 512] bf16 (16 < H <= 24), LC the arena's rows (512
++// e4m3 codes, then the row's fp32 scale; RS bytes apart), POS / BASE / SPR [R] int32 (segments.SegRows), TOK [R, W]
++// int32 selected tokens (sparse rows' first CNT[r] read), PO / PM / PL the chunk partials of nch chunks
++// [nch, R, H, (512)] fp32, as _seg_chunks stores them; ctas: CTAs (0: one an item, R * nch).
++void seg_chunks(const at::Tensor& QA, const at::Tensor& LC, int64_t RS, const at::Tensor& POS, const at::Tensor& BASE,
++                const at::Tensor& SPR, const at::Tensor& TOK, const at::Tensor& CNT, at::Tensor PO, at::Tensor PM,
++                at::Tensor PL, int64_t nch, double scale, int64_t ctas) {
++    TORCH_CHECK(QA.is_cuda() && QA.scalar_type() == at::kBFloat16 && LC.element_size() == 1 &&
++                POS.scalar_type() == at::kInt && BASE.scalar_type() == at::kInt && SPR.scalar_type() == at::kInt &&
++                TOK.scalar_type() == at::kInt && CNT.scalar_type() == at::kInt &&
++                PO.scalar_type() == at::kFloat && PM.scalar_type() == at::kFloat && PL.scalar_type() == at::kFloat,
++                "seg chunks: dtypes");
++    const int64_t R = QA.size(0), H = QA.size(1);
++    TORCH_CHECK(QA.dim() == 3 && QA.size(2) == LW && H > 16 && H <= HQ && QA.is_contiguous() && LC.is_contiguous() &&
++                TOK.is_contiguous() && TOK.dim() == 2 && POS.numel() >= R && BASE.numel() >= R && SPR.numel() >= R &&
++                PO.is_contiguous() && PM.is_contiguous() && PL.is_contiguous() && PO.numel() >= nch * R * H * LW &&
++                PM.numel() >= nch * R * H && PL.numel() >= nch * R * H && nch >= 1, "seg chunks: shapes");
++    TORCH_CHECK(RS % 16 == 0 && RS >= LW + 4, "seg chunks: an FP8 cache of 16-byte aligned rows");
++    TORCH_CHECK(LC.numel() / RS < (int64_t(1) << 31), "seg chunks: arena rows past int32");
++    if (R == 0) return;
++    const c10::cuda::CUDAGuard guard(QA.device());
++    static bool attr = false;
++    if (!attr) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(seg_chunks_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)sizeof(Smem)));
++        attr = true;
++    }
++    const int items = (int)(R * nch);
++    const int grid = ctas > 0 && ctas < items ? (int)ctas : items;
++    Win w{POS.data_ptr<int32_t>(), BASE.data_ptr<int32_t>(), SPR.data_ptr<int32_t>(), TOK.data_ptr<int32_t>(),
++          CNT.data_ptr<int32_t>(), (int)TOK.size(1), (int)R, items, grid};
++    seg_chunks_kernel<<<grid, NT, sizeof(Smem), at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(QA.data_ptr()), reinterpret_cast<const uint8_t*>(LC.data_ptr()),
++        (int)RS, w, PO.data_ptr<float>(), PM.data_ptr<float>(), PL.data_ptr<float>(), (int)H, (float)scale);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("seg_chunks", &seg_chunks); }

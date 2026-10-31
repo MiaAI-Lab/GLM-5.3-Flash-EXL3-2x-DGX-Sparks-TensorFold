@@ -1,16 +1,3 @@
-# The split prefill's exchanges on a ring (TF_NCCL_RING=1, set by scripts/nodes.sh on four Sparks cabled as a ring
-# without a switch). exchange_all sent every peer its rows straight there (ncclSend / ncclRecv), which needs a cable
-# between every pair; on a ring two pairs have none, so start.sh fell back to TF_GLM_HC_EXCHANGE=gather, an all-gather
-# of every rank's whole fp32 partial at each exchange (three times the bytes, no overlap). Now exchange_all passes each
-# message the shorter way round the ring, a hop a step, the rank opposite half each way, and delivers exactly the same
-# bytes, so the rank-order sums and replies are unchanged. Each hop is a two-rank all-gather on a communicator with
-# that neighbour, opened at start in link order with its own NCCL graph file (TF_NCCL_RING_GRAPHS: toward the previous
-# rank, toward the next): NCCL's point-to-point receives take no graph file and listen on a device of NCCL's choosing,
-# on a ring cabled port to like port half the time one without the peer (ibv_modify_qp timeouts). The two links run on
-# their own streams, launched in link order on every rank. Measured on four Sparks (an 8 MiB block a peer, the split
-# prefill's): 2.6-2.75 ms against 4.6-5.0 for the gather mode's all-gather of the same rows; every byte checked. Off
-# (the default), nothing changes.
-
 diff --git tensorfold/cuda/comm.py tensorfold/cuda/comm.py
 index f541a89..d8ffcad 100644
 --- tensorfold/cuda/comm.py

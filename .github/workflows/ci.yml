@@ -1,0 +1,43 @@
+name: ci
+# CPU-only checks: patches apply to the pinned TensorFold source, the image pin matches the
+# patch set, and the self-contained tools tests pass against a patched source tree.
+# No GPU, no docker, no model downloads (only the checkpoint's chat_template.jinja, a few KB).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  patches-and-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patches to the pinned TensorFold source
+        run: |
+          git clone --depth 1 --branch v0.6.0 https://github.com/ashhart/TensorFold.git /tmp/tf
+          cd /tmp/tf/src
+          for p in "$OLDPWD"/patches/*.patch; do
+            echo "applying $(basename "$p")"
+            patch -p0 --forward < "$p" > /dev/null || { echo "::error::$(basename "$p") does not apply to TensorFold v0.6.0"; exit 1; }
+          done
+      - name: Self-contained tools tests (against the patched tree)
+        run: |
+          MD="$RUNNER_TEMP/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/rev"
+          mkdir -p "$MD"
+          B=https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/resolve/main
+          for f in chat_template.jinja tokenizer_config.json tokenizer.json; do
+            curl -fsSL -o "$MD/$f" "$B/$f"
+          done
+          python tools/test_chunked_bodies.py --source-root /tmp/tf/src
+          python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
+      - name: Image pin matches the patch set
+        run: |
+          # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
+          E="$(sed -n 's/^IMAGE_EXTRAS="\(.*\)"/\1/p' scripts/config.sh)"
+          H="$( (cat patches/*.patch; echo "$E") | sha256sum | cut -c1-12)"
+          T="$(sed -n 's/^IMAGE_TAG="\${IMAGE_TAG:-\(v[^"]*\)}"/\1/p' scripts/config.sh)"
+          echo "patch-set hash: $H   pinned IMAGE_TAG: $T"
+          if [ "$T" != "v0.6.0-$H" ]; then
+            echo "::error::IMAGE_TAG ($T) does not match the current patch set (v0.6.0-$H). Publish an image for this patch set or bump the pin."
+            exit 1
+          fi

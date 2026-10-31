@@ -1,49 +1,8 @@
-# A row-split prompt chunk in two halves, one's exchanges and glue under the other's compute (TF_GLM_PROMPT_MICROBATCH=1
-# with TF_GLM_HC_SPLIT=1 and the overlap; off by default until measured on the Sparks; meant with
-# TF_GLM_PREFILL_ROWS=4096):
-#
-# - Why: the row split's exchanges (every rank's fp32 partials of the other ranks' rows at two sites a layer, then the
-#   glued rows) run on a side stream, but the main stream soon waits for them: the glue needs the partials, the next
-#   block the glued rows. The overlap hides little more than a block's output projection; past two ranks the exchanges
-#   are much of a chunk's time (four Sparks on a ring: ~24 MiB of partials a rank and site).
-# - microbatch: half A = rows [0, h), half B = rows [h, R) at position p + h (h about half, a multiple of 64, KDA's
-#   chunked grid, and of the world size, so A has no pad row), each row-split by its own HcSplit over row views of the
-#   prompt buffers (the row-indexed tensors' rows, the KDA and latent scratch rows, its own region of the partial
-#   staging; the main stream's scratch shared), both on the buffers' side stream. A layer runs A's KDA / DSA block, B's,
-#   A's MoE / MLP, B's on the main stream; after each half's block its chain (the partials' exchange, then the glue on
-#   its own rows and the glued rows' swap: HcSplit.glue_side) is queued on the side stream, so A's runs under B's
-#   compute and B's under A's next block; the main stream joins a half's chain right before that half's next block.
-#   With TF_GLM_PROMPT_OWN_FRONT each half's DSA block runs its own-row front as in 0102. Layer-sliced prefill
-#   (compute_steps) drains both halves' side work at each yield, as the unhalved split joins its side stream, and
-#   the chunk's split ends inactive (a later unsplit forward on the prompt buffers takes the unsplit path).
-# - TF_GLM_PROMPT_MICROBATCH_MIN_ROWS (default 2,048): halves of fewer rows run the chunk whole. Measured on one GB10
-#   (EXL3 routed experts, real routing, a rank's widths 1024 / 768 / 512): 1,024-row calls take 23-73% longer a row than
-#   2,048-row ones, 2,048-row ones 4-31% longer than 4,096-row ones; the 4-bit prompt matmuls cost the same a row from
-#   1,024 to 4,096 rows (within 7%). So 2,048-row chunks stay whole, and 4,096-row chunks run as two halves at today's
-#   2,048-row cost a row. At three ranks the halves sit on a 192-row grid (64 x 3): a 4,096-row chunk is 1,920 +
-#   2,176 rows, so it runs halved there only with TF_GLM_PROMPT_MICROBATCH_MIN_ROWS=1920.
-# - hcsplit: SplitSettings.microbatch / micro_min (the ranks' startup comparison), HcSplit(stream=...) to share the side
-#   stream, glue_side / join, finish() joining a halved chunk's splits.
-#
-# Bits: the halves are two chunks run layer by layer (A at p, B at p + h); a row's arithmetic does not depend on the
-# chunking, and the order keeps two consecutive chunks' dependencies: B's KDA continues from A's state of the layer, B's
-# attention reads A's latents and index keys of the layer (A's block came first on the main stream); nothing of A
-# reads B. The side stream touches only a half's own rows and its own staging.
-#
-# Tests: tests/cpu/test_prompt_own_front.py (interpreter, gloo, 2 / 3 / 4 ranks, p2p and all-gather) and
-# tests/gpu/test_prompt_split_streams_gpu.py (2 and 3 ranks as processes on one GB10, the side stream, events and the
-# glue's fronts real, 4-bit dense projections, FP8 caches): halved chunks, with and without the own-row front, leave the
-# unsplit path's head rows, final rows and every cache row bit for bit.
-#
-# Provenance and credit: ported from the GLM-5.3 recipe's patch 0148 (Mia's AI Lab) to Flash's KDA layers and
-# hyper-connection glue. The design (two micro-batches a chunk, each half's exchange / glue chain on a communication
-# stream under the other half's compute) follows the one drowzeys authored: github.com/drowzeys/TensorFold, branch
-# glm53-tp4-2026-10-05, compute_prompt_sp with TF_GLM53_PROMPT_OVERLAP. No code was copied from it.
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 39bf37f..e513896 100644
+index 4f44161..271a12f 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -711,6 +711,7 @@ class GlmEngine:
+@@ -723,6 +723,7 @@ class GlmEngine:
              raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
                                 "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_PROMPT_OWN_FRONT, "
@@ -52,10 +11,10 @@ index 39bf37f..e513896 100644
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 6b96075..dc7f510 100644
+index eaa7339..f321342 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -890,8 +890,11 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+@@ -1041,8 +1041,11 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
      ``mixer``: the layers' KDA / DSA blocks as ``mixer(layer, done)`` instead of on ``st`` (a chunk of several
      streams' prompts, ``multi_prefill``)."""
  

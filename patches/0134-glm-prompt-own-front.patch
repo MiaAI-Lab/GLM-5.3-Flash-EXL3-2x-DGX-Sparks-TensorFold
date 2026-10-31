@@ -1,48 +1,8 @@
-# A row-split prompt chunk's DSA layers run their replicated front on each rank's own rows (TF_GLM_PROMPT_OWN_FRONT=1
-# with TF_GLM_HC_SPLIT=1; off by default until measured on the Sparks):
-#
-# - Why: with the row split each rank ends a layer holding the next layer's normed input for its own rows only and
-#   swapped them (hidden 4,096 x bf16: 8 KiB a row), so that every rank ran the next block on every row. KDA and the
-#   MoE need every row (split by heads and experts), but most of a DSA block's front is replicated: q_a / kv_a and their
-#   norms, the indexer's key / weight projection, its gate, its query projection and the top-k over every visible
-#   pooled key, which grows with the context. Every rank ran all of it on every row.
-# - own_front.front: before a DSA layer the glue keeps the normed rows on their owner (HcSplit.glue(share=False)); each
-#   rank runs the front on its own rows (forward.dsa_front, already run during the glue with TF_GLM_PREFILL_OVERLAP=2,
-#   plus the indexer's keys, weights, gates and queries) and shares the outputs: the index keys / weights (bf16) and
-#   gates (fp32), then the q_a / kv_a norms' rows (4 KiB a row); every rank writes every row's index keys, gates and
-#   pooled keys, selects its own rows' top-512 pools (sparse.select_pools) and shares them (512 int32 a row); every
-#   rank then makes every row's tokens from the pools (sparse.pool_tokens, select_tokens' formulas). own_front.rest:
-#   q_b for the rank's heads on the other rows, the latent write, absorb, dense attention, sparse attention, expand and
-#   o_proj, as before.
-# - hcsplit: HcSplit.share / wait (whole own shares, send/receive or the all-gather, on the side stream with the
-#   overlap) and glue(share=False); SplitSettings.own_front joins the ranks' startup comparison.
-# - sparse: _select_prompt's blocks factored into _prompt_blocks, select_pools and pool_tokens (the same kernels).
-# - forward: the prompt's sparse attention call in one place (sparse_prompt), used by dsa_rows and own_front.
-# - Kept on the unchanged path: several streams' prompts in one chunk (multi_prefill's mixer), chunks too short to
-#   split, decode and verify windows, TF_GLM_LATENT=0.
-#
-# Bits: every kernel is the unchanged path's on the same row; a row's pools depend on its query, weights and the
-# pooled keys at or before its position, written on every rank before any rank selects, and are the same in any block
-# of rows; partials are still summed rank 0 first; every rank writes its caches from the same shared bytes. Rows that
-# keep dense attention (count 0) may get other, unread, pools.
-#
-# Bytes a DSA layer's own rows send (instead of 8 KiB a row of normed rows): 4.8 KiB a row (index keys 320 B, gates
-# 512 B, the norms' rows 4,096 B), 6.8 KiB once the chunk has sparse rows (pools 2 KiB).
-#
-# GPU check (one GB10, a 2,048-row chunk, FP8 and bf16 pooled keys, 2.6k to 128k tokens): each rank's own-row pools at
-# TP=2 / 3 / 4 give exactly the whole chunk's tokens and counts. The selection a rank runs at 128k (FP8): 26.8 ms on
-# 2,048 rows, 13.6 / 8.7 / 6.3 ms on its 1,024 / 683 / 512 (32k: 6.0 -> 2.8 / 2.0 / 1.4 ms).
-#
-# Provenance and credit: ported from the GLM-5.3 recipe's patch 0147 (Mia's AI Lab) to Flash's DSA (pooled keys, no
-# rotary part; pools shared instead of token lists). The design (the replicated projections and the indexer's top-k on
-# a rank's own rows, their outputs gathered) follows drowzeys' sequence-parallel prompt path, which drowzeys authored:
-# github.com/drowzeys/TensorFold, branch glm53-tp4-2026-10-05, compute_prompt_sp with TF_GLM53_SP_SELECT. No code was
-# copied from it.
 diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
-index 60322fa..39bf37f 100644
+index f175d43..4f44161 100644
 --- tensorfold/families/glm5_next/cuda/engine.py
 +++ tensorfold/families/glm5_next/cuda/engine.py
-@@ -710,7 +710,8 @@ class GlmEngine:
+@@ -722,7 +722,8 @@ class GlmEngine:
          if odd:
              raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
                                 "TF_GLM_LATENT, TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID, TF_GLM_KVB, TF_GLM_COPY_*, "
@@ -53,10 +13,10 @@ index 60322fa..39bf37f 100644
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
                                 "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 8ecaf31..6b96075 100644
+index ab3ada3..eaa7339 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
-@@ -692,16 +692,26 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -830,10 +830,8 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
              tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
                                                    pk.shape[0] - 2, pos_dev, bucket=sparse_np)
          with prof.timed("dsa: sparse attention"):
@@ -69,7 +29,8 @@ index 8ecaf31..6b96075 100644
              else:
                  latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
      with prof.timed("dsa: expand"):
-         return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+@@ -847,6 +845,18 @@ class _Lat:
+         self.pos, self.base = pos, base
  
  
 +def sparse_prompt(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, ol: torch.Tensor,
@@ -87,7 +48,7 @@ index 8ecaf31..6b96075 100644
  def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
                   select: bool = True) -> torch.Tensor | None:
      """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
-@@ -880,11 +890,15 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+@@ -1031,11 +1041,15 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
      ``mixer``: the layers' KDA / DSA blocks as ``mixer(layer, done)`` instead of on ``st`` (a chunk of several
      streams' prompts, ``multi_prefill``)."""
  
@@ -103,7 +64,7 @@ index 8ecaf31..6b96075 100644
      try:
          Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
          first, h = layers[0], layers[0].attn_hc
-@@ -894,6 +908,9 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+@@ -1045,6 +1059,9 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
          for i, layer in enumerate(layers):
              if mixer is not None:
                  mixer(layer, done)
@@ -113,7 +74,7 @@ index 8ecaf31..6b96075 100644
              else:
                  _mixer(layer, w, st, b, R, nch, host_pos, None, done)
              front = ffn_front(layer, w, b) if fronts else None
-@@ -904,7 +921,8 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+@@ -1055,7 +1072,8 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
              front = mixer_front(nxt, w, b) if fronts and nxt is not None else None
              with prof.timed("hc (layer end)"):
                  sp.glue(nxt.attn_hc if nxt is not None else None, nxt.in_norm if nxt is not None else None,
@@ -492,11 +453,11 @@ index 0000000..0d7a9a5
 +
 +    return rest(layer, w, st, b, R, nch, host_pos, front(layer, w, st, b, R, host_pos, done))
 diff --git tensorfold/families/glm5_next/cuda/sparse.py tensorfold/families/glm5_next/cuda/sparse.py
-index 18b0e85..187f004 100644
+index 9e9f6c1..cda9fd0 100644
 --- tensorfold/families/glm5_next/cuda/sparse.py
 +++ tensorfold/families/glm5_next/cuda/sparse.py
-@@ -357,6 +357,19 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
-       dot;
+@@ -523,6 +523,19 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+     - prompt_pools selects (patch 0101: one pass over the scores, top_pools' pools);
      - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
  
 +    width = TOPK_POOLS * POOL + POOL - 1
@@ -515,7 +476,7 @@ index 18b0e85..187f004 100644
      dev = qi.device
      NP = pool_count(pos, R, np_max)
      # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
-@@ -366,9 +379,6 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+@@ -532,9 +545,6 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
      H = wts.shape[1]
      D = qi.shape[1] // H
      wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
@@ -523,12 +484,12 @@ index 18b0e85..187f004 100644
 -    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
 -    counts = torch.empty((R,), dtype=torch.int32, device=dev)
      pkv, pks, rs, fp8 = kv8.parts(pk)
+     cand = torch.empty((B * 2 * prompt_tile(NP)[0],), dtype=torch.int32, device=dev)   # prompt_pools' candidates
      for a in range(0, R, B):
-         n = min(B, R - a)
-@@ -379,9 +389,34 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
-                                                                    HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
-                                                                    L=SCORE_LOOP, RS=rs, FP8=fp8, num_warps=4)
-         pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+@@ -551,9 +561,34 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
+                                                                        BP=64, L=SCORE_LOOP, RS=rs, FP8=fp8,
+                                                                        num_warps=4)
+         pools = prompt_pools(scores, TOPK_POOLS, cand)                                  # ascending pool index
 -        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
 -                      num_warps=4)
 -    return tokens, counts
