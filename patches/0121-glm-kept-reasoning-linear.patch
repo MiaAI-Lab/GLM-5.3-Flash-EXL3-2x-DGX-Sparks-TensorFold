@@ -1,0 +1,113 @@
+# Kept reasoning is restored in one pass over the conversation. KeptReasoning.restore (patch 0036) keyed each assistant
+# tool step that came back without reasoning by a signature of the whole conversation before it, rebuilt for every
+# step: each one re-encoded and hashed every earlier message, so a request cost the square of its length, in Python
+# with the GIL held, before admission and outside the TTFT metric. An agent client that sends empty think blocks back
+# bare (pi does) makes nearly every step a candidate: ~4-5 s a request at ~2,000 messages / ~400k tokens, with the
+# engine loop and every other stream stopped meanwhile. _History keeps one running SHA-256 over the message shapes
+# (each length-prefixed) and copies it at each step: one pass a request. The same keys cover the same history (role,
+# stripped text, calls; no ids or reasoning), ids are still tried first, so the same steps are restored with the same
+# reasoning; the key format is new, which only matters within one process. tools/kept_reasoning_check.py.
+
+diff --git tensorfold/families/glm5_next/cuda/kept_reasoning.py tensorfold/families/glm5_next/cuda/kept_reasoning.py
+--- tensorfold/families/glm5_next/cuda/kept_reasoning.py
++++ tensorfold/families/glm5_next/cuda/kept_reasoning.py
+@@ -14,6 +14,11 @@
+ 
+ ``TF_GLM_KEEP_REASONING``: replies kept (default 1024; 0 turns this off); ``TF_GLM_KEEP_REASONING_MB``: their text
+ at most (default 32 MiB); the oldest go first.
++
++Keys are one running SHA-256 over the conversation's message shapes (``_History``): ``restore`` copies it at each
++step, so a request costs one pass over its messages. Before, each step re-encoded every message before it, so a
++request cost the square of its length, with the GIL held: ~5 s at 404k tokens / 2,020 messages, the engine loop and
++every other stream stopped meanwhile.
+ """
+ 
+ from __future__ import annotations
+@@ -69,25 +74,54 @@
+     return out
+ 
+ 
+-def signature(history: list[Any], calls: Any) -> str:
+-    """The key of ``calls`` written after ``history``: each message's role, text (stripped, as the template renders
+-    it) and calls, without ids or reasoning, then the calls."""
++def _encode(value: Any) -> bytes:
++    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
++    return text.encode("utf-8", "surrogatepass")
+ 
+-    shape = []
+-    for m in history:
++
++class _History:
++    """A running hash of a conversation's message shapes (role, text stripped as the template renders it, calls;
++    no ids or reasoning), each length-prefixed: the key of calls after any prefix costs one copy of the hash."""
++
++    def __init__(self) -> None:
++        self.hash = hashlib.sha256(b"tf-kept-reasoning-v2\0")
++
++    def add(self, m: Any) -> None:
+         if not isinstance(m, dict):
+-            continue
++            return
+         entry = [str(m.get("role") or ""), _text(m.get("content")).strip()]
+         if m.get("role") == "assistant" and m.get("tool_calls"):
+             entry.append(_calls(m.get("tool_calls")))
+-        shape.append(entry)
+-    text = json.dumps([shape, _calls(calls)], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+-    return "sig:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
++        data = _encode(entry)
++        self.hash.update(len(data).to_bytes(8, "little"))
++        self.hash.update(data)
++
++    def key(self, calls: Any) -> str:
++        h = self.hash.copy()
++        data = _encode(_calls(calls))
++        h.update(b"\xffcalls")
++        h.update(len(data).to_bytes(8, "little"))
++        h.update(data)
++        return "sig:" + h.hexdigest()
+ 
+ 
+-def _keys(history: list[Any], calls: Any) -> list[str]:
++def signature(history: list[Any], calls: Any) -> str:
++    """The key of ``calls`` written after ``history``: each message's role, text (stripped, as the template renders
++    it) and calls, without ids or reasoning, then the calls."""
++
++    run = _History()
++    for m in history:
++        run.add(m)
++    return run.key(calls)
++
++
++def _ids(calls: Any) -> list[str]:
+     ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
+-    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [signature(history, calls)]
++    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)]
++
++
++def _keys(history: list[Any], calls: Any) -> list[str]:
++    return _ids(calls) + [signature(history, calls)]
+ 
+ 
+ class KeptReasoning:
+@@ -143,13 +177,15 @@
+         if not isinstance(messages, list) or not self.items:
+             return messages
+         out = None
++        run = _History()
+         for i, m in enumerate(messages):
+-            if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
++            if (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+                     and not _text(m.get("reasoning_content")).strip() and not _text(m.get("reasoning")).strip()
+                     and "</think>" not in _text(m.get("content"))):
+-                continue
+-            kept = self._find(_keys(messages[:i], m["tool_calls"]))
+-            if kept is not None:
+-                out = out if out is not None else list(messages)
+-                out[i] = {**m, "reasoning_content": kept}
++                # the ids first (cheap), then the conversation's key: the order ``_keys`` gives them
++                kept = self._find(_ids(m["tool_calls"])) or self._find([run.key(m["tool_calls"])])
++                if kept is not None:
++                    out = out if out is not None else list(messages)
++                    out[i] = {**m, "reasoning_content": kept}
++            run.add(m)                       # the shape has no reasoning: the same before or after a restore
+         return messages if out is None else out

@@ -1,0 +1,18 @@
+# Phone photos (iPhone MPO JPEGs) are accepted (issue #201): the decode guard refused any image whose Pillow
+# n_frames was not 1, and an MPO file reports 2 or more (the picture plus a preview, depth map or gain map) although
+# only its first frame is ever loaded. An MPO is now let through; animated WebP and multi-frame PNG images are
+# still refused, and the size and pixel limits above the guard still apply to the (first-frame) dimensions.
+# MiaAI-Lab, Apache-2.0.
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -211,7 +211,9 @@
+                 if (min(width, height) <= 0 or max(width, height) > limits.max_dimension
+                         or width * height > min(limits.max_pixels, remaining_pixels)):
+                     raise ImageInputError("image dimensions exceed the decoded pixel limit")
+-                if getattr(source, "n_frames", 1) != 1:
++                # An MPO (what iPhones and many Android phones save as .jpg) is a JPEG whose first frame is the
++                # picture; its other frames (preview, depth, gain map) are never read: only frame 0 is loaded below.
++                if getattr(source, "n_frames", 1) != 1 and source.format != "MPO":
+                     raise ImageInputError("animated and multipage images are unsupported; send a single frame")
+                 source.verify()
+             with image.open(io.BytesIO(data), formats=_FORMATS) as source:

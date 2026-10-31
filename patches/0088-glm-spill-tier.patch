@@ -2,7 +2,8 @@
 # every rank and are read back beside decoding streams when a request extends them, also after a clean restart. New
 # tensorfold/cuda/spill.py (no model code), hooks in the one-stream and --parallel paths. With 0072's display span the
 # rows there go to and from disk through a kernel, as 0072's own moves do (CUDA refuses a memcpy across its two
-# registrations); a request 0073 cancels leaves the tier's read bookkeeping too. By @wojo, Apache-2.0.
+# registrations); a request 0073 cancels leaves the tier's read bookkeeping too.
+# By Robert Wojciechowski (GitHub @wojo, X @rwojo), Apache-2.0.
 diff --git tensorfold/cli.py tensorfold/cli.py
 index c2e3768..c57336d 100644
 --- tensorfold/cli.py
@@ -142,7 +143,7 @@ index 0000000..c7a8eb8
 +read is used only when it worked on every rank, and at start only entries every rank holds are kept, in rank 0's
 +order.
 +
-+Credits: wojo (Robert Wojciechowski, https://github.com/wojo) wrote this module and its hooks. The idea of NVMe session
++Credits: Robert Wojciechowski (GitHub @wojo, X @rwojo) wrote this module and its hooks. The idea of NVMe session
 +state per rank was proposed in MiaAI-Lab's GLM-5.3-Flash vLLM kit pull request #232, authored by gabewillen (the idea
 +only, no code). The multi-rank design (one directory a rank, rank 0 deciding, an agreement on every read, a reconcile
 +at start) is that of patch 0250 of jayleaton/glm53-tensorfold-spark, authored by Jay Leaton (Apache-2.0). The file
@@ -2420,7 +2421,7 @@ index af9769e..ce427a1 100644
              else:
                  try:
                      left = until - time.monotonic() if until is not None else 0.0
-@@ -1895,9 +2405,24 @@ class GlmScheduler(Scheduler):
+@@ -1895,17 +2405,34 @@ class GlmScheduler(Scheduler):
              if self._cancel_item(item):
                  continue
              stream, box = item
@@ -2441,11 +2442,21 @@ index af9769e..ce427a1 100644
 +                if read is not None:
 +                    self.loading.append((read, item))
 +                    continue
-+            self.staged.discard(id(stream))
++                self.staged.discard(id(stream))      # (nothing read, e.g. no room for it yet: looked for again if it waits)
              self.boxes[id(stream)] = box
              try:
                  self.decoder.admit(stream)
-@@ -1912,10 +2437,20 @@ class GlmScheduler(Scheduler):
++                self.staged.discard(id(stream))
+             except NoRoom:
+                 self.boxes.pop(id(stream))
+                 self.held = item
+                 break
+             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                self.staged.discard(id(stream))
+                 self.boxes.pop(id(stream)).put(("error", exc))
+                 continue
+             if stream.done:
+@@ -1912,10 +2440,20 @@ class GlmScheduler(Scheduler):
                  done.append(stream)
          return done
  
@@ -2467,7 +2478,7 @@ index af9769e..ce427a1 100644
              return
          live = list(self.decoder.streams.values())
          stream = next((s for s in reversed(live) if s.background and not s.done and s.constraint is None
-@@ -1956,7 +2491,10 @@ class GlmScheduler(Scheduler):
+@@ -1956,7 +2494,10 @@ class GlmScheduler(Scheduler):
      def _iteration(self) -> None:
          self._cancel_waiting()
          self._yield()

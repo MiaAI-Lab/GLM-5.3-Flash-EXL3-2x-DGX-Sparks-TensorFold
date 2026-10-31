@@ -1,0 +1,71 @@
+# A call to a tool the request did not offer stays text, as before and as TensorFold's server since 7be90a36b and
+# 806af974c (v1.0.0 on, callName returns an offered name or nothing), and is now reported (#103). The call is never
+# made and never run; a one-call reply drops it as before. parse_tool_calls takes a `rejected` list and gets the name
+# of each block that parsed as a call (GLM, Qwen or JSON markup) to an unoffered tool (prose that only names the tags
+# is no block: 0112). The server logs one line for such a reply,
+# `[tensorfold] tool call rejected: unknown_tool_name ['exec'] (2 tools offered); kept as text` (names only, never an
+# argument); TF_GLM_TOOL_DIAGNOSTICS=1 also lists them in the reply's `tensorfold` block (a stream's last event) as
+# `tool_call_rejections: [{"reason": "unknown_tool_name", "name": "exec"}]`, so a gateway can tell the reply from an
+# ordinary answer and re-prompt. Tokens, content, calls and finish_reason are unchanged. Adapted from BadAd84's
+# patch 0114 (#137). CPU check: tools/test_unoffered_tool_call.py.
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -141,8 +141,11 @@
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+ 
+ 
+-def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
+-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls."""
++def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None,
++                     rejected: list[str] | None = None) -> tuple[str, list[dict[str, Any]] | None]:
++    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls.
++    ``rejected``, when given, gets the name of each call to a tool the request did not offer (#103): that block
++    stays text, as before and as TensorFold's server since 7be90a36b, and is never a call."""
+ 
+     if not tools:
+         return text, None
+@@ -182,6 +185,8 @@
+                 if glm is not None:
+                     name, args = glm
+         if not name or str(name).lower() not in known:
++            if name and rejected is not None:
++                rejected.append(str(name)[:128])
+             if max_calls is None:
+                 residue.append(match.group(0))
+             continue
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -66,6 +66,18 @@
+     text = config.get("text_config") or config
+     limit = text.get("max_position_embeddings") or config.get("max_position_embeddings")
+     return int(limit) if isinstance(limit, int) and limit > 0 else 0
++
++
++def tool_call_rejections(names: list[str], offered: int, stats: dict[str, Any]) -> dict[str, Any]:
++    """Calls a reply made to tools the request did not offer (#103): they stay text and never run. One log line names
++    them (the names only, never an argument); TF_GLM_TOOL_DIAGNOSTICS=1 also lists them in the reply's "tensorfold"
++    block (a stream's last event) as ``tool_call_rejections``, so a gateway can tell the reply from an answer."""
++
++    print(f"[tensorfold] tool call rejected: unknown_tool_name {names!r} ({offered} tools offered); kept as text",
++          flush=True)
++    if os.environ.get("TF_GLM_TOOL_DIAGNOSTICS", "").strip() != "1":
++        return stats
++    return {**stats, "tool_call_rejections": [{"reason": "unknown_tool_name", "name": n} for n in names]}
+ 
+ 
+ class App:
+@@ -615,7 +627,11 @@
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+         text = stops.visible(raw_text) + closing[0]
+         raw_answer = split(text, True)[1]
+-        content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
++        rejected: list[str] = []                          # calls to tools the request did not offer: text (#103)
++        content, calls = (parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls, rejected=rejected) if tools
++                          else (answer, None))
++        if rejected:
++            stats = tool_call_rejections(rejected, len(tools), stats)
+         content = policy.content(content) if tools else content
+         call_deltas, streamed = [], 0
+         # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the end
