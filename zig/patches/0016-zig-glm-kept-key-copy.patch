@@ -1,0 +1,48 @@
+diff --git a/zig/src/server/glm_kept.zig b/zig/src/server/glm_kept.zig
+index dc108a6..8fb7b06 100644
+--- a/zig/src/server/glm_kept.zig
++++ b/zig/src/server/glm_kept.zig
+@@ -70,7 +70,13 @@ pub const KeptReasoning = struct {
+         k.next += 1;
+         try k.items.put(k.gpa, n, .{ .text = copy, .keys = owned });
+         k.size += copy.len;
+-        for (owned) |key| try k.by_key.put(k.gpa, key, n); // a key kept again points at the newer reply
++        // a key kept again points at the newer reply and holds the newer reply's copy: `put` would keep the older reply's
++        // slice as the map's key, which its eviction frees while the map still reads it
++        for (owned) |key| {
++            const slot = try k.by_key.getOrPut(k.gpa, key);
++            slot.key_ptr.* = key;
++            slot.value_ptr.* = n;
++        }
+         while (k.items.count() > k.entries or k.size > k.chars) {
+             const old = k.items.values()[0];
+             const old_n = k.items.keys()[0];
+@@ -352,6 +358,28 @@ test "the oldest replies go first, by count and by size" {
+     try std.testing.expectEqual(@as(usize, 0), tiny.items.count());
+ }
+ 
++test "a key kept again by a newer reply is that reply's copy, so evicting the older one frees no key the map holds" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var k = KeptReasoning.init(std.testing.allocator, std.testing.io, 1, 1);
++    defer k.deinit();
++    const history = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"go\"}]")).ok;
++    const calls = (try json.parse(a, "[{\"id\":\"call_0123456789abcdef01234567\",\"function\":{\"name\":\"f\",\"arguments\":{}}}]")).ok;
++    // the same step twice (a retried request): the second reply keeps the same keys, then the first is evicted
++    try k.remember(history, calls.array, "first");
++    try k.remember(history, calls.array, "second");
++    try std.testing.expectEqual(@as(usize, 1), k.items.count());
++    const live = k.items.values()[0].keys;
++    var it = k.by_key.keyIterator();
++    while (it.next()) |stored| {
++        var owned = false;
++        for (live) |key| owned = owned or key.ptr == stored.*.ptr;
++        try std.testing.expect(owned); // a key from the evicted reply would be freed memory the next lookup reads
++    }
++    try std.testing.expectEqualStrings("second", (try k.find(a, live)).?);
++}
++
+ test "the signatures are kept_reasoning.py's" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
