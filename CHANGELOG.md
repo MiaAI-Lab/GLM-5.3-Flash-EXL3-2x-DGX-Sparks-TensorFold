@@ -10,6 +10,207 @@ Every change to this recipe, newest first. Each release names the image it serve
   pull request that changes `patches/` the pin check now passes with a warning naming the tag the set hashes to.
   A push to `main`, and a pull request that does not change `patches/` (a pin bump, for example), still fail on a
   mismatch.
+- **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
+  by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
+  for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
+  (6 reads in 6 rounds in the check, 1 now). The mark now goes after `admit` succeeds or the request fails. Added when
+  taking it: a request whose first `prestage` read nothing (no room for the read yet) drops the mark, so the prompt
+  is looked for again and read once there is room (without that it would have prefilled from scratch). CPU test:
+  `tools/test_queued_cancellation.py` (two cases; fails on the unpatched source).
+- **KV sharding** (patch `0129-glm-kv-shard`, `TF_GLM_KV_SHARD=1`, off by default, by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): each
+  conversation's MLA latent cache is stored once, on the Spark that owns it,
+  instead of on every Spark (tensor parallelism splits the heads, but every head reads the whole latent). The owner
+  computes the decode attention of its rows; a prompt chunk on the other Sparks gets only the history rows its sparse
+  attention selects, or borrows free rows and attends locally. Two Sparks, `PARALLEL=8`: the pool holds 1.87x the tokens
+  (1.51M -> 2.83M; 1.85M -> 3.47M with `DISPLAY_KV_MIB=1792`), every reply byte-equal to the unsharded engine's, decode
+  within 1%, prompts within noise when rows can be borrowed and +1.8-3.5% when they are sent. A borrowed row is pinned
+  while its prompt fills (a compaction moving it gave wrong replies under concurrent load; found in review, fixed, and
+  a forced-compaction run on two Sparks is byte-equal). A cache hit whose part has no room no longer drops the cache
+  or evicts kept conversations while another part has room: its rows are carried there (`TF_GLM_KV_SHARD_CARRY`,
+  on; only when it saves a recompute, an eviction or a pause, never to even out the parts). The same shard code serves
+  the tp4 branch (own-row front, microbatching, a carry relayed over a switchless ring's neighbour links); two Sparks
+  and four (tp4, on a ring) tested, three untested. The staging buffers a prompt's history fetch keeps (`shard._grown`) are outside the start-up
+  estimate. Builds on `0128` and `0119` (renumbered from `0118`, which #216 uses). CPU checks: `tools/kv_shard_check.py`, `tools/kv_shard_mutants.sh`.
+
+- **A rewound conversation keeps its id** (patch `0119-glm-chat-continued`, by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): patch
+  `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
+  client rewinding before the kept turns (issue #104, @danielbanu), a state read back from the spill tier, or dropped
+  states split one session into several ids, and `TF_GLM_KEEP_PER_CHAT` counted each piece on its own: one session
+  held more states than the quota. Now the stream joins the conversation whose own kept state its prompt repeats past
+  that conversation's first prompt and the first 32 tokens of the reply to it. On two Sparks (PARALLEL=8,
+  `TF_GLM_KEEP_PER_CHAT=2`, `TF_GLM_CACHE_ENTRIES=16`), a ~110k-token session rewinding three rounds every fifth of 16
+  while six chats fill the cache: before, its states went under 3 ids; after, 1, holding 2 states as asked; replies
+  the same drafted and with `draft:false`. New counters `chats_continued`, `chats_continued_prefill_tokens` (`/health`,
+  `/metrics`) and a rank-0 log line for one prefilling 4096 tokens or more, with where the prompt left the kept state
+  and what it resumed from. Two sessions with the same opening message and the same first reply (temperature 0)
+  cannot be told apart by this match and share an id. CPU check: `tools/chat_continued_check.py` (fails on the
+  unpatched engine; also runs `_admitted` itself and the `chat_roots` pruning).
+- **`prepare.sh` warns when a node's NVIDIA CDI device cannot be confirmed** (by
+  [SvangenStudios](https://github.com/SvangenStudios), [pull request #207](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/207),
+  issue #150): without the host's CDI spec, a `systemctl daemon-reload` can remove the GPU from a running container's
+  cgroup and the next kernel load fails with `operation not permitted`. `prepare.sh` now runs `nvidia-ctk cdi list`
+  on the head and on each worker and warns, with the fix, when `nvidia.com/gpu=all` is not listed (an ssh failure is
+  reported as such). A warning only; nothing is changed on the node. The README's Requirements say the same.
+- **README: `/no_think` in prompt text does not disable thinking** (by
+  [travellingsoldier85](https://github.com/travellingsoldier85), [pull request #193](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/193)):
+  the template does not read a `/no_think` or `/think` suffix, so a request that sends one keeps the server's
+  default; the README names the settings that do work and says an empty `content` with `finish_reason: "length"` is
+  a reply to retry.
+- **README: static addresses for the link (issue #196) and the Ablit weights' drafter (issue #83)**: a moved RoCE
+  GID is not noticed by a running engine, so the Requirements ask for static addresses; the Ablit section records
+  why the stock DFlash2 drafter stays for `ABLIT=1`, with the two controlled runs by
+  [troshab](https://github.com/troshab) and [gulldan](https://github.com/gulldan) that measured the refitted one.
+- **CREDITS: four patch credits that had lost their name** (0101, 0103, 0105, 0107, by
+  [BadAd84](https://github.com/BadAd84)) are complete again and sit in the Patches section.
+- **A chat's pictures keep their size past the 8th, so it still resumes from its kept prompt state**
+  (`TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS`, by [abadawe-dev](https://github.com/abadawe-dev)): TensorFold caps a picture
+  at min(`IMAGE_TOKENS`, the request's picture budget / its pictures), and its own budget of 16,384 holds 8 pictures at
+  2,048. From the 9th on, every new picture shrank all the earlier ones: their rows and content keys changed, the
+  kept state matched only up to the chat's first picture, and the rest was read again on every turn that brought a
+  picture. An agent session reading screenshots at ~420k tokens waited 150-167 s (187-191k tokens) after each one.
+  `scripts/config.sh` now sets the budget to `MAX_IMAGES` x `IMAGE_TOKENS` (50 x 2,048 = 102,400, at most 262,144),
+  so the cap is the same for any number of pictures a request can carry, and reserves the feature rows that adds in
+  the tower's workspace (`TENSORFOLD_VISION_WORKSPACE_MIB` 768 -> 1,440 MiB: rank 0's startup estimate 88.09 ->
+  88.74 GiB, the pool 2,582,528 -> 2,537,472 tokens on two Sparks at `PARALLEL=4`). `tools/picture_turns.py`, a
+  48k-token chat, pictures 9 to 11: 16.4-16.6k tokens read and 13.0-13.3 s a turn before, 2.1k and 2.5-2.8 s now; a
+  cold request of 50 full-size pictures (102,118 tokens) answers and resumes. Pictures past the 8th are no longer
+  downscaled, so they cost up to 2,048 tokens each. `TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS=16384` restores the shared
+  budget. No patch and no image change. CPU check: `tools/picture_budget_check.py`.
+- **A phone photo (an iPhone MPO JPEG) is accepted** (patch `0110-vision-mpo-first-frame`, issue #201, diagnosed by
+  [robertforbes68](https://github.com/robertforbes68)): the decode guard refused any image whose `n_frames` was not 1, and
+  an MPO (what iPhones and many Android phones save as `.jpg`: the picture plus a preview, depth or gain map) reports 2
+  or more, so a photo straight from the phone got a 400 "animated and multipage images are unsupported". An MPO is now
+  read from its first frame, the only one ever decoded; the size and pixel limits apply as before, and animated WebP and
+  multi-frame PNG are still refused. CPU check: `tools/test_mpo_first_frame.py` (needs Pillow; fails without the patch).
+- **Pictures inside a Responses `function_call_output`** (patch `0109-responses-tool-image`, issue #162, by
+  [StrayDragon](https://github.com/StrayDragon), [pull request #175](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/175)):
+  an agent that returns a tool's screenshot as `input_image` parts got a 400 ("must be a string or input_text
+  parts"), although the chat route renders tool-result pictures. The `_output` hunk of TensorFold commit 69d0ca9 (v0.6.3)
+  now lets those parts through. CPU check: `tools/test_responses_tool_image.py` (fails without the patch).
+- **Streamed replies keep the connection alive while they wait** (patch `0111-server-sse-keepalive`, issue #106,
+  reported with the first version of the patch by [stevehansen](https://github.com/stevehansen)): a streamed reply
+  sent nothing between its first event and its first token, so a request waiting for a lane or filling a long prompt
+  was silent for minutes, and a proxy in front cut it as idle (reported: behind a Cloudflare Tunnel every such stream
+  ended at ~125 s). Now a stream that has sent nothing for `SSE_KEEPALIVE_S` seconds (15) writes an SSE comment line,
+  `: keepalive`, on the chat, completions, Messages and Responses streams; SSE clients skip comment lines, and the
+  events are the same bytes. `SSE_KEEPALIVE_S=0` turns it off; a value that is not a number of seconds stops the
+  server at start. Non-streamed replies are unchanged. CPU test: `tools/test_sse_keepalive.py`.
+- **A streamed Anthropic reply opens with the prompt's token count** (patch `0112-anthropic-stream-head-usage`,
+  by [kky42](https://github.com/kky42), fixing TensorFold #672): `message_start` carried `usage({})`, all zeros, and
+  the real counts only arrived in the final `message_delta`, so a client that reads prompt counts from the head
+  (Claude Code's context-window indicator) showed ~0% used on every streaming request. The CUDA chat handler now
+  hands its prepared prompt's length to the translated request's wire before the stream head, and the head reports
+  it whole (cache fields 0); the final delta keeps the engine's input/cache_read split, the two totals equal, and
+  no second render runs. The Mac server's head is written before its render, so it keeps the old zeros (in the
+  patch header). CPU check: `tools/test_anthropic_stream_head.py`.
+- **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0114-glm-tool-tag-mention`, by
+- **A call to a tool the request did not offer stays text, and is now reported** (patch `0115-glm-unoffered-tool-call`,
+  by [kky42](https://github.com/kky42), adapted from [BadAd84](https://github.com/BadAd84)'s #137, #103): such a call
+  stayed content text with `finish_reason` "stop" and nothing said why, so a gateway could not tell it from an answer.
+  It still stays text and never runs, as in TensorFold since 7be90a36b / 806af974c (v1.0.0 on, only an offered name is
+  a call; a one-call reply drops it). Now the server logs `tool call rejected: unknown_tool_name ['<name>']` (names
+  only), and with `TF_GLM_TOOL_DIAGNOSTICS=1` the reply's `tensorfold` block lists them as `tool_call_rejections`.
+  Tokens, content, calls and `finish_reason` are unchanged. CPU check: `tools/test_unoffered_tool_call.py`.
+- **A tool call after a quoted `<tool_call>` tag is a call again** (patch `0112-glm-tool-tag-mention`, by
+  [kky42](https://github.com/kky42)): every place the server finds GLM calls ran a block from any `<tool_call>` to the
+  next `</tool_call>`, so a reply that mentioned the tag ("the literal `<tool_call>` markup") before its real call made
+  one unparseable block of both: across `</think>` in the reasoning (cut at the mention), across the prose in the
+  answer. The call came back as content text with `finish_reason` "stop" and no `tool_calls`, and the agent stopped.
+  An opener now starts a block only when a call's head follows (GLM's name then `<arg_key>` or `</tool_call>`, Qwen's
+  `<function=`, or JSON), and a call in the think block does not cross `</think>`. A word the tags enclose with space
+  ("The tags are `<tool_call> and </tool_call>`.") is prose too, not a call without arguments, which the chat template
+  writes `<tool_call>name</tool_call>`: it stays in `content`, streamed as well (the content hider used to drop it from
+  the stream), and naming an offered tool that way is no longer a call. Two Sparks, 30 live replies to five prompts
+  about the tag, each ending in a real `bash` call (seeded; v1.10's image and the same image with only this file
+  changed, token-identical replies): `tool_calls` 15/30 -> 30/30, whole and streamed alike, and call markup in
+  `content` 18 -> 0. A whole example call the model quotes is still read as a call, as before (3 of the 30 gave two
+  calls). CPU check: `tools/test_think_tag_mention.py`.
+- **A quoted `<think>` stays text** (patch `0116-glm-literal-added-tokens`, by [ahinore](https://github.com/ahinore)):
+  the chat route renders a request into one string and encodes it whole, and HF tokenizers takes every added
+  token's text out of a string, special or not (`<think>` and `</think>` are not special), so a request that only
+  quoted one got that token: an agent reading another model's raw output, a chat template or a log saw `<think>`,
+  `</think>`, `<tool_call>` or `<|user|>` as the tokens themselves, and wrote such a quote back as the token, where
+  the reply's reasoning/content split broke. The request's text (content, reasoning, call arguments, JSON-escaped
+  ones too, and the tools' definitions) is now masked before the template renders and encoded as text, around the
+  template's own tokens; GLM's kept reasoning is put back before masking, so it is still found for clients that
+  renumber call ids. A prompt without such text encodes to the same ids; `/nothink`, assistant turns with their
+  reasoning inline and requests with pictures are as before; `TF_GLM_LITERAL_TOKENS=0` turns it off. The same
+  prompts as tokens and as text, 10 sampled replies each, two Sparks (four): replies that wrote a quoted `</think>`
+  as the token 7 (8) -> 0; an expected value starting with `<think>` written right 0 (0) -> 10 (10); which side of a
+  failing assertion starts with `</think>` 4 (3) -> 8 (7). A quote the model writes as text inside its reasoning
+  still ends the reasoning where the reply is split today (at the first `</think>` in the text). CPU check:
+  `tools/literal_tokens_check.py`.
+- **A `<tool_call>` or `</think>` the reply spells as text stays text** (patch `0117-glm-reply-marker-ids`, by [ahinore](https://github.com/ahinore)):
+  GLM writes its markup as single tokens, but the server read the decoded reply as text.
+  - **What went wrong:**
+    - a `</think>` the model quoted in its reasoning ended the reasoning there;
+    - an example call written as text became a real `tool_calls` entry;
+    - a real call whose argument contains `</arg_value>`, `</tool_call>` or `</think>` was cut.
+  - **The fix:**
+    - each marker token in the reply is recorded with the occurrence of its text it wrote;
+    - every other occurrence is made inert at the same length before the parsers read the reply (`ThinkSplit`, the call hiding and streaming, the end parser, #22's closing), so the parsers are unchanged;
+    - everything the server sends has the text back.
+  - **Scope:** a reply without spelled markup parses as before; `TF_GLM_REPLY_IDS=0` turns it off; other families are unchanged. It is the reply's side of patch 0122's rule and applies with or without it. It ports `TENSORFOLD_REPLY_IDS` from [bertholomus/TensorFold@113a151c](https://github.com/bertholomus/TensorFold/commit/113a151cc69dba111a3bab3f9d6f33cb0dac61c5).
+  - **Measured:** four Sparks with 0122, 10 sampled replies per case, recorded and parsed both ways. The answer was right:
+    - which side of a failing assertion starts with `</think>`: 4 -> 7;
+    - an expected value starting with `<think>`: 9 -> 10;
+    - echo `<think>hello</think> world`: 0 -> 5.
+  - **CPU check:** `tools/reply_ids_check.py`.
+- **A rewound conversation keeps its id** (patch `0119-glm-chat-continued`, by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)): patch
+  `0089` gave a stream a new conversation id unless it resumed from one of that conversation's own turn states, so a
+  client rewinding before the kept turns (issue #104, @danielbanu), a state read back from the spill tier, or dropped
+  states split one session into several ids, and `TF_GLM_KEEP_PER_CHAT` counted each piece on its own: one session
+  held more states than the quota. Now the stream joins the conversation whose own kept state its prompt repeats past
+  that conversation's first prompt and the first 32 tokens of the reply to it. On two Sparks (PARALLEL=8,
+  `TF_GLM_KEEP_PER_CHAT=2`, `TF_GLM_CACHE_ENTRIES=16`), a ~110k-token session rewinding three rounds every fifth of 16
+  while six chats fill the cache: before, its states went under 3 ids; after, 1, holding 2 states as asked; replies
+  the same drafted and with `draft:false`. New counters `chats_continued`, `chats_continued_prefill_tokens` (`/health`,
+  `/metrics`) and a rank-0 log line for one prefilling 4096 tokens or more, with where the prompt left the kept state
+  and what it resumed from. CPU check: `tools/chat_continued_check.py` (fails on the unpatched engine).
+
+- **A system prompt's kept state stays once a second conversation goes on from it** (patch
+  `0120-glm-fork-point-shared`, issue #121, diagnosed with a proposed fix by @RyanLeeUPC; by
+  [BadAd84](https://github.com/BadAd84)): with a short first message, a conversation's own kept state is the
+  system block's state. The next conversation resumed from it and kept a longer state beside it, and past
+  `TF_GLM_CACHE_ENTRIES` the system block's state was dropped as superseded, so the third conversation on that
+  system prompt prefilled it whole again. A kept state that a prompt goes on from differently than the prompt that
+  wrote it is now a shared prefix (kept by recency, `0077`) and no conversation's own turn state
+  (`TF_GLM_KEEP_PER_CHAT`); so is one two conversations prefilled at the same time. A conversation's own next turn
+  is unchanged. The same replies: only which kept states stay changes. Known limit: with the opt-in
+  `TF_GLM_EFFORT_TAIL=1` (`0096`) the generation prompt ends in the effort line, which the conversation's own next turn does
+  not repeat at that position, so its own turn state can be taken for a fork (kept by recency instead of superseded-first;
+  never a different reply). CPU check: `tools/fork_point_check.py`.
+- **Long agent sessions no longer stall before each request starts** (patch `0121-glm-kept-reasoning-linear`, by
+  [cawilliamson](https://github.com/cawilliamson)): `KeptReasoning.restore` (patch `0036`) looks up the reasoning of
+  every assistant tool step a client sent back without any, by a signature of the conversation before that step, and
+  rebuilt that signature from the whole history for every step: each request re-encoded and hashed its conversation
+  once per tool step, the square of its length, in Python with the GIL held, before admission (so outside the TTFT
+  metric) and with the engine loop and every other stream stopped meanwhile. A client that returns empty think blocks
+  bare makes nearly every step a candidate. Three Sparks, `PARALLEL=4`, a real ~2,000-message, ~404k-token agent
+  session replayed fully cached (`prefill_s` 0.2): 4.8-5.3 s before the response headers, the thread inside
+  `kept_reasoning.restore` in every stack dump; the fixed part of each turn grew from ~0.4 s at ~100k tokens to ~7 s
+  at ~400k while decode held ~45-55 tok/s. One running SHA-256 over the message shapes, copied at each step, makes it
+  one pass: that session's restore 4.06 -> 0.014 s, the same restores (the same history in each key; ids are still
+  tried first). CPU check: `tools/kept_reasoning_check.py` (fails on the unpatched source).
+- **The first start of a new image no longer gets a smaller pool** (patch `0122-cuda-budget-parked-pages`, by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)). TensorFold
+  budgets each rank from `MemAvailable` at start; the first start of an
+  image the worker lacked read 89.44 GiB "within" on rank 0 against 94.86 for a warm restart of the same image, and
+  kept 2 prompt states, not 32. On kernel 6.7+ a bulk free leaves GiBs of free pages on the per-CPU lists (`pagesets`
+  `count:` in `/proc/zoneinfo`), in neither `MemFree` nor `MemAvailable`: the image copy in `prepare.sh` (`docker save`
+  / `docker load`) parks 5-9 GiB there, which comes back at ~0.05-0.1 GiB/s over 1-2 minutes, and the first start of a new
+  image compiles `tensorfold_roce_v1` inside the rank container ~1 s before the budget is read, which parks 2.4 GiB
+  more. `capacity.admit` now reads `/proc/meminfo` and, right after it, the lists once at start-up (every zone and CPU,
+  less their `high_min:` resting level, so a warm start's idle 0.28 GiB, 0.11 GiB over it, does not move the budget; 0
+  when `/proc/zoneinfo` is unreadable) and adds the excess to that one `MemAvailable` reading (capped at `MemTotal`) for
+  both `available_bytes` and `page_room`, so pages that drain in between are undercounted, never counted twice. The
+  start-up log says how many it counted, from 0.25 GiB. Only that start-up read counts them: the Qwen families' live memory gate
+  keeps its figure, and the GLM family reads `MemAvailable` nowhere else. `start.sh`'s own "memory available" check
+  (and its warning below ~110 GiB) counts the same excess. Cold first start of a new image, TP=2: 94.58 GiB "within"
+  on rank 0 (rank 1 95.20) against 89.44 with nothing counted; a warm restart 94.86. CPU check on synthetic zoneinfo / meminfo files, admit() included: `tools/parked_pages_check.py`.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
@@ -116,6 +317,63 @@ Every change to this recipe, newest first. Each release names the image it serve
   vision line for 15 minutes, every rank spinning); with the patch it serves in 145 s. Both loaders now copy each
   tensor out of the mmap first (`.clone()`): the same bytes, one host copy a tensor at start; the main weights use
   direct reads and never had the problem. CPU check: `tools/mmap_upload_check.py` (fails on the unpatched loaders).
+- **A GET with a body no longer breaks the next request on its connection** (patch `0113-http-get-delete-body-discard`,
+  by [cawilliamson](https://github.com/cawilliamson)): the CUDA handler's `do_GET` and `do_DELETE` never read a request
+  body, so a GET or DELETE carrying one left its bytes on the keep-alive connection and the stdlib parsed them as the
+  next request's start: a "Bad request syntax" 400, an HTML page with no JSON, for whatever came next. Scanners probe
+  with GET bodies, and behind a pooling proxy (nginx upstream keepalive) the next request on that connection is often
+  another client's: the cross-session 400s that prompted this, with the probe's bytes quoted in a real agent's error.
+  Both now read the body through `0059`'s `_discard_body` (`read_body`: Content-Length or chunked; a refusal closes the
+  connection) before answering; a request without one reads nothing. CPU test: `tools/test_get_bodies.py` (fails on
+  the unpatched source).
+- **Broken concurrent GLM engine is visible** (patch `0118-glm-broken-health-exit`): `/health` reports `ok: false` and its first error in `broken`; `/metrics` exposes `tensorfold_health:ok`. Opt-in `TF_GLM_EXIT_ON_BROKEN=1` logs the cause and exits with code 1 as soon as the broken state latches. The existing stall watchdog is unchanged. The cause shown in `/health` is cut at 200 characters. CPU check: `tools/test_broken_health_exit.py`.
+- **Spill tier, blocks** (patch `0128-glm-spill-blocks`; with `PARALLEL` above 1 and `SPILL_GIB` set; off by default):
+  every kept prompt state is written to local disk when it is kept, in blocks of 2,048 tokens that later turns and forks
+  of the same conversation share, so a conversation resumes from disk after an eviction, a clean restart, a `kill -9` or
+  a watchdog restart, and a turn writes only its new rows (a 10.4k-token turn of a 50k conversation: 68 MiB, not the
+  whole state). Each conversation keeps its newest `SPILL_TURNS` (4) states, older turns trimmed as each one is written
+  (each held a ~91 MB small part; the rows stay, the newest turn names them), and small parts go to disk with O_DIRECT,
+  so the page cache keeps no copy. Room goes by conversation: old turns beyond `SPILL_TURNS`, abandoned forks, whole
+  conversations least recently used, shared system prompts last; `SPILL_QUOTA` caps one conversation's share (#122,
+  reported by [xiepengqi](https://github.com/xiepengqi): one conversation's per-turn states filled 128 GiB in 30 minutes
+  and pushed the others out). The free-disk floor makes room in the same order. Blocks with equal bytes are linked, not
+  written twice. Rank 0 asks every Spark before a read (HAS). The block layout, the lineage, writing at keep through a
+  pinned ring and the fsync order are those of
+  [PR #118](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/118) by
+  [BadAd84](https://github.com/BadAd84), brought into the spill tier so there is one tier and one set of settings. The
+  one-stream engine (`PARALLEL=1`) keeps its file a state. `SPILL_HIGHWATER` no longer changes anything.
+  A restore reads ahead on 8 threads into pinned slots (`TF_GLM_SPILL_READ_BLOCKS`, 16) and the engine copies the
+  blocks read between rounds (`TF_GLM_SPILL_LOAD_MS`, 40 ms, one budget for every restore in flight, each first in
+  turn; beside decoding streams a restore ends only once those copies are done, rather than its end copying the
+  read-ahead in one pause), as #118 does: issued from the reader's own thread, each
+  copy waited on the decode loop (~0.25 ms a call against ~9 us idle), so a 260k-token restore beside a decoding stream
+  took 1.0-1.3 s on two Sparks and 8.6-12.7 s on three (measured by [BadAd84](https://github.com/BadAd84)); now
+  0.54-0.61 s with 32 blocks read ahead (idle 0.40-0.46 s), the same replies. The read-ahead's first blocks go in the
+  two 64 MiB read buffers pinned at start (ten blocks on two Sparks); the rest is pinned before the pool is sized, in
+  power-of-two pieces, so that comes out of the pool, not the margin it keeps (the default 16 blocks: ~14k tokens at
+  `PARALLEL=4`; 9 costs the pool nothing). The write ring's size is `TF_GLM_SPILL_STAGE_MIB` (256 MiB). A restore
+  whose read fails on one Spark (a damaged or missing block) ends on every Spark and the
+  prompt is computed again: a Spark with more blocks left than read slots (above ~65k tokens) waited for ever for the
+  slots its own copies held (a ~100k-token conversation with damaged blocks on two Sparks: the request hung until the
+  client gave up after 15 minutes; now answered in 50 s, its prompt recomputed). CPU check: `hang` in
+  `tools/spill_blocks_check.py`. Rows copied to host memory before they go (`release`) have their own cap,
+  `SPILL_RELEASE_MIB` (an eighth of `MEMORY_RESERVE_GIB` by default, not the 16 GiB write backlog); a state past it is
+  not stored. One engine a `SPILL_DIR` (a flock on `.lock-rank<N>`: a second engine runs without the tier and says
+  why), and temporary files opened `O_EXCL | O_NOFOLLOW`.
+- **A system prompt prefilled once for every agent** (patch `0128`, `PREFIX_WAIT=1`, off by default: it changes
+  admission also with `SPILL_GIB=0`): a request whose prompt starts
+  with what another request is still prefilling waits for that state, apart from the queue, then resumes from it. Six
+  agents at once on a fresh 12k-token system prompt: all answered in 14.7-15.0 s instead of 45.7-47.0 s, the slowest
+  first token 13.5-13.8 s instead of 45.0-46.2 s, the same replies. Counted in `/health` (`prefix_waits`,
+  `prefix_wait_tokens`) and `/metrics` (`prefix_waits_total`, `prefix_wait_tokens_total`).
+- `tools/kept_state_check.py`: the spill tier writes a state when it is kept, not when it is dropped.
+  `tools/test_queued_cancellation.py`: the scheduler's prefix-wait list. `tools/spill_blocks_check.py` (CPU): the
+  block store and its hooks in `multi.py` (a read only reads; the engine copies, rank 1 as far as LOADPART says), the
+  room (the files each eviction step deletes, the eviction order, a point being read, blocks a new state names), old
+  turns trimmed (`SPILL_TURNS`), the quota, the floor, a restart with torn, orphaned and foreign files, older builds
+  pruned, the release cap, temporary files and the folder lock, and the prefix wait (off by default; what it waits
+  for, its release, the scheduler holding a request apart); `tools/spill_blocks_mutants.sh` runs it on faithful
+  mutants of each fix. Its whole-run watchdog is 900 s by default (`TEST_TIMEOUT_S`).
 
 ## v1.10 (2026-10-08): the effort line at the tail (opt-in), a kept-state share, and a checked second rail
 
@@ -161,7 +419,8 @@ Image: `v0.6.0-ff5dffc865d3` (`sha256:20275b2be818635a9c711d80a177477488d2c75cad
 50 GiB floor, a 20,469-token prompt is written (0.21 GiB), read back after a restart (prefill 10.96 -> 0.21 s, restore
 29 ms) and the needle answer is unchanged; with defaults, the smoke test, `tools/anthropiccheck.py` and `tools/toolcheck.py` pass.
 
-- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by Robert Wojciechowski, @wojo):
+- **Spill tier: the free-disk floor makes room** (patch `0088-glm-spill-tier`, #78 by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X)):
   a write that would leave less than `SPILL_MIN_FREE_GIB` free now drops the oldest spilled files first, and is
   skipped only when that cannot make the room (before: always skipped). Writes still queued count as written. Off
   unless `SPILL_GIB` is set.
@@ -264,8 +523,9 @@ contributors' measurements are in the PRs.
   restore reads on a background thread while other streams keep decoding. Every read is checked against per-block
   CRC-32s, and the files are private to you. Prompts with images or video are stored under their pictures'
   content (`PARALLEL` above 1). It works beside `DISPLAY_KV_MIB` (rows in the display reservation go to and from disk
-  through a kernel, as the pool's own moves there do). Authored by Robert Wojciechowski
-  ([wojo](https://github.com/wojo), PR #78); credits in `NOTICE` and `CREDITS.md`.
+  through a kernel, as the pool's own moves there do). Authored by
+  Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X), PR #78;
+  credits in `NOTICE` and `CREDITS.md`.
   Numbers: README, "Spill tier".
 - **Kept-state limits** (patch `0089-glm-kept-state`; `TF_GLM_KEPT_BYTES_GIB`, `TF_GLM_KEEP_PER_CHAT`; both off by
   default): a byte budget for the device memory the kept prompt states own outside the pool (past it the entry cap's

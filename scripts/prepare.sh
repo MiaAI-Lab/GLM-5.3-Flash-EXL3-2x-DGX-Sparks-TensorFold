@@ -59,7 +59,16 @@ command -v rsync >/dev/null || die "rsync is not installed on this node (sudo ap
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
 if ! command -v nvidia-smi >/dev/null; then warn "nvidia-smi not found on this node"
 elif ! nvidia-smi -L >/dev/null 2>&1; then warn "nvidia-smi failed on this node: is the NVIDIA driver working?"; fi
+# CDI devices the toolkit can see; this does not verify how docker injects the GPU. Without CDI the legacy hook can
+# lose the GPU of a running container after a host daemon-reload (issue #150).
+CDI_CHECK='devices=$(nvidia-ctk cdi list 2>/dev/null) && printf "%s\n" "$devices" | grep -Fx nvidia.com/gpu=all >/dev/null'
+cdi_warn() {
+  warn "could not confirm the NVIDIA CDI device nvidia.com/gpu=all on $1 (nvidia-ctk cdi list); the legacy hook can lose
+    the GPU after a host daemon-reload (issue #150). If nvidia-cdi-refresh is installed, enable spec generation with
+    sudo systemctl enable --now nvidia-cdi-refresh.path nvidia-cdi-refresh.service, then recreate the containers"
+}
 docker info 2>/dev/null | grep -qi nvidia || warn "docker does not list an nvidia runtime on this node; --gpus all may fail"
+eval "$CDI_CHECK" || cdi_warn "this node"
 check_workers
 # "the worker" at TP=2, "worker 2 (user@host)" beyond
 wname() { if (( TP == 2 )); then echo "the worker"; else echo "worker $1 ($(worker_host "$1"))"; fi; }
@@ -70,6 +79,9 @@ for i in $(worker_ids); do
   worker "$i" 'docker info >/dev/null 2>&1' || die "$w ($(worker_host "$i")) cannot talk to its docker daemon (docker group?)"
   worker "$i" 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $w: is the NVIDIA driver working?"
   worker "$i" 'docker info 2>/dev/null | grep -qi nvidia' || warn "docker does not list an nvidia runtime on $w; --gpus all may fail"
+  worker "$i" "$CDI_CHECK" || {
+    if (( $? == 255 )); then warn "could not check NVIDIA CDI on $w: ssh failed"; else cdi_warn "$w"; fi
+  }
   [[ "$(worker_weights "$i")" == nfs ]] || worker "$i" 'command -v rsync >/dev/null' ||
     die "rsync is not installed on $w (sudo apt install rsync)"
 done
