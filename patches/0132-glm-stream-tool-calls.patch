@@ -1,0 +1,600 @@
+# GLM tool calls stream while they decode. With 0053 the chat stream held each call and sent it whole, header and
+# arguments in one delta, at its </tool_call>, with an empty delta every 2 s before that. The Messages and Responses
+# streams drop empty deltas, and the empty deltas reset 0111's keep-alive timer, so a long call sent no byte at all
+# there: on two Sparks a Write call with 28,490 characters of content was silent for 128.5 s on /v1/messages, then came
+# as one input_json_delta. An agent client's live token count stops for the whole call.
+# cuda/reply_text.py, GlmCallStreamer: a call's header (index, id, name, empty arguments) goes out when its name is
+# whole and names an offered tool. A string value goes out as JSON-escaped pieces while it decodes. A tail that can
+# begin </arg_value> or </tool_call> waits, and the stream decoder already holds a partial UTF-8 character. A typed or
+# nullable value goes out at its </arg_value>, as decode_parameter reads it. The closing brace waits for the block's
+# </tool_call>. Then parse_tool_calls reads the block, and the call continues from what went out to the parser's
+# arguments, so the pieces join to the whole reply's arguments byte for byte (key order, escapes, types, unknown
+# keys). A call the parser can read otherwise (an <arg_key> the model left out, text after </arg_key>) holds its
+# pieces, and the parser's arguments go out at the closer. A repeated key goes out twice: the call closes when its
+# JSON decodes to the parser's object. A call whose sent pieces the parser does not continue gets no brace; it stays
+# open and the server logs a line. unmask (0117) runs on a call's whole arguments, so a spelled tag that two pieces
+# split comes back whole.
+# cuda/server.py: a round is cut after each </tool_call> token, and an open call's pieces to its closer go out before
+# the round's text, so no text delta comes between a call's header and its last piece (that ends the call for
+# LiteLLM's Messages stream). A round's text still goes out in one delta when no call delta comes between. At the
+# finish the calls go out as the stream sent them, then the calls of blocks the streamer skipped (JSON, Qwen) under
+# the next indexes; the handler sends no call twice. The finish reason is the parser's.
+# A reply that ends inside a call (max_tokens, a stop string) ends as the whole reply does: finish_reason length or
+# stop, no tool_calls. This drops 0053's rule that a cut call is never sent: its header and pieces went out, and it
+# stays open without a closing brace, as vLLM and the Anthropic API stream a cut call. No switch.
+# Unchanged: requests without tools, whole (non-stream) replies, the one-call policy (parallel_tool_calls false), calls
+# held in the think block to the end, other families' calls. /v1/messages and /v1/responses stream the calls too.
+# CPU check: tools/stream_tool_calls_check.py (22 GLM-5.3 token cases through the chat and Messages routes, the
+# stock replies' hashes, and the streamer against the parser on random replies).
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -415,148 +415,281 @@ def _json(value: Any) -> str:
+     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+ 
+ 
++def _same_object(text: str, other: str) -> bool:
++    """Whether two JSON texts decode to the same object, key order and value types included (a repeated key: its last
++    value in its first key's place, as ``json.loads`` and the end parser's dict both read it)."""
++
++    def shape(value: Any) -> Any:
++        if isinstance(value, dict):
++            return ["object", [(k, shape(v)) for k, v in value.items()]]
++        if isinstance(value, list):
++            return ["array", [shape(v) for v in value]]
++        return [type(value).__name__, value]
++
++    try:
++        return shape(json.loads(text)) == shape(json.loads(other))
++    except ValueError:
++        return False
++
++
+ class GlmCallStreamer:
+     """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
+-    deltas: each call is followed while it is written (its arguments' JSON built a string value as it arrives and a
+-    typed one when whole, joining to what ``parse_tool_calls`` gives) and sent whole, header and arguments in one delta,
+-    once its ``</tool_call>`` arrives. A call the reply ends inside (its token limit) is never sent: a client could
+-    store or run its cut arguments.
+-
+-    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas; ``sent`` counts the
+-    calls sent. A block it cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays
+-    with the end parser."""
++    deltas while they are written (patch 0132; with 0053 each call went out whole at its ``</tool_call>``, so a long
++    file write sent no event for minutes and an agent client's token count stopped). A call's header (index, id, name,
++    empty arguments) goes out once its name is whole and names an offered tool; then its arguments' JSON in pieces: a
++    text value as JSON-escaped pieces while it decodes (a tail that may begin ``</arg_value>`` or ``</tool_call>``
++    waits; the stream decoder already holds back a partial character), a typed or nullable value whole at its
++    ``</arg_value>``, as ``decode_parameter`` reads it. The closing brace waits for the block's ``</tool_call>``: the
++    end parser then reads the block, and the call goes on from what went out to the parser's arguments (normally just
++    the brace), so the pieces join to ``parse_tool_calls``'s arguments byte for byte, key order, escaping, typing and
++    unknown keys included. Where the streamer cannot tell how the parser will read a call (an ``<arg_key>`` the model
++    left out, which the parser puts back; text after an ``</arg_key>``, which can lengthen the key) it holds that call's
++    pieces and the parser's arguments go out at the closer. A repeated key goes out twice (the parser keeps one value
++    in the first key's place); the call closes when its JSON decodes to the parser's object, which ``json.loads`` gives.
++    A call whose sent pieces the parser does not continue (a value the block's closer cuts) gets no closing brace: it
++    stays open, and the server logs a line. A call the reply ends inside (its token limit, a stop string) stays open
++    too, as vLLM and the Anthropic API stream a cut call: no JSON goes out as complete that the parser would not return.
+ 
+-    def __init__(self, tools: list[dict[str, Any]]) -> None:
++    ``feed`` takes the reply's answer so far (text that only grows; a text that does not extend the one read turns the
++    streamer off for the reply) and returns the new deltas. ``calls`` holds each call whose header went out (its
++    arguments as sent, with ``unmask`` not applied), ``whole()`` the ones sent closed, ``sent`` their count. A block it
++    cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays with the end parser
++    (``rest``). ``unmask`` (patch 0117) gives a call's arguments back their spelled markup: it runs on all of a call's
++    arguments, so a spelled tag split between two pieces is given back whole."""
++
++    def __init__(self, tools: list[dict[str, Any]], unmask: Any = None) -> None:
+         self.tools = tools
+         self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+         self.schemas = parameter_schemas(tools)
+-        self.calls: list[dict[str, Any]] = []          # every call whose header was sent, its arguments as sent
++        self.unmask = unmask if unmask is not None else (lambda value: value)
++        self.calls: list[dict[str, Any]] = []          # every call whose header went out, its arguments as sent
++        self.status: list[str] = []                     # each call: "open", "whole" (sent closed), "left" (left open)
++        self.shown: list[str] = []                      # each call's arguments as the deltas wrote them (unmasked)
++        self.announced = 0                              # headers sent
++        self.flushed = 0                                # calls before this one have every piece sent
+         self.skipped: list[str] = []                    # whole blocks it did not follow, for the end parser
+         self.pos, self.state, self.start = 0, "outside", 0
++        self.end = -1                                   # the current block's </tool_call>, once written
++        self.scan = 0                                   # where the search for that closer goes on
+         self.open = False                               # the last call's header went out, its </tool_call> has not
+         self.schema: dict[str, Any] = {}               # the current call's parameter schemas
+         self.value_schema: dict[str, Any] | None = None     # the current typed value's schema, None for text
+         self.maybe_null = False                         # a nullable text value that may still be ``null``: held
+-        self.sent = 0                                   # calls sent whole (the last one may still be open)
++        self.head = ""                                  # the current argument's JSON head, sent with its value
++        self.keys: set[str] = set()                     # the current call's keys
++        self.repeated = False                           # the current call repeated a key
++        self.read = ""                                  # the text read so far
++        self.off = False                                # the text changed under the streamer: nothing more streams
++        self.sent = 0                                   # calls sent whole
+ 
+-    def _args(self, out: list[dict[str, Any]], piece: str) -> None:
+-        index = len(self.calls) - 1
+-        self.calls[index]["function"]["arguments"] += piece
+-        last = out[-1]["tool_calls"][0] if out else None
+-        if last is not None and last["index"] == index and "id" not in last:      # one delta a call a feed
+-            last["function"]["arguments"] += piece
+-        else:
+-            out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
++    def feed(self, text: str, block: bool = False) -> list[dict[str, Any]]:
++        """The new deltas in ``text``; ``block``: only to the end of the call being written (its </tool_call>), so the
++        server sends its last pieces before the text that follows its block."""
+ 
+-    def feed(self, text: str) -> list[dict[str, Any]]:
+-        self._follow(text)
+-        whole = len(self.calls) - (1 if self.open else 0)
+-        out = [{"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+-                                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]}
+-               for i, c in enumerate(self.calls[self.sent:whole], self.sent)]
+-        self.sent = whole
+-        return out
++        if self.off:
++            return []
++        if not text.startswith(self.read):              # positions hold only on a text that extends the one read
++            self.off = True
++            print(f"[tensorfold] GLM tool-call stream off for this reply: its text changed under the streamer "
++                  f"({len(self.calls)} call headers sent; the end parser sends the rest)", flush=True)
++            return []
++        self.read = text
++        self._follow(text, block and self.open)
++        return self._deltas()
+ 
+-    def _follow(self, text: str) -> list[dict[str, Any]]:
++    def whole(self) -> list[dict[str, Any]]:
++        """The calls sent closed, in order (their arguments are the end parser's)."""
++
++        return [call for call, status in zip(self.calls, self.status) if status == "whole"]
++
++    def _deltas(self) -> list[dict[str, Any]]:
+         out: list[dict[str, Any]] = []
++        for index in range(self.flushed, len(self.calls)):
++            call = self.calls[index]
++            if index >= self.announced:
++                out.append({"tool_calls": [{"index": index, "id": call["id"], "type": "function",
++                                            "function": {"name": call["function"]["name"], "arguments": ""}}]})
++                self.announced = index + 1
++            shown = self.unmask(call["function"]["arguments"])
++            if len(shown) > len(self.shown[index]):
++                if not shown.startswith(self.shown[index]):         # never: an unmasked text that is not an extension
++                    self._leave(index, "its unmasked arguments changed")
++                    continue
++                piece = shown[len(self.shown[index]):]
++                out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
++                self.shown[index] = shown
++        self.flushed = len(self.calls) - (1 if self.open else 0)
++        return out
++
++    def _follow(self, text: str, block: bool = False) -> None:
+         while True:
+-            rest = text[self.pos:]
+             if self.state == "outside":
+-                at = rest.find(_CALL_OPEN)
++                if block:
++                    return
++                at = text.find(_CALL_OPEN, self.pos)
+                 if at < 0:
+-                    return out
+-                self.start = self.pos + at
+-                self.pos, self.state = self.start + len(_CALL_OPEN), "name"
+-            elif self.state == "name":                  # the end parser's name: the text before <arg_key> or the end
+-                if not _call_head(text, self.pos):      # a mentioned tag: text, as the end parser reads it
+-                    self.state = "outside"
++                    return
++                self.start, self.end = at, -1
++                self.pos = self.scan = at + len(_CALL_OPEN)
++                self.state = "name"
++                continue
++            if self.end < 0:                            # the end parser's block ends at the first </tool_call>
++                found = text.find(_CALL_CLOSE, self.scan)
++                if found >= 0:
++                    self.end = found
++                else:
++                    self.scan = max(self.scan, len(text) - len(_CALL_CLOSE) + 1)
++            whole = self.end >= 0                       # the block is written: nothing more comes inside it
++            view = text[:self.end] if whole else text
++            body = self.start + len(_CALL_OPEN)
++            if self.state == "skip":                    # a block the end parser decides: to its end
++                if not whole:
++                    return
++                self.skipped.append(text[self.start:self.end + len(_CALL_CLOSE)])
++                self._next()
++                continue
++            if self.state == "name":                    # the end parser's name: the text before <arg_key> or the end
++                if not _call_head(text, body):          # a mentioned tag: text, as the end parser reads it
++                    self.state, self.pos = "outside", body
+                     continue
+-                ends = [at for at in (rest.find(_KEY), rest.find(_CALL_CLOSE)) if at >= 0]
+-                if not ends:
+-                    if len(rest) > 256:
++                key = view.find(_KEY, body)
++                stop = key if key >= 0 else (self.end if whole else -1)
++                if stop < 0:
++                    if len(view) - body > 256:
+                         self.state = "skip"
+                         continue
+-                    return out
+-                name = rest[:min(ends)].strip()
++                    return
++                name = view[body:stop].strip()
+                 if not self._callable(name):
+                     self.state = "skip"
+                     continue
+-                name, id_ = self.known[name.lower()], f"call_{uuid.uuid4().hex[:24]}"
+-                self.calls.append({"id": id_, "type": "function", "function": {"name": name, "arguments": ""}})
+-                self.open = True
+-                out.append({"tool_calls": [{"index": len(self.calls) - 1, "id": id_, "type": "function",
+-                                            "function": {"name": name, "arguments": ""}}]})
+-                self.schema = self.schemas.get(name.lower(), {})
+-                self.pos, self.state = self.pos + min(ends), "arguments"
+-            elif self.state == "skip":                  # a block the end parser decides: to its end
+-                at = rest.find(_CALL_CLOSE)
+-                if at < 0:
+-                    return out
+-                self.pos, self.state = self.pos + at + len(_CALL_CLOSE), "outside"
+-                self.skipped.append(text[self.start:self.pos])
+-            elif self.state == "arguments":             # text between arguments is ignored, as the end parser does
+-                key, close = rest.find(_KEY), rest.find(_CALL_CLOSE)
+-                if close >= 0 and (key < 0 or close < key):
+-                    self._args(out, "}" if self.calls[-1]["function"]["arguments"] else "{}")
+-                    self.pos, self.state, self.open = self.pos + close + len(_CALL_CLOSE), "outside", False
+-                    self._repaired(text[self.start:self.pos])
+-                elif key >= 0:
+-                    self.pos, self.state = self.pos + key + len(_KEY), "key"
+-                else:
+-                    return out
++                self._header(self.known[name.lower()])
++                self.pos, self.state = stop, "arguments"
++            self._arguments(view, whole)
++            if not whole:
++                return
++            self._close(text[self.start:self.end + len(_CALL_CLOSE)])
++            self._next()
++
++    def _arguments(self, view: str, whole: bool) -> None:
++        """Follow the current call's arguments in ``view`` (its block so far, all of it when ``whole``), as
++        ``_GLM_ARG_RE``'s findall reads them: each ``<arg_key>K</arg_key>`` then ``<arg_value>V</arg_value>``, text
++        between arguments skipped."""
++
++        while True:
++            if self.state == "held":                    # the end parser decides the rest of this call at its closer
++                return
++            if self.state == "arguments":
++                key = view.find(_KEY, self.pos)
++                if _KEY_END in view[self.pos:key if key >= 0 else len(view)]:
++                    self.state = "held"                 # an <arg_key> the model left out (#22): the parser puts it back
++                    return
++                if key < 0:
++                    return
++                self.pos, self.state = key + len(_KEY), "key"
+             elif self.state == "key":
+-                end = rest.find(_KEY_END)
+-                opens = _VALUE_OPENS.match(rest, end + len(_KEY_END)) if end >= 0 else None
++                end = view.find(_KEY_END, self.pos)
++                if end < 0:                             # being written, or the block ends in it (then no argument)
++                    return
++                opens = _VALUE_OPENS.match(view, end + len(_KEY_END))
+                 if opens is None:
+-                    after = rest[end + len(_KEY_END):] if end >= 0 else ""
+-                    cut = _CALL_CLOSE in (rest if end < 0 else after)
+-                    if not cut and (end < 0 or not after.strip() or _VALUE.startswith(after.lstrip())):
+-                        return out                      # the key or its value's opener is still being written
+-                    self.state = "arguments"            # not an argument the end parser reads the same way
+-                    continue
+-                key = rest[:end].strip()
++                    after = view[end + len(_KEY_END):]
++                    if not whole and (not after.strip() or _VALUE.startswith(after.lstrip())):
++                        return                          # its value's opener is being written
++                    self.state = "held"                 # the parser may read a longer key, to a later </arg_key>
++                    return
++                key = view[self.pos:end].strip()
+                 schema = self.schema.get(key, {})
+                 self.value_schema = schema if typed_parameter(schema) else None
+                 self.maybe_null = self.value_schema is None and nullable_text(schema)
+-                opened = "{" if not self.calls[-1]["function"]["arguments"] else ","
++                self.repeated = self.repeated or key in self.keys
++                self.keys.add(key)
++                opened = "," if self.calls[-1]["function"]["arguments"] else "{"
+                 quote = "" if self.value_schema is not None or self.maybe_null else '"'
+-                self._args(out, opened + _json(key) + ":" + quote)
+-                self.pos, self.state = self.pos + opens.end(), "value"
++                self.head = opened + _json(key) + ":" + quote
++                self.pos, self.state = opens.end(), "value"
+             elif self.state == "value":
+-                end = rest.find(_VALUE_END)
++                end = view.find(_VALUE_END, self.pos)
++                if end < 0 and whole:                   # the block ends inside the value: no such argument
++                    self.state = "held"
++                    return
+                 if self.value_schema is not None:       # typed: decoded whole, as the end parser does
+                     if end < 0:
+-                        return out
+-                    self._args(out, _json(decode_parameter(rest[:end], self.value_schema, python=False)))
++                        return
++                    self._args(self.head + _json(decode_parameter(view[self.pos:end], self.value_schema,
++                                                                  python=False)))
+                 elif self.maybe_null:                   # text or null: held while it may still be ``null``
+-                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                    written = view[self.pos:end] if end >= 0 else self._ready(view)
+                     if end >= 0 and written == "null":
+-                        self._args(out, "null")
++                        self._args(self.head + "null")
+                     elif end < 0 and "null".startswith(written):
+-                        return out
++                        return
+                     else:
+-                        self._args(out, '"')
++                        self.head += '"'
+                         self.maybe_null = False
+                         continue
+-                else:                                   # text: as it arrives, less a tail that may begin the closer
+-                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                else:                                   # text: as it arrives, less a tail that may begin a closer
++                    written = view[self.pos:end] if end >= 0 else self._ready(view)
+                     piece = _json(written)[1:-1] + ('"' if end >= 0 else "")
+                     if piece:
+-                        self._args(out, piece)
++                        self._args(self.head + piece)
++                        self.head = ""
+                     if end < 0:
+                         self.pos += len(written)
+-                        return out
+-                self.pos, self.state = self.pos + end + len(_VALUE_END), "arguments"
++                        return
++                self.pos, self.state, self.head = end + len(_VALUE_END), "arguments", ""
++
++    def _ready(self, view: str) -> str:
++        """The value text from ``pos`` that can go out: less a tail that may begin ``</arg_value>`` or
++        ``</tool_call>``."""
++
++        held = max(_partial_tag(view, _VALUE_END), _partial_tag(view, _CALL_CLOSE))
++        return view[self.pos:max(self.pos, len(view) - held)]
+ 
+-    def _repaired(self, block: str) -> None:
+-        """A whole call whose markup lost an ``<arg_key>`` (``repair_glm_keys``): its arguments as the end parser reads
+-        it repaired (the streamer skipped the argument it could not see); it has not been sent yet."""
++    def _args(self, piece: str) -> None:
++        self.calls[-1]["function"]["arguments"] += piece
+ 
+-        if block.count(_KEY_END) <= block.count(_KEY):
++    def _header(self, name: str) -> None:
++        self.calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
++                           "function": {"name": name, "arguments": ""}})
++        self.status.append("open")
++        self.shown.append("")
++        self.open = True
++        self.schema = self.schemas.get(name.lower(), {})
++        self.value_schema, self.maybe_null, self.head = None, False, ""
++        self.keys, self.repeated = set(), False
++
++    def _close(self, block: str) -> None:
++        """The current call's block is whole: the end parser reads it, and the call goes on to the parser's arguments
++        when they continue what went out; else it is left open (no brace closes JSON the parser does not return)."""
++
++        if not self.open:                               # a mention, or a block skipped: nothing was sent
+             return
+-        calls = parse_tool_calls(block, self.tools)[1] or []
+-        if len(calls) == 1 and calls[0]["function"]["name"] == self.calls[-1]["function"]["name"]:
+-            self.calls[-1]["function"]["arguments"] = calls[0]["function"]["arguments"]
++        index = len(self.calls) - 1
++        call, self.open = self.calls[index], False
++        sent = call["function"]["arguments"]
++        parsed = parse_tool_calls(block, self.tools)[1] or []
++        args = (parsed[0]["function"]["arguments"] if len(parsed) == 1
++                and parsed[0]["function"]["name"] == call["function"]["name"] else None)
++        if args is not None and args.startswith(sent):
++            call["function"]["arguments"] = args
++        elif args is not None and self.repeated and _same_object(sent + "}", args):
++            call["function"]["arguments"] = sent + "}"          # a repeated key: the same object as the parser's
++        else:
++            self._leave(index, "the end parser reads its block otherwise" if args is not None
++                        else "the end parser takes no call from its block")
++            return
++        self.status[index] = "whole"
++        self.sent += 1
++
++    def _leave(self, index: int, why: str) -> None:
++        if self.status[index] != "left":
++            print(f"[tensorfold] GLM tool call {index} ({self.calls[index]['function']['name']}) left open: {why}; "
++                  f"no closing brace was sent", flush=True)
++        self.status[index] = "left"
++
++    def _next(self) -> None:
++        self.pos, self.state, self.end = self.end + len(_CALL_CLOSE), "outside", -1
+ 
+     def _callable(self, name: str) -> bool:
+         """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -32,11 +32,32 @@ from tensorfold.cuda.stream_pacing impor
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ 
+-# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
+-# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
++# While a GLM tool call is written its arguments stream (patch 0132); while a piece is held (a typed value, a call the
++# end parser decides at its closer) an idle client (upstream #114: one that drops a reply sending nothing) gets an
++# empty delta this often
+ CALL_KEEPALIVE_S = 2.0
+ 
+ 
++def _after_marks(tokens: list[int], mark: int) -> list[list[int]]:
++    """``tokens`` cut after each ``mark`` (patch 0132: a round cut after each ``</tool_call>``, so a call's last pieces
++    go out before the text that follows its block in the same round; a text delta inside a call ends it for LiteLLM's
++    Messages stream)."""
++
++    pieces, at = [], 0
++    for i, token in enumerate(tokens):
++        if token == mark:
++            pieces.append(tokens[at:i + 1])
++            at = i + 1
++    if at < len(tokens):
++        pieces.append(tokens[at:])
++    return pieces or [tokens]
++
++
++def _same_calls(a: list[dict[str, Any]], b: list[dict[str, Any]]) -> bool:
++    return [(c["function"]["name"], c["function"]["arguments"]) for c in a] == \
++           [(c["function"]["name"], c["function"]["arguments"]) for c in b]
++
++
+ # -- requests --------------------------------------------------------------------------------
+ 
+ _MADE = threading.Lock()                # guards the lazily made per-app ``Turns``
+@@ -416,10 +437,12 @@ class App:
+         stopped = {"client": False, "stop": False}
+         failed: list[Exception] = []
+         stream = StreamDecoder(self.tok, ends)
+-        # a streamed reply's GLM calls go out while they are written (a long file write would otherwise send nothing
+-        # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
++        # a streamed reply's GLM calls go out while they are written, the arguments in pieces as they decode (patch
++        # 0132: a long file write would otherwise send nothing for minutes, past the idle cut of clients such as LiteLLM
++        # and Node's fetch, and an agent's token count stops); one call a reply waits
+         glm_calls = bool(tools) and self._glm_calls()
+         calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        call_end = self.tok.token_to_id("</tool_call>") if calls_stream is not None else None
+         quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
+         # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
+         # end parser
+@@ -436,6 +459,8 @@ class App:
+ 
+         def unmask(value: Any) -> Any:
+             return marks.unmask(value) if reply_marks is not None else value
++        if calls_stream is not None:
++            calls_stream.unmask = unmask     # on a call's whole arguments: a spelled tag two pieces split is given back
+         # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
+         think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
+                  else None)
+@@ -478,6 +503,17 @@ class App:
+             playout.put(delta, paced)
+             return not playout.gone
+ 
++        def send_calls(parts: list[dict[str, Any]], held: dict[str, Any]) -> bool:
++            """A piece's call deltas, after the round's text held so far (it comes first in the reply): False once the
++            client has gone (patch 0132)."""
++
++            if parts and held:
++                text = dict(held)
++                held.clear()
++                if not send(text, True):
++                    return False
++            return all(send(part, False) for part in parts)
++
+         def text_delta(tokens: list[int]) -> tuple[dict[str, Any], str]:
+             """The reasoning and answer text these tokens add (the part not sent yet), and the raw text so far."""
+ 
+@@ -517,25 +553,44 @@ class App:
+                 if playout is not None and ending:
+                     playout.flush()
+                 pieces = [[t] for t in new] if playout is not None and not ending and len(new) > 1 else [new]
+-                raw, wrote = "", False
++                # patch 0132: a round cut after each </tool_call>, so a call's last pieces go out before the text after
++                # its block; the round's text goes out in one delta until a call delta comes between, as it did
++                split = calls_stream is not None and len(pieces) == 1 and len(new) > 1 and call_end is not None
++                if split:
++                    pieces = _after_marks(new, call_end)
++                raw, wrote, called = "", False, False
++                held: dict[str, Any] = {}
+                 for piece in pieces:
+                     delta, raw = text_delta(piece)
+-                    if not delta:
+-                        continue
+-                    if not send(delta, True):
+-                        stopped["client"] = True
+-                        break
+-                    wrote = True
+-                parts: list[dict[str, Any]] = []
++                    if calls_stream is not None and calls_stream.open:   # a call written before this piece: its
++                        parts = unmask(calls_stream.feed(call_text(raw), block=True))     # pieces to its closer first
++                        called = called or bool(parts)
++                        if not send_calls(parts, held):
++                            stopped["client"] = True
++                            break
++                    if delta:
++                        wrote = True
++                        if split:
++                            for key, value in delta.items():
++                                held[key] = held.get(key, "") + value
++                        elif not send(delta, True):
++                            stopped["client"] = True
++                            break
++                    if calls_stream is not None:    # the piece's call deltas after its text, before the next piece's
++                        parts = unmask(calls_stream.feed(call_text(raw)))
++                        called = called or bool(parts)
++                        if not send_calls(parts, held):
++                            stopped["client"] = True
++                            break
++                if held and not stopped["client"] and not send(held, True):
++                    stopped["client"] = True
+                 if calls_stream is not None and not stopped["client"]:
+-                    parts += unmask(calls_stream.feed(call_text(raw)))
+-                    if parts or wrote:
++                    if called or wrote:
+                         quiet_since[0] = time.monotonic()
+                     elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+-                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
+-                        quiet_since[0] = time.monotonic()
+-                if not all(send(part, False) for part in parts):
+-                    stopped["client"] = True
++                        quiet_since[0] = time.monotonic()  # a piece held: an empty delta keeps idle clients waiting
++                        if not send({}, False):
++                            stopped["client"] = True
+                 if xml_stream is not None and not stopped["client"]:
+                     for call_delta in xml_stream.feed(answer_raw[0]):     # never the reasoning
+                         if not send(call_delta, False):
+@@ -658,13 +713,28 @@ class App:
+         if rejected:
+             stats = tool_call_rejections(rejected, len(tools), stats)
+         content = policy.content(content) if tools else content
+-        call_deltas, streamed = [], 0
+-        # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the end
+-        # (never streamed) are the end parser's, sent whole
++        call_deltas, extra_deltas, streamed, parsed = [], [], 0, calls
++        # the calls streamed as sent, then any the streamer did not follow, whole, under the next indexes (patch 0132:
++        # all of them go out from here, so the handler sends none); calls held in the think block to the end (never
++        # streamed) are the end parser's, sent whole
+         if calls_stream is not None and (think is None or think.stream_from is not None):
+-            call_deltas = calls_stream.feed(call_text(raw))
+-            streamed = calls_stream.sent
+-            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
++            call_deltas = calls_stream.feed(call_text(raw))       # the last pieces (a call #22's close made whole)
++            whole = calls_stream.whole()
++            if not calls_stream.off:
++                extra = calls_stream.rest(tools)
++            elif _same_calls(whole, (calls or [])[:len(whole)]):  # the streamer stopped: the parser's later calls
++                extra = (calls or [])[len(whole):]
++            else:
++                extra = []
++                print("[tensorfold] GLM tool-call stream: the calls sent differ from the end parser's; no more calls "
++                      "go out for this reply", flush=True)
++            heads = len(calls_stream.calls)
++            extra_deltas = [{"tool_calls": [{"index": heads + i, "id": c["id"], "type": "function",
++                                             "function": {"name": c["function"]["name"],
++                                                          "arguments": c["function"]["arguments"]}}]}
++                            for i, c in enumerate(extra)]
++            calls = [*whole, *extra] or None
++            streamed = len(calls or ())
+         # a call the token limit cut (the reply ended inside it): never sent, nor its markup as content; one the
+         # model's end token left open that would not parse, its markup as text (``closing`` closed the others)
+         cut = calls_stream is not None and calls_stream.open and not ended
+@@ -673,10 +743,14 @@ class App:
+         elif tools and not ended and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
+             content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+-        if tail:
++        if tail and call_deltas:          # a call's last pieces first: text inside a call ends it for some clients
++            call_deltas.append({"content": tail})
++        elif tail:
+             final["content"] = tail
+-        finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
+-                                                         else "length")
++        call_deltas += extra_deltas
++        # the end parser's finish reason, also when a call it reads went out otherwise and was left open (0132)
++        finish = ("tool_calls" if (calls or parsed) and not cut
++                  else "stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+         final, calls, call_deltas = unmask(final), unmask(calls), unmask(call_deltas)
+         content, reasoning = unmask(content), unmask(reasoning)
+         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
