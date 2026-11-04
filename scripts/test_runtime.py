@@ -138,6 +138,19 @@ class RuntimeDifferences(unittest.TestCase):
         self.assertIn("--format docker-archive", read("scripts/runtime.sh"))
         self.assertIn('rt_save "$IMAGE" | worker "$i" \'ctr load\'', read("scripts/prepare.sh"))
 
+    def test_free_space_is_read_with_the_right_privilege(self):
+        # rootful podman's store (/var/lib/containers, 0700 root) cannot be stat'ed or df'ed by the login user: the
+        # free-space checks must go through rt_dev/rt_free_gb, which use sudo when the runtime does.
+        prep = read("scripts/prepare.sh")
+        self.assertNotIn("df -BG", prep, "prepare.sh must not df the store directly")
+        self.assertNotIn('stat -c %d', prep, "prepare.sh must not stat the store directly")
+        self.assertIn('rt_dev "$DOCKER_ROOT"', prep)
+        self.assertIn('free_gb() { rt_free_gb "$1"; }', prep)
+        rt = read("scripts/runtime.sh")
+        self.assertIn("rt_needs_root()", rt)
+        self.assertIn('sudo -n stat -c %d "$1"', rt)
+        self.assertIn('sudo -n df -BG --output=avail "$1"', rt)
+
     def test_publish_logs_in_per_runtime(self):
         pub = read("scripts/publish-image.sh")
         self.assertIn("--authfile", pub)

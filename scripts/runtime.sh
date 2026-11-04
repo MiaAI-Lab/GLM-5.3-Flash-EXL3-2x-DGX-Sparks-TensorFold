@@ -96,3 +96,19 @@ rt_has_gpu() {
     ctr info 2>/dev/null | grep -qi nvidia
   fi
 }
+
+# rt_needs_root: whether this runtime's store is only readable by root (rootful podman: /var/lib/containers is 0700).
+rt_needs_root() { [[ "${CONTAINER_RT:-docker}" == podman && "${CONTAINER_RT_SUDO:-0}" == 1 ]]; }
+
+# rt_dev <path>: the filesystem's device id, read with the privilege the runtime runs as. A bare stat as the login
+# user fails on rootful podman's store (EACCES on /var/lib/containers), and an empty value then poisons the
+# arithmetic in prepare.sh's free-space checks.
+rt_dev() {
+  if rt_needs_root; then sudo -n stat -c %d "$1" 2>/dev/null; else stat -c %d "$1" 2>/dev/null; fi
+}
+
+# rt_free_gb <path>: whole GiB available, same privilege rule (docker's root is readable by the docker group).
+rt_free_gb() {
+  if rt_needs_root; then sudo -n df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'
+  else df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; fi
+}

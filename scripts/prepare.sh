@@ -101,8 +101,8 @@ done
 
 PATCHES_HASH=$(image_hash)
 built_hash=$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
-free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-worker_free_gb() { worker "$1" "df -BG --output=avail '$2' | tail -1 | tr -dc '0-9'"; }
+free_gb() { rt_free_gb "$1"; }   # rootful podman's store is root-only: rt_free_gb reads it as root
+worker_free_gb() { worker "$1" "$(declare -f rt_needs_root rt_free_gb); rt_free_gb '$2'"; }
 models=("$MODEL_ID"); [[ "$DRAFTER" == dflash2 ]] && models+=("$DFLASH2_ID")
 # hub_missing_gb: GB (GiB, as df counts) the download still needs on the head: the files of each revision to serve
 # whose blob is not in the cache yet (by name, the LFS sha256 or else the git blob id, and by size), from the Hub's
@@ -146,7 +146,7 @@ else
 fi
 (( need_ckpt )) || ckpt_what="nothing to download"
 need_img=0; [[ $REBUILD -eq 0 && "$built_hash" == "$PATCHES_HASH" ]] || need_img=$IMAGE_FREE_GB
-if [[ "$(stat -c %d "$HF_CACHE")" == "$(stat -c %d "$DOCKER_ROOT" 2>/dev/null)" ]]; then
+if [[ "$(rt_dev "$HF_CACHE")" == "$(rt_dev "$DOCKER_ROOT")" ]]; then
   have=$(free_gb "$HF_CACHE"); (( have >= need_ckpt + need_img )) ||
     die "only ${have} GB free under $HF_CACHE (also Docker's root), ~$((need_ckpt + need_img)) GB needed: $ckpt_what; the image needs ${need_img} GB (IMAGE_FREE_GB)"
 else
@@ -158,7 +158,7 @@ fi
 declare -a WORKER_DOCKER_ROOT=()
 disk=""
 for i in $(worker_ids); do
-  WORKER_DOCKER_ROOT[i]=$(worker "$i" "$(declare -f rt_root); rt_root" 2>/dev/null || echo "$DOCKER_ROOT")
+  WORKER_DOCKER_ROOT[i]=$(worker "$i" "$(declare -f rt_needs_root rt_root rt_free_gb); rt_root" 2>/dev/null || echo "$DOCKER_ROOT")
   if [[ "$(worker_weights "$i")" == nfs ]]; then d=${WORKER_DOCKER_ROOT[i]}; else d=${WORKER_HF[i]}; fi
   if (( TP == 2 )); then disk+=", $(worker_free_gb "$i" "$d") GB under $d on the worker"
   else disk+=", $(worker_free_gb "$i" "$d") GB under $d on worker $i"; fi
