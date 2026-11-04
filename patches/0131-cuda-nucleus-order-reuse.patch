@@ -1,0 +1,53 @@
+--- tensorfold/cuda/sampling.py
++++ tensorfold/cuda/sampling.py
+@@ -155,22 +155,20 @@
+     return os.environ.get("TENSORFOLD_NUCLEUS_UNION", "0") == "1"
+ 
+ 
+-def _union_covers(vals, ids, mass, widths, r: int, need: int) -> bool:
++def _union_covers(vals, ids, widths, r: int, need: int, v, cumulative) -> bool:
+     """Whether row r's top_p nucleus lies inside the ranks' candidates taken together: walking them merged (value
+     down, then id) to the cumulative mass ``need`` stops at a value v* above the last candidate of every rank that
+     did not send its whole shard. A token no rank sent is at or below its rank's last candidate, below v*, so the
+-    merged walk is the whole vocabulary's up to v*: the same nucleus, the same draw as from whole shards."""
++    merged walk is the whole vocabulary's up to v*: the same nucleus, the same draw as from whole shards.
++    ``v`` and ``cumulative`` are the draw's sorted, unpadded values and cumulative integer mass."""
+ 
+     partial = [k for k in range(vals.shape[0]) if int((ids[k, r] >= 0).sum()) != widths[k, r]]
+     if not partial:                                              # every rank sent its whole shard
+         return True
+-    v, i, m = vals[:, r].reshape(-1), ids[:, r].reshape(-1), mass[:, r].reshape(-1)
+-    order = np.lexsort((i, -v))
+-    order = order[i[order] >= 0]
+-    at = np.nonzero(np.cumsum(m[order]) >= need)[0]
++    at = np.nonzero(cumulative >= need)[0]
+     if not len(at):
+         return False
+-    top = v[order][int(at[0])]
++    top = v[int(at[0])]
+     for k in partial:
+         if not top > vals[k, r][ids[k, r] >= 0].min():
+             return False
+@@ -191,8 +189,6 @@
+         total = int(sums[:, r].sum())
+         need = math.ceil(Fraction(s.top_p) * total) if cut else None
+         floor = vals[:, r, :].max() + s.min_log                   # the min_p cut (-inf when off)
+-        if union and not _union_covers(vals, ids, mass, widths, r, need):
+-            return None
+         for k in range(0 if not union else vals.shape[0], vals.shape[0]):  # a rank's share inside its candidates
+             real = int((ids[k, r] >= 0).sum())
+             if real == widths[k, r]:                              # its whole shard
+@@ -211,9 +207,12 @@
+         order = np.lexsort((i, -v))
+         order = order[i[order] >= 0]
+         v, i, m = v[order], i[order], m[order]
++        cumulative = np.cumsum(m) if cut else None
++        if union and not _union_covers(vals, ids, widths, r, need, v, cumulative):
++            return None
+         keep = len(v)
+         if cut:
+-            keep = int((np.cumsum(m) < need).sum()) + 1
++            keep = int((cumulative < need).sum()) + 1
+         if s.min_p > 0.0:
+             keep = min(keep, int((v >= floor).sum()))
+         score = v[:keep] - np.log(-np.log(uniform(s.seed, int(position), i[:keep])))
