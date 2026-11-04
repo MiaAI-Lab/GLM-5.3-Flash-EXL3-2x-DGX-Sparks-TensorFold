@@ -151,6 +151,13 @@ class RuntimeDifferences(unittest.TestCase):
         self.assertIn('sudo -n stat -c %d "$1"', rt)
         self.assertIn('sudo -n df -BG --output=avail "$1"', rt)
 
+    def test_download_token_goes_in_by_value(self):
+        # with rootful podman, `-e HF_TOKEN` would read root's environment (sudo resets it) and the gated download
+        # would 403 immediately; the value has to be passed.
+        prep = read("scripts/prepare.sh")
+        self.assertIn('-e "HF_TOKEN=$HF_TOKEN"', prep)
+        self.assertNotRegex(prep, r"\$\{HF_TOKEN:\+-e HF_TOKEN\}")
+
     def test_publish_logs_in_per_runtime(self):
         pub = read("scripts/publish-image.sh")
         self.assertIn("--authfile", pub)

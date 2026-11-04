@@ -235,7 +235,10 @@ download() {  # <repo id> <revision or empty>
     hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
   else
     # Keep downloads owned by the host user, in the same HF_CACHE/hub layout as the host CLI.
-    ctr run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+    # The token goes in by value: a bare `-e HF_TOKEN` asks podman for the variable in *its* environment, and with
+    # CONTAINER_RT_SUDO=1 that is root's (sudo resets it), so the gated repo answers 403 at once.
+    local tok=(); [[ -n "${HF_TOKEN:-}" ]] && tok=(-e "HF_TOKEN=$HF_TOKEN")
+    ctr run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python "${tok[@]}" \
       -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
       'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
   fi
