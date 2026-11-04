@@ -151,6 +151,13 @@ class RuntimeDifferences(unittest.TestCase):
         self.assertIn('sudo -n stat -c %d "$1"', rt)
         self.assertIn('sudo -n df -BG --output=avail "$1"', rt)
 
+    def test_kernel_cache_is_created_before_the_mount(self):
+        # podman refuses a -v source that does not exist yet; docker created it. Both nodes must have the per-image
+        # directory before the container starts.
+        start = read("start.sh")
+        self.assertIn('mkdir -p "$KERNEL_CACHE/$KCACHE"', start)
+        self.assertIn('mkdir -p \\$HOME/.cache/tensorfold-glm53/$KCACHE', start)
+
     def test_download_token_goes_in_by_value(self):
         # with rootful podman, `-e HF_TOKEN` would read root's environment (sudo resets it) and the gated download
         # would 403 immediately; the value has to be passed.

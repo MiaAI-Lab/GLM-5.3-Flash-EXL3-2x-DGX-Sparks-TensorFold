@@ -189,6 +189,14 @@ done
 # build of the same name, older or newer, must never be the one loaded
 KCACHE=$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(ctr image inspect -f '{{.Id}}' "$IMAGE" | cut -d: -f2 | cut -c1-12)
+# The kernel cache is bind-mounted per image. Docker creates a missing source directory for -v; podman refuses it
+# ("statfs ...: no such file or directory") because it checks the source before creating it, so make it here.
+mkdir -p "$KERNEL_CACHE/$KCACHE"
+for i in $(worker_ids); do
+  [[ -z "${WORKER_DOWN[$i]:-}" ]] || continue
+  worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE" >/dev/null ||
+    die "could not create the kernel cache for $KCACHE on $(wname "$i")"
+done
 # (docker creates the folder at the mount: the cache is the containers', so it may not be writable from here)
 # The snapshots every rank serves (config.sh's pins, else refs/main), as paths under the containers' cache mount: the
 # ranks read them offline, whatever the Hub's main is now. A worker's cache is its own HF_HOME (prepare.sh copies
@@ -353,10 +361,10 @@ launch() {
       case "$a" in '$HOME'*) remote+=" \"$a\"" ;; *) remote+=" $(printf '%q' "$a")" ;; esac
     done
     if (( DRY )); then
-      printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "mkdir -p \$HOME/.cache/tensorfold-glm53 &&$remote"
+      printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE &&$remote"
       continue
     fi
-    worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53 &&$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
+    worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE &&$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
   done
   rank0=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank 0 --master "$MASTER_ADDR" --master-port "$MASTER_PORT"
          --name "$SERVED_NAME" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}")
