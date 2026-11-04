@@ -127,8 +127,8 @@ API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
 URL="http://$API_HOST:$PORT"
 
-running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
-running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+running_here()   { [[ "$(ctr inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+running_worker() { [[ "$(worker "$1" ctr inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 # Words for the nodes: "both Sparks" / "the worker" at TP=2, "all 3 Sparks" / "rank 2 (user@host)" beyond.
 SPARKS="both Sparks"; (( TP == 2 )) || SPARKS="all $TP Sparks"
 wname() { if (( TP == 2 )); then echo "the worker"; else echo "rank $1 ($(worker_host "$1"))"; fi; }
@@ -149,12 +149,12 @@ printf '%s  %s · %s x DGX Spark · %s at once · %s-token window · %s KV · %s
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
-command -v docker >/dev/null || die "docker is not installed"
+rt_present
 mkdir -p "$KERNEL_CACHE" "$STATE_DIR"
 exec 8>"$STATE_DIR/start.lock"
 flock -n 8 || die "another ./start.sh is already running; wait for it to finish"
 need_workers
-(( DRY )) && log "DRY_RUN=1: printing the docker commands; nothing is stopped, started or prepared"
+(( DRY )) && log "DRY_RUN=1: printing the $CONTAINER_RT commands; nothing is stopped, started or prepared"
 
 # ---------------------------------------------------------------- already running?
 all_running() { local i; running_here || return 1; for i in $(worker_ids); do running_worker "$i" || return 1; done; }
@@ -179,16 +179,24 @@ else
 fi
 why="scripts/prepare.sh did not"; [[ "${PREPARE:-auto}" == 0 ]] && why="PREPARE=0 skipped scripts/prepare.sh, which would"
 (( DRY )) && why="DRY_RUN: scripts/prepare.sh would"
-docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: $why build it"
+ctr image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: $why build it"
 for i in $(worker_ids); do
   [[ -z "${WORKER_DOWN[$i]:-}" ]] || continue
-  worker "$i" docker image inspect "$IMAGE" >/dev/null 2>&1 || { (( DRY )) && warn "image $IMAGE missing on $(wname "$i"): $why copy it there"; } ||
+  worker "$i" ctr image inspect "$IMAGE" >/dev/null 2>&1 || { (( DRY )) && warn "image $IMAGE missing on $(wname "$i"): $why copy it there"; } ||
     die "image $IMAGE missing on $(wname "$i"): $why copy it there"
 done
 # Compiled kernels are kept per image (its patches hash): a build is found by its extension's name, so another image's
 # build of the same name, older or newer, must never be the one loaded
-KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
-[[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(docker image inspect -f '{{.Id}}' "$IMAGE" | cut -d: -f2 | cut -c1-12)
+KCACHE=$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
+[[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(ctr image inspect -f '{{.Id}}' "$IMAGE" | cut -d: -f2 | cut -c1-12)
+# The kernel cache is bind-mounted per image. Docker creates a missing source directory for -v; podman refuses it
+# ("statfs ...: no such file or directory") because it checks the source before creating it, so make it here.
+mkdir -p "$KERNEL_CACHE/$KCACHE"
+for i in $(worker_ids); do
+  [[ -z "${WORKER_DOWN[$i]:-}" ]] || continue
+  worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE" >/dev/null ||
+    die "could not create the kernel cache for $KCACHE on $(wname "$i")"
+done
 # (docker creates the folder at the mount: the cache is the containers', so it may not be writable from here)
 # The snapshots every rank serves (config.sh's pins, else refs/main), as paths under the containers' cache mount: the
 # ranks read them offline, whatever the Hub's main is now. A worker's cache is its own HF_HOME (prepare.sh copies
@@ -225,7 +233,7 @@ SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, link, previous server, port, memory"
 # tensorfold's own parser, in a throwaway container without the GPU: a typo fails here, before anything is stopped
-docker run --rm --entrypoint python "$IMAGE" -c \
+ctr run --rm --entrypoint python "$IMAGE" -c \
   'import sys; from tensorfold.cli import build_parser; build_parser().parse_args(sys.argv[1:])' \
   serve "$MODEL_ARG" --tp "$TP" --rank 0 --master 127.0.0.1 --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null 2>"$STATE_DIR/args.err" ||
   if (( DRY )); then warn "DRY_RUN: tensorfold serve in $IMAGE rejects these arguments: $(tail -1 "$STATE_DIR/args.err")"
@@ -252,11 +260,11 @@ elif (( here_up || any_worker_up )); then             # after the setup and the 
   fi
   ./stop.sh
 fi
-left_here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && left_here=1
+left_here=0; ctr ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && left_here=1
 any_left=0
 for i in $(worker_ids); do
   left_worker[i]=0
-  worker "$i" "docker ps -a --format '{{.Names}}' | grep -qx '$CONTAINER_NAME'" 2>/dev/null && { left_worker[i]=1; any_left=1; }
+  worker "$i" "ctr ps -a --format '{{.Names}}' | grep -qx '$CONTAINER_NAME'" 2>/dev/null && { left_worker[i]=1; any_left=1; }
 done
 if (( ! DRY && ( left_here || any_left ) )); then
   if (( TP == 2 )); then
@@ -269,13 +277,13 @@ if (( ! DRY && ( left_here || any_left ) )); then
   if (( left_here )); then
     saved=$(save_log "$LOG_DIR" 0 "$CONTAINER_NAME" "$LOG_KEEP") || warn "could not save rank 0's log to $LOG_DIR"
     [[ -z "${saved:-}" ]] || log "Rank 0's log: $saved"
-    docker rm -f "$CONTAINER_NAME" >/dev/null
+    ctr rm -f "$CONTAINER_NAME" >/dev/null
   fi
   for i in $(worker_ids); do
     (( left_worker[i] )) || continue
     saved=$(worker_save_log "$i") || warn "could not save rank $i's log on $(worker_host "$i")"
     [[ -z "${saved:-}" ]] || log "Rank $i's log (on $(worker_host "$i")): $saved"
-    worker "$i" "docker rm -f '$CONTAINER_NAME' >/dev/null"
+    worker "$i" "ctr rm -f '$CONTAINER_NAME' >/dev/null"
   done
 fi
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
@@ -297,11 +305,11 @@ if (( ! low )); then
   else log "Arguments OK, port $PORT free, ${here_gb} GiB memory available here, $(for i in $(worker_ids); do printf '%s on rank %s, ' "${there_gb[i]}" "$i"; done | sed 's/, $//')"; fi
 else
   (( here_gb >= 110 )) ||
-    warn "only ${here_gb} GiB memory available here (the default needs ~110): stop other GPU workloads (docker ps), or lower CONTEXT"
+    warn "only ${here_gb} GiB memory available here (the default needs ~110): stop other GPU workloads ($CONTAINER_RT ps), or lower CONTEXT"
   for i in $(worker_ids); do
     [[ -z "${WORKER_DOWN[$i]:-}" ]] || continue
     (( there_gb[i] >= 110 )) ||
-      warn "only ${there_gb[i]} GiB memory available on $(wname "$i") (the default needs ~110): stop other GPU workloads there (ssh $(worker_host "$i") docker ps), or lower CONTEXT"
+      warn "only ${there_gb[i]} GiB memory available on $(wname "$i") (the default needs ~110): stop other GPU workloads there (ssh $(worker_host "$i") $CONTAINER_RT ps), or lower CONTEXT"
   done
 fi
 
@@ -316,8 +324,12 @@ env_args() {
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }
 env_args
-RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK
+RUN_ARGS=(--gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK
           --ulimit memlock=-1 --ulimit stack=67108864)
+# --shm-size together with --ipc=host is one of the four podman differences: docker accepts the pair, podman refuses
+# it. With host IPC the container already sees the host's /dev/shm (61 GiB on a Spark), so nothing is lost.
+[[ "$CONTAINER_RT" == podman ]] || RUN_ARGS+=(--shm-size 16g)
+[[ -n "${CGROUP_PARENT:-}" ]] && RUN_ARGS+=(--cgroup-parent "$CGROUP_PARENT")
 # DISPLAY_KV_BACKEND=dispram (patch 0087): dispramd's socket and its python client in every rank
 if (( DISPLAY_KV_MIB )) && [[ "$DISPLAY_KV_BACKEND" == dispram ]]; then
   RUN_ARGS+=(-v /run/dispram:/run/dispram -v /opt/kindling/dispram/python:/opt/dispram:ro -e PYTHONPATH=/opt/dispram)
@@ -341,7 +353,7 @@ launch() {
   for (( i = TP - 1; i >= 1; i-- )); do
     rankw=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank "$i" --master "${LINK_HEAD_ADDR[i]:-$MASTER_ADDR}" --master-port "$MASTER_PORT" "${SERVE_ARGS[@]}")
     log "Rank $i on $(worker_host "$i"): ${rankw[*]}"
-    worker_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
+    worker_cmd=("${RT[@]}" run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
                 $(rank_nccl_env "$i")
                 -v "${WORKER_MOUNT[i]}" -v "\$HOME/.cache/tensorfold-glm53/$KCACHE:/cache"
                 "$IMAGE" "${rankw[@]}")
@@ -349,15 +361,15 @@ launch() {
       case "$a" in '$HOME'*) remote+=" \"$a\"" ;; *) remote+=" $(printf '%q' "$a")" ;; esac
     done
     if (( DRY )); then
-      printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "mkdir -p \$HOME/.cache/tensorfold-glm53 &&$remote"
+      printf '[dry-run] rank %s on %s:\n  %s\n' "$i" "$(worker_host "$i")" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE &&$remote"
       continue
     fi
-    worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53 &&$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
+    worker "$i" "mkdir -p \$HOME/.cache/tensorfold-glm53/$KCACHE &&$remote" >/dev/null || die "could not start rank $i on $(worker_host "$i")"
   done
   rank0=(tensorfold serve "$MODEL_ARG" --tp "$TP" --rank 0 --master "$MASTER_ADDR" --master-port "$MASTER_PORT"
          --name "$SERVED_NAME" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}")
   log "Rank 0 here: ${rank0[*]}"
-  here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
+  here_cmd=("${RT[@]}" run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
             $(rank_nccl_env 0)
             -v "$HF_CACHE":/root/.cache/huggingface -v "$KERNEL_CACHE/$KCACHE":/cache
             "$IMAGE" "${rank0[@]}")
@@ -379,17 +391,17 @@ foreground() {
         worker "$i" true 2>/dev/null || continue    # a worker out of reach for a moment says nothing about its rank
         running_worker "$i" && continue
         warn "rank $i on $(worker_host "$i") exited: stopping rank 0"
-        docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
+        ctr stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
         exit 1
       done
     done ) &
   watch=$!
-  docker logs -f "$CONTAINER_NAME" || true
+  ctr logs -f "$CONTAINER_NAME" || true
   kill "$watch" 2>/dev/null || true
   w=0; wait "$watch" || w=$?
-  code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
+  code=$(ctr inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # a worker's rank failed, even if rank 0 then shut down cleanly
-  for i in $(worker_ids); do worker "$i" "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true; done
+  for i in $(worker_ids); do worker "$i" "ctr stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true; done
   exit "$code"
 }
 # NVIDIA's container banner, without its license notice (GOVERNING TERMS ...), which stays visible
@@ -399,7 +411,7 @@ trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 # GPU memory a container's processes hold so far (GiB); on the worker through ssh, with this definition
 gpu_gib() {
   local pids
-  pids=$(docker top "$1" -eo pid 2>/dev/null | tail -n +2 | paste -sd'|')
+  pids=$(ctr top "$1" -eo pid 2>/dev/null | tail -n +2 | paste -sd'|')
   [[ -n "$pids" ]] || { echo 0; return; }
   nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
     awk -F', *' -v re="^($pids)$" '$1 ~ re { s += $2 } END { printf "%.1f", s / 1024 }'
@@ -408,10 +420,10 @@ fail() {
   kill $LOGS_PID 2>/dev/null || true
   sleep 0.5
   printf '\n%s── rank 0 (here): last server log lines ──%s\n' "$D" "$R"
-  docker logs --tail 25 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+  ctr logs --tail 25 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
   for i in $(worker_ids); do
     printf '%s── rank %s (%s): last server log lines ──%s\n' "$D" "$i" "$(worker_host "$i")" "$R"
-    worker "$i" docker logs --tail 25 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
+    worker "$i" ctr logs --tail 25 "$CONTAINER_NAME" 2>&1 | sed 's/^/  │ /'
   done
   die "$1"
 }
@@ -422,8 +434,8 @@ fail() {
 split_nccl_failed() {
   local i
   [[ "$SPLIT" == 1 ]] || return 1
-  { docker logs "$CONTAINER_NAME" 2>&1 || true
-    for i in $(worker_ids); do worker "$i" docker logs "$CONTAINER_NAME" 2>&1 || true; done
+  { ctr logs "$CONTAINER_NAME" 2>&1 || true
+    for i in $(worker_ids); do worker "$i" ctr logs "$CONTAINER_NAME" 2>&1 || true; done
   } | grep 'NCCL error 2: unhandled system error' >/dev/null      # not -q: an early exit fails the pipe (pipefail)
 }
 split_tries=0; refitted=0
@@ -437,27 +449,27 @@ for attempt in 1 2 3 4; do
     *) step 4 "Loading: ~80 GiB of weights on each Spark (2-6 min; the very first start also compiles CUDA kernels)" ;;
   esac
   # docker logs is the background job, so killing it ends the whole pipeline (no orphaned `docker logs -f`)
-  docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
+  ctr logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
   LOGS_PID=$!
   start=$SECONDS; next_beat=15; refit=""; retry=""
   until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
     if ! running_here; then
       # the memory at this start holds a smaller window than asked: once, take the largest one TensorFold names
-      refit=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
+      refit=$(ctr logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
       [[ -n "$refit" && $refitted == 0 ]] && break
       refit=""
       (( split_tries < 2 )) && split_nccl_failed && { retry=split; break; }
-      fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
+      fail "rank 0 exited (code $(ctr inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
     fi
     (( SECONDS - start < WAIT_TIMEOUT )) ||
-      fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running: docker logs -f $CONTAINER_NAME"
+      fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running: $CONTAINER_RT logs -f $CONTAINER_NAME"
     if (( SECONDS - start >= next_beat )); then
       for i in $(worker_ids); do
         running_worker "$i" && continue
         (( split_tries < 2 )) && split_nccl_failed && { retry=split; break 2; }
-        fail "rank $i on $(worker_host "$i") exited (code $(worker "$i" docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo "?")) before the server was ready"
+        fail "rank $i on $(worker_host "$i") exited (code $(worker "$i" ctr inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo "?")) before the server was ready"
       done
-      estimate=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*startup estimate \([0-9.]*\) GiB.*/\1/p' | tail -1)
+      estimate=$(ctr logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*startup estimate \([0-9.]*\) GiB.*/\1/p' | tail -1)
       there=""
       for i in $(worker_ids); do
         g=$(worker "$i" "$(declare -f gpu_gib); gpu_gib $CONTAINER_NAME" 2>/dev/null || echo "?")
@@ -512,7 +524,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
     Window   $(arg_value --context) tokens$( (( TP == 2 )) || echo " · $TP Sparks (experimental)") · $(arg_value --parallel) at once · $KV KV · $DRAFTER drafts · $DENSE dense weights$( [[ "$VISION" == 1 ]] && echo " · images and video")$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")$( [[ "$SPLIT" == 1 ]] && echo " · split prefill")$( [[ "$KDA_CHUNKED" == 1 ]] && echo " · chunked KDA")
     Drafts   $DRAFT_POLICY · copy drafts $( [[ "$COPY" == 1 ]] && echo "up to $COPY_MAX$( [[ "$COPY_CODE" == 1 ]] && echo ", code rules")" || echo off) · shared system prompts $( [[ "$SHARED_PREFIX" == 1 ]] && echo on || echo off)
-    Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
+    Logs     $CONTAINER_RT logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s $CONTAINER_RT logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  ./start.sh restart
     Stop     ./stop.sh
 

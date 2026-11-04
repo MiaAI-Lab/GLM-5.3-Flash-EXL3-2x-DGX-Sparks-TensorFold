@@ -5,5 +5,10 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # WORKER2=user@192.0.2.3       # rank 2
 # WORKER_WEIGHTS2=nfs          # per worker: copy or nfs (default: WORKER_WEIGHTS)
 # WORKER_HF_CACHE2=/models/hf   # per worker: its Hugging Face cache when it is not its HF_HOME
+# The container runtime: docker (default) or podman. Rootful podman is what a Spark pair needs: the worker's NFS
+# volume and CGROUP_PARENT are root's. CGROUP_PARENT is the system slice each rank joins (no swap, if it says so).
+# CONTAINER_RT=podman
+# CONTAINER_RT_SUDO=1
+# CGROUP_PARENT=tensorfold.slice
 # ABLIT=1                      # the gated Ablit weights instead (README "Ablit weights"); needs HF_TOKEN below
 # HF_TOKEN=hf_...              # a Hugging Face read token whose account agreed to the Ablit model's terms

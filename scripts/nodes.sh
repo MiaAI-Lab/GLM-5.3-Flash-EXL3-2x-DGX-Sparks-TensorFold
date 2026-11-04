@@ -34,7 +34,10 @@ declare -A WORKER_DOWN=()
 worker() {
   local i=$1; shift
   [[ -z "${WORKER_DOWN[$i]:-}" ]] || return 255
-  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "$(worker_host "$i")" "$@"
+  # The runtime's command word goes first: a one-liner sent here says `ctr ...` like the scripts do locally, and the
+  # worker's own `docker`/`podman` is chosen by this node's CONTAINER_RT (runtime_ctr). A command that brings its own
+  # definition (worker_save_log) still works: the definitions do not collide.
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "$(worker_host "$i")" "$(remote_ctr)$*"
 }
 
 # save_log <dir> <rank> <container> <keep>: the container's log (stdout and stderr, with timestamps) gzipped into
@@ -43,11 +46,11 @@ worker() {
 save_log() {
   local dir=$1 rank=$2 c=$3 keep=$4 stamp f i=0
   [[ "$keep" =~ ^[0-9]+$ ]] && (( keep > 0 )) || return 0
-  docker inspect "$c" >/dev/null 2>&1 || return 0
+  ctr inspect "$c" >/dev/null 2>&1 || return 0
   mkdir -p "$dir" || return 1
   stamp=$(date +%Y%m%d-%H%M%S); f="$dir/$stamp-rank$rank.log.gz"
   while [[ -e "$f" ]]; do f="$dir/$stamp.$((++i))-rank$rank.log.gz"; done   # same second: still sorts as newer
-  if ! docker logs --timestamps "$c" 2>&1 | gzip > "$f"; then rm -f "$f"; return 1; fi
+  if ! ctr logs --timestamps "$c" 2>&1 | gzip > "$f"; then rm -f "$f"; return 1; fi
   ls -1 "$dir"/*-rank"$rank".log.gz 2>/dev/null | { grep -vxF "$f" || true; } | LC_ALL=C sort -r | tail -n +"$keep" | xargs -r rm -f --
   echo "$f"
 }
@@ -113,20 +116,39 @@ worker_hf_cache() {
 # ensure_nfs_volume i creates it (or checks the one there names the same export); worker_nfs i <cmd...> runs a command
 # in a throwaway container on worker i with the volume at /hf.
 nfs_server() { local s; s=$(wval NFS_SERVER "$1"); echo "${s:-${LINK_HEAD_ADDR[$1]:-}}"; }
+# The export's server is spelled differently by the two runtimes: Docker puts it in the mount options
+# (device=:/path, o=addr=server,...), podman's local driver wants it in the device (device=server:/path) and a
+# mount.nfs that only sees ":" fails to resolve the server. nfs_volume_args sets NFS_DEVICE / NFS_OPTS per runtime.
+nfs_volume_args() {
+  local server=$1
+  if [[ "$CONTAINER_RT" == podman ]]; then
+    NFS_DEVICE="$server:$NFS_PATH"
+    NFS_OPTS="nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600"
+  else
+    NFS_DEVICE=":$NFS_PATH"
+    NFS_OPTS="addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600"
+  fi
+}
+nfs_volume_matches() {  # <inspect output> <server>
+  local have=$1 server=$2
+  [[ "${have%% *}" == "$NFS_DEVICE" ]] || return 1
+  if [[ "$CONTAINER_RT" == podman ]]; then [[ "$have" == *"nfsvers=4.2"* ]]; else [[ "$have" == *"addr=$server,"* ]]; fi
+}
 ensure_nfs_volume() {
   local i=$1 server have h
   server=$(nfs_server "$i"); h=$(worker_host "$i")
   [[ -n "$server" ]] || die "no NFS server address for $h: set $(wvar NFS_SERVER "$i") to the head's address on that worker's link"
-  have=$(worker "$i" "docker volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
+  nfs_volume_args "$server"
+  have=$(worker "$i" "ctr volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
-    worker "$i" "docker volume create --driver local --opt type=nfs --opt device=':$NFS_PATH' \
-      --opt o='addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600' '$NFS_VOLUME'" >/dev/null ||
-      die "could not create the docker volume $NFS_VOLUME on $h"
-  elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$server,"* ]]; then
-    die "$h's docker volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there (docker volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
+    worker "$i" "ctr volume create --driver local --opt type=nfs --opt device='$NFS_DEVICE' \
+      --opt o='$NFS_OPTS' '$NFS_VOLUME'" >/dev/null ||
+      die "could not create the $CONTAINER_RT volume $NFS_VOLUME on $h"
+  elif ! nfs_volume_matches "$have" "$server"; then
+    die "$h's $CONTAINER_RT volume $NFS_VOLUME is ${have%% *} from ${have#* }, not $NFS_DEVICE from $server: remove it there ($CONTAINER_RT volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
   fi
 }
-worker_nfs() { local i=$1; shift; worker "$i" "docker run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
+worker_nfs() { local i=$1; shift; worker "$i" "ctr run --rm --entrypoint '$1' -v '$NFS_VOLUME:/hf:ro' '$IMAGE' $(printf '%q ' "${@:2}")"; }
 
 # link_info <peer address>: this node's side of the link to <peer>: "<address> <netdev> <rdma device> <gid index>".
 # The netdev and source address come from the route to the peer; the RDMA device from sysfs; the GID index is the
@@ -222,9 +244,9 @@ declare -a NODE_DEV=() NODE_HCAS=() NODE_GID=() LINK_HEAD_ADDR=() LINK_WORKER_AD
 # matches across a mixed pair (issue #8). The template holds no spaces: worker() passes it through ssh, which
 # re-splits arguments. A missing image is "missing". worker_image_ident <i> <image>: on worker i.
 IMAGE_IDENT='{{.RootFS.Layers}}{{.Config.Env}}{{.Config.Entrypoint}}{{.Config.Cmd}}{{.Config.WorkingDir}}'
-image_ident() { local s; s=$(docker image inspect -f "$IMAGE_IDENT" "$1" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing; }
+image_ident() { local s; s=$(ctr image inspect -f "$IMAGE_IDENT" "$1" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing; }
 worker_image_ident() {
-  local s; s=$(worker "$1" docker image inspect -f "$IMAGE_IDENT" "$2" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
+  local s; s=$(worker "$1" ctr image inspect -f "$IMAGE_IDENT" "$2" 2>/dev/null) && sha256sum <<<"$s" | cut -c1-64 || echo missing
 }
 
 # cx7_peer <i>: worker i's address on a CX7 port that one of this node's CX7 ports reaches directly (same subnet, no
