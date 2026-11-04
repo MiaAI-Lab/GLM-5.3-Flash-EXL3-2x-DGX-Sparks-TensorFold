@@ -1,0 +1,117 @@
+# Idle trim (TF_GLM_IDLE_TRIM_S, off by default): a rank that has had no stream for that many seconds gives back the memory it
+# only caches, once per idle spell: Python garbage (gc.collect), torch's unused cached CUDA blocks (empty_cache) and the C
+# heap's free pages (malloc_trim). A long prompt's prefill scratch stays in torch's cache after its request ends, and on the
+# Spark's one memory pool that is memory the OS, the other rank's NCCL buffers and the next start cannot use: field reports
+# of MemAvailable that stays low after the agents disconnect, and of reserved CUDA memory ~25 GB above what is in use
+# (issues #143, #168, #197). The KV pool, the kept prompts and the weights are not touched (empty_cache frees only blocks no
+# tensor uses), so the next request prefills no more than it would have; it can pay the CUDA allocations the trim freed.
+# Every rank runs its own timer (a daemon thread on the rank's ``idle`` flag): no new message between the ranks. Each trim
+# logs "[tensorfold] rank N idle S s: trimmed X GiB of cached CUDA memory"; /health's idle_trim has the count and the bytes.
+# Same replies: memory only.
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 7b6016b..4f69fcb 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -98,6 +98,39 @@ def watchdog_exits(value: str | None = None) -> bool:
+     return raw == "1"
+ 
+ 
++def idle_trim_seconds(value: str | None = None) -> float:
++    """TF_GLM_IDLE_TRIM_S: seconds a rank may sit idle (no stream, none queued) before it gives the memory it only
++    caches back to the system (torch's cached blocks, Python garbage, the C heap's free pages); 0 (default): never."""
++
++    value = os.environ.get("TF_GLM_IDLE_TRIM_S", "") if value is None else value
++    try:
++        s = 0.0 if value.strip() == "" else float(value)
++    except ValueError:
++        s = -1.0
++    if s < 0:
++        raise ValueError(f"TF_GLM_IDLE_TRIM_S: seconds (0: off), not {value!r}")
++    return s
++
++
++def trim_memory() -> tuple[int, int]:
++    """Return what this process only caches to the system: Python garbage, torch's unused cached CUDA blocks and the C
++    heap's free pages. Returns (bytes torch had reserved, bytes it reserves now). Nothing a stream or a kept prompt
++    holds is touched: ``empty_cache`` frees only blocks no tensor uses."""
++
++    import gc
++
++    before = torch.cuda.memory_reserved()
++    gc.collect()
++    torch.cuda.empty_cache()
++    try:
++        import ctypes
++
++        ctypes.CDLL("libc.so.6").malloc_trim(0)
++    except (OSError, AttributeError):
++        pass
++    return before, torch.cuda.memory_reserved()
++
++
+ def _watch(seconds: float, what: str) -> None:
+     if seconds > 0:
+         import faulthandler
+@@ -703,6 +736,13 @@ class MultiDecoder:
+         self.chats_continued = self.chats_continued_prefill = 0
+         self.outbox: list[int] = []
+         self.idle = True
++        self.idle_trim_s = idle_trim_seconds()           # TF_GLM_IDLE_TRIM_S, read now: a typo fails at start
++        self.trims = 0                                   # idle spells that ended in a trim, and what they gave back
++        self.trimmed_bytes = 0
++        self.trim_stop = threading.Event()
++        if self.idle_trim_s > 0 and torch.cuda.is_available():
++            self.device_index = torch.cuda.current_device()
++            threading.Thread(target=self._trim_idle, name="idle-trim", daemon=True).start()
+         self.exit_on_broken = exit_on_broken()
+         self.broken: Exception | None = None
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+@@ -746,6 +786,39 @@ class MultiDecoder:
+                 "carry": dict(self.carry, ms_total=round(self.carry["ms_total"], 1), ms_max=round(self.carry["ms_max"], 1),
+                               refused=dict(self.carry["refused"]))}
+ 
++    def _trim_idle(self) -> None:
++        """Both ranks, a thread: once ``idle`` has held for TF_GLM_IDLE_TRIM_S, trim the memory this rank only caches
++        (``trim_memory``), once per idle spell. The prefill scratch of a long prompt stays in torch's cache after its
++        request ends; on the Spark's one memory pool that is memory nothing else can use. The pool, the kept prompts
++        and the weights are not touched, so the next request prefills no more than it would have."""
++
++        import sys
++
++        torch.cuda.set_device(self.device_index)
++        since: float | None = None
++        done = False
++        poll = min(5.0, max(0.5, self.idle_trim_s / 4))
++        while not self.trim_stop.wait(poll):
++            if not self.idle:
++                since, done = None, False
++                continue
++            now = time.monotonic()
++            if since is None:
++                since = now
++            if done or now - since < self.idle_trim_s:
++                continue
++            done = True
++            try:
++                before, after = trim_memory()
++            except Exception as exc:                  # noqa: BLE001  (a trim that fails is skipped, never fatal)
++                print(f"[tensorfold] rank {self.rank} idle trim failed: {exc!r}", file=sys.stderr, flush=True)
++                continue
++            self.trims += 1
++            self.trimmed_bytes += max(0, before - after)
++            print(f"[tensorfold] rank {self.rank} idle {self.idle_trim_s:g} s: trimmed "
++                  f"{(before - after) / 2**30:.2f} GiB of cached CUDA memory ({before / 2**30:.2f} -> "
++                  f"{after / 2**30:.2f} GiB reserved)", file=sys.stderr, flush=True)
++
+     def health(self) -> dict:
+         lanes = list(self.lanes.values())
+         return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
+@@ -755,6 +828,8 @@ class MultiDecoder:
+                 "kv_shard_twins": dict(self.twins, held=sum(1 for l in lanes if l.twin is not None)),
+                 "kv_shard": self._shard_health() if self.pool.half else None,
+                 "kept_prompts": len(self.kept),
++                "idle_trim": {"after_s": self.idle_trim_s, "trims": self.trims,
++                              "trimmed_bytes": self.trimmed_bytes},
+                 # streams that continued their conversation without resuming from its own turn state (a rewind before
+                 # its kept states, or they were dropped or read back from disk), and the tokens those prefilled
+                 "chats_continued": self.chats_continued,
