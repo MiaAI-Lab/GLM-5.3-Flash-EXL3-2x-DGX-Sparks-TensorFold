@@ -5,6 +5,21 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **GLM tool calls stream while they decode** (patch `0132-glm-stream-tool-calls`, by
+  [nuk3s](https://github.com/nuk3s)): `0053` held each call and sent it whole at its `</tool_call>`, with an empty
+  delta every 2 s before that. `/v1/messages` and `/v1/responses` drop empty deltas, and the empty deltas also reset
+  `0111`'s keep-alive timer, so a long call sent no byte at all there. On two Sparks a Write call with 28,490
+  characters of content was silent for 128.5 s on `/v1/messages`, then came as one `input_json_delta`; that is past
+  the ~125 s idle cut that issue #106 measured behind a Cloudflare Tunnel. Now a call's header goes out when its name
+  is whole, a string value goes out as JSON-escaped pieces while it decodes, other values at their `</arg_value>`, and
+  the closing brace once the end parser has read the block, so the pieces join to the whole reply's arguments byte for
+  byte. With the patch on the same pair, the same Write's longest gap between events was 0.6 s, and a short Write
+  (1,014 characters of content) came as 405 argument deltas on the chat route and 410 `input_json_delta` on
+  `/v1/messages`, both equal to the whole reply (before: 809 characters, 1 delta on each route). A reply cut inside a call still ends with `length` or `stop` and no
+  `tool_calls`, but its stream has already sent that call's header and pieces, without the closing brace (vLLM and the
+  Anthropic API stream a cut call the same way; `0053` never sent it). Requests without tools, whole replies and
+  `parallel_tool_calls: false` are unchanged. CPU check: `tools/stream_tool_calls_check.py` (8 of its 24 checks fail
+  on the unpatched engine).
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round

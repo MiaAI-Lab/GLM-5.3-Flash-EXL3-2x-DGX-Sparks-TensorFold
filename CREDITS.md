@@ -233,6 +233,8 @@ checkpoint's ShapleyMcg attribution and the drafter's license).
   [cawilliamson](https://github.com/cawilliamson).
 - `0122-cuda-budget-parked-pages` (the start-up budget counts the pages parked on the per-CPU free lists): by
   Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub, [@rwojo](https://x.com/rwojo) on X).
+- `0132-glm-stream-tool-calls` (GLM tool calls stream while they decode; its check
+  `tools/stream_tool_calls_check.py`): by [nuk3s](https://github.com/nuk3s).
 - Every patch, except the parts credited above: by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
