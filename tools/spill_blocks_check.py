@@ -1208,6 +1208,13 @@ for kk, v in env.items():
         os.environ[kk] = v
 
 
+def small_host(ids) -> int:
+    """The bytes of the small state a keep of ``ids`` copies to the host (``snap``'s tensors)."""
+
+    items, _ = SP.encode(snap(ids), skip=M.MultiDecoder._SPILL_SKIP)
+    return sum(t.numel() * t.element_size() for _, t in items)
+
+
 def stalled(st: S.BlockStore):
     """The writer held at its next block until the returned event (a slow disk)."""
 
@@ -1235,11 +1242,12 @@ x2 = m.pool.add(3 * B, 2 * B)
 fill(ar, 3 * B, 2 * B, 516)
 st.persist(ids2, snap(ids2), extent=x2, lineage="r2", skip=M.MultiDecoder._SPILL_SKIP)
 m.pool.remove(x1)                                       # (its rows go before they are written: the pool's guard)
+smalls = small_host(ids1) + small_host(ids2)            # (both small states wait for the stalled writer)
 check("release: rows within the cap are copied to the host", st.stats["released_blocks"] == 3
-      and st.host_bytes == 3 * st.block_bytes)
+      and st.host_bytes == 3 * st.block_bytes + smalls)
 m.pool.remove(x2)
 check("release: past the cap a state's rows are not copied, the state is dropped", st.stats["released_blocks"] == 3
-      and st.stats["release_dropped"] == 1 and st.host_bytes == 3 * st.block_bytes)
+      and st.stats["release_dropped"] == 1 and st.host_bytes == 3 * st.block_bytes + smalls)
 fill(ar, 0, 5 * B, 517)                                 # (other streams write those rows now)
 gate.set()
 st.drain(TIMEOUT / 4)
@@ -1257,10 +1265,77 @@ fill(ar, 0, n, 518)
 st.persist(ids_of(n, 519), snap(ids_of(n, 519)), extent=Pool(ROWS).add(0, align_up(n)), lineage="t",
            skip=M.MultiDecoder._SPILL_SKIP)
 tail = S._span_bytes(ar.planes, B, n)
-check("release: the block a kept state's end cuts counts in the same host bytes", st.host_bytes == tail)
+check("release: the block a kept state's end cuts and its small state count in the same host bytes",
+      st.host_bytes == tail + small_host(ids_of(n, 519)))
 gate.set()
 st.drain(TIMEOUT / 4)
 check("release: ... until it is written", st.host_bytes == 0)
+ar = arena(212)
+st = store(ar, "release-whole")
+gate = stalled(st)
+x = Pool(ROWS).add(0, 2 * B)
+fill(ar, 0, 2 * B, 524)
+st.persist(ids_of(2 * B, 525), snap(ids_of(2 * B, 525)), extent=x, lineage="w", skip=M.MultiDecoder._SPILL_SKIP)
+check("release: a kept state without a cut block holds its small state's host copy alone",
+      st.host_bytes == small_host(ids_of(2 * B, 525)) > 0)
+gate.set()
+st.drain(TIMEOUT / 4)
+check("release: ... until it is written, and it is stored", st.host_bytes == 0 and S.point_key(ids_of(2 * B, 525))
+      in st.index)
+
+# a keep's own host copies (its small state, the block its end cuts) are counted against the cap BEFORE they are made:
+# with TF_GLM_SPILL_RELEASE_MIB=0, twelve small keeps behind a stalled writer used to hold their twelve cut blocks and
+# small states in host memory all the same
+saved_cap = os.environ.get("TF_GLM_SPILL_RELEASE_MIB")
+os.environ["TF_GLM_SPILL_RELEASE_MIB"] = "0"
+ar = arena(213)
+st = store(ar, "release-zero")
+if saved_cap is None:
+    os.environ.pop("TF_GLM_SPILL_RELEASE_MIB")
+else:
+    os.environ["TF_GLM_SPILL_RELEASE_MIB"] = saved_cap
+gate = stalled(st)
+got = []
+for i in range(12):                                     # (each under one block: the whole state is the block it cuts)
+    n, base = B // 2 + 7 * i, (i % 8) * B
+    fill(ar, base, n, 530 + i)
+    got.append(st.persist(ids_of(n, 550 + i), snap(ids_of(n, 550 + i)), extent=Pool(ROWS).add(base, align_up(n)),
+                          lineage=f"z{i}", skip=M.MultiDecoder._SPILL_SKIP))
+check("release cap 0: twelve small keeps behind a stalled writer hold nothing in host memory (no block, no small state)",
+      st.release_cap == 0 and st.host_bytes == 0)
+check("release cap 0: each is refused at the keep, counted, and queues nothing", got == ["release_cap"] * 12
+      and st.stats["release_dropped"] == 12 and not st.waiting and not st.pending and st.backlog == 0)
+gate.set()
+st.drain(TIMEOUT / 4)
+check("release cap 0: nothing is written", not block_files(st) and not st.index and st.stats["write_failed"] == 0)
+ar = arena(214)
+st = store(ar, "release-fit")
+gate = stalled(st)
+n1, n2 = B + 9, B // 2 + 3
+one = S._span_bytes(ar.planes, B, n1) + small_host(ids_of(n1, 560))
+st.release_cap = one                                    # (room for the first keep's two host copies, exactly)
+fill(ar, 0, n1, 561)
+fill(ar, 4 * B, n2, 562)
+r1 = st.persist(ids_of(n1, 560), snap(ids_of(n1, 560)), extent=Pool(ROWS).add(0, align_up(n1)), lineage="f1",
+                skip=M.MultiDecoder._SPILL_SKIP)
+r2 = st.persist(ids_of(n2, 563), snap(ids_of(n2, 563)), extent=Pool(ROWS).add(4 * B, align_up(n2)), lineage="f2",
+                skip=M.MultiDecoder._SPILL_SKIP)
+check("release cap: a keep whose host copies fit is queued; the next, past the cap, is refused before copying",
+      (r1, r2) == ("queued", "release_cap") and st.host_bytes == one and st.stats["release_dropped"] == 1)
+gate.set()
+st.drain(TIMEOUT / 4)
+check("release cap: the one that fit is stored, the refused one is not, and the host bytes go back to 0",
+      S.point_key(ids_of(n1, 560)) in st.index and S.point_key(ids_of(n2, 563)) not in st.index
+      and st.host_bytes == 0)
+ar = arena(215)
+st = store(ar, "release-room", turns=0)
+olds = [put(st, ar, ids_of(2 * B, 570 + i), f"o{i}")[0] for i in range(2)]
+st.cap, st.release_cap = st.stored(), 0                 # (a full tier: the next keep would need room)
+fill(ar, 0, 2 * B, 572)
+r = st.persist(ids_of(2 * B, 573), snap(ids_of(2 * B, 573)), extent=Pool(ROWS).add(0, 2 * B), lineage="o2",
+               skip=M.MultiDecoder._SPILL_SKIP)
+check("release cap: a keep refused for host memory makes no room first (nothing stored is evicted for it)",
+      r == "release_cap" and all(k in st.index for k in olds))
 
 # -- the prefix wait: off by default (it changes admission with the spill tier off too) ---------------------------------
 probe = "from tensorfold.families.glm5_next.cuda import multi as M; print(M.PREFIX_WAIT)"

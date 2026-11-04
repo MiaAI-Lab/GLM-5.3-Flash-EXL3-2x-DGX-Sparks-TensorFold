@@ -57,7 +57,7 @@ run() {   # name, then (file under tensorfold/, old, new) for each edit (name "p
 B=cuda/spill_blocks.py; MU=families/glm5_next/cuda/multi.py
 run patched
 # review 1: the tail block copied at keep
-run tail-staged-later $B "        cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in new[-1:] if e - s < self.block]" "        cut = []"
+run tail-staged-later $B "            cut = [(h, _host(torch.cat(self._parts(extent, s, e)))) for s, e, h in tail]" "            cut = []"
 run tail-copied-and-staged $B "            job = Job(pt, new[:len(new) - len(cut)], (items, layer)" "            job = Job(pt, new, (items, layer)"
 run tail-not-queued $B "        for h, data in cut:                                 # (written before the blocks the pumps stage)\n            self.jobs.put((\"rows\", job, h, data))\n" ""
 # review 2: a move of an extent being read waits for neither the read nor the disk
@@ -153,7 +153,14 @@ run release-uncapped $B "                fits = self.host_bytes + need <= self.r
 run release-not-counted $B "                if fits:\n                    self.host_bytes += need\n" ""
 run release-never-let-go $B "                    with self.lock:\n                        self.host_bytes -= item.numel() * item.element_size()\n" "                    pass\n"
 run release-cap-backlog $B "    return reserve // RELEASE_SHARE\n" "    return BACKLOG\n"
-run cut-not-counted $B "            self.host_bytes += sum(t.numel() * t.element_size() for _, t in cut)   # (at most a block a state)\n" ""
+run keep-copies-not-counted $B "            self.host_bytes += host\n" ""
+# a keep's own host copies (its small state, the block its end cuts) count against the cap before they are made
+run keep-uncapped $B "            if self.host_bytes + host > self.release_cap:  # (host memory past TF_GLM_SPILL_RELEASE_MIB): not stored\n" "            if False:\n" \
+    $B "            if self.host_bytes + host > self.release_cap:  # (again, as it is taken)\n" "            if False:\n"
+run keep-cap-after-room $B "            if self.host_bytes + host > self.release_cap:  # (host memory past TF_GLM_SPILL_RELEASE_MIB): not stored\n" "            if False:\n"
+run small-not-counted $B "        host = small_host + sum(" "        host = 0 + sum(" \
+    $B "                self.host_bytes -= job.small_host\n" ""
+run small-never-let-go $B "                self.host_bytes -= job.small_host\n" ""
 # the prefix wait: off by default
 run prefix-wait-default-on $MU "PREFIX_WAIT = os.environ.get(\"TF_GLM_PREFIX_WAIT\", \"0\") not in (\"\", \"0\")" "PREFIX_WAIT = os.environ.get(\"TF_GLM_PREFIX_WAIT\", \"1\") != \"0\""
 run prefix-wait-ignores-flag $MU "        if not PREFIX_WAIT or not s.draft" "        if not s.draft"

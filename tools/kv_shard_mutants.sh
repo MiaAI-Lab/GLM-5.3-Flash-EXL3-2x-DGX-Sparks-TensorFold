@@ -135,6 +135,9 @@ run refusal-recounted $MU "        if lane.xwhy != why:\n            self._refus
 run no-spill-salt $MU "        return in_part(c.lineage, self.pool.half_of(c.extent)) if self.pool.half else c.lineage" "        return c.lineage"
 run salt-unsharded $MU "        return in_part(c.lineage, self.pool.half_of(c.extent)) if self.pool.half else c.lineage" "        return in_part(c.lineage, self.pool.half_of(c.extent))"
 run salt-stacks $SB "    return f\"{head.partition('#')[0]}#{int(part)}{bar}{rest}\"" "    return f\"{head}#{int(part)}{bar}{rest}\""
+# the host bytes the spill tier counts against TF_GLM_SPILL_RELEASE_MIB: the rows this rank holds (its planes present)
+run keep-cut-counts-all-planes $SB "        host = small_host + sum(self._span(extent.base, s, e) for s, e, _ in tail)" "        host = small_host + sum(_span_bytes(self.planes, s, e) for s, e, _ in tail)"
+run release-counts-all-planes $SB "            need = sum(self._span(job.where.base, s, e) for s, e, _ in left)" "            need = sum(_span_bytes(self.planes, s, e) for s, e, _ in left)"
 run no-release-on-cross-move $MU "            self._release_rows(x, 0 if cross else None)" "            self._release_rows(x, None)"
 rm -f "$OUT"
 echo "exit $bad"
