@@ -126,6 +126,8 @@ part of this recipe. See the [qualification note](docs/MCDMA_MAC_STUDIO_QUALIFIC
   `ssh-copy-id user@<worker>` (after `ssh-keygen -t ed25519` if you have no key); check with
   `ssh -o BatchMode=yes user@<worker> true`.
 - Docker with the NVIDIA container runtime, your user in the `docker` group, and `rsync`, on both Sparks.
+  Podman works too, rootful, with the same NVIDIA toolkit (`CONTAINER_RT=podman`, `CONTAINER_RT_SUDO=1`; see
+  [Podman instead of Docker](#podman-instead-of-docker)).
   On each Spark, also keep the NVIDIA CDI spec generated (`sudo systemctl enable --now nvidia-cdi-refresh.path
   nvidia-cdi-refresh.service`, then recreate the containers; `nvidia-ctk cdi list` shows `nvidia.com/gpu=all`):
   without it, a host `systemctl daemon-reload` can remove the GPU from a running container, and the next kernel
@@ -762,6 +764,23 @@ Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one RoCE
 port even when the cabled port's two PCIe links, or a second port, are up; at two Sparks `start.sh` pings each second rail across the link before using it and drops one that does not answer, with a warning), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
 server reach Hugging Face; by default it serves from the local cache only).
+
+### Podman instead of Docker
+
+The scripts drive containers through one command word (`ctr`, `scripts/runtime.sh`), so the pair runs under Podman
+without a second copy of them:
+
+```bash
+CONTAINER_RT=podman        # docker (default) or podman
+CONTAINER_RT_SUDO=1        # rootful podman: the worker's NFS volume and CGROUP_PARENT need root
+CGROUP_PARENT=tensorfold.slice   # optional: the system slice each rank joins (no swap, if the slice says so)
+```
+
+Docker stays the default and needs nothing. Rootful Podman is what the Spark pair needs: rootless cannot mount the
+worker's read-only NFS volume or join a system slice. An existing Docker pair moves without a rebuild
+(`docker save | podman load` on each Spark; the image is identified by its layers and config, not by the runtime).
+The flags that differ (`--shm-size` with `--ipc=host`, the NFS volume's device spelling, the image store's root, the
+build's network) are in [docs/PODMAN.md](docs/PODMAN.md).
 
 ### Thinking and sampling
 

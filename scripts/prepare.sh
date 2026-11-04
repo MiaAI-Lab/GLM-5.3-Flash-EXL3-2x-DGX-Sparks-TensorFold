@@ -54,9 +54,8 @@ if [[ "$MODEL_ID" == "$ABLIT_ID" ]]; then
     *) warn "Hugging Face answered HTTP $code when checking HF_TOKEN against the gated $MODEL_ID; trying the download" ;;
   esac
 fi
-command -v docker >/dev/null || die "docker is not installed"
+rt_require "prepare.sh checks the runtime on both nodes"
 command -v rsync >/dev/null || die "rsync is not installed on this node (sudo apt install rsync)"
-docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
 if ! command -v nvidia-smi >/dev/null; then warn "nvidia-smi not found on this node"
 elif ! nvidia-smi -L >/dev/null 2>&1; then warn "nvidia-smi failed on this node: is the NVIDIA driver working?"; fi
 # CDI devices the toolkit can see; this does not verify how docker injects the GPU. Without CDI the legacy hook can
@@ -67,7 +66,7 @@ cdi_warn() {
     the GPU after a host daemon-reload (issue #150). If nvidia-cdi-refresh is installed, enable spec generation with
     sudo systemctl enable --now nvidia-cdi-refresh.path nvidia-cdi-refresh.service, then recreate the containers"
 }
-docker info 2>/dev/null | grep -qi nvidia || warn "docker does not list an nvidia runtime on this node; --gpus all may fail"
+rt_has_gpu || warn "$CONTAINER_RT cannot hand a GPU to a container on this node; --gpus all may fail"
 eval "$CDI_CHECK" || cdi_warn "this node"
 check_workers
 # "the worker" at TP=2, "worker 2 (user@host)" beyond
@@ -76,9 +75,10 @@ declare -a WORKER_HF=()
 for i in $(worker_ids); do
   need_worker "$i"
   w=$(wname "$i")
-  worker "$i" 'docker info >/dev/null 2>&1' || die "$w ($(worker_host "$i")) cannot talk to its docker daemon (docker group?)"
+  worker "$i" 'ctr info >/dev/null 2>&1' ||
+    die "$w ($(worker_host "$i")) cannot talk to its $CONTAINER_RT (docker: the docker group; podman rootful: passwordless sudo)"
   worker "$i" 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $w: is the NVIDIA driver working?"
-  worker "$i" 'docker info 2>/dev/null | grep -qi nvidia' || warn "docker does not list an nvidia runtime on $w; --gpus all may fail"
+  worker "$i" "$(declare -f rt_has_gpu); rt_has_gpu" || warn "$CONTAINER_RT cannot hand a GPU to a container on $w; --gpus all may fail"
   worker "$i" "$CDI_CHECK" || {
     if (( $? == 255 )); then warn "could not check NVIDIA CDI on $w: ssh failed"; else cdi_warn "$w"; fi
   }
@@ -100,7 +100,7 @@ for i in $(worker_ids); do
 done
 
 PATCHES_HASH=$(image_hash)
-built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
+built_hash=$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 worker_free_gb() { worker "$1" "df -BG --output=avail '$2' | tail -1 | tr -dc '0-9'"; }
 models=("$MODEL_ID"); [[ "$DRAFTER" == dflash2 ]] && models+=("$DFLASH2_ID")
@@ -135,7 +135,7 @@ hub_missing_gb() {
 # Disk on the head: what the download still needs (plus 5 GB), and the image (unless built from these patches), both
 # on one filesystem when Docker's root shares it with HF_CACHE. Without the Hub's file list: MIN_FREE_GB, unless every
 # snapshot to serve is already here (as before).
-DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+DOCKER_ROOT=$(rt_root)
 if missing=$(hub_missing_gb); then
   need_ckpt=0; (( missing == 0 )) || need_ckpt=$((missing + 5))
   ckpt_what="the download needs ~${missing} GB that the cache does not hold yet"
@@ -158,7 +158,7 @@ fi
 declare -a WORKER_DOCKER_ROOT=()
 disk=""
 for i in $(worker_ids); do
-  WORKER_DOCKER_ROOT[i]=$(worker "$i" "docker info -f '{{.DockerRootDir}}'" 2>/dev/null || echo /var/lib/docker)
+  WORKER_DOCKER_ROOT[i]=$(worker "$i" "$(declare -f rt_root); rt_root" 2>/dev/null || echo "$DOCKER_ROOT")
   if [[ "$(worker_weights "$i")" == nfs ]]; then d=${WORKER_DOCKER_ROOT[i]}; else d=${WORKER_HF[i]}; fi
   if (( TP == 2 )); then disk+=", $(worker_free_gb "$i" "$d") GB under $d on the worker"
   else disk+=", $(worker_free_gb "$i" "$d") GB under $d on worker $i"; fi
@@ -171,19 +171,19 @@ log "Disk: $(free_gb "$HF_CACHE") GB free under $HF_CACHE here$disk"
 prebuilt=$(prebuilt_image)            # the pinned digest (config.sh's IMAGE_TAG / IMAGE_DIGEST), else the hash's tag
 if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
   log "Pulling the prebuilt image $prebuilt (PULL=0 builds instead)"
-  if docker pull "$prebuilt" &&
-     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
-    docker tag "$prebuilt" "$IMAGE"; built_hash=$PATCHES_HASH
+  if ctr pull "$prebuilt" &&
+     [[ "$(ctr image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
+    ctr tag "$prebuilt" "$IMAGE"; built_hash=$PATCHES_HASH
     log "Using $prebuilt as $IMAGE"
   else
     warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
   fi
 fi
 if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
-  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
+  ctr image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; ctr pull "$BASE_IMAGE"; }
   log "Building $IMAGE (TensorFold $TF_VERSION, patches $PATCHES_HASH: $(compgen -G 'patches/*.patch' | wc -l) patches, plus $IMAGE_EXTRAS)"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
-  docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+  ctr build $(rt_build_net) "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_SPEC="git+${TF_REPO}@${TF_VERSION}" --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg EXTRAS="$IMAGE_EXTRAS" \
     -f - patches <<'DOCKERFILE'
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
@@ -203,7 +203,7 @@ DOCKERFILE
 else
   log "Image $IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
 fi
-docker run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1
+ctr run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1
 
 # ---------------------------------------------------------------- 3. image (workers)
 image_id=$(image_ident "$IMAGE")                    # by content: .Id differs between image stores (issue #8)
@@ -213,13 +213,13 @@ for i in $(worker_ids); do
   wfree=$(worker_free_gb "$i" "${WORKER_DOCKER_ROOT[i]}")
   (( wfree >= IMAGE_FREE_GB )) ||
     die "only ${wfree} GB free under $w's Docker root (${WORKER_DOCKER_ROOT[i]}); the image needs ~${IMAGE_FREE_GB} GB (IMAGE_FREE_GB)"
-  if [[ "${PULL:-1}" == 1 ]] && worker "$i" docker pull "$prebuilt" >/dev/null 2>&1 &&
+  if [[ "${PULL:-1}" == 1 ]] && worker "$i" ctr pull "$prebuilt" >/dev/null 2>&1 &&
      [[ "$(worker_image_ident "$i" "$prebuilt")" == "$image_id" ]]; then
-    worker "$i" docker tag "$prebuilt" "$IMAGE"
+    worker "$i" ctr tag "$prebuilt" "$IMAGE"
     log "Using $prebuilt as $IMAGE on $w"
   else
-    log "Copying $IMAGE to $w (docker save | docker load; only missing layers are stored)"
-    docker save "$IMAGE" | worker "$i" docker load >/dev/null
+    log "Copying $IMAGE to $w ($CONTAINER_RT save | $CONTAINER_RT load; only missing layers are stored)"
+    rt_save "$IMAGE" | worker "$i" 'ctr load' >/dev/null
   fi
   [[ "$(worker_image_ident "$i" "$IMAGE")" == "$image_id" ]] || die "$w's $IMAGE differs from the head's"
 done
@@ -235,7 +235,7 @@ download() {  # <repo id> <revision or empty>
     hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
   else
     # Keep downloads owned by the host user, in the same HF_CACHE/hub layout as the host CLI.
-    docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+    ctr run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
       -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
       'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
   fi
@@ -259,7 +259,7 @@ done
 # before the copy: the worker gets only a checkpoint TensorFold reads
 log "Verifying checkpoint with tensorfold info"
 # (without its "EXL3 support is experimental" note: this recipe serves the EXL3 checkpoint on purpose)
-info=$(docker run --rm --entrypoint tensorfold -e HF_HUB_OFFLINE=1 -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" \
+info=$(ctr run --rm --entrypoint tensorfold -e HF_HUB_OFFLINE=1 -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" \
   info "/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev "$MODEL_ID")" 2>&1) ||
   die "tensorfold info cannot read the checkpoint: $info"
 printf '%s\n' "$info" | grep -v "EXL3 support is experimental" || true

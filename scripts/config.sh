@@ -86,6 +86,11 @@ prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
+# The container runtime (docker by default; CONTAINER_RT=podman + CONTAINER_RT_SUDO=1 for rootful podman, and
+# CGROUP_PARENT=<slice> to put each rank in a system slice). Sourced here, so start.sh, stop.sh, prepare.sh and the
+# helpers all resolve `ctr` the same way; scripts/local.sh can set the three keys.
+source "$_cfg_root/scripts/runtime.sh"
+
 CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on both Sparks
 
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash-EXL3}"
@@ -429,11 +434,11 @@ PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
   local hash label wlabel i line
   hash=$(image_hash)
-  label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
-  wlabel=$(worker 1 docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
+  label=$(ctr image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
+  wlabel=$(worker 1 ctr image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   line="model=$MODEL_ID@$MODEL_REVISION drafter=$DRAFTER@$DFLASH2_REVISION image=$label worker=$wlabel patches=$hash worker_host=$WORKER weights=$WORKER_WEIGHTS"
   for (( i = 2; i < TP; i++ )); do
-    wlabel=$(worker "$i" docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
+    wlabel=$(worker "$i" ctr image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
     line+=" worker$i=$wlabel worker${i}_host=$(worker_host "$i") weights$i=$(worker_weights "$i") nfs$i=$(wval NFS_SERVER "$i")"
   done
   echo "$line"

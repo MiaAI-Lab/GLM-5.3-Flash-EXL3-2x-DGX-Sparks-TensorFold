@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **The pair can run under Podman** (`CONTAINER_RT=podman`, `CONTAINER_RT_SUDO=1`, optional `CGROUP_PARENT`): all
+  container calls go through `ctr` (`scripts/runtime.sh`), remote one-liners included, and the four places the runtimes
+  differ are handled (build network, `--shm-size` with `--ipc=host`, the NFS volume's device spelling, the image
+  store's root). Docker stays the default; nothing changes for a pair that does not set `CONTAINER_RT`. See
+  [docs/PODMAN.md](docs/PODMAN.md).
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
