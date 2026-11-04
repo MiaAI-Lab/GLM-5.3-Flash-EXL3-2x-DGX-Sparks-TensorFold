@@ -5,6 +5,19 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A worker restarted alone no longer leaves the ranks serving a dead set** (patch `0131-cuda-peer-watch`, issue
+  #129, by [BadAd84](https://github.com/BadAd84)): a rank that stops cannot rejoin the ranks still running, yet rank
+  0 kept its weights and answered `/v1/models` while every request hung, until the head restarted too. Rank 0 now
+  ends (exit code 1) when another rank shows no sign of life for `TENSORFOLD_PEER_TIMEOUT_S` seconds (120; `0`:
+  never) or starts again, and a worker's rank when rank 0 has been gone as long (with three Sparks the worker that
+  did not restart otherwise waits forever), unless rank 0 began a clean stop, so a spill flush still finishes - and
+  the clean-stop mark is written inside its own try, so a store that refuses it cannot skip the shutdown hook after
+  it. Rank 0's own store is its process's: a failed call there is logged and watching goes on, and it ends only when
+  no call of its has answered for the timeout. The store has no authentication, so the rendezvous port belongs on
+  the cluster's private network. So `FOREGROUND=1` under systemd, or a container restart policy, starts every rank
+  again. Each rank calls the rendezvous store every 2 s from a thread of its own; rank 0 drops the NCCL id from the
+  store once every rank holds it, so a rank that starts again never takes the old one. Serving is unchanged. CPU
+  check: `tools/peer_watch_check.py`.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
