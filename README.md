@@ -1,3 +1,10 @@
+# 🚨 NEW, BETTER RECIPE AVAILABLE — EVERYONE SHOULD USE IT 🚨
+
+> [!IMPORTANT]
+> ## This recipe is superseded. **Everything should be using the new one.**
+>
+> # 👉 [github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104) 👈
+
 <h1 align="center">GLM-5.3-Flash EXL3 on DGX Sparks with TensorFold</h1>
 
 <p align="center">
