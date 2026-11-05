@@ -1,6 +1,8 @@
 name: ci
 # CPU-only checks: patches apply to the pinned TensorFold source, the image pin matches the
-# patch set, and the self-contained tools tests pass against a patched source tree.
+# patch set, and the self-contained tools tests pass against a patched source tree. A pull
+# request that changes patches/ cannot carry a published image for its new set, so there the
+# pin mismatch is a warning naming the expected tag; everywhere else it fails.
 # No GPU, no docker, no model downloads (only the checkpoint's chat_template.jinja, a few KB).
 on:
   pull_request:
@@ -12,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Apply patches to the pinned TensorFold source
         run: |
           git clone --depth 1 --branch v0.6.0 https://github.com/ashhart/TensorFold.git /tmp/tf
@@ -31,6 +35,9 @@ jobs:
           python tools/test_chunked_bodies.py --source-root /tmp/tf/src
           python tools/test_effort_tail.py  --source-root /tmp/tf/src --model-dir "$MD"
       - name: Image pin matches the patch set
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           # image_hash() from scripts/config.sh: sha256(cat patches/*.patch + IMAGE_EXTRAS)[:12]
           E="$(sed -n 's/^IMAGE_EXTRAS="\(.*\)"/\1/p' scripts/config.sh)"
@@ -38,6 +45,12 @@ jobs:
           T="$(sed -n 's/^IMAGE_TAG="\${IMAGE_TAG:-\(v[^"]*\)}"/\1/p' scripts/config.sh)"
           echo "patch-set hash: $H   pinned IMAGE_TAG: $T"
           if [ "$T" != "v0.6.0-$H" ]; then
+            if [ "$EVENT" = pull_request ] && ! git diff --quiet "$BASE" HEAD -- patches/; then
+              msg="this PR changes patches/: its set hashes to v0.6.0-$H, IMAGE_TAG is $T. Expected until an image for the merged set is published and pinned."
+              echo "::warning::$msg"
+              echo "Image pin: $msg" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             echo "::error::IMAGE_TAG ($T) does not match the current patch set (v0.6.0-$H). Publish an image for this patch set or bump the pin."
             exit 1
           fi

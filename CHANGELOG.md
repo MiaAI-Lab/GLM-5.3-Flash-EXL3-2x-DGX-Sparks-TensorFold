@@ -5,6 +5,11 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **CI: a pull request that adds or changes a patch is no longer red for the image pin alone** (by
+  [BadAd84](https://github.com/BadAd84)). Such a PR cannot carry a published image for its new patch set, so on a
+  pull request that changes `patches/` the pin check now passes with a warning naming the tag the set hashes to.
+  A push to `main`, and a pull request that does not change `patches/` (a pin bump, for example), still fail on a
+  mismatch.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
