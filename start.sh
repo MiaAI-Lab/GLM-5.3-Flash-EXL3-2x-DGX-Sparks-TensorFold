@@ -41,6 +41,7 @@
 #            e.g.
 #            TENSORFOLD_GLM_IMAGE_TOKENS, TENSORFOLD_GLM_REQUEST_IMAGE_TOKENS (scripts/config.sh: MAX_IMAGES x
 #            IMAGE_TOKENS), TENSORFOLD_MEMORY_RESERVE_GIB, TF_GLM_KEEP_REASONING=0
+#            MALLOC_ARENA_MAX (2) goes to every rank too: glibc's malloc arenas (issue #154)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -311,7 +312,7 @@ fi
 # passes as set, as in v1.4 (unset: the ranks take NCCL_IB_HCA's devices).
 env_args() {
   local _skip='^$' name
-  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
+  ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" -e MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}")
   (( TP == 2 )) || _skip='^TF_ROCE_HCA='
   while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_GLM|TF_ROCE)_[A-Z0-9_]+=' | grep -v "$_skip" || true)
 }
