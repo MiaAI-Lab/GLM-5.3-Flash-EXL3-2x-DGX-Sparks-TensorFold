@@ -672,6 +672,12 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
   `NCCL_CROSS_NIC=1`, `NCCL_IB_SUBNET_AWARE_ROUTING=1` (the image's NCCL 2.30.7 has it), the RoCE v2 GID index when
   it is the same on all of a node's devices, and no P2P or SHM transport. These come from a vLLM recipe that ran on
   the same three Sparks.
+- **Firewall.** NCCL's bootstrap is a ring over each Spark's LAN netdev (rank 0 to 1 to 2 and back to 0) on
+  ephemeral ports. It does not use the CX7 cables. A Spark with its host firewall on must accept every other Spark's
+  LAN address on any port (ufw: `sudo ufw allow from <peer address>`, once for each peer). Rules for the CX7 interfaces alone
+  are not enough. With one leg dropped, `ncclCommInitRank` never returns: every rank's log ends after the NCCL
+  plugin loads, and no rank prints an error. Two Sparks do not show it when the head allows the worker and the
+  worker's firewall is off.
 - `prepare.sh` on its own takes `TP` too: `TP=3 scripts/prepare.sh`.
 
 ## Configuration
