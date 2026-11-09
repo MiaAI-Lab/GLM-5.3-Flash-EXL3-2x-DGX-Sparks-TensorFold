@@ -256,6 +256,10 @@ typo leaves it running (running requests are cut off; `stop.sh` warns). Extra ar
 both ranks after the defaults, so they win (`./start.sh restart --max-tokens 16384`); `./start.sh --help` lists all.
 `FOREGROUND=1 ./start.sh` stays attached to rank 0's log and exits with its exit code (for a systemd unit), without
 the progress lines, the window retry or the smoke test; when either rank ends, it stops the other one.
+At three Sparks the unit runs `FOREGROUND=1 ./start-tp3.sh`, or `FOREGROUND=1 ./start.sh` with `TP=3` in `scripts/local.sh`:
+`./start.sh` alone serves two Sparks and leaves `WORKER2` out without a warning. The two take `COMM` from different
+places: `./start-tp3.sh` exports `COMM=${COMM:-nccl}`, which wins over `scripts/local.sh`, while `./start.sh` takes
+`COMM` from `scripts/local.sh`, else the default `roce`.
 
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
