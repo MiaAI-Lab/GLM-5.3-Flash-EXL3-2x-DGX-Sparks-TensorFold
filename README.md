@@ -364,7 +364,8 @@ every Spark. Tensor parallelism splits the attention heads, but every head reads
 held a full copy: 11 DSA layers x (528 bytes of fp8 latent + 36 of pooled keys) = 6,204 bytes a token a Spark. With
 the shard the pool is split in parts, one a Spark; a conversation lives in one part, and only that Spark (its owner)
 keeps its latents, the pooled keys staying on every Spark: 3,300 bytes a token at two Sparks, so the same memory holds
-1.87x the tokens (computed: 2.66x at three, untested there). The same shard code serves the tp4 branch (four Sparks):
+1.87x the tokens (computed: 2.66x at three; measured at three Sparks with `PARALLEL=8`: 2.68x, from 2,902,016 to 7,778,304
+tokens, a decode round 3.7% longer at one request, 42.8 to 44.4 ms). The same shard code serves the tp4 branch (four Sparks):
 there its own-row prompt front and microbatching run with it, and on a switchless ring a carry is relayed over the
 neighbour links; four Sparks on a ring measured 3.4x the pool with byte-equal replies (#152). On this branch a carry
 always goes straight from owner to owner.
