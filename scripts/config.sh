@@ -46,6 +46,8 @@ if [[ "$TP" != 2 ]]; then
 fi
 MASTER_ADDR="${MASTER_ADDR:-$_ma}"
 SOCKET_IFNAME="${SOCKET_IFNAME:-}"
+ROCE_NETDEVS_EXCLUDE="${ROCE_NETDEVS_EXCLUDE:-}"   # netdev globs the RoCE pairing skips (space/comma list), e.g. "*f1np1" when
+                                                 # point-to-point cables sit next to the switch ports; empty = use every RoCE netdev
 
 # ABLIT=1 serves the Ablit weights, Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit (the same checkpoint,
 # abliterated; README "Ablit weights"), instead of the published checkpoint; 0 (default) the published one. The Ablit
