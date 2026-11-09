@@ -309,6 +309,17 @@ detect_link() {
 # node_inventory [master]: this node's default-route netdev ("default <netdev>"), whether it routes to <master>
 # ("master ok|none"), and one line per RoCE netdev that is up with an IPv4 address: "<netdev> <rdma device>
 # <address/prefix> <RoCE v2 GID index of that address, or ->". Read-only (ip and sysfs).
+# _netdev_excluded <netdev>: true when the netdev matches a glob in ROCE_NETDEVS_EXCLUDE (space or comma separated;
+# default empty = every RoCE netdev is used, as before). For nodes that also carry links the serve must not pair over,
+# for example a second set of point-to-point cables next to a switch, whose shared subnet would otherwise read as a link.
+_netdev_excluded() {
+  local g IFS=$' ,'
+  local -a globs=()
+  read -r -a globs <<<"${ROCE_NETDEVS_EXCLUDE:-}"   # read -a does not glob-expand, so a pattern never matches local files
+  # shellcheck disable=SC2053  # $g is a glob on purpose (e.g. "*f1np1")
+  for g in "${globs[@]}"; do [[ "$1" == $g ]] && return 0; done
+  return 1
+}
 node_inventory() {
   local n dev hca cidr want idx f
   echo "default $(ip -o -4 route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
@@ -316,6 +327,7 @@ node_inventory() {
   for n in /sys/class/net/*; do
     dev=${n##*/}
     [[ -d $n/device/infiniband && "$(cat "$n/operstate" 2>/dev/null)" == up ]] || continue
+    _netdev_excluded "$dev" && continue   # ROCE_NETDEVS_EXCLUDE: netdevs the RoCE pairing must not use
     hca=$(ls "$n/device/infiniband" | head -1)
     for cidr in $(ip -o -4 addr show dev "$dev" | awk '{print $4}'); do
       want=$(printf '0000:0000:0000:0000:0000:ffff:%02x%02x:%02x%02x' $(tr '.' ' ' <<<"${cidr%/*}"))
@@ -377,7 +389,7 @@ detect_links() {
   local -a inv=()
   inv[0]=$(node_inventory)
   for i in $(worker_ids); do
-    inv[i]=$(worker "$i" "$(declare -f node_inventory); node_inventory $MASTER_ADDR" 2>/dev/null || true)
+    inv[i]=$(worker "$i" "ROCE_NETDEVS_EXCLUDE=$(printf %q "${ROCE_NETDEVS_EXCLUDE:-}"); $(declare -f _netdev_excluded node_inventory); node_inventory $MASTER_ADDR" 2>/dev/null || true)
     [[ "${inv[i]}" != *"master none"* ]] ||
       die "$(worker_host "$i") has no route to MASTER_ADDR $MASTER_ADDR: set MASTER_ADDR to an address of this node it reaches"
   done
