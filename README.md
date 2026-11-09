@@ -653,6 +653,13 @@ devices toward all its peers, and each device's RoCE v2 GID is found on its own)
   each Spark are used, each toward one peer). Wire it as a directed ring, each Spark's port 0 to the next Spark's
   port 1; a mirrored ring leaves one pair NCCL cannot connect. `start.sh` refuses a pair of ranks without a common
   subnet.
+- **CX7 firmware.** Check that the three cards run the same firmware before the first start
+  (`cat /sys/class/infiniband/rocep1s0f0/fw_ver` on each Spark). DGX OS's CX7 firmware manager checks for a cable
+  before it acts, skips a card that has none, and reports no error. A Spark updated while its CX7 was uncabled keeps
+  the older firmware until the manager's boot service runs on a reboot with the cable in. To update at once, run
+  the manager's `install`, reboot, then `verify`. One such card (28.45.4028, the other two on 28.50.1002) sent at
+  12.8 Gb/s and received at 104 Gb/s; after its update it sent at 104. `ib_write_bw` in both directions on each
+  cable shows it.
 - **Settings** (in `scripts/local.sh`): `WORKER` (rank 1) and `WORKER2` (rank 2), each with its own `FABRIC_PEER`,
   `FABRIC_PEER2` if needed (`./start.sh` uses `WORKER` only). Weights per worker: `WORKER_WEIGHTS`, `WORKER_WEIGHTS2`
   (default: `WORKER_WEIGHTS`). With `nfs`, each worker mounts the head's export from the head's address on that
