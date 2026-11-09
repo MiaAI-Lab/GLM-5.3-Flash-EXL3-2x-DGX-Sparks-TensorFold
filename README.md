@@ -768,7 +768,8 @@ Less common settings are described in `scripts/config.sh` and `scripts/nodes.sh`
 `scripts/prepare.sh --rebuild`), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE` (default `$HF_HOME` or
 `~/.cache/huggingface`), `KERNEL_CACHE`, `STATE_DIR`, `MIN_FREE_GB`, `IMAGE_FREE_GB`, `NCCL_RAILS` (`1`: one RoCE
 port even when the cabled port's two PCIe links, or a second port, are up; at two Sparks `start.sh` pings each second rail across the link before using it and drops one that does not answer, with a warning), `NCCL_CHANNELS` (4), `NCCL_DEBUG`, `RSYNC_OPTS`. `start.sh` also takes `HF_HUB_OFFLINE=0` (let the
-server reach Hugging Face; by default it serves from the local cache only).
+server reach Hugging Face; by default it serves from the local cache only) and `MALLOC_ARENA_MAX` (`2`: glibc's malloc
+arenas in every rank; glibc's own limit is 8 a core, and rank 0's host memory grew with it, issue #154).
 
 ### Thinking and sampling
 

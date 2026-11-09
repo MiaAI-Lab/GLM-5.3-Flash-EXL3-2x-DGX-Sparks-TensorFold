@@ -5,6 +5,10 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **Every rank runs with `MALLOC_ARENA_MAX=2`** (`start.sh`, issue #154; found by @anakronox, confirmed by @kutovoy):
+  glibc gives a process up to 8 malloc arenas a core and keeps the pages each one touched, so rank 0's host memory
+  grew with picture traffic, about 560 MiB/h of RSS, and 5 MiB/h with the cap over 44.3 h (kutovoy's episodes 2 and
+  4 on #154), with decode and prefill speeds unchanged. `MALLOC_ARENA_MAX=<n>` sets another value.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
