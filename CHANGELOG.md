@@ -5,6 +5,14 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased
 
+- **A second grid state short of a prompt's end** (patch `0130-glm-grid-tail-state`, issue #173, by
+  [plyldavid-maker](https://github.com/plyldavid-maker)): a drafted prompt keeps its state at `floor(n / 64) * 64`,
+  which on a long prompt can sit inside the final turn's text, so a later prompt sharing everything before that turn
+  no longer matches and prefills from scratch — same-prefix second questions paid a full cold prefill above long
+  contexts (misses from ~790k here), shorter ones hit by the remainder's luck. The patch keeps one more state 256
+  tokens earlier, inside the shared prefix; the end grid state still credits an exact replay. Measured on two Sparks
+  (GB10, `PARALLEL=8`, KV=fp8): a 904,517-token pair's second request went from `cached_tokens=0` after a 614 s
+  prefill to `cached_tokens=904,256` in 3.8 s; byte-exact suite and decode speeds unchanged.
 - **A request held for room no longer re-reads its stored prompt every round** (patch `0088-glm-spill-tier`, PR #210
   by [nanashi66](https://github.com/nanashi66)): `GlmScheduler._admit` forgot a request's "its stored prompt was looked
   for" mark before `admit`, so a request `NoRoom` held started the NVMe read of its state again in every retry round
