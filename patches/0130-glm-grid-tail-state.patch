@@ -1,0 +1,62 @@
+Patch 0130: a second grid state short of a prompt's end (issue #173). A drafted prompt keeps its
+prompt state at floor(n / grid) * grid; on a long prompt that point can sit inside the final turn's
+text (the tail question of a fresh request, the last user message of an agent turn), so a later prompt
+sharing everything before the tail is no longer a prefix of the kept state and prefills from scratch:
+a same-prefix second question paid a full cold prefill above long contexts (misses from ~790k on this
+stack), while shorter ones hit. The extra state sits GRID_TAIL (256) tokens earlier, in the shared
+prefix, and keeps that request's hit; the end grid state still gives an exact replay its credit.
+Same bits: prefill is the same for any chunking, and kept states only choose prefill reuse
+(resumed prompts equal fresh ones); the sequential prefill just stops once more.
+CPU check: tools/grid_tail_check.py (kept-state lengths for a long prompt with a tail).
+--- tensorfold/families/glm5_next/cuda/engine.py	2026-10-25 15:33:09.000000000 +0800
++++ tensorfold/families/glm5_next/cuda/engine.py	2026-11-08 14:53:54.807554484 +0800
+@@ -130,6 +130,11 @@
+     return point if point > cut else None
+ 
+ 
++GRID_TAIL = 256                      # a drafted prompt keeps a second grid state this many tokens short of
++                                     # its end grid point: the end grid state can sit inside the prompt's final
++                                     # turn's text, where a later prompt with a different tail no longer matches
++                                     # it and prefills from scratch (kept-state misses on long prompts); the
++                                     # earlier state stays in the shared prefix and keeps that next request's hit
+ SHARED_DEFAULT = 256                  # TF_GLM_SHARED_PREFIX=1: the fewest tokens a shared-prefix state adds
+ SHARED_MIN = 16
+ SHARED_MOST = 2                       # shared-prefix states a request keeps at most (the header's two slots)
+@@ -1422,9 +1427,14 @@
+         # same way, each prefilled to as a prompt of its length and resumed from, so fresh and resumed prompts pass
+         # through the same states there too
+         stops = sorted(p for p in set(shared) if point is not None and cut < p < point)
++        if point is not None:
++            tail = grid_point(len(prompt) - GRID_TAIL, cut, self.grid)
++            if tail is not None and cut < tail < point:
++                stops.append(tail)
+         stats: dict[str, Any] = {"shared": list(stops)} if stops else {}
+         if point is not None and point < len(prompt):
+             stops.append(point)
++        stops = sorted(set(stops))           # shared points and the tail state ascend into the sequential prefill
+         resume, kept = hit, []
+         for stop in stops:
+             head = list(prompt[:stop])
+--- tensorfold/families/glm5_next/cuda/multi.py	2026-11-08 16:24:56.000000000 +0800
++++ tensorfold/families/glm5_next/cuda/multi.py	2026-11-08 18:15:10.291748750 +0800
+@@ -1377,7 +1377,7 @@
+     def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
+         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
+ 
+-        from .engine import decode_policy, grid_point
++        from .engine import decode_policy, grid_point, GRID_TAIL
+         from .forward import State
+ 
+         g, e = self.g, self.e
+@@ -1498,6 +1498,11 @@
+             lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
+             lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
+                                               else [])
++            tail = grid_point(len(prompt) - GRID_TAIL, cut, self.grid)
++            if lane.point is not None and tail is not None and cut < tail < lane.point and tail not in lane.stops:
++                lane.stops.append(tail)   # a state in the shared prefix keeps a different-tail request's hit
++                lane.stops.sort()         # (issue #173; engine.GRID_TAIL): _plan takes the first stop past the
++                                          # position, so the stops ascend; the end grid state still serves replays
+         s.started = time.perf_counter()
+         lane.t0 = s.started
+         self.lanes[lane.sid] = lane
